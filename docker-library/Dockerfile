@@ -1,6 +1,6 @@
-FROM ubuntu:22.04
+FROM ubuntu:24.04
 
-LABEL org.sqlite.static.binary.linux.x86_64.dockerfile.version="1.0.7"
+LABEL org.sqlite.static.library.linux.x86_64.dockerfile.version="2.0.0"
 
 ARG URL_SQLITE_SOURCE_ZIP
 
