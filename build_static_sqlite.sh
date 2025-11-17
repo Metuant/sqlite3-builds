@@ -1,6 +1,6 @@
 #!/bin/sh
 
-SQLITE_ZIP_URL='https://sqlite.org/2025/sqlite-amalgamation-3500400.zip'
+SQLITE_ZIP_URL='https://sqlite.org/2025/sqlite-amalgamation-3510000.zip'
 SQLite_compressor='upx'  # Program to use for compressing compiled sqlite
                          # Keep it empty as "" to disable compression
 
