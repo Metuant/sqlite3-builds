@@ -6,51 +6,48 @@
     |____/   \__\_\ |_____| |_|  \__|  \___| |____/
                                                     
 ```
-# static-sqlite3
+# sqlite3-builds
 
-[![Build sqlite](https://github.com/Scalesoft/static-sqlite3/actions/workflows/sqlite-build.yml/badge.svg?event=push)](https://github.com/Scalesoft/static-sqlite3/actions/workflows/sqlite-build.yml)
+[![Build sqlite](https://github.com/darthShadow/sqlite3-builds/actions/workflows/sqlite-build.yml/badge.svg?event=push)](https://github.com/darthShadow/sqlite3-builds/actions/workflows/sqlite-build.yml)
 
-Compile a statically linked `sqlite3` for amd64 platforms due to abcense of statically compiled `sqlite3` program for x86_64 Linux platforms on official site.
+This fork builds both:
+
+1. A statically-linked `sqlite3` CLI shell binary (Alpine/musl, x86_64-v3, UPX-compressed)
+2. A `libsqlite3.so` shared library (Ubuntu 24.04/glibc, x86_64-v3)
 
 ## Compilation Requirements
-Docker required (using official Linux distribution of alpine:latest)
 
-## Running Requirements
-
-- Linux
-- compatible with classic `sh` shells, such as bash,dash,ash,etc
-
-- Optional:
-  - OpenSSH 8.0+ (to use `ssh-keygen` to verify compiled files in [release][1] section)
-  - `git` (to pull conveniently this repository)
+Docker.
 
 ## Compiling
 
 ```bash
-git clone https://github.com/CompuRoot/static-sqlite3.git
-cd static-sqlite3
+git clone https://github.com/darthShadow/sqlite3-builds.git
+cd sqlite3-builds
 ./build_static_sqlite.sh
 ```
-Compiled file will be placed in your local `release` directory.
+
+Compiled files are placed in your local `release` directory:
+
+- `release/cli/` contains `sqlite3` and `sqlite3_orig`
+- `release/library/` contains `libsqlite3.so`
 
 ## Pre-compiled binary
 
-You can also download already compiled, `sqlite3` program from [releases][1].<br>
-To check integrity and authenticity of pre-compiled program, - download both, `sqlite3` and its signature `sqlite3.sig`,
-and run following command in a download directory:
-```
-<sqlite3 ssh-keygen -Y check-novalidate -n 'https://github.com/compuroot.file' -s sqlite3.sig
-```
+Pre-compiled artifacts are published on [GitHub Releases][1] when a `v*` tag is pushed, for example `v3.51.0`.
+
+Signing: TODO.
 
 ## Customization
 
-- You can change `sqlite3` version to compile by edit file `build_static_sqlite.sh` . You need to supply direct link to official `sqlite3` download link in variable: `SQLITE_ZIP_URL`
-- By default compiled `sqlite3` stripped and packed with `upx` compressor to reduce file size. If you don’t want to have compressed version, keep variable `SQLite_compressor` empty.
-- You can change compile-time options by editing `docker/Build.sh` file before running `build_static_sqlite.sh`. As of now, `Build.sh` following closely to official recommendation with compile-time options.
+- Change the SQLite version by editing `SQLITE_ZIP_URL` in `build_static_sqlite.sh`.
+- Change CLI compile-time flags in `docker-cli/Build.sh`.
+- Change library compile-time flags in `docker-library/Build.sh`.
+- Keep `SQLite_compressor` empty in `build_static_sqlite.sh` to disable CLI compression.
 
 ## Motivation
 
-Make portable `sqlite3` program that can run without dependencies on any x86_64 Linux.
+Make a portable optimized `sqlite3` CLI and `libsqlite3.so` library for Linux x86_64-v3 hosts.
 
 
-[1]: https://github.com/CompuRoot/static-sqlite3/releases
+[1]: https://github.com/darthShadow/sqlite3-builds/releases

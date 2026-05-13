@@ -1,10 +1,13 @@
 #!/bin/sh
+set -eu
 
-SQLITE_ZIP_URL='https://sqlite.org/2025/sqlite-amalgamation-3510000.zip'
+SQLITE_ZIP_URL='https://sqlite.org/2026/sqlite-amalgamation-3530100.zip'
+SQLITE_SHA3_256='3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114'
 SQLite_compressor='upx'  # Program to use for compressing compiled sqlite
                          # Keep it empty as "" to disable compression
 
-DockerImage='static-sqlite'
+DockerCliImage='static-sqlite3-cli'
+DockerLibraryImage='static-sqlite3-library'
 
 ### No user intervention below this point ######################################
 
@@ -12,53 +15,71 @@ onErr(){
   local msg errNum
   msg="${1}"
   errNum=$2
-  printf "Error[%i]: %s\n" ${errNum} "${msg}"
+  printf "Error[%i]: %s\n" "${errNum}" "${msg}"
   exit 1
 }
 
 errMsgDep="Cannot continue due to absence of required dependency"
 
-ID=$(type id); [ $? -eq 0 ] && ID="/${ID#*/}" || onErr "${errMsgDep}" 1
-
-if [ $($ID -u) -eq 0 ]; then
-  SUDO=''
+if ID=$(type id); then
+  ID="/${ID#*/}"
 else
-  SUDO=$(type sudo); [ $? -eq 0 ] && SUDO="/${SUDO#*/}" || SUDO=''
+  onErr "${errMsgDep}" 1
 fi
 
-DOCKER=$(type docker);
-[ $? -eq 0 ] && DOCKER="/${DOCKER#*/}" || onErr "Please install docker first..." 2
+if [ "$($ID -u)" -eq 0 ]; then
+  SUDO=''
+else
+  if SUDO=$(type sudo); then
+    SUDO="/${SUDO#*/}"
+  else
+    SUDO=''
+  fi
+fi
 
-$SUDO $DOCKER version  >/dev/null 2>&1
-[ $? -ne 0 ] && {
+if DOCKER=$(type docker); then
+  DOCKER="/${DOCKER#*/}"
+else
+  onErr "Please install docker first..." 2
+fi
+
+if ! $SUDO $DOCKER version  >/dev/null 2>&1; then
   errMsg="$(printf '\n  You are not authorized to run docker,')"
   errMsg="${errMsg}$(printf '\n  try to "su -" into root account and try again.\n\n')"
   onErr  "${errMsg}" 3
-}
+fi
 
 
 
-cd ./docker
+$SUDO $DOCKER build --rm --no-cache=true -t "${DockerCliImage}"              \
+  --build-arg URL_SQLITE_SOURCE_ZIP="${SQLITE_ZIP_URL}"                      \
+  --build-arg COMPRESS_SQLITE3="${SQLite_compressor}"                        \
+  --build-arg MARCH="${MARCH:-x86-64-v3}"                                    \
+  --build-arg SQLITE_SHA3_256="${SQLITE_SHA3_256}"                           \
+  -f docker-cli/Dockerfile .
 
-$SUDO $DOCKER build --rm --no-cache=true -t "${DockerImage}" .  \
-  --build-arg URL_SQLITE_SOURCE_ZIP="${SQLITE_ZIP_URL}"         \
-  --build-arg COMPRESS_SQLITE3="${SQLite_compressor}"
-cd ..
+$SUDO $DOCKER build --rm --no-cache=true -t "${DockerLibraryImage}"          \
+  --build-arg URL_SQLITE_SOURCE_ZIP="${SQLITE_ZIP_URL}"                      \
+  --build-arg MARCH="${MARCH:-x86-64-v3}"                                    \
+  --build-arg SQLITE_SHA3_256="${SQLITE_SHA3_256}"                           \
+  -f docker-library/Dockerfile .
 
 printf "\n\n===== Taking ready to use static sqlite3 =======================================\n\n"
 
 arch="${SQLITE_ZIP_URL##*/}"
 workdir="${arch%.*}"
 
-[ ! -d release ] && mkdir release
+mkdir -p release release/cli release/library
 
-$SUDO $DOCKER run --rm -v $(pwd)/release:/release/  \
-  -it "${DockerImage}"                              \
-  cp -fv /app/${workdir}/sqlite3 /release/
+$SUDO $DOCKER run --rm -v "$(pwd)/release/cli:/release/"  \
+  "${DockerCliImage}"                                     \
+  cp -fv /app/${workdir}/dist/sqlite3 /app/${workdir}/dist/sqlite3_orig /release/
 
-$SUDO $DOCKER stop "${DockerImage}"
+$SUDO $DOCKER run --rm -v "$(pwd)/release/library:/release/"  \
+  "${DockerLibraryImage}"                                     \
+  cp -fv /app/${workdir}/dist/libsqlite3.so /release/
 
-cd   release
+cd release/cli
 echo "=============================="
 ldd  sqlite3
 echo "------------------------------"
@@ -67,8 +88,14 @@ echo "------------------------------"
 echo '.version' | ./sqlite3
 echo "=============================="
 
-cd ..
+cd ../library
+echo "=============================="
+file libsqlite3.so
+echo "------------------------------"
+ldd  libsqlite3.so
+echo "=============================="
 
-# Cleanup the built image
-$SUDO $DOCKER image rm "${DockerImage}" >/dev/null 2>&1
+cd ../..
 
+# Cleanup the built images
+$SUDO $DOCKER image rm "${DockerCliImage}" "${DockerLibraryImage}" >/dev/null 2>&1

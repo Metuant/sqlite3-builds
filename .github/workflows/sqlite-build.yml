@@ -3,49 +3,120 @@ name: Build sqlite
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 env:
-  version: "3510000"
-  release_year: "2025"
+  SQLITE_VERSION: "3530100"
+  SQLITE_RELEASE_YEAR: "2026"
+  SQLITE_SHA3_256: "3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114"
   docker_cli_image: "sqlite3-cli"
   docker_library_image: "sqlite3-library"
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            march: x86-64-v2
+            arch_suffix: linux-x86_64-v2
+          - runner: ubuntu-24.04
+            march: x86-64-v3
+            arch_suffix: linux-x86_64-v3
+          - runner: ubuntu-24.04
+            march: x86-64-v4
+            arch_suffix: linux-x86_64-v4
+          - runner: ubuntu-24.04-arm
+            march: armv8-a
+            arch_suffix: linux-arm64
+    runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
       - name: Build sqlite CLI
-        working-directory: ./docker-cli
-        run: sudo docker build --rm --no-cache=true -t "${docker_cli_image}" . --build-arg URL_SQLITE_SOURCE_ZIP="https://www.sqlite.org/${release_year}/sqlite-amalgamation-${version}.zip" --build-arg COMPRESS_SQLITE3="upx"
+        run: sudo docker build --rm --no-cache=true -t "${docker_cli_image}" -f docker-cli/Dockerfile . --build-arg URL_SQLITE_SOURCE_ZIP="https://www.sqlite.org/${SQLITE_RELEASE_YEAR}/sqlite-amalgamation-${SQLITE_VERSION}.zip" --build-arg COMPRESS_SQLITE3="upx" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_SHA3_256="${SQLITE_SHA3_256}"
       - name: Extract binary from docker image
-        uses: shrink/actions-docker-extract@v3
+        uses: shrink/actions-docker-extract@04c17c51a5b9fd93b7aed2e05e86c8fe2d90ee52 # v3.1.0
         id: extract_cli
         with:
           image: ${{env.docker_cli_image}}
-          path: /app/sqlite-amalgamation-${{env.version}}/dist/.
+          path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
           destination: cli
       - name: Upload sqlite CLI artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           path: ${{ steps.extract_cli.outputs.destination }}
-          name: sqlite-${{env.version}}-cli
+          name: sqlite-${{env.SQLITE_VERSION}}-cli-${{ matrix.arch_suffix }}
+          retention-days: 90
       - name: Build sqlite library
-        working-directory: ./docker-library
-        run: sudo docker build --rm --no-cache=true -t "${docker_library_image}" . --build-arg URL_SQLITE_SOURCE_ZIP="https://www.sqlite.org/${release_year}/sqlite-amalgamation-${version}.zip"
+        run: sudo docker build --rm --no-cache=true -t "${docker_library_image}" -f docker-library/Dockerfile . --build-arg URL_SQLITE_SOURCE_ZIP="https://www.sqlite.org/${SQLITE_RELEASE_YEAR}/sqlite-amalgamation-${SQLITE_VERSION}.zip" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_SHA3_256="${SQLITE_SHA3_256}"
       - name: Extract binary from docker image
-        uses: shrink/actions-docker-extract@v3
+        uses: shrink/actions-docker-extract@04c17c51a5b9fd93b7aed2e05e86c8fe2d90ee52 # v3.1.0
         id: extract_library
         with:
           image: ${{env.docker_library_image}}
-          path: /app/sqlite-amalgamation-${{env.version}}/dist/.
+          path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
           destination: library
       - name: Upload sqlite library artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           path: ${{ steps.extract_library.outputs.destination }}
-          name: sqlite-${{env.version}}-library
+          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ matrix.arch_suffix }}
+          retention-days: 90
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download sqlite artifacts
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: sqlite-*
+          path: release
+          merge-multiple: false
+      - name: Archive release artifacts
+        run: |
+          cd release
+          for artifact in sqlite-*-cli-*; do
+            suffix="${artifact#sqlite-${SQLITE_VERSION}-cli-}"
+            zip -r "../sqlite-${GITHUB_REF_NAME}-cli-${suffix}.zip" "${artifact}"
+          done
+          for artifact in sqlite-*-library-*; do
+            suffix="${artifact#sqlite-${SQLITE_VERSION}-library-}"
+            zip -r "../sqlite-${GITHUB_REF_NAME}-library-${suffix}.zip" "${artifact}"
+          done
+          cd ..
+          sha256sum sqlite-*.zip > SHA256SUMS
+      - name: Create release
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            SQLite upstream version: ${{env.SQLITE_VERSION}}
+
+            Changes: https://www.sqlite.org/changes.html
+          files: |
+            sqlite-${{ github.ref_name }}-cli-linux-x86_64-v2.zip
+            sqlite-${{ github.ref_name }}-cli-linux-x86_64-v3.zip
+            sqlite-${{ github.ref_name }}-cli-linux-x86_64-v4.zip
+            sqlite-${{ github.ref_name }}-cli-linux-arm64.zip
+            sqlite-${{ github.ref_name }}-library-linux-x86_64-v2.zip
+            sqlite-${{ github.ref_name }}-library-linux-x86_64-v3.zip
+            sqlite-${{ github.ref_name }}-library-linux-x86_64-v4.zip
+            sqlite-${{ github.ref_name }}-library-linux-arm64.zip
+            SHA256SUMS
+          draft: false
+          prerelease: false

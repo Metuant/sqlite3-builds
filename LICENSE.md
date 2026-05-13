@@ -1,6 +1,6 @@
 BSD 0-Clause License
 
-Copyright © CompuRoot.
+Copyright (c) 2025 darthShadow. Originally based on work by CompuRoot.
 
 Permission to use, copy, modify, and/or distribute this software for any
 purpose with or without fee is hereby granted.
