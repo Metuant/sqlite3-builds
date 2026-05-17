@@ -1,18 +1,19 @@
-# syntax=docker/dockerfile:1
+# syntax=docker/dockerfile:1.5
+# WHY: BuildKit syntax enables the cache mount used by the CLI build step.
 FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
 
 LABEL org.sqlite.static.binary.linux.x86_64.dockerfile.version="2.0.0"
 
-ARG URL_SQLITE_SOURCE_ZIP
+ARG SQLITE_AMALG_URL
 ARG COMPRESS_SQLITE3
 ARG MARCH
-ARG SQLITE_SHA3_256
+ARG SQLITE_AMALG_SHA3_256
 
 # Version of SQLite to download (full url to sqlite-amalgamation.zip)
-ENV SQLITE_URL_SRC="${URL_SQLITE_SOURCE_ZIP}"
+ENV SQLITE_URL_SRC="${SQLITE_AMALG_URL}"
 ENV COMPRESSOR="${COMPRESS_SQLITE3}"
 ENV MARCH="${MARCH}"
-ENV SQLITE_SHA3_256="${SQLITE_SHA3_256}"
+ENV SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"
 ENV CC="ccache gcc"
 ENV CCACHE_DIR="/ccache"
 
@@ -43,5 +44,5 @@ RUN echo "**** Install Dependencies ****" && \
 
 WORKDIR /app
 
-COPY Build.sh /app/
+COPY build/Build.sh /app/Build.sh
 RUN --mount=type=cache,target=/ccache chmod +x /app/Build.sh && ./Build.sh cli "${SQLITE_URL_SRC}" "${COMPRESSOR}"

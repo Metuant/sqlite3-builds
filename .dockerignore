@@ -1,4 +1,7 @@
 *
-!Build.sh
+!build/Build.sh
 !docker-cli/**
 !docker-library/**
+!src/**
+!scripts/**
+!tests/**
