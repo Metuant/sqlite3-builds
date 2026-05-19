@@ -28,8 +28,8 @@ case "${target}" in
     ;;
   library)
     target_cflags="-DSQLITE_ENABLE_NORMALIZE -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS -DSQLITE_ENABLE_UNLOCK_NOTIFY -DSQLITE_DEFAULT_PCACHE_INITSZ=256 -DSQLITE_DEFAULT_MEMSTATUS=0"
-    sources="sqlite3.c /app/auto_extension.c"
-    target_ldflags="-fPIC -shared -lm -ldl -pthread"
+    sources="sqlite3.c /app/auto_extension.c /app/observability.c"
+    target_ldflags="-fPIC -shared -Wl,-z,defs -lm -ldl -pthread"
     output="dist/libsqlite3.so"
     case "${LIBRARY_VARIANT}" in
       generic)
@@ -37,7 +37,6 @@ case "${target}" in
       plex)
         target_cflags="${target_cflags} -DSQLITE_ENABLE_ICU -DU_HAVE_LIB_SUFFIX=1 -DU_LIB_SUFFIX_C_NAME=_plex -I${PLEX_ICU_INCLUDE}"
         target_ldflags="${target_ldflags} -L${PLEX_ICU_LIB}"
-        target_ldflags="${target_ldflags} -Wl,-z,defs"
         target_ldflags="${target_ldflags} -Wl,--push-state,--no-as-needed -licuucplex -licui18nplex -licudataplex -Wl,--pop-state"
         SQLITE_SRC_DIR="/app/$(basename "${SQLITE_SRC_URL%.zip}")"
         sources="${sources} ${SQLITE_SRC_DIR}/ext/icu/icu.c"
@@ -106,11 +105,16 @@ else
 fi
 mkdir -p dist
 
+if [ "${target}" = "library" ]; then
+  patch -p1 < /app/tools/sqlite-amalgamation.patch
+fi
+
 printf "\n\n===== Compiling... Please wait... ==============================================\n\n"
 
 # SQLITE_DEFAULT_MMAP_SIZE=8589934592 is 8 GiB; aggressive for low-memory hosts (raises VSZ).
 # SQLITE_ENABLE_UPDATE_DELETE_LIMIT is inactive on amalgamation builds (requires Lemon parser regen).
 # SQLITE_MAX_EXPR_DEPTH=0 disables runtime depth checks; relies on MAX_LENGTH/MAX_SQL_LENGTH for DoS protection.
+# SQLITE_THREADSAFE=2 is Multi-thread (no per-connection mutex); PMS calls sqlite3_config(SQLITE_CONFIG_MULTITHREAD) and Emby passes SQLITE_OPEN_NOMUTEX -- neither shares sqlite3* handles across threads.
 if ! ${CC:-gcc} \
   -O3 \
   -march="${MARCH}" \
@@ -173,7 +177,7 @@ if ! ${CC:-gcc} \
   -DSQLITE_SORTER_PMASZ=1024 \
   -DSQLITE_STMTJRNL_SPILL=-1 \
   -DSQLITE_TEMP_STORE=3 \
-  -DSQLITE_THREADSAFE=1 \
+  -DSQLITE_THREADSAFE=2 \
   -DSQLITE_USE_ALLOCA \
   -DSQLITE_USE_URI=1 \
   ${target_cflags} \
@@ -191,6 +195,81 @@ if [ "${target}" = "cli" ]; then
   if [ -n "${compressor}" ]; then
     echo "===== Compressing... ==========================================================="
     ${compressor} dist/sqlite3
+  fi
+fi
+
+if [ "${target}" = "library" ]; then
+  undefined_real_symbols="$(nm -D --undefined-only "${output}" | awk '$1 == "U" && $2 ~ /^sqlite3_.*_real$/ { print }')"
+  if [ -n "${undefined_real_symbols}" ]; then
+    printf "FATAL: unresolved sqlite3_*_real symbols in %s:\n%s\n" "${output}" "${undefined_real_symbols}" >&2
+    exit 1
+  fi
+  exported_real_symbols="$(nm -D --defined-only "${output}" | awk '$NF ~ /^sqlite3_.*_real$/ { print }')"
+  if [ -n "${exported_real_symbols}" ]; then
+    printf "FATAL: exported sqlite3_*_real symbols in %s:\n%s\n" "${output}" "${exported_real_symbols}" >&2
+    exit 1
+  fi
+
+  missing_obs_entry=0
+  config_names="$(grep -E '^#define SQLITE_CONFIG_[A-Z0-9_]+[[:space:]]+[0-9]+' sqlite3.h | awk '$2 !~ /_MAX$/ {print $2}')"
+  config_count="$(printf "%s\n" "${config_names}" | awk 'NF { count++ } END { print count + 0 }')"
+  if [ ! -f /app/tools/expected-sqlite-config-count.txt ]; then
+    printf "FATAL: /app/tools/expected-sqlite-config-count.txt not found (regenerate from sqlite3.h #define SQLITE_CONFIG_* count if SQLite was bumped)\n" >&2
+    exit 1
+  fi
+  expected_config_count="$(tr -d '[:space:]' < /app/tools/expected-sqlite-config-count.txt)"
+  case "${expected_config_count}" in
+    ''|*[!0-9]*)
+      printf "FATAL: /app/tools/expected-sqlite-config-count.txt contains non-numeric content: '%s' (regenerate from sqlite3.h #define SQLITE_CONFIG_* count)\n" "${expected_config_count}" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${config_count}" -ne "${expected_config_count}" ]; then
+    printf "FATAL: extracted %s SQLITE_CONFIG_* names from sqlite3.h; expected exactly %s (regenerate tools/expected-sqlite-config-count.txt if SQLite was bumped)\n" \
+      "${config_count}" "${expected_config_count}" >&2
+    exit 1
+  fi
+  for name in ${config_names}; do
+    if ! grep -Eq "\\{[[:space:]]*${name}," /app/observability.c; then
+      printf "FATAL: missing observability config decode entry for %s\n" "${name}" >&2
+      missing_obs_entry=1
+    fi
+    if ! grep -Eq "case[[:space:]]+${name}:" /app/observability.c; then
+      printf "FATAL: missing observability config forwarding case for %s\n" "${name}" >&2
+      missing_obs_entry=1
+    fi
+  done
+  dbconfig_names="$(grep -E '^#define SQLITE_DBCONFIG_[A-Z0-9_]+[[:space:]]+[0-9]+' sqlite3.h | awk '$2 != "SQLITE_DBCONFIG_MAX" {print $2}')"
+  dbconfig_count="$(printf "%s\n" "${dbconfig_names}" | awk 'NF { count++ } END { print count + 0 }')"
+  if [ ! -f /app/tools/expected-sqlite-dbconfig-count.txt ]; then
+    printf "FATAL: /app/tools/expected-sqlite-dbconfig-count.txt not found (regenerate from sqlite3.h #define SQLITE_DBCONFIG_* count if SQLite was bumped)\n" >&2
+    exit 1
+  fi
+  expected_dbconfig_count="$(tr -d '[:space:]' < /app/tools/expected-sqlite-dbconfig-count.txt)"
+  case "${expected_dbconfig_count}" in
+    ''|*[!0-9]*)
+      printf "FATAL: /app/tools/expected-sqlite-dbconfig-count.txt contains non-numeric content: '%s' (regenerate from sqlite3.h #define SQLITE_DBCONFIG_* count)\n" "${expected_dbconfig_count}" >&2
+      exit 1
+      ;;
+  esac
+  if [ "${dbconfig_count}" -ne "${expected_dbconfig_count}" ]; then
+    printf "FATAL: extracted %s SQLITE_DBCONFIG_* names from sqlite3.h; expected exactly %s (regenerate tools/expected-sqlite-dbconfig-count.txt if SQLite was bumped)\n" \
+      "${dbconfig_count}" "${expected_dbconfig_count}" >&2
+    exit 1
+  fi
+  for name in ${dbconfig_names}; do
+    [ "$name" = "SQLITE_DBCONFIG_MAX" ] && continue
+    if ! grep -Eq "\\{[[:space:]]*${name}," /app/observability.c; then
+      printf "FATAL: missing observability db-config decode entry for %s\n" "${name}" >&2
+      missing_obs_entry=1
+    fi
+    if ! grep -Eq "case[[:space:]]+${name}:" /app/observability.c; then
+      printf "FATAL: missing observability db-config forwarding case for %s\n" "${name}" >&2
+      missing_obs_entry=1
+    fi
+  done
+  if [ "${missing_obs_entry}" -ne 0 ]; then
+    exit 1
   fi
 fi
 

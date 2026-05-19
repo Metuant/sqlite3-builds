@@ -41,18 +41,18 @@ jobs:
     runs-on: ${{ matrix.runner }}
 
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Build sqlite CLI
         run: sudo docker build --rm -t "${docker_cli_image}" -f docker-cli/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg COMPRESS_SQLITE3="upx" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"
       - name: Extract binary from docker image
-        uses: shrink/actions-docker-extract@04c17c51a5b9fd93b7aed2e05e86c8fe2d90ee52 # v3.1.0
+        uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
         id: extract_cli
         with:
           image: ${{env.docker_cli_image}}
           path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
           destination: cli
       - name: Upload sqlite CLI artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: ${{ steps.extract_cli.outputs.destination }}
           name: sqlite-${{env.SQLITE_VERSION}}-cli-${{ matrix.arch_suffix }}
@@ -60,14 +60,14 @@ jobs:
       - name: Build sqlite library
         run: sudo docker build --rm -t "${docker_library_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"
       - name: Extract binary from docker image
-        uses: shrink/actions-docker-extract@04c17c51a5b9fd93b7aed2e05e86c8fe2d90ee52 # v3.1.0
+        uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
         id: extract_library
         with:
           image: ${{env.docker_library_image}}
           path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
           destination: library
       - name: Upload sqlite library artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: ${{ steps.extract_library.outputs.destination }}
           name: sqlite-${{env.SQLITE_VERSION}}-library-${{ matrix.arch_suffix }}
@@ -75,42 +75,99 @@ jobs:
       - name: Build sqlite Plex library
         run: sudo docker build --rm -t "${docker_library_plex_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" --build-arg LIBRARY_VARIANT=plex
       - name: Extract Plex library from docker image
-        uses: shrink/actions-docker-extract@04c17c51a5b9fd93b7aed2e05e86c8fe2d90ee52 # v3.1.0
+        uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
         id: extract_library_plex
         with:
           image: ${{env.docker_library_plex_image}}
           path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
           destination: library-plex
       - name: Upload sqlite Plex library artifact
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: ${{ steps.extract_library_plex.outputs.destination }}
           name: sqlite-${{env.SQLITE_VERSION}}-library-plex-${{ matrix.arch_suffix }}
           retention-days: 90
+      - name: Pull Plex image (pre-replacement SHA)
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/plex:1.42.2
+      - name: Pull Emby image (pre-replacement SHA)
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/emby:version-4.9.3.0
+      - name: Emit pre-replacement SHAs
+        run: |
+          set -euo pipefail
+          pins_dir="sqlite-pins-pre-${{ matrix.arch_suffix }}"
+          fragment="${pins_dir}/SQLITE_LIBRARY_PINS_PRE"
+          mkdir -p "$pins_dir"
+          : > "$fragment"
+
+          emit_pre_row() {
+            local target="$1" image="$2" target_path="$3"
+            local cid="" copy_path pre_sha img_digest
+            cleanup_container() {
+              if [ -n "$cid" ]; then
+                docker rm -f "$cid" >/dev/null 2>&1 || true
+              fi
+            }
+            trap cleanup_container RETURN
+
+            cid="$(docker create --entrypoint /bin/sh "$image" -c true)"
+            copy_path="${pins_dir}/${target}-libsqlite3.so"
+            docker cp "${cid}:${target_path}" "$copy_path"
+            test -f "$copy_path" || { echo "FATAL: docker cp produced non-regular file at $copy_path" >&2; exit 1; }
+            pre_sha="$(sha256sum "$copy_path" | awk '{print $1}')"
+            [ -n "$pre_sha" ] || { echo "FATAL: sha256sum returned empty for $copy_path" >&2; exit 1; }
+            img_digest="$(
+              docker image inspect \
+                --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
+                "$image"
+            )"
+            if [ -z "$img_digest" ]; then
+              echo "FATAL: docker image inspect returned no repo digest" >&2
+              echo "       image: $image" >&2
+              exit 1
+            fi
+            printf "pre|1|%s|%s|%s|%s|%s|runtime|%s\n" \
+              "$target" \
+              "${{ matrix.arch_suffix }}" \
+              "$image" \
+              "$img_digest" \
+              "$target_path" \
+              "$pre_sha" \
+              >> "$fragment"
+            cleanup_container
+            trap - RETURN
+          }
+
+          emit_pre_row \
+            "plex" \
+            "lscr.io/linuxserver/plex:1.42.2" \
+            "/usr/lib/plexmediaserver/lib/libsqlite3.so"
+          emit_pre_row \
+            "emby" \
+            "lscr.io/linuxserver/emby:version-4.9.3.0" \
+            "/app/emby/lib/libsqlite3.so.3.49.2"
+      - name: Upload pre-replacement SHA artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: sqlite-pins-pre-${{ matrix.arch_suffix }}/SQLITE_LIBRARY_PINS_PRE
+          name: sqlite-pins-pre-${{ matrix.arch_suffix }}
+          retention-days: 90
+      - name: Pull Plex image (ICU smoke)
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/plex:1.42.2
       - name: ICU smoke stage 2 (Plex variant against Plex's bundled ICU)
         env:
           ARTIFACT_DIR: ${{ steps.extract_library_plex.outputs.destination }}
         run: |
           set -euo pipefail
-          retry_pull() {
-            local image="$1" max=3 delay=10 i
-            for i in $(seq 1 "$max"); do
-              if docker pull "$image"; then return 0; fi
-              if [ "$i" -lt "$max" ]; then
-                echo "docker pull $image attempt $i/$max failed; retrying in ${delay}s..." >&2
-                sleep "$delay"
-                delay=$((delay * 2))
-              fi
-            done
-            echo "FATAL: docker pull $image failed after $max attempts" >&2
-            return 1
-          }
-
           # WHY: The Plex image pin fixes the ICU runtime ABI checked below.
           PLEX_IMG="lscr.io/linuxserver/plex:1.42.2"
           EXPECTED_ICU_MAJOR="69"
           ARTIFACT_DIR_ABS="$(realpath "$ARTIFACT_DIR")"
-          retry_pull "$PLEX_IMG"
           PLEX_ICU_SOS=$(docker run --rm --entrypoint /bin/ls "$PLEX_IMG" \
             /usr/lib/plexmediaserver/lib/ \
             | grep '^libicu.*plex\.so\.[0-9]\+$' || true)
@@ -188,6 +245,10 @@ jobs:
                   "$plex_loader" --library-path /usr/lib/plexmediaserver/lib --list /tmp/icu_smoke || true' || true
             exit 1
           }
+      - name: Pull Plex image (PMS first-init)
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/plex:1.42.2
       - name: PMS first-init smoke (Plex)
         env:
           ARTIFACT_DIR: ${{ steps.extract_library_plex.outputs.destination }}
@@ -195,20 +256,6 @@ jobs:
           EXPECTED_ICU_MAJOR: "69"
         run: |
           set -euo pipefail
-          retry_pull() {
-            local image="$1" max=3 delay=10 i
-            for i in $(seq 1 "$max"); do
-              if docker pull "$image"; then return 0; fi
-              if [ "$i" -lt "$max" ]; then
-                echo "docker pull $image attempt $i/$max failed; retrying in ${delay}s..." >&2
-                sleep "$delay"
-                delay=$((delay * 2))
-              fi
-            done
-            echo "FATAL: docker pull $image failed after $max attempts" >&2
-            return 1
-          }
-
           : "Plex image ${PLEX_IMG} with expected ICU major ${EXPECTED_ICU_MAJOR}"
           ARTIFACT_DIR_ABS="$(realpath "$ARTIFACT_DIR")"
           if [ ! -f "$ARTIFACT_DIR_ABS/libsqlite3.so" ]; then
@@ -222,7 +269,6 @@ jobs:
           PMS_CONTAINER="pms-smoke-${{ github.run_id }}-${{ matrix.arch_suffix }}"
           trap 'status=$?; docker logs "$PMS_CONTAINER" 2>&1 || true; docker stop "$PMS_CONTAINER" 2>/dev/null || true; exit "$status"' EXIT
 
-          retry_pull "$PLEX_IMG"
           docker run --detach \
             --name "$PMS_CONTAINER" \
             -e PUID=1000 \
@@ -260,25 +306,84 @@ jobs:
             echo "FATAL: PMS logs contain SQLite/runtime bad signal"
             exit 1
           fi
+          pms_logs="$(docker logs "$PMS_CONTAINER" 2>&1 || true)"
+          if ! printf "%s\n" "$pms_logs" | grep -E '\[sqlite3-builds-obs\].*SQLITE_TRACE_STMT' >/dev/null; then
+            echo "FATAL: PMS logs missing SQLITE_TRACE_STMT observability marker"
+            exit 1
+          fi
+          pms_open_marker_count="$(printf "%s\n" "$pms_logs" | grep -Ec '\[sqlite3-builds-obs\].* sqlite3_open(_v2|16)? ' || true)"
+          if [ "$pms_open_marker_count" -lt 1 ]; then
+            echo "FATAL: PMS observability positive-mode marker count check failed: open=$pms_open_marker_count"
+            exit 1
+          fi
+      - name: Pull Plex image (PMS kill-switch smoke)
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/plex:1.42.2
+      - name: PMS kill-switch off-state smoke
+        run: |
+          set -euo pipefail
+          PLEX_IMG="lscr.io/linuxserver/plex:1.42.2"
+          ARTIFACT_DIR_ABS="$(realpath "${{ steps.extract_library_plex.outputs.destination }}")"
+          if [ ! -f "$ARTIFACT_DIR_ABS/libsqlite3.so" ]; then
+            echo "FATAL: missing extracted Plex library at $ARTIFACT_DIR_ABS/libsqlite3.so"
+            exit 1
+          fi
+
+          PMS_CONFIG_DIR="$(mktemp -d)"
+          PMS_DB_COPY_DIR="$(mktemp -d)"
+          PMS_DB_COPY="${PMS_DB_COPY_DIR}/com.plexapp.plugins.library.db"
+          PMS_CONTAINER="pms-obs-off-smoke-${{ github.run_id }}-${{ matrix.arch_suffix }}"
+          trap 'status=$?; docker logs "$PMS_CONTAINER" 2>&1 || true; docker stop "$PMS_CONTAINER" 2>/dev/null || true; exit "$status"' EXIT
+
+          docker run --detach \
+            --name "$PMS_CONTAINER" \
+            -e PUID=1000 \
+            -e PGID=1000 \
+            -e VERSION=docker \
+            -e SQLITE3_DISABLE_OBSERVABILITY=1 \
+            --mount "type=bind,src=${PMS_CONFIG_DIR},dst=/config" \
+            --mount "type=bind,src=${ARTIFACT_DIR_ABS}/libsqlite3.so,dst=/usr/lib/plexmediaserver/lib/libsqlite3.so,readonly" \
+            --network host \
+            "$PLEX_IMG"
+
+          pms_ready=0
+          for attempt in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/localhost/32400' 2>/dev/null; then
+              pms_ready=1
+              break
+            fi
+            sleep 3
+          done
+          if [ "$pms_ready" -ne 1 ]; then
+            echo "FATAL: PMS did not open TCP 32400 within 90 seconds"
+            docker logs "$PMS_CONTAINER" 2>&1 || true
+            exit 1
+          fi
+
+          sleep 5
+          docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY"
+          table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';")"
+          if [ "$table_count" -lt 20 ]; then
+            echo "FATAL: expected at least 20 PMS tables, got $table_count"
+            exit 1
+          fi
+
+          docker stop "$PMS_CONTAINER" >/dev/null 2>&1 || true
+          pms_logs="$(docker logs "$PMS_CONTAINER" 2>&1 || true)"
+          if printf "%s\n" "$pms_logs" | grep -Fq '[sqlite3-builds-obs]'; then
+            echo "FATAL: PMS observability kill switch emitted marker lines"
+            exit 1
+          fi
+      - name: Pull Emby image (first-init smoke)
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/emby:version-4.9.3.0
       - name: Emby first-init smoke
         env:
           GENERIC_ARTIFACT_DIR: ${{ steps.extract_library.outputs.destination }}
         run: |
           set -euo pipefail
-          retry_pull() {
-            local image="$1" max=3 delay=10 i
-            for i in $(seq 1 "$max"); do
-              if docker pull "$image"; then return 0; fi
-              if [ "$i" -lt "$max" ]; then
-                echo "docker pull $image attempt $i/$max failed; retrying in ${delay}s..." >&2
-                sleep "$delay"
-                delay=$((delay * 2))
-              fi
-            done
-            echo "FATAL: docker pull $image failed after $max attempts" >&2
-            return 1
-          }
-
           # WHY: tag pin fixes the Emby runtime ABI checked below.
           EMBY_IMG="lscr.io/linuxserver/emby:version-4.9.3.0"
           GENERIC_ARTIFACT_DIR_ABS="$(realpath "$GENERIC_ARTIFACT_DIR")"
@@ -291,7 +396,6 @@ jobs:
           EMBY_CONTAINER="emby-smoke-${{ github.run_id }}-${{ matrix.arch_suffix }}"
           trap 'status=$?; docker logs "$EMBY_CONTAINER" 2>&1 || true; docker stop "$EMBY_CONTAINER" 2>/dev/null || true; exit "$status"' EXIT
 
-          retry_pull "$EMBY_IMG"
           docker run --detach \
             --name "$EMBY_CONTAINER" \
             -e PUID=1000 \
@@ -343,6 +447,7 @@ jobs:
             "DQS=1"
             "DEFAULT_WORKER_THREADS=8"
             "MAX_WORKER_THREADS=8"
+            "THREADSAFE=2"
             "DEFAULT_WAL_AUTOCHECKPOINT=16000"
             "DEFAULT_JOURNAL_SIZE_LIMIT=67108864"
             "SORTER_PMASZ=1024"
@@ -372,6 +477,87 @@ jobs:
             echo "FATAL: Emby logs contain SQLite/runtime bad signal"
             exit 1
           fi
+          if ! printf "%s\n" "$emby_logs" | grep -E '\[sqlite3-builds-obs\].*SQLITE_TRACE_STMT' >/dev/null; then
+            echo "FATAL: Emby logs missing SQLITE_TRACE_STMT observability marker"
+            exit 1
+          fi
+          emby_open_marker_count="$(printf "%s\n" "$emby_logs" | grep -Ec '\[sqlite3-builds-obs\].* sqlite3_open(_v2|16)? ' || true)"
+          if [ "$emby_open_marker_count" -lt 1 ]; then
+            echo "FATAL: Emby observability positive-mode marker count check failed: open=$emby_open_marker_count"
+            exit 1
+          fi
+      - name: Pull Emby image (kill-switch smoke)
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/emby:version-4.9.3.0
+      - name: Emby kill-switch off-state smoke
+        run: |
+          set -euo pipefail
+          EMBY_IMG="lscr.io/linuxserver/emby:version-4.9.3.0"
+          GENERIC_ARTIFACT_DIR_ABS="$(realpath "${{ steps.extract_library.outputs.destination }}")"
+          if [ ! -f "$GENERIC_ARTIFACT_DIR_ABS/libsqlite3.so" ]; then
+            echo "FATAL: missing extracted generic library at $GENERIC_ARTIFACT_DIR_ABS/libsqlite3.so"
+            exit 1
+          fi
+
+          EMBY_CONFIG_DIR="$(mktemp -d)"
+          EMBY_CONTAINER="emby-obs-off-smoke-${{ github.run_id }}-${{ matrix.arch_suffix }}"
+          trap 'status=$?; docker logs "$EMBY_CONTAINER" 2>&1 || true; docker stop "$EMBY_CONTAINER" 2>/dev/null || true; exit "$status"' EXIT
+
+          docker run --detach \
+            --name "$EMBY_CONTAINER" \
+            -e PUID=1000 \
+            -e PGID=1000 \
+            -e SQLITE3_DISABLE_OBSERVABILITY=1 \
+            --mount "type=bind,src=${EMBY_CONFIG_DIR},dst=/config" \
+            --mount "type=bind,src=${GENERIC_ARTIFACT_DIR_ABS}/libsqlite3.so,dst=/app/emby/lib/libsqlite3.so.3.49.2,readonly" \
+            --network host \
+            "$EMBY_IMG"
+
+          sqlite_version_line=""
+          emby_logs=""
+          for attempt in $(seq 1 30); do
+            emby_logs="$(docker logs "$EMBY_CONTAINER" 2>&1 || true)"
+            sqlite_version_line="$(printf "%s\n" "$emby_logs" | grep "Sqlite version:" | tail -n 1 || true)"
+            if [ -n "$sqlite_version_line" ]; then
+              break
+            fi
+            sleep 3
+          done
+          if [ -z "$sqlite_version_line" ]; then
+            echo "FATAL: Emby did not log Sqlite version: within 90 seconds"
+            docker logs "$EMBY_CONTAINER" 2>&1 || true
+            exit 1
+          fi
+
+          observed_version="$(printf "%s\n" "$sqlite_version_line" | sed -n 's/.*Sqlite version:[[:space:]]*\([^[:space:]]\+\).*/\1/p')"
+          expected_version="$(awk -v v="$SQLITE_VERSION" 'BEGIN {
+            major = substr(v, 1, length(v) - 6) + 0
+            minor = substr(v, length(v) - 5, 2) + 0
+            patch = substr(v, length(v) - 3, 2) + 0
+            printf "%d.%d.%d", major, minor, patch
+          }')"
+          if [ "$observed_version" != "$expected_version" ]; then
+            echo "FATAL: Emby logged Sqlite version $observed_version, expected $expected_version from SQLITE_VERSION=$SQLITE_VERSION"
+            exit 1
+          fi
+
+          docker stop "$EMBY_CONTAINER" >/dev/null 2>&1 || true
+          emby_logs="$(docker logs "$EMBY_CONTAINER" 2>&1 || true)"
+          if printf "%s\n" "$emby_logs" | grep -Fq '[sqlite3-builds-obs]'; then
+            echo "FATAL: Emby observability kill switch emitted marker lines"
+            exit 1
+          fi
+      - name: Deploy assertion test
+        run: bash tests/deploy_assertion_test.sh
+      - name: Observability count check
+        run: bash tests/check_obs_counts.sh
+      - name: ABI obsolete config ops test
+        run: bash tests/abi_obsolete_config_ops_test.sh "${docker_library_image}"
+      - name: Regenerate deploy pins test
+        run: bash tests/regen_deploy_pins_test.sh
+      - name: Assemble library pins test
+        run: bash tests/assemble_library_pins_test.sh
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
@@ -382,12 +568,14 @@ jobs:
       contents: write
 
     steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Download sqlite artifacts
-        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           pattern: sqlite-*
           path: release
           merge-multiple: false
+          digest-mismatch: warn
       - name: Archive release artifacts
         run: |
           set -euo pipefail
@@ -400,7 +588,13 @@ jobs:
           done
           for artifact in sqlite-*-library-*; do
             suffix="${artifact#sqlite-${SQLITE_VERSION}-library-}"
-            tar -czf "../sqlite-${GITHUB_REF_NAME}-library-${suffix}.tar.gz" -C "${artifact}" .
+            if [[ "${suffix}" == plex-* ]]; then
+              tar -czf "../sqlite-${GITHUB_REF_NAME}-library-${suffix}.tar.gz" \
+                --exclude=icu_smoke -C "${artifact}" .
+            else
+              tar -czf "../sqlite-${GITHUB_REF_NAME}-library-${suffix}.tar.gz" \
+                -C "${artifact}" .
+            fi
           done
           cd ..
           : > SHA256SUMS
@@ -415,8 +609,98 @@ jobs:
               rm -rf "$tmp"
             fi
           done
+      - name: Download pre-replacement SHA artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sqlite-pins-pre-*
+          path: pins-pre
+          merge-multiple: false
+          digest-mismatch: warn
+      - name: Fetch prior library pins
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p prior-pins
+          if ! gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 30 \
+            --json tagName \
+            --jq '.[].tagName' > prior-pins/tags; then
+            echo "FATAL: gh release list failed" >&2
+            exit 1
+          fi
+
+          fetched_count=0
+          while IFS= read -r prior_tag; do
+            if [ "$prior_tag" = "$GITHUB_REF_NAME" ]; then
+              continue
+            fi
+            if [ "$fetched_count" -ge 4 ]; then
+              break
+            fi
+            if ! assets="$(
+              gh release view "$prior_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json assets \
+                --jq '.assets[].name'
+            )"; then
+              echo "FATAL: gh release view failed for $prior_tag" >&2
+              exit 1
+            fi
+            if ! printf "%s\n" "$assets" | grep -Fxq "SQLITE_LIBRARY_PINS"; then
+              echo "::warning::missing SQLITE_LIBRARY_PINS on $prior_tag"
+              continue
+            fi
+            mkdir -p "prior-pins/$prior_tag"
+            if ! gh release download "$prior_tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "SQLITE_LIBRARY_PINS" \
+              --dir "prior-pins/$prior_tag" \
+              --clobber; then
+              echo "FATAL: failed to download SQLITE_LIBRARY_PINS" >&2
+              echo "       release: $prior_tag" >&2
+              exit 1
+            fi
+            fetched_count=$((fetched_count + 1))
+          done < prior-pins/tags
+          echo "Fetched $fetched_count prior SQLITE_LIBRARY_PINS asset(s)."
+      - name: Assemble deploy library pins
+        run: |
+          set -euo pipefail
+          pre_args=()
+          while IFS= read -r pre_file; do
+            pre_args+=("$pre_file")
+          done < <(
+            find pins-pre -type f -name SQLITE_LIBRARY_PINS_PRE | sort
+          )
+          if [ "${#pre_args[@]}" -eq 0 ]; then
+            echo "FATAL: no pre-replacement SHA fragments found" >&2
+            exit 1
+          fi
+
+          prior_args=()
+          while IFS= read -r prior_file; do
+            prior_args+=(--prior "$prior_file")
+          done < <(
+            find prior-pins -type f -name SQLITE_LIBRARY_PINS | sort
+          )
+
+          bash tools/assemble-library-pins.sh \
+            --release-tag "$GITHUB_REF_NAME" \
+            --sha256sums SHA256SUMS \
+            "${prior_args[@]}" \
+            "${pre_args[@]}" > SQLITE_LIBRARY_PINS
+      - name: Regenerate deploy script pins
+        run: |
+          set -euo pipefail
+          bash tools/regen-deploy-pins.sh \
+            SQLITE_LIBRARY_PINS \
+            scripts/update-sqlite-library.sh \
+            "$GITHUB_REF_NAME"
+          cp scripts/update-sqlite-library.sh update-sqlite-library.sh
       - name: Create release
-        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2.6.2
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
@@ -427,5 +711,7 @@ jobs:
           files: |
             sqlite-${{ github.ref_name }}-*.tar.gz
             SHA256SUMS
+            SQLITE_LIBRARY_PINS
+            update-sqlite-library.sh
           draft: false
           prerelease: false

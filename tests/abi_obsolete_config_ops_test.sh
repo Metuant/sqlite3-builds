@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/.." && pwd -P)"
+image_name="${1:-sqlite3-library}"
+machine="$(uname -m)"
+host_os="$(uname -s)"
+
+case "${machine}" in
+  aarch64 | arm64)
+    march="armv8-a"
+    ;;
+  *)
+    march="x86-64-v2"
+    ;;
+esac
+
+sqlite_amalg_url="${SQLITE_AMALG_URL:-https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip}"
+sqlite_amalg_sha3_256="${SQLITE_AMALG_SHA3_256:-3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114}"
+
+tmpdir="$(mktemp -d /tmp/abi-obsolete-config-ops-test.XXXXXX 2>/dev/null || { mkdir -p /tmp/abi-obsolete-config-ops-test-$$; echo /tmp/abi-obsolete-config-ops-test-$$; })"
+trap 'rm -rf "${tmpdir}"' EXIT
+
+fatal() {
+  echo "FATAL: $*" >&2
+  exit 1
+}
+
+cat > "${tmpdir}/abi_obsolete_config_ops.c" <<'EOF'
+#include <stdio.h>
+#include <sqlite3.h>
+
+static int check_allowed_rc(const char *label, int rc) {
+    if (rc != SQLITE_OK && rc != SQLITE_MISUSE) {
+        fprintf(stderr, "FATAL: %s returned %d (expected %d or %d)\n",
+                label, rc, SQLITE_OK, SQLITE_MISUSE);
+        return 1;
+    }
+    printf("%s=%d\n", label, rc);
+    return 0;
+}
+
+int main(void) {
+    int failed = 0;
+
+    failed |= check_allowed_rc("scratch_pre", sqlite3_config(SQLITE_CONFIG_SCRATCH));
+    failed |= check_allowed_rc("pagecache_pre", sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0));
+    failed |= check_allowed_rc("heap_pre", sqlite3_config(SQLITE_CONFIG_HEAP, NULL, 0, 0));
+    failed |= check_allowed_rc("pcache_pre", sqlite3_config(SQLITE_CONFIG_PCACHE));
+    failed |= check_allowed_rc("getpcache_pre", sqlite3_config(SQLITE_CONFIG_GETPCACHE));
+
+    failed |= check_allowed_rc("initialize", sqlite3_initialize());
+    failed |= check_allowed_rc("pcache_post", sqlite3_config(SQLITE_CONFIG_PCACHE));
+    failed |= check_allowed_rc("getpcache_post", sqlite3_config(SQLITE_CONFIG_GETPCACHE));
+
+    sqlite3_shutdown();
+    return failed ? 1 : 0;
+}
+EOF
+
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  if ! docker image inspect "${image_name}" >/dev/null 2>&1; then
+    docker build --rm \
+      -t "${image_name}" \
+      -f "${repo_root}/docker-library/Dockerfile" \
+      "${repo_root}" \
+      --build-arg SQLITE_AMALG_URL="${sqlite_amalg_url}" \
+      --build-arg MARCH="${march}" \
+      --build-arg SQLITE_AMALG_SHA3_256="${sqlite_amalg_sha3_256}" >/dev/null
+  fi
+
+  docker run --rm \
+    -v "${tmpdir}:/work" \
+    "${image_name}" \
+    bash -lc '
+      set -euo pipefail
+      LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)")
+      AMALG_DIR=$(dirname "$LIB_DIR")
+      gcc -O0 -o /work/abi_obsolete_config_ops /work/abi_obsolete_config_ops.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" -lsqlite3 -ldl -lpthread
+      LD_LIBRARY_PATH="$LIB_DIR" /work/abi_obsolete_config_ops
+    '
+else
+  command -v curl >/dev/null 2>&1 || fatal "curl not found"
+  command -v unzip >/dev/null 2>&1 || fatal "unzip not found"
+  command -v patch >/dev/null 2>&1 || fatal "patch not found"
+  command -v cc >/dev/null 2>&1 || fatal "cc not found"
+  command -v openssl >/dev/null 2>&1 || fatal "openssl not found"
+
+  amalg_zip="${tmpdir}/sqlite-amalgamation.zip"
+  curl -fsSL "${sqlite_amalg_url}" -o "${amalg_zip}"
+  actual_sha3="$(openssl dgst -sha3-256 "${amalg_zip}" | awk '{print $2}')"
+  [[ "${actual_sha3}" == "${sqlite_amalg_sha3_256}" ]] || fatal "source SHA3-256 mismatch: expected ${sqlite_amalg_sha3_256}, got ${actual_sha3}"
+
+  unzip -q "${amalg_zip}" -d "${tmpdir}"
+  amalg_dir="$(find "${tmpdir}" -maxdepth 1 -type d -name 'sqlite-amalgamation-*' | head -n 1)"
+  [[ -n "${amalg_dir}" ]] || fatal "sqlite amalgamation directory not found after unzip"
+
+  cp "${repo_root}/src/auto_extension.c" "${tmpdir}/auto_extension.c"
+  cp "${repo_root}/src/observability.c" "${tmpdir}/observability.c"
+  (
+    cd "${amalg_dir}"
+    patch -p1 < "${repo_root}/tools/sqlite-amalgamation.patch" >/dev/null
+  )
+
+  case "${host_os}" in
+    Darwin)
+      lib_path="${tmpdir}/libsqlite3.dylib"
+      shared_flags="-dynamiclib"
+      runtime_var="DYLD_LIBRARY_PATH"
+      extra_ldflags=""
+      ;;
+    *)
+      lib_path="${tmpdir}/libsqlite3.so"
+      shared_flags="-shared -fPIC"
+      runtime_var="LD_LIBRARY_PATH"
+      extra_ldflags="-ldl"
+      ;;
+  esac
+
+  cc -O0 ${shared_flags} \
+    -I"${amalg_dir}" \
+    -DSQLITE_CORE \
+    -DSQLITE_ENABLE_LOAD_EXTENSION \
+    -DSQLITE_ENABLE_NORMALIZE \
+    -DSQLITE_ENABLE_UNLOCK_NOTIFY \
+    -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS \
+    -DSQLITE_DEFAULT_PCACHE_INITSZ=256 \
+    -DSQLITE_OMIT_SHARED_CACHE \
+    -DSQLITE_THREADSAFE=2 \
+    -DSQLITE_USE_URI=1 \
+    "${amalg_dir}/sqlite3.c" \
+    "${tmpdir}/auto_extension.c" \
+    "${tmpdir}/observability.c" \
+    -lpthread ${extra_ldflags} \
+    -o "${lib_path}"
+
+  cc -O0 -o "${tmpdir}/abi_obsolete_config_ops" "${tmpdir}/abi_obsolete_config_ops.c" \
+    -I"${amalg_dir}" -L"${tmpdir}" -lsqlite3 -lpthread ${extra_ldflags}
+  env "${runtime_var}=${tmpdir}" "${tmpdir}/abi_obsolete_config_ops"
+fi
+
+echo "abi obsolete config ops test passed"

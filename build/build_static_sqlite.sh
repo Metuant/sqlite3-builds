@@ -46,6 +46,12 @@ else
   onErr "Please install docker first..." 2
 fi
 
+if [ "$(uname -s)" = "Linux" ]; then
+  for _cmd in ldd file; do
+    type "${_cmd}" >/dev/null 2>&1 || onErr "${errMsgDep}: ${_cmd}" 1
+  done
+fi
+
 if ! $SUDO $DOCKER version  >/dev/null 2>&1; then
   errMsg="$(printf '\n  You are not authorized to run docker,')"
   errMsg="${errMsg}$(printf '\n  try to "su -" into root account and try again.\n\n')"

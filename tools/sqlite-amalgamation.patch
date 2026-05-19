@@ -1,0 +1,55 @@
+--- a/sqlite3.c
++++ b/sqlite3.c
+@@ -187294,7 +187294,7 @@
+ **    *  Recursive calls to this routine from thread X return immediately
+ **       without blocking.
+ */
+-SQLITE_API int sqlite3_initialize(void){
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_initialize_real(void){
+   MUTEX_LOGIC( sqlite3_mutex *pMainMtx; )      /* The main static mutex */
+   int rc;                                      /* Result code */
+ #ifdef SQLITE_EXTRA_INIT
+@@ -187530,7 +187530,7 @@
+ ** threadsafe.  Failure to heed these warnings can lead to unpredictable
+ ** behavior.
+ */
+-SQLITE_API int sqlite3_config(int op, ...){
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_config_real(int op, ...){
+   va_list ap;
+   int rc = SQLITE_OK;
+ 
+@@ -188054,7 +188054,7 @@
+ /*
+ ** Configuration settings for an individual database connection
+ */
+-SQLITE_API int sqlite3_db_config(sqlite3 *db, int op, ...){
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_db_config_real(sqlite3 *db, int op, ...){
+   va_list ap;
+   int rc;
+ 
+@@ -190790,14 +190790,14 @@
+ /*
+ ** Open a new database handle.
+ */
+-SQLITE_API int sqlite3_open(
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_open_real(
+   const char *zFilename,
+   sqlite3 **ppDb
+ ){
+   return openDatabase(zFilename, ppDb,
+                       SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, 0);
+ }
+-SQLITE_API int sqlite3_open_v2(
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_open_v2_real(
+   const char *filename,   /* Database filename (UTF-8) */
+   sqlite3 **ppDb,         /* OUT: SQLite db handle */
+   int flags,              /* Flags */
+@@ -190810,7 +190810,7 @@
+ /*
+ ** Open a new database handle.
+ */
+-SQLITE_API int sqlite3_open16(
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_open16_real(
+   const void *zFilename,
+   sqlite3 **ppDb
+ ){

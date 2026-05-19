@@ -1,0 +1,29 @@
+name: Retry docker pull
+description: >
+  Pulls a docker image with retries and exponential backoff
+  (max=3 attempts, initial delay=10s, doubling on each failure).
+inputs:
+  image:
+    description: Docker image reference to pull (required).
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        image="${{ inputs.image }}"
+        max=3
+        delay=10
+        for i in $(seq 1 "$max"); do
+          if docker pull "$image"; then
+            exit 0
+          fi
+          if [ "$i" -lt "$max" ]; then
+            echo "docker pull $image attempt $i/$max failed; retrying in ${delay}s..." >&2
+            sleep "$delay"
+            delay=$((delay * 2))
+          fi
+        done
+        echo "FATAL: docker pull $image failed after $max attempts" >&2
+        exit 1

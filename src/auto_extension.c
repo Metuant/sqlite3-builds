@@ -14,6 +14,12 @@ SQLITE_API int sqlite3_enable_shared_cache(int enable) {
     return SQLITE_OK;
 }
 
+#include <stdatomic.h>
+
+__attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void);
+__attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned trace, void *ctx, void *p, void *x);
+__attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
+
 /* WHY: Constructor stores cfg_rc here so tests can assert that the runtime
  * SORTERREF_SIZE config call landed before sqlite3_initialize(). The variable
  * is written exactly once during single-threaded library load and read later;
@@ -79,6 +85,15 @@ static int autopragma_init(
      * sqlite3_log instead. */
     (void)pApi;
     (void)pzErr;
+
+    if (!obs_is_disabled()) {
+        int trace_rc = sqlite3_trace_v2(db, SQLITE_TRACE_STMT, obs_trace_stmt_cb, NULL);
+        if (trace_rc != SQLITE_OK) {
+            obs_logf("sqlite3_trace_v2",
+                     "event=registration_failed db=%p rc=%d",
+                     (void*)db, trace_rc);
+        }
+    }
 
     /* WHY: Only literal "1" disables tuning so empty or diagnostic values do
      * not silently turn it off. */
@@ -165,11 +180,14 @@ static int autopragma_init(
  * Embedding hosts that need other sqlite3_config verbs must call them before
  * this library is dlopen'd. The target media-server surfaces are not known
  * to make late sqlite3_config calls; this has not been verified by
- * disassembly. Compile-time defaults (SQLITE_THREADSAFE=1,
+ * disassembly. Compile-time defaults (SQLITE_THREADSAFE=2,
  * SQLITE_DEFAULT_LOOKASIDE, SQLITE_DEFAULT_MEMSTATUS) already lock in the
- * most common pre-init knobs, so any unaudited late call would no-op with
- * SQLITE_MISUSE rather than degrade observed behavior. */
-__attribute__((constructor))
+ * most common pre-init knobs; under THREADSAFE=2 (Multi-thread), connections
+ * are not per-handle-mutexed by default -- callers must externally serialize
+ * a single connection or pass SQLITE_OPEN_FULLMUTEX. Any unaudited late call
+ * to sqlite3_config would no-op with SQLITE_MISUSE rather than degrade
+ * observed behavior. */
+__attribute__((constructor(102)))
 static void register_autopragma(void) {
     /* WHY: 16384 (16 KB) replaces inline content with rowid references only
      * for rows above 16 KB. Plex/Emby metadata rows are well under that and

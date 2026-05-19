@@ -11,6 +11,7 @@ RUN echo "**** Install Dependencies ****" && \
     apt-get -y install --no-install-recommends \
         apt-transport-https \
         ca-certificates \
+        openssl \
         software-properties-common \
         file \
         gpg-agent \
@@ -22,6 +23,7 @@ RUN echo "**** Install Dependencies ****" && \
     apt-get -y install --no-install-recommends \
         gcc \
         binutils \
+        patch \
         zlib1g \
         zlib1g-dev
 
@@ -42,6 +44,7 @@ RUN echo "**** Install Dependencies ****" && \
         make \
         musl-dev \
         openssl \
+        patch \
         pkgconf \
         python3 \
         unzip \
@@ -59,6 +62,10 @@ WORKDIR /app
 
 COPY build/Build.sh /app/Build.sh
 COPY src/auto_extension.c /app/auto_extension.c
+COPY src/observability.c /app/observability.c
+COPY tools/sqlite-amalgamation.patch /app/tools/sqlite-amalgamation.patch
+COPY tools/expected-sqlite-config-count.txt /app/tools/expected-sqlite-config-count.txt
+COPY tools/expected-sqlite-dbconfig-count.txt /app/tools/expected-sqlite-dbconfig-count.txt
 COPY tests/ /app/tests/
 
 RUN chmod +x /app/Build.sh
@@ -124,8 +131,8 @@ RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
 RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       set -euo pipefail; \
       LIB=$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so); \
-      if nm -D --undefined-only "$LIB" | grep fcntl64; then \
-        echo "FAIL: fcntl64 found"; \
+      if nm -D --undefined-only "$LIB" | grep -E '(fcntl64|@GLIBC_)'; then \
+        echo "FAIL: fcntl64 or GLIBC-versioned symbol found"; \
         exit 1; \
       fi; \
     fi

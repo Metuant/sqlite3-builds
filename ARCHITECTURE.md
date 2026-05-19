@@ -30,6 +30,9 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `src/auto_extension.c` | Built into both library variants; registers per-connection PRAGMA tuning. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
+| `tests/regen_deploy_pins_test.sh` | Round-trip harness for `tools/regen-deploy-pins.sh`: placeholder substitution, metadata rewriting, `bash -n` validation, and identity against the committed snapshot. |
+| `tests/assemble_library_pins_test.sh` | Unit tests for `tools/assemble-library-pins.sh`: synthetic SHA256SUMS parsing, plex/emby artifact mapping, prior-post carryover filtering, count-parity guard, and `validate_row` checks; `validate_row` also enforces semantic shape: kind (`pre`|`post`), non-empty target, and `/`-prefixed target_path. |
+| `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `tools/expected-sqlite-*-count.txt`. |
 | `scripts/update-sqlite-library.sh` | LSIO/container deploy helper for replacing bundled SQLite libraries. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
@@ -164,6 +167,28 @@ For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c`, links a
 shared object, applies library-only feature defaults, and writes
 `dist/libsqlite3.so`.
 
+For `library`, it also applies `tools/sqlite-amalgamation.patch` to the
+extracted SQLite amalgamation with `patch -p1` before compile. The patch
+renames the six wrapped SQLite API definitions to hidden `*_real` symbols:
+
+- `sqlite3_initialize`
+- `sqlite3_config`
+- `sqlite3_db_config`
+- `sqlite3_open`
+- `sqlite3_open_v2`
+- `sqlite3_open16`
+
+SQLite version bumps that change any target definition shape cause `patch` to
+reject hunks and fail the build with patch's native error message. The library
+build then compiles `sqlite3.c`, `/app/auto_extension.c`, and
+`/app/observability.c`; the CLI target does not run this patch and does not
+include observability.
+
+After the library compile, `build/Build.sh` checks every
+`SQLITE_CONFIG_*` and `SQLITE_DBCONFIG_*` define in the pinned `sqlite3.h`
+against the decode tables in `/app/observability.c`. Missing table entries are
+build failures.
+
 For the Plex variant, it additionally requires `SQLITE_SRC_URL`, verifies the
 SQLite full source archive, adds `ext/icu/icu.c`, enables ICU, and links with
 Plex-suffixed ICU libraries.
@@ -182,7 +207,10 @@ and SHA pin. The CLI image is only responsible for the static CLI artifact.
 and an Alpine/musl base for the Plex variant.
 
 It installs the shared-library build toolchain and copies `build/Build.sh`,
-`src/auto_extension.c`, and `tests/` into `/app`.
+`src/auto_extension.c`, `tests/`, `tools/sqlite-amalgamation.patch`,
+`tools/expected-sqlite-config-count.txt`, and
+`tools/expected-sqlite-dbconfig-count.txt` into `/app`, with the tools files
+under `/app/tools/`.
 
 For the generic variant, it builds the shared library and runs the
 auto-extension smoke.
@@ -221,13 +249,56 @@ the deploy script's `resolve_arch` function.
 Each build output is extracted with the pinned Docker-extract action and
 uploaded as a workflow artifact.
 
+Each matrix row also emits a `sqlite-pins-pre-<arch>` artifact containing
+pre-replacement SHA rows for the pinned Plex and Emby LSIO images. The row
+includes target kind, manifest schema, architecture suffix, source image,
+resolved image repo digest, target path, artifact marker, and current bundled
+library SHA. The pinned LSIO images are pulled through `retry-pull` composite
+action steps before `emit_pre_row` reads the cached images.
+
+The matrix runs `tests/deploy_assertion_test.sh` after the Emby first-init
+smoke. The test sources `scripts/lib/deploy-assertion.sh` directly and uses a
+synthetic in-script manifest fixture to exercise pre-row, managed-window
+post-row, current-release post-row, unknown-SHA, and target-kind isolation
+behavior without Docker or network access. It covers Plex, the dormant Jellyfin
+skip, and Emby pre-row, managed-window post-row, and unknown-SHA fatal cases.
+The shell coverage also includes `tests/regen_deploy_pins_test.sh`,
+`tests/assemble_library_pins_test.sh`, and `tests/check_obs_counts.sh`.
+
 ### Release Job
 
 On tag builds, the release job downloads all `sqlite-*` artifacts, archives each
 artifact directory as `.tar.gz`, writes `SHA256SUMS`, adds archive SHAs and
-library extracted-`.so` SHAs, and publishes archives plus `SHA256SUMS`.
+library extracted-`.so` SHAs, and publishes archives plus `SHA256SUMS`. In
+Plex library deploy archives, `icu_smoke` is excluded so only `libsqlite3.so`
+is published as the deploy artifact.
 
 The deploy script consumes this naming contract directly.
+
+The release job downloads the matrix `sqlite-pins-pre-*` fragments, fetches up
+to four prior managed-release `SQLITE_LIBRARY_PINS` assets, assembles a new
+`SQLITE_LIBRARY_PINS` manifest, and regenerates `update-sqlite-library.sh`
+before publishing release assets. Missing prior pin assets warn and skip; GitHub
+release API failures fail the job. The pre-replacement SHA emission step pulls
+each pinned LSIO image through the `retry-pull` composite action before calling
+`emit_pre_row`, so transient registry failures are retried with backoff.
+
+`tools/assemble-library-pins.sh` derives current-release post rows from
+`SHA256SUMS`, carries current pre rows from matrix fragments, and carries only
+the owning-release post rows from prior manifests so the bounded window does not
+grow transitively.
+
+`tools/regen-deploy-pins.sh` reads
+`scripts/update-sqlite-library.sh.template`, substitutes the
+`__SQLITE_LIBRARY_PINS_BLOCK__` placeholder inside the
+`cat <<'PINS_EOF' ... PINS_EOF` heredoc with the assembled manifest content,
+substitutes `__ASSERT_PRE_REPLACEMENT_SHA__` with the inline assertion
+function, and writes the rendered deploy script in place. The write is atomic:
+the tool writes to a pid-suffixed tmp file, verifies the rendered content
+(size, closing sentinel, metadata assignment), then replaces the target via
+`os.replace()`. The release tag is the deterministic `generated_at` value. The
+post-render syntax check uses `bash -n` because the rendered deploy script uses
+Bash array syntax.
 
 ## Compile Profile
 
@@ -328,6 +399,58 @@ loaded. Common pre-init knobs (threading mode, lookaside, memstatus) are
 locked at compile time, so unaudited late calls would no-op with
 `SQLITE_MISUSE`.
 
+## Observability Layer
+
+`src/observability.c` is compiled into both shared-library variants and is
+excluded from the CLI target.
+
+The library target patches SQLite's amalgamation so these public APIs are
+implemented by wrappers in `src/observability.c` while the original SQLite
+implementations remain available as hidden `*_real` symbols:
+
+- `sqlite3_initialize`
+- `sqlite3_config`
+- `sqlite3_db_config`
+- `sqlite3_open`
+- `sqlite3_open_v2`
+- `sqlite3_open16`
+
+The wrappers are log-only. They call the hidden real implementation, return the
+real return code unchanged, and log after the call with numeric `rc=N`. They do
+not mutate config opcodes, db-config opcodes, open flags, filenames, handles,
+or return codes.
+
+The observability kill switch is:
+
+```text
+SQLITE3_DISABLE_OBSERVABILITY=1
+```
+
+Only literal `1` disables observability. The value is cached once during the
+priority-101 observability constructor, with per-wrapper `pthread_once`
+fallback. Disabled mode skips wrapper log emission and skips per-connection
+`sqlite3_trace_v2` registration.
+
+Log lines are written to stderr:
+
+```text
+[sqlite3-builds-obs] <ISO-8601-UTC-ms> <pid> <kernel-tid> <fn> key=value ...
+```
+
+Kernel thread IDs come from `syscall(SYS_gettid)`. SQL text emitted by statement
+trace logging is capped at 3 KiB and receives a `...[TRUNC]` tail when
+truncated.
+
+`sqlite3_initialize` uses a thread-local depth counter so nested initialization
+still calls the real implementation but only the outer 0-to-1 transition logs
+failures where `rc != SQLITE_OK`.
+
+`autopragma_init()` registers `sqlite3_trace_v2(..., SQLITE_TRACE_STMT, ...)`
+before the `SQLITE3_DISABLE_AUTOPRAGMA` gate. Observability is orthogonal to
+PRAGMA injection: target filtering, read-only skips, and the autopragma kill
+switch do not suppress observability logs. Trace registration failure logs and
+continues; it must never make `sqlite3_open*` fail.
+
 ## Smoke Tests
 
 ### `auto_extension_smoke`
@@ -415,6 +538,11 @@ fails when logs contain any of: `SQLITE_`, `database disk image is malformed`,
 `Cannot create table`, `no such function`, `no such collation`, or
 `Failed to open`.
 
+The smoke also requires observability marker lines for an open wrapper and
+`SQLITE_TRACE_STMT`. A duplicate disabled-mode smoke starts PMS with
+`SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
+`[sqlite3-builds-obs]` line is emitted.
+
 ### Emby first-init smoke
 
 The CI Emby first-init smoke runs after generic library artifact extraction.
@@ -432,9 +560,14 @@ for readiness by polling startup logs for the prefix-agnostic
 After readiness, the smoke verifies the logged SQLite version equals the
 workflow `SQLITE_VERSION` converted from the upstream archive form to dotted
 form. It also prints Emby's logged SQLite compiler options and verifies the
-15 curated `compile_options` used by the tuned library are present. The
+16 curated `compile_options` used by the tuned library are present. The
 workflow prints full Emby logs and fails when logs contain the same bad-signal
 set as §PMS first-init smoke.
+
+The smoke also requires observability marker lines for an open wrapper and
+`SQLITE_TRACE_STMT`. A duplicate disabled-mode smoke starts Emby with
+`SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
+`[sqlite3-builds-obs]` line is emitted.
 
 ## Deploy Architecture
 
@@ -464,14 +597,16 @@ Deploy flow:
 2. Resolve `TAG` from the latest GitHub release redirect when `TAG` is unset.
 3. Resolve the architecture suffix from `uname -m` and CPU features.
 4. Select the target archive and destination path.
-5. Download `SHA256SUMS` and look up archive plus extracted-`.so` SHAs.
-6. Exit successfully when the destination already has the expected `.so` SHA.
-7. Warn and exit successfully when the destination path is absent.
-8. Download and verify the archive.
-9. Reject unsafe tar members before extraction.
-10. Extract and verify `libsqlite3.so`.
-11. Back up the current destination.
-12. Copy to a same-directory temp path, verify it, replace with `mv`, verify the
+5. Warn and exit successfully when the destination path is absent.
+6. Assert the current destination SHA against the embedded
+   `SQLITE_LIBRARY_PINS` manifest before any release-asset download.
+7. Exit successfully when the current SHA matches the current-release post row.
+8. Download `SHA256SUMS` and look up archive plus extracted-`.so` SHAs.
+9. Download and verify the archive.
+10. Reject unsafe tar members before extraction.
+11. Extract and verify `libsqlite3.so`.
+12. Back up the current destination.
+13. Copy to a same-directory temp path, verify it, replace with `mv`, verify the
     destination, and roll back from the fresh backup on replacement failure.
 
 The missing-target skip is deliberate because a shared LSIO hook can run in a
@@ -483,6 +618,49 @@ the final `mv` stays on the same filesystem.
 The script must not touch Plex's `libicu*plex.so.69` files. Plex keeps using
 those runtime ICU libraries directly, and the Plex SQLite variant only replaces
 `libsqlite3.so`.
+
+### Library Pin Manifest
+
+`SQLITE_LIBRARY_PINS` is a release asset and is also embedded in the release
+asset copy of `update-sqlite-library.sh`.
+
+The manifest schema is pipe-delimited:
+
+```text
+kind|schema|target|arch|source|source_digest|target_path|artifact|sha256
+```
+
+The first data row is metadata:
+
+```text
+version|1|managed_window|5|release_tag|<tag>|generated_at|<tag>
+```
+
+`pre` rows describe the bundled library SHA in the pinned LSIO runtime image
+before replacement. `post` rows describe managed deployed library SHAs derived
+from release `SHA256SUMS` extracted-`.so` entries. The managed window is five
+releases: the current release plus four prior managed releases.
+
+### Pre-replacement Assertion
+
+Before downloading release artifacts, `scripts/update-sqlite-library.sh`
+computes the current target library SHA and checks it against
+`SQLITE_LIBRARY_PINS`.
+
+The assertion passes only when the current SHA matches a same-target,
+same-architecture, same-path `pre` row or a managed-window `post` row. A
+current-release `post` row exits successfully as already deployed. An unknown
+SHA is fatal with no bypass environment variable.
+
+The dormant Jellyfin branch warns and skips the pin assertion because this
+cycle does not validate JF deployment.
+
+`tools/regen-deploy-pins.sh` inlines the assertion function into the deploy
+script at render time through the `__ASSERT_PRE_REPLACEMENT_SHA__` placeholder,
+so the release asset has zero runtime file dependencies beyond the script
+itself. After the assertion passes, the deploy script captures the verified SHA
+and performs a TOCTOU recheck immediately before backup and replacement to guard
+against concurrent mutations.
 
 ## Deploy Tool Surface
 
@@ -627,6 +805,40 @@ Auto-extension:
 - The kill switch must remain literal `SQLITE3_DISABLE_AUTOPRAGMA=1`.
 - Read-only opens must stay quiet.
 - Maintenance must set the kill switch.
+
+Observability:
+
+- Observability wrappers must chain to the hidden real SQLite implementation
+  and return its result unchanged.
+- Observability is log-only in the initial pass; it must not inject config,
+  db-config, open-flag, filename, handle, or return-code behavior.
+- Trace registration failure must log and continue; it must never fail
+  `sqlite3_open*`.
+- Observability log emission is independent of target filtering, read-only
+  filtering, and `SQLITE3_DISABLE_AUTOPRAGMA`.
+- The observability kill switch must remain literal
+  `SQLITE3_DISABLE_OBSERVABILITY=1`.
+- CLI builds must not carry the observability wrapper layer.
+
+M-series invariants:
+
+- M7: Source-level amalgamation patching via a checked-in unified-diff `.patch`
+  file applied with `patch -p1` after unzip; SQLite version bumps that change
+  any of the six target signatures cause `patch` to reject hunks and fail the
+  build with patch's native error message. `tools/sqlite-amalgamation.patch` is
+  the single locus of amalgamation modifications.
+
+Pin manifest:
+
+- The managed deploy window is current plus four prior releases.
+- `SQLITE_LIBRARY_PINS` uses schema version 1 with the 9-column data shape and
+  metadata row.
+- `generated_at` equals the release tag.
+- Missing `docker image inspect` repo digest for a pinned LSIO image is a CI
+  failure.
+- Deploy-script SHA mismatch has no bypass environment variable.
+- The release asset copy of `update-sqlite-library.sh` is the authoritative
+  script for a release tag.
 
 ## Out of Scope
 
