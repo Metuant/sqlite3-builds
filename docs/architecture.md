@@ -28,7 +28,11 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `docker-cli/Dockerfile` | Alpine-based static CLI build image. |
 | `docker-library/Dockerfile` | Shared-library build image: Ubuntu/glibc for the generic variant and Alpine/musl for the Plex variant. |
 | `src/auto_extension.c` | Built into both library variants; registers per-connection PRAGMA tuning. |
+| `src/slow_query_tracker.c` | Hidden observability satellite for PROFILE-based slow-query logging and bounded per-template stats. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
+| `tests/slow_query_smoke.c` | Runtime smoke for the slow-query tracker threshold parser, kill switches, LRU bound, truncation, and stats dump. |
+| `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
+| `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
 | `tests/regen_deploy_pins_test.sh` | Round-trip harness for `tools/regen-deploy-pins.sh`: placeholder substitution, metadata rewriting, `bash -n` validation, and identity against the committed snapshot. |
 | `tests/assemble_library_pins_test.sh` | Unit tests for `tools/assemble-library-pins.sh`: synthetic SHA256SUMS parsing, plex/emby artifact mapping, prior-post carryover filtering, count-parity guard, and `validate_row` checks; `validate_row` also enforces semantic shape: kind (`pre`|`post`), non-empty target, and `/`-prefixed target_path. |
@@ -180,9 +184,9 @@ renames the six wrapped SQLite API definitions to hidden `*_real` symbols:
 
 SQLite version bumps that change any target definition shape cause `patch` to
 reject hunks and fail the build with patch's native error message. The library
-build then compiles `sqlite3.c`, `/app/auto_extension.c`, and
-`/app/observability.c`; the CLI target does not run this patch and does not
-include observability.
+build then compiles `sqlite3.c`, `/app/auto_extension.c`,
+`/app/observability.c`, and `/app/slow_query_tracker.c`; the CLI target does
+not run this patch and does not include observability.
 
 After the library compile, `build/Build.sh` checks every
 `SQLITE_CONFIG_*` and `SQLITE_DBCONFIG_*` define in the pinned `sqlite3.h`
@@ -212,15 +216,16 @@ It installs the shared-library build toolchain and copies `build/Build.sh`,
 `tools/expected-sqlite-dbconfig-count.txt` into `/app`, with the tools files
 under `/app/tools/`.
 
-For the generic variant, it builds the shared library and runs the
-auto-extension smoke.
+For the generic variant, it builds the shared library and runs the new
+config-after-dlopen, shutdown/reinit, and auto-extension smokes.
 
 For the Plex variant, it also builds ICU 69.1 under `/opt/icu-69-plex`, exposes
 `PLEX_ICU_INCLUDE` and `PLEX_ICU_LIB`, checks ICU soname and symbol shape with
-`ldd` and `nm`, runs `icu_smoke`, and runs `auto_extension_smoke` with the Plex
-ICU path available. The Plex branch builds under Alpine/musl so the resulting
-library does not carry glibc-versioned symbols such as `fcntl64`, which Plex's
-`libgcompat` shim does not provide.
+`ldd` and `nm`, runs `icu_smoke`, and runs the config-after-dlopen,
+shutdown/reinit, and auto-extension smokes with the Plex ICU path available. The
+Plex branch builds under Alpine/musl so the resulting library does not carry
+glibc-versioned symbols such as `fcntl64`, which Plex's `libgcompat` shim does
+not provide.
 
 For the Plex variant, the build stage fails if the produced `libsqlite3.so`
 carries `fcntl64` or any other glibc-versioned symbol.
@@ -316,9 +321,17 @@ virtual tables. The library target keeps those out of application processes.
 
 `src/auto_extension.c` is compiled into both library variants.
 
-At library load time, a constructor calls `sqlite3_auto_extension()` and
-registers a callback. SQLite invokes that callback for each new connection
-after the handle exists.
+The priority-102 constructor still calls
+`sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 16384)` before effective SQLite
+initialization so `SQLITE_ENABLE_SORTER_REFERENCES` is active. Auto-extension
+registration is lazy: the observability `sqlite3_open`, `sqlite3_open_v2`, and
+`sqlite3_open16` wrappers call `auto_extension_register_for_open()` immediately
+before the hidden real open function. That helper calls
+`sqlite3_auto_extension(autopragma_init)`, which performs the first effective
+`sqlite3_initialize()` when needed; `openDatabase` then reaches
+`sqlite3AutoLoadExtensions(db)` and runs the callback for the new connection.
+Embedders may call startup-only `sqlite3_config()` verbs after `dlopen` and
+before their first public open.
 
 The callback is best-effort:
 
@@ -363,7 +376,7 @@ The emitted PRAGMA block is:
 
 ```sql
 PRAGMA cache_size=-1048576;
-PRAGMA mmap_size=8589934592;
+PRAGMA mmap_size=34359738368;
 PRAGMA temp_store=2;
 PRAGMA threads=8;
 PRAGMA wal_autocheckpoint=16000;
@@ -378,10 +391,11 @@ re-sets `analysis_limit=0` during planned-downtime runs so maintenance
 `optimize()` calls execute without the per-connection ceiling.
 
 The same callback runs for Plex, Emby, and the retained-but-unvalidated JF
-target. PMS issues its own per-connect PRAGMAs after `sqlite3_open_v2`, so the
+target. PMS issues its own per-connect PRAGMAs after 2-arg `sqlite3_open`
+returns with implicit `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE`, so the
 injected settings are best-effort for Plex and sticky for Emby/JF connections
-that do not run an app-side PRAGMA pass. Analysis and optimization remain in
-the planned-downtime maintenance lifecycle.
+that do not run an app-side PRAGMA pass. Analysis and optimization remain in the
+planned-downtime maintenance lifecycle.
 
 `synchronous` is not set by the callback. The compile profile already gives WAL
 databases the desired synchronous mode, and a connection-level PRAGMA would
@@ -390,14 +404,6 @@ also affect rollback-journal databases.
 `optimize` is not set by the callback. Optimization and analysis run in the
 planned-downtime maintenance script, where application-specific collations and
 tokenizers are available and the lifecycle is explicit.
-
-Calling `sqlite3_auto_extension()` initializes SQLite, after the
-constructor first calls `sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 16384)`
-to activate `SQLITE_ENABLE_SORTER_REFERENCES`. Embedders that need other
-global `sqlite3_config()` calls must make them before the library is
-loaded. Common pre-init knobs (threading mode, lookaside, memstatus) are
-locked at compile time, so unaudited late calls would no-op with
-`SQLITE_MISUSE`.
 
 ## Observability Layer
 
@@ -415,10 +421,17 @@ implementations remain available as hidden `*_real` symbols:
 - `sqlite3_open_v2`
 - `sqlite3_open16`
 
-The wrappers are log-only. They call the hidden real implementation, return the
-real return code unchanged, and log after the call with numeric `rc=N`. They do
-not mutate config opcodes, db-config opcodes, open flags, filenames, handles,
-or return codes.
+Apart from lazy auto-extension registration in the open wrappers, the wrappers
+are log-only. They call the hidden real implementation, return the real return
+code unchanged, and log after the call with numeric `rc=N`. They do not mutate
+config opcodes, db-config opcodes, open flags, filenames, handles, or return
+codes.
+
+The `sqlite3_open`, `sqlite3_open_v2`, and `sqlite3_open16` wrappers call
+`auto_extension_register_for_open()` after observability initialization and
+immediately before their hidden `_real` open implementation. The helper is
+per-open and may trigger effective SQLite initialization before `openDatabase`
+enters its own initialization path.
 
 The observability kill switch is:
 
@@ -443,13 +456,82 @@ truncated.
 
 `sqlite3_initialize` uses a thread-local depth counter so nested initialization
 still calls the real implementation but only the outer 0-to-1 transition logs
-failures where `rc != SQLITE_OK`.
+failures where `rc != SQLITE_OK`. This absorbs helper-triggered initialization
+followed by `openDatabase`'s initialization check without false failure logs.
 
-`autopragma_init()` registers `sqlite3_trace_v2(..., SQLITE_TRACE_STMT, ...)`
-before the `SQLITE3_DISABLE_AUTOPRAGMA` gate. Observability is orthogonal to
+`autopragma_init()` registers a unified trace callback before the AUTOPRAGMA
+gate, with STMT always enabled and PROFILE conditionally added when slow-query
+tracking is enabled. Observability is orthogonal to
 PRAGMA injection: target filtering, read-only skips, and the autopragma kill
 switch do not suppress observability logs. Trace registration failure logs and
 continues; it must never make `sqlite3_open*` fail.
+
+### Slow-Query Tracker
+
+The same per-connection trace registration uses one unified callback with
+`SQLITE_TRACE_STMT` always enabled and `SQLITE_TRACE_PROFILE` added only when
+slow-query tracking is enabled. SQLite allows one trace callback per
+connection, so the tracker shares the existing registration site that runs
+before the connection escapes to application code.
+
+The kill-switch hierarchy is:
+
+```text
+SQLITE3_DISABLE_OBSERVABILITY=1 -> no observability or tracker work
+SQLITE3_DISABLE_SLOW_QUERY=1 -> STMT observability stays on, PROFILE tracker off
+```
+
+The helper unconditionally calls `sqlite3_auto_extension` regardless of the
+`SQLITE3_DISABLE_AUTOPRAGMA=1` state. An alternative -- early-return from the
+helper when `SQLITE3_DISABLE_AUTOPRAGMA=1` -- was considered and rejected: it
+would have skipped `sqlite3_trace_v2(SQLITE_TRACE_STMT)` registration in
+`autopragma_init`, conflating AUTOPRAGMA disable with observability disable.
+The accepted per-open mutex + dedup-scan cost preserves orthogonality between
+the two kill switches.
+
+`SQLITE3_SLOW_QUERY_THRESHOLD_MS` defaults to `100`. The parser accepts only
+unsigned decimal milliseconds, allows `0` for debug-only all-sample logging,
+and falls back to `100` for unset, empty, signed, non-digit, trailing-junk,
+ERANGE, or pre-conversion overflow values. PROFILE elapsed values come from
+SQLite's millisecond-quantized timing source and are scaled to nanoseconds by
+SQLite before the callback receives them.
+
+The tracker keeps a process-global 1024-entry LRU keyed by parameterized
+`sqlite3_sql()` text. It stores and displays at most 1024 SQL bytes per
+template, uses the full SQL FNV-1a hash as the probe accelerator, and uses that
+full hash as the equality proof for templates longer than 1024 bytes. Existing
+STMT logging keeps its separate 3 KiB SQL cap; `SLOW_QUERY_SQL_CAP` does not
+change `OBS_SQL_CAP`, and config/db-config decode tables stay in
+`src/observability.c`.
+
+LRU evictions tombstone the bucket entry and trigger an amortized O(1) bucket
+rebuild when tombstones reach 25% of entries_used.
+
+Stats are retained as count, sum, sum-of-squares, min, and max. Supported
+compilers use `unsigned __int128` accumulators; fallback compilers use
+`uint64_t` with a per-template sample cap and one warning per capped template.
+The dump path heap-allocates value snapshots, copies under the tracker mutex,
+sorts by descending total elapsed time, and emits `slow_query_stats` lines
+after releasing the mutex.
+
+Dumps occur at normal process exit and at most every five minutes during
+PROFILE activity. The atexit path sets an atomic in-exit flag first, so later
+PROFILE callbacks return before touching SQLite pointers or the mutex, and it
+uses `pthread_mutex_trylock`; on contention it emits a one-line skip diagnostic
+instead of stalling process shutdown.
+
+The tracker is an observability satellite that depends on the hidden
+`obs_logf` / `obs_is_disabled` ABI in this MVP. A Phase 2 sink-abstraction
+layer is deferred until runtime evidence justifies persistent or alternate
+export paths.
+
+### Slow-Query Verification
+
+Docker build compiles + runs `slow_query_smoke`, `slow_query_atexit_smoke`,
+`slow_query_concurrency_smoke`. CI re-runs positive, disabled-mode, atexit,
+and concurrency checks. Bench binaries (`slow_query_select1_bench`,
+`slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`) compile
+unconditionally; execute only with `RUN_BENCH=1`.
 
 ## Smoke Tests
 
@@ -478,6 +560,31 @@ Execution points:
 
 - Generic library Docker build.
 - Plex library Docker build with Plex ICU paths in the loader environment.
+
+### `config_after_dlopen_smoke`
+
+`tests/config_after_dlopen_smoke.c` links against the just-built library inside
+the library Docker image.
+
+It proves:
+
+- `SQLITE_CONFIG_MULTITHREAD` and `SQLITE_CONFIG_MEMSTATUS` still return
+  `SQLITE_OK` after library load and before first intentional open.
+- A target-matched first open still receives the active PRAGMA profile.
+- Three fresh-process concurrent first opens, one per public open wrapper
+  (`sqlite3_open`, `sqlite3_open_v2`, `sqlite3_open16`), all succeed and
+  receive the active PRAGMA profile.
+
+### `shutdown_reinit_smoke`
+
+`tests/shutdown_reinit_smoke.c` links against the just-built library inside the
+library Docker image.
+
+It proves:
+
+- A target-matched first open receives the active PRAGMA profile.
+- After `sqlite3_shutdown()`, a later public open path re-registers the lazy
+  auto-extension and receives the active PRAGMA profile again.
 
 ### `icu_smoke`
 
@@ -539,7 +646,10 @@ fails when logs contain any of: `SQLITE_`, `database disk image is malformed`,
 `Failed to open`.
 
 The smoke also requires observability marker lines for an open wrapper and
-`SQLITE_TRACE_STMT`. A duplicate disabled-mode smoke starts PMS with
+`SQLITE_TRACE_STMT`. Positive-mode logs must not contain startup
+`sqlite3_config` operations returning `rc=21` (CI pattern:
+`[sqlite3-builds-obs] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21`).
+A duplicate disabled-mode smoke starts PMS with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
 `[sqlite3-builds-obs]` line is emitted.
 
@@ -565,7 +675,10 @@ workflow prints full Emby logs and fails when logs contain the same bad-signal
 set as §PMS first-init smoke.
 
 The smoke also requires observability marker lines for an open wrapper and
-`SQLITE_TRACE_STMT`. A duplicate disabled-mode smoke starts Emby with
+`SQLITE_TRACE_STMT`. Positive-mode logs must not contain startup
+`sqlite3_config` operations returning `rc=21` (CI pattern:
+`[sqlite3-builds-obs] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21`).
+A duplicate disabled-mode smoke starts Emby with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
 `[sqlite3-builds-obs]` line is emitted.
 

@@ -55,7 +55,7 @@ sha256_of() { sha256sum "$1" | awk '{print $1}'; }
 
 assert_pre_replacement_sha() {
   # >>> ASSERT_PRE_REPLACEMENT_SHA BEGIN <<<
-  local target=$1 current_sha match expected_sha_list
+  local target=$1 current_sha match expected_sha_list already_current=0
 
   if [[ "${target}" == "jellyfin" ]]; then
     echo "WARNING: skipping SQLite library pin assertion for dormant jellyfin target" >&2
@@ -121,12 +121,50 @@ assert_pre_replacement_sha() {
       ;;
     current-post\|*)
       echo "${target_path} already deployed at ${current_sha}."
-      exit 0
+      already_current=1
       ;;
     *)
       fatal "internal pin assertion error for ${target}: ${match}"
       ;;
   esac
+  if [[ "${target}" == "plex" ]]; then
+    local target_dir so icu_path icu_sha icu_expected
+    target_dir="${target_path%/*}"
+    for so in libicuucplex.so.69 libicui18nplex.so.69 libicudataplex.so.69; do
+      icu_path="${target_dir}/${so}"
+      [[ -f "${icu_path}" ]] || continue
+      icu_sha="$(sha256_of "${icu_path}")"
+      if ! printf "%s\n" "${SQLITE_LIBRARY_PINS}" | tr -d '\r' | awk -F'|' \
+        -v arch="${arch}" \
+        -v target_path="${icu_path}" \
+        -v current_sha="${icu_sha}" '
+          /^#/ || NF == 0 { next }
+          $1 != "pre" || NF != 9 || $2 != "1" { next }
+          $3 != "plex" || $4 != arch || $7 != target_path || $9 != current_sha { next }
+          { found = 1; exit }
+          END { if (!found) exit 1 }
+        '; then
+        icu_expected="$(
+          printf "%s\n" "${SQLITE_LIBRARY_PINS}" | tr -d '\r' | awk -F'|' \
+            -v arch="${arch}" \
+            -v target_path="${icu_path}" '
+              /^#/ || NF == 0 { next }
+              $1 == "pre" && NF == 9 && $2 == "1" && $3 == "plex" && $4 == arch && $7 == target_path {
+                print "pre source=" $5 " digest=" $6 " sha=" $9
+              }
+            '
+        )"
+        if [[ -z "${icu_expected}" ]]; then
+          icu_expected="(none)"
+        fi
+        fatal "unknown Plex ICU SHA for ${arch} at ${icu_path}: ${icu_sha}; expected ICU pre SHAs: ${icu_expected}"
+      fi
+      echo "Verified managed Plex ICU ${so} ${arch} SHA ${icu_sha}."
+    done
+  fi
+  if [[ "${already_current}" -eq 1 ]]; then
+    exit 0
+  fi
   OUT_ASSERTED_SHA="${current_sha}"
   # >>> ASSERT_PRE_REPLACEMENT_SHA END <<<
 }

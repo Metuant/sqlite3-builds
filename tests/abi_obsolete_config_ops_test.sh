@@ -30,10 +30,25 @@ cat > "${tmpdir}/abi_obsolete_config_ops.c" <<'EOF'
 #include <stdio.h>
 #include <sqlite3.h>
 
-static int check_allowed_rc(const char *label, int rc) {
-    if (rc != SQLITE_OK && rc != SQLITE_MISUSE) {
-        fprintf(stderr, "FATAL: %s returned %d (expected %d or %d)\n",
-                label, rc, SQLITE_OK, SQLITE_MISUSE);
+enum {
+    ALLOW_SQLITE_OK = 1 << 0,
+    ALLOW_SQLITE_ERROR = 1 << 1,
+    ALLOW_SQLITE_MISUSE = 1 << 2
+};
+
+static int check_allowed_rc(const char *label, int rc, int allowed) {
+    int ok = 0;
+    if (rc == SQLITE_OK && (allowed & ALLOW_SQLITE_OK)) ok = 1;
+    if (rc == SQLITE_ERROR && (allowed & ALLOW_SQLITE_ERROR)) ok = 1;
+    if (rc == SQLITE_MISUSE && (allowed & ALLOW_SQLITE_MISUSE)) ok = 1;
+
+    if (!ok) {
+        fprintf(stderr, "FATAL: %s returned %d (expected%s%s%s)\n",
+                label,
+                rc,
+                (allowed & ALLOW_SQLITE_OK) ? " SQLITE_OK" : "",
+                (allowed & ALLOW_SQLITE_ERROR) ? " SQLITE_ERROR" : "",
+                (allowed & ALLOW_SQLITE_MISUSE) ? " SQLITE_MISUSE" : "");
         return 1;
     }
     printf("%s=%d\n", label, rc);
@@ -43,15 +58,23 @@ static int check_allowed_rc(const char *label, int rc) {
 int main(void) {
     int failed = 0;
 
-    failed |= check_allowed_rc("scratch_pre", sqlite3_config(SQLITE_CONFIG_SCRATCH));
-    failed |= check_allowed_rc("pagecache_pre", sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0));
-    failed |= check_allowed_rc("heap_pre", sqlite3_config(SQLITE_CONFIG_HEAP, NULL, 0, 0));
-    failed |= check_allowed_rc("pcache_pre", sqlite3_config(SQLITE_CONFIG_PCACHE));
-    failed |= check_allowed_rc("getpcache_pre", sqlite3_config(SQLITE_CONFIG_GETPCACHE));
+    failed |= check_allowed_rc("scratch_pre", sqlite3_config(SQLITE_CONFIG_SCRATCH),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_ERROR | ALLOW_SQLITE_MISUSE);
+    failed |= check_allowed_rc("pagecache_pre", sqlite3_config(SQLITE_CONFIG_PAGECACHE, NULL, 0, 0),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_MISUSE);
+    failed |= check_allowed_rc("heap_pre", sqlite3_config(SQLITE_CONFIG_HEAP, NULL, 0, 0),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_ERROR | ALLOW_SQLITE_MISUSE);
+    failed |= check_allowed_rc("pcache_pre", sqlite3_config(SQLITE_CONFIG_PCACHE),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_ERROR | ALLOW_SQLITE_MISUSE);
+    failed |= check_allowed_rc("getpcache_pre", sqlite3_config(SQLITE_CONFIG_GETPCACHE),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_ERROR | ALLOW_SQLITE_MISUSE);
 
-    failed |= check_allowed_rc("initialize", sqlite3_initialize());
-    failed |= check_allowed_rc("pcache_post", sqlite3_config(SQLITE_CONFIG_PCACHE));
-    failed |= check_allowed_rc("getpcache_post", sqlite3_config(SQLITE_CONFIG_GETPCACHE));
+    failed |= check_allowed_rc("initialize", sqlite3_initialize(),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_MISUSE);
+    failed |= check_allowed_rc("pcache_post", sqlite3_config(SQLITE_CONFIG_PCACHE),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_MISUSE);
+    failed |= check_allowed_rc("getpcache_post", sqlite3_config(SQLITE_CONFIG_GETPCACHE),
+                               ALLOW_SQLITE_OK | ALLOW_SQLITE_MISUSE);
 
     sqlite3_shutdown();
     return failed ? 1 : 0;
@@ -132,7 +155,8 @@ else
     "${amalg_dir}/sqlite3.c" \
     "${tmpdir}/auto_extension.c" \
     "${tmpdir}/observability.c" \
-    -lpthread ${extra_ldflags} \
+    "${repo_root}/src/slow_query_tracker.c" \
+    -lpthread -lm ${extra_ldflags} \
     -o "${lib_path}"
 
   cc -O0 -o "${tmpdir}/abi_obsolete_config_ops" "${tmpdir}/abi_obsolete_config_ops.c" \

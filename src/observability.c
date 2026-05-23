@@ -27,6 +27,7 @@ extern int sqlite3_open_v2_real(
     const char *filename, sqlite3 **ppDb, int flags, const char *zVfs
 );
 extern int sqlite3_open16_real(const void *filename, sqlite3 **ppDb);
+__attribute__((visibility("hidden"))) extern void auto_extension_register_for_open(void);
 
 static pthread_once_t g_obs_once = PTHREAD_ONCE_INIT;
 static atomic_int g_obs_disabled;
@@ -498,12 +499,18 @@ SQLITE_API int sqlite3_open(const char *filename, sqlite3 **ppDb) {
     char file[4096];
 
     pthread_once(&g_obs_once, obs_init_once);
+    auto_extension_register_for_open();
     rc = sqlite3_open_real(filename, ppDb);
     if (!atomic_load_explicit(&g_obs_disabled, memory_order_acquire)) {
         obs_escape_unlimited(filename, file, sizeof(file));
-        obs_logf("sqlite3_open",
-                 "file=\"%s\" flags=SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE db=%p rc=%d",
-                 file, ppDb ? (void*)*ppDb : NULL, rc);
+        if (rc == SQLITE_OK) {
+            obs_logf("sqlite3_open",
+                     "file=\"%s\" flags=SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE db=%p rc=%d",
+                     file, ppDb ? (void*)*ppDb : NULL, rc);
+        } else {
+            obs_logf("sqlite3_open", "file=\"%s\" db=%p rc=%d",
+                     file, ppDb ? (void*)*ppDb : NULL, rc);
+        }
     }
     return rc;
 }
@@ -517,6 +524,7 @@ SQLITE_API int sqlite3_open_v2(
     char flagbuf[1024];
 
     pthread_once(&g_obs_once, obs_init_once);
+    auto_extension_register_for_open();
     rc = sqlite3_open_v2_real(filename, ppDb, flags, zVfs);
     if (!atomic_load_explicit(&g_obs_disabled, memory_order_acquire)) {
         obs_escape_unlimited(filename, file, sizeof(file));
@@ -532,6 +540,7 @@ SQLITE_API int sqlite3_open16(const void *filename, sqlite3 **ppDb) {
     int rc;
 
     pthread_once(&g_obs_once, obs_init_once);
+    auto_extension_register_for_open();
     rc = sqlite3_open16_real(filename, ppDb);
     if (!atomic_load_explicit(&g_obs_disabled, memory_order_acquire)) {
         if (rc == SQLITE_OK) {

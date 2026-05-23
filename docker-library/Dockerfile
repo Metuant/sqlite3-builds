@@ -63,6 +63,7 @@ WORKDIR /app
 COPY build/Build.sh /app/Build.sh
 COPY src/auto_extension.c /app/auto_extension.c
 COPY src/observability.c /app/observability.c
+COPY src/slow_query_tracker.c /app/slow_query_tracker.c
 COPY tools/sqlite-amalgamation.patch /app/tools/sqlite-amalgamation.patch
 COPY tools/expected-sqlite-config-count.txt /app/tools/expected-sqlite-config-count.txt
 COPY tools/expected-sqlite-dbconfig-count.txt /app/tools/expected-sqlite-dbconfig-count.txt
@@ -157,6 +158,49 @@ RUN set -euo pipefail; \
     if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       LDFLAGS_VARIANT="${PLEX_ICU_LDFLAGS}"; LDPATH_VARIANT=":${PLEX_ICU_LIB}"; \
     fi; \
+    gcc -O0 -o /app/config_after_dlopen_smoke /app/tests/config_after_dlopen_smoke.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/config_after_dlopen_smoke; \
+    gcc -O0 -o /app/shutdown_reinit_smoke /app/tests/shutdown_reinit_smoke.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/shutdown_reinit_smoke; \
+    gcc -O2 -o /app/config_after_dlopen_concurrent_bench \
+        /app/tests/config_after_dlopen_concurrent_bench.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread
+
+RUN set -euo pipefail; \
+    LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)"); \
+    AMALG_DIR=$(dirname "$LIB_DIR"); \
+    LDFLAGS_VARIANT=""; LDPATH_VARIANT=""; \
+    if [ "$LIBRARY_VARIANT" = "plex" ]; then \
+      LDFLAGS_VARIANT="${PLEX_ICU_LDFLAGS}"; LDPATH_VARIANT=":${PLEX_ICU_LIB}"; \
+    fi; \
     gcc -O0 -o /app/auto_extension_smoke /app/tests/auto_extension_smoke.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/auto_extension_smoke
+
+RUN set -euo pipefail; \
+    LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)"); \
+    AMALG_DIR=$(dirname "$LIB_DIR"); \
+    LDFLAGS_VARIANT=""; LDPATH_VARIANT=""; \
+    if [ "$LIBRARY_VARIANT" = "plex" ]; then \
+      LDFLAGS_VARIANT="${PLEX_ICU_LDFLAGS}"; LDPATH_VARIANT=":${PLEX_ICU_LIB}"; \
+    fi; \
+    gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -o /app/slow_query_smoke \
+        /app/tests/slow_query_smoke.c /app/slow_query_tracker.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_smoke; \
+    gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -o /app/slow_query_atexit_smoke \
+        /app/tests/slow_query_atexit_smoke.c /app/slow_query_tracker.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
+    atexit_output="$(LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_atexit_smoke 2>&1)"; \
+    printf "%s\n" "$atexit_output"; \
+    printf "%s\n" "$atexit_output" | grep -E 'slow_query_stats|dump_skipped'; \
+    gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -o /app/slow_query_concurrency_smoke \
+        /app/tests/slow_query_concurrency_smoke.c /app/slow_query_tracker.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_concurrency_smoke; \
+    gcc -O2 -o /app/slow_query_select1_bench /app/tests/slow_query_select1_bench.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    gcc -O2 -o /app/slow_query_metadata_bench /app/tests/slow_query_metadata_bench.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread

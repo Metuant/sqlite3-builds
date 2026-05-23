@@ -17,8 +17,9 @@ SQLITE_API int sqlite3_enable_shared_cache(int enable) {
 #include <stdatomic.h>
 
 __attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void);
-__attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned trace, void *ctx, void *p, void *x);
+__attribute__((visibility("hidden"))) SQLITE_API int obs_trace_cb(unsigned trace, void *ctx, void *p, void *x);
 __attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
+__attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
 
 /* WHY: Constructor stores cfg_rc here so tests can assert that the runtime
  * SORTERREF_SIZE config call landed before sqlite3_initialize(). The variable
@@ -28,6 +29,19 @@ static int g_sorterref_cfg_rc = SQLITE_OK;
 
 int auto_extension_sorterref_cfg_rc(void) {
     return g_sorterref_cfg_rc;
+}
+
+static int sqlite_log_should_route(int err_code, const char *msg) {
+    int primary = err_code & 0xff;
+    if (primary == SQLITE_NOTICE || primary == SQLITE_WARNING) return 1;
+    if (!msg) return 0;
+    return strstr(msg, "PANIC") != NULL || strstr(msg, "panic") != NULL;
+}
+
+static void sqlite_log_to_observability(void *ctx, int err_code, const char *msg) {
+    (void)ctx;
+    if (!sqlite_log_should_route(err_code, msg)) return;
+    obs_logf("sqlite3_log", "rc=%d msg=\"%s\"", err_code, msg ? msg : "");
 }
 
 static int ends_with(const char *str, const char *suffix) {
@@ -87,7 +101,9 @@ static int autopragma_init(
     (void)pzErr;
 
     if (!obs_is_disabled()) {
-        int trace_rc = sqlite3_trace_v2(db, SQLITE_TRACE_STMT, obs_trace_stmt_cb, NULL);
+        unsigned trace_mask = SQLITE_TRACE_STMT;
+        if (!slow_query_disabled()) trace_mask |= SQLITE_TRACE_PROFILE;
+        int trace_rc = sqlite3_trace_v2(db, trace_mask, obs_trace_cb, NULL);
         if (trace_rc != SQLITE_OK) {
             obs_logf("sqlite3_trace_v2",
                      "event=registration_failed db=%p rc=%d",
@@ -127,9 +143,10 @@ static int autopragma_init(
      * current profile this is a no-op that documents intent only; it does not
      * restore the always-memory guarantee if the compile profile relaxes.
      *
-     * PMS issues its own per-connect PRAGMAs after sqlite3_open_v2 returns,
-     * so these settings are best-effort for Plex and sticky for Emby/JF
-     * connections that do not run an app-side PRAGMA pass.
+     * PMS issues its own per-connect PRAGMAs after 2-arg sqlite3_open returns
+     * with implicit SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE, so these settings
+     * are best-effort for Plex and sticky for Emby/JF connections that do not
+     * run an app-side PRAGMA pass.
      *
      * PRAGMA synchronous: deliberately NOT set. Compile-time
      * DEFAULT_WAL_SYNCHRONOUS=1 already provides synchronous=NORMAL for WAL
@@ -147,7 +164,7 @@ static int autopragma_init(
     char *err = NULL;
     int rc = sqlite3_exec(db,
         "PRAGMA cache_size=-1048576;"
-        "PRAGMA mmap_size=8589934592;"
+        "PRAGMA mmap_size=34359738368;"
         "PRAGMA temp_store=2;"
         "PRAGMA threads=8;"
         "PRAGMA wal_autocheckpoint=16000;"
@@ -166,45 +183,43 @@ static int autopragma_init(
     return SQLITE_OK;
 }
 
-/* Library constructor: registers the auto-extension at dlopen time.
+__attribute__((visibility("hidden"))) SQLITE_API void auto_extension_register_for_open(void) {
+    int rc = sqlite3_auto_extension((void(*)(void))autopragma_init);
+    if (rc != SQLITE_OK) {
+        sqlite3_log(rc, "auto_extension: registration failed: rc=%d", rc);
+        obs_logf("auto_extension_register_for_open", "event=registration_failed rc=%d", rc);
+    }
+}
+
+/* Library constructor: configures pre-init SQLite process-wide hooks.
  *
- * Order matters. sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE) MUST run before
- * sqlite3_auto_extension(), which triggers sqlite3_initialize() internally.
- * After init, sqlite3_config() returns SQLITE_MISUSE for every verb except
- * SQLITE_CONFIG_LOG and SQLITE_CONFIG_PCACHE_HDRSZ.
+ * Registration is lazy from the public sqlite3_open, sqlite3_open_v2, and
+ * sqlite3_open16 wrappers. sqlite3_auto_extension() is not called at dlopen
+ * because it performs effective SQLite initialization internally. Embedders may
+ * call startup-only sqlite3_config() verbs between dlopen and first public open.
  *
- * SORTERREF_SIZE is what actually activates the SQLITE_ENABLE_SORTER_REFERENCES
- * compile flag. Without this runtime config, the feature stays disabled
- * (threshold = INT_MAX, effectively never trips) even though it is compiled in.
- *
- * Embedding hosts that need other sqlite3_config verbs must call them before
- * this library is dlopen'd. The target media-server surfaces are not known
- * to make late sqlite3_config calls; this has not been verified by
- * disassembly. Compile-time defaults (SQLITE_THREADSAFE=2,
- * SQLITE_DEFAULT_LOOKASIDE, SQLITE_DEFAULT_MEMSTATUS) already lock in the
- * most common pre-init knobs; under THREADSAFE=2 (Multi-thread), connections
- * are not per-handle-mutexed by default -- callers must externally serialize
- * a single connection or pass SQLITE_OPEN_FULLMUTEX. Any unaudited late call
- * to sqlite3_config would no-op with SQLITE_MISUSE rather than degrade
- * observed behavior. */
+ * CONFIG_LOG routes selected process-wide SQLite diagnostics into the existing
+ * observability sink. SORTERREF_SIZE is what actually activates the
+ * SQLITE_ENABLE_SORTER_REFERENCES compile flag. Without this runtime config,
+ * the feature stays disabled (threshold = INT_MAX, effectively never trips)
+ * even though it is compiled in. Both stay in this priority-102 constructor so
+ * the config lands before any helper-triggered sqlite3_initialize(). */
 __attribute__((constructor(102)))
 static void register_autopragma(void) {
+    int log_rc = sqlite3_config(SQLITE_CONFIG_LOG, sqlite_log_to_observability, NULL);
+    if (log_rc != SQLITE_OK) {
+        obs_logf("sqlite3_config", "op=SQLITE_CONFIG_LOG rc=%d", log_rc);
+    }
+
     /* WHY: 16384 (16 KB) replaces inline content with rowid references only
      * for rows above 16 KB. Plex/Emby metadata rows are well under that and
      * skip the feature; large FTS shadow rows get the memory benefit. */
     int cfg_rc = sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 16384);
     g_sorterref_cfg_rc = cfg_rc;
     if (cfg_rc != SQLITE_OK) {
-        /* WHY: Config failure leaves sorter-references inert; library still
-         * registers the auto-extension and applies the rest of its tuning. */
+        /* WHY: Config failure leaves sorter-references inert; lazy
+         * auto-extension registration still applies the rest of its tuning. */
         sqlite3_log(cfg_rc,
             "auto_extension: SORTERREF_SIZE config failed: rc=%d", cfg_rc);
-    }
-
-    int rc = sqlite3_auto_extension((void(*)(void))autopragma_init);
-    if (rc != SQLITE_OK) {
-        /* WHY: Registration failure disables optional tuning only; application
-         * startup should continue with SQLite's normal behavior. */
-        sqlite3_log(rc, "auto_extension: registration failed: rc=%d", rc);
     }
 }

@@ -68,6 +68,7 @@ python3 - \
   "${script_dir}" <<'PY'
 import sys
 import os
+import subprocess
 from pathlib import Path
 
 template_path, pins_path, deploy_path, schema_version, window_n, release_tag, generated_at, script_dir = sys.argv[1:]
@@ -167,13 +168,17 @@ try:
         os.unlink(tmp)
         sys.stderr.write("FATAL: rendered file missing SQLITE_LIBRARY_PINS_RELEASE_TAG metadata\n")
         sys.exit(1)
+    syntax = subprocess.run(["bash", "-n", tmp], text=True, capture_output=True)
+    if syntax.returncode != 0:
+        if syntax.stdout:
+            sys.stderr.write(syntax.stdout)
+        if syntax.stderr:
+            sys.stderr.write(syntax.stderr)
+        sys.stderr.write(f"FATAL: rendered deploy script failed bash -n: {tmp}\n")
+        sys.exit(1)
     os.replace(tmp, deploy_path)
 except Exception:
     if os.path.exists(tmp):
         os.unlink(tmp)
     raise
 PY
-
-if ! bash -n "${deploy_script}"; then
-  fatal "rendered deploy script failed bash -n: ${deploy_script}"
-fi

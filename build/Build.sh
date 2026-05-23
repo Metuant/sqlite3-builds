@@ -28,7 +28,7 @@ case "${target}" in
     ;;
   library)
     target_cflags="-DSQLITE_ENABLE_NORMALIZE -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS -DSQLITE_ENABLE_UNLOCK_NOTIFY -DSQLITE_DEFAULT_PCACHE_INITSZ=256 -DSQLITE_DEFAULT_MEMSTATUS=0"
-    sources="sqlite3.c /app/auto_extension.c /app/observability.c"
+    sources="sqlite3.c /app/auto_extension.c /app/observability.c /app/slow_query_tracker.c"
     target_ldflags="-fPIC -shared -Wl,-z,defs -lm -ldl -pthread"
     output="dist/libsqlite3.so"
     case "${LIBRARY_VARIANT}" in
@@ -111,10 +111,10 @@ fi
 
 printf "\n\n===== Compiling... Please wait... ==============================================\n\n"
 
-# SQLITE_DEFAULT_MMAP_SIZE=8589934592 is 8 GiB; aggressive for low-memory hosts (raises VSZ).
+# SQLITE_DEFAULT_MMAP_SIZE=34359738368 is 32 GiB; aggressive for low-memory hosts (raises VSZ).
 # SQLITE_ENABLE_UPDATE_DELETE_LIMIT is inactive on amalgamation builds (requires Lemon parser regen).
 # SQLITE_MAX_EXPR_DEPTH=0 disables runtime depth checks; relies on MAX_LENGTH/MAX_SQL_LENGTH for DoS protection.
-# SQLITE_THREADSAFE=2 is Multi-thread (no per-connection mutex); PMS calls sqlite3_config(SQLITE_CONFIG_MULTITHREAD) and Emby passes SQLITE_OPEN_NOMUTEX -- neither shares sqlite3* handles across threads.
+# SQLITE_THREADSAFE=2 is Multi-thread (no per-connection mutex); PMS and Emby call sqlite3_config(SQLITE_CONFIG_MULTITHREAD) at startup, Emby calls it twice per startup and also passes SQLITE_OPEN_NOMUTEX -- neither shares sqlite3* handles across threads.
 if ! ${CC:-gcc} \
   -O3 \
   -march="${MARCH}" \
@@ -132,8 +132,8 @@ if ! ${CC:-gcc} \
   -DSQLITE_DEFAULT_CACHE_SIZE=-1048576 \
   -DSQLITE_DEFAULT_FOREIGN_KEYS=1 \
   -DSQLITE_DEFAULT_LOOKASIDE=2048,512 \
-  -DSQLITE_DEFAULT_PAGE_SIZE=4096 \
-  -DSQLITE_DEFAULT_MMAP_SIZE=8589934592 \
+  -DSQLITE_DEFAULT_PAGE_SIZE=16384 \
+  -DSQLITE_DEFAULT_MMAP_SIZE=34359738368 \
   -DSQLITE_DEFAULT_SYNCHRONOUS=2 \
   -DSQLITE_DEFAULT_WAL_SYNCHRONOUS=1 \
   -DSQLITE_DEFAULT_WAL_AUTOCHECKPOINT=16000 \
@@ -207,6 +207,15 @@ if [ "${target}" = "library" ]; then
   exported_real_symbols="$(nm -D --defined-only "${output}" | awk '$NF ~ /^sqlite3_.*_real$/ { print }')"
   if [ -n "${exported_real_symbols}" ]; then
     printf "FATAL: exported sqlite3_*_real symbols in %s:\n%s\n" "${output}" "${exported_real_symbols}" >&2
+    exit 1
+  fi
+  exported_lazy_helper="$(nm -D --defined-only "${output}" | awk '$NF == "auto_extension_register_for_open" { print }')"
+  if [ -n "${exported_lazy_helper}" ]; then
+    printf "FATAL: exported auto_extension_register_for_open symbol in %s:\n%s\n" "${output}" "${exported_lazy_helper}" >&2
+    exit 1
+  fi
+  if readelf --dyn-syms -Ws "${output}" | awk '$8 == "auto_extension_register_for_open" { found=1 } END { exit found ? 0 : 1 }'; then
+    printf "FATAL: auto_extension_register_for_open present in dynamic symbol table for %s\n" "${output}" >&2
     exit 1
   fi
 

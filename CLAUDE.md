@@ -4,12 +4,12 @@ This repository builds tuned SQLite artifacts for media-server containers: a
 static CLI, a generic shared library, a Plex shared library, deployment helpers,
 and planned-downtime maintenance scripts.
 
-Read ARCHITECTURE.md first.
+Read docs/architecture.md first.
 
 Project-specific guidance:
 
 - The global kernel still applies; read `~/.claude/CLAUDE.md`.
-- Treat `ARCHITECTURE.md` as the current repository map for build, deploy,
+- Treat `docs/architecture.md` as the current repository map for build, deploy,
   smoke-test, and maintenance behavior.
 - JF is deferred. Its deploy branch is retained but not current-cycle
   validated; JF maintenance is absent from `scripts/optimize_media_servers.sh`

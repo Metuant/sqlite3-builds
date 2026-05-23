@@ -22,7 +22,7 @@ static const pragma_check PRAGMA_CHECKS[] = {
      * mirrors, so the smoke can distinguish active, disabled, and filter-miss paths. */
     {"busy_timeout", "PRAGMA busy_timeout;", 10000, 0},
     {"cache_size", "PRAGMA cache_size;", -1048576, -1048576},
-    {"mmap_size", "PRAGMA mmap_size;", 8589934592LL, 8589934592LL},
+    {"mmap_size", "PRAGMA mmap_size;", 34359738368LL, 34359738368LL},
     {"wal_autocheckpoint", "PRAGMA wal_autocheckpoint;", 16000, 16000},
     {"journal_size_limit", "PRAGMA journal_size_limit;", 67108864, 67108864},
     {"threads", "PRAGMA threads;", 8, 8},

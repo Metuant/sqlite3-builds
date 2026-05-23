@@ -13,7 +13,6 @@ permissions:
 
 env:
   SQLITE_VERSION: "3530100"
-  SQLITE_RELEASE_YEAR: "2026"
   SQLITE_AMALG_URL: "https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip"
   SQLITE_AMALG_SHA3_256: "3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114"
   SQLITE_SRC_URL: "https://www.sqlite.org/2026/sqlite-src-3530100.zip"
@@ -293,16 +292,28 @@ jobs:
             exit 1
           fi
 
-          sleep 5
-          docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY"
-          table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';")"
-          if [ "$table_count" -lt 20 ]; then
-            echo "FATAL: expected at least 20 PMS tables, got $table_count"
-            exit 1
-          fi
+          wait_for_pms_table_count() {
+            local attempt table_count
+            table_count=0
+            for attempt in $(seq 1 30); do
+              if docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY" >/dev/null 2>&1; then
+                table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
+                case "$table_count" in
+                  "" | *[!0-9]*) table_count=0 ;;
+                esac
+                if [ "$table_count" -ge 20 ]; then
+                  return 0
+                fi
+              fi
+              sleep 1
+            done
+            echo "FATAL: expected at least 20 PMS tables within 30 seconds, got $table_count"
+            return 1
+          }
+          wait_for_pms_table_count
 
           bad_signal_re='\bSQLITE_(ERROR|INTERNAL|NOMEM|IOERR|CORRUPT|FULL|CANTOPEN|PROTOCOL|MISMATCH|MISUSE|NOTADB|FORMAT|AUTH)\b|database disk image is malformed|Cannot create table|no such function|no such collation|Failed to open'
-          if docker logs "$PMS_CONTAINER" 2>&1 | grep -E "$bad_signal_re"; then
+          if docker logs "$PMS_CONTAINER" 2>&1 | grep -Ev '^\[sqlite3-builds-obs\]' | grep -E "$bad_signal_re"; then
             echo "FATAL: PMS logs contain SQLite/runtime bad signal"
             exit 1
           fi
@@ -314,6 +325,10 @@ jobs:
           pms_open_marker_count="$(printf "%s\n" "$pms_logs" | grep -Ec '\[sqlite3-builds-obs\].* sqlite3_open(_v2|16)? ' || true)"
           if [ "$pms_open_marker_count" -lt 1 ]; then
             echo "FATAL: PMS observability positive-mode marker count check failed: open=$pms_open_marker_count"
+            exit 1
+          fi
+          if printf "%s\n" "$pms_logs" | grep -E '\[sqlite3-builds-obs\] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21' >/dev/null; then
+            echo "FATAL: PMS logs contain startup sqlite3_config rc=21 after lazy auto-extension registration"
             exit 1
           fi
       - name: Pull Plex image (PMS kill-switch smoke)
@@ -361,13 +376,25 @@ jobs:
             exit 1
           fi
 
-          sleep 5
-          docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY"
-          table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';")"
-          if [ "$table_count" -lt 20 ]; then
-            echo "FATAL: expected at least 20 PMS tables, got $table_count"
-            exit 1
-          fi
+          wait_for_pms_table_count() {
+            local attempt table_count
+            table_count=0
+            for attempt in $(seq 1 30); do
+              if docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY" >/dev/null 2>&1; then
+                table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
+                case "$table_count" in
+                  "" | *[!0-9]*) table_count=0 ;;
+                esac
+                if [ "$table_count" -ge 20 ]; then
+                  return 0
+                fi
+              fi
+              sleep 1
+            done
+            echo "FATAL: expected at least 20 PMS tables within 30 seconds, got $table_count"
+            return 1
+          }
+          wait_for_pms_table_count
 
           docker stop "$PMS_CONTAINER" >/dev/null 2>&1 || true
           pms_logs="$(docker logs "$PMS_CONTAINER" 2>&1 || true)"
@@ -452,7 +479,7 @@ jobs:
             "DEFAULT_JOURNAL_SIZE_LIMIT=67108864"
             "SORTER_PMASZ=1024"
             "DEFAULT_CACHE_SIZE=-1048576"
-            "DEFAULT_MMAP_SIZE=8589934592"
+            "DEFAULT_MMAP_SIZE=34359738368"
             "MAX_MMAP_SIZE=1099511627776"
             "ENABLE_FTS3_TOKENIZER"
             "ENABLE_SETLK_TIMEOUT"
@@ -473,7 +500,7 @@ jobs:
           fi
 
           bad_signal_re='\bSQLITE_(ERROR|INTERNAL|NOMEM|IOERR|CORRUPT|FULL|CANTOPEN|PROTOCOL|MISMATCH|MISUSE|NOTADB|FORMAT|AUTH)\b|database disk image is malformed|Cannot create table|no such function|no such collation|Failed to open'
-          if printf "%s\n" "$emby_logs" | grep -E "$bad_signal_re"; then
+          if printf "%s\n" "$emby_logs" | grep -Ev '^\[sqlite3-builds-obs\]' | grep -E "$bad_signal_re"; then
             echo "FATAL: Emby logs contain SQLite/runtime bad signal"
             exit 1
           fi
@@ -484,6 +511,102 @@ jobs:
           emby_open_marker_count="$(printf "%s\n" "$emby_logs" | grep -Ec '\[sqlite3-builds-obs\].* sqlite3_open(_v2|16)? ' || true)"
           if [ "$emby_open_marker_count" -lt 1 ]; then
             echo "FATAL: Emby observability positive-mode marker count check failed: open=$emby_open_marker_count"
+            exit 1
+          fi
+          if printf "%s\n" "$emby_logs" | grep -E '\[sqlite3-builds-obs\] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21' >/dev/null; then
+            echo "FATAL: Emby logs contain startup sqlite3_config rc=21 after lazy auto-extension registration"
+            exit 1
+          fi
+      - name: Slow-query positive smoke
+        run: |
+          set -euo pipefail
+          out=""
+          set +e
+          out="$(docker run --rm "${docker_library_image}" /bin/sh -c '
+            LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)")
+            LD_LIBRARY_PATH="$LIB_DIR" /app/slow_query_smoke
+          ' 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            printf "%s\n" "$out"
+            exit "$status"
+          fi
+          printf "%s\n" "$out"
+          if ! grep -Fq 'slow query smoke passed' <<<"$out"; then
+            echo "FATAL: slow-query smoke did not report success"
+            exit 1
+          fi
+          if ! grep -E '\[sqlite3-builds-obs\].* slow_query ' <<<"$out" >/dev/null; then
+            echo "FATAL: slow-query smoke missing slow_query marker"
+            exit 1
+          fi
+      - name: Slow-query disabled-mode smoke
+        run: |
+          set -euo pipefail
+          out=""
+          set +e
+          out="$(docker run --rm \
+            -e SQLITE3_SLOW_QUERY_THRESHOLD_MS=0 \
+            -e SQLITE3_DISABLE_SLOW_QUERY=1 \
+            "${docker_library_image}" \
+            /bin/sh -c '
+              LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)")
+              LD_LIBRARY_PATH="$LIB_DIR" /app/slow_query_smoke child-kill
+            ' 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            printf "%s\n" "$out"
+            exit "$status"
+          fi
+          printf "%s\n" "$out"
+          if ! grep -E '\[sqlite3-builds-obs\].*SQLITE_TRACE_STMT' <<<"$out" >/dev/null; then
+            echo "FATAL: slow-query disabled-mode smoke missing SQLITE_TRACE_STMT marker"
+            exit 1
+          fi
+          if grep -E '\[sqlite3-builds-obs\].* slow_query(_stats)?( |$)' <<<"$out" >/dev/null; then
+            echo "FATAL: slow-query disabled-mode smoke emitted slow_query output"
+            exit 1
+          fi
+      - name: Slow-query atexit smoke
+        run: |
+          set -euo pipefail
+          out=""
+          set +e
+          out="$(docker run --rm "${docker_library_image}" /bin/sh -c '
+            LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)")
+            LD_LIBRARY_PATH="$LIB_DIR" /app/slow_query_atexit_smoke
+          ' 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            printf "%s\n" "$out"
+            exit "$status"
+          fi
+          printf "%s\n" "$out"
+          if ! grep -E '\[sqlite3-builds-obs\].*(slow_query_stats|dump_skipped)' <<<"$out" >/dev/null; then
+            echo "FATAL: slow-query atexit smoke missing stats or contention diagnostic"
+            exit 1
+          fi
+      - name: Slow-query concurrency smoke
+        run: |
+          set -euo pipefail
+          out=""
+          set +e
+          out="$(docker run --rm "${docker_library_image}" /bin/sh -c '
+            LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)")
+            LD_LIBRARY_PATH="$LIB_DIR" /app/slow_query_concurrency_smoke
+          ' 2>&1)"
+          status=$?
+          set -e
+          if [ "$status" -ne 0 ]; then
+            printf "%s\n" "$out"
+            exit "$status"
+          fi
+          printf "%s\n" "$out"
+          if ! grep -Fq 'slow query concurrency smoke passed' <<<"$out"; then
+            echo "FATAL: slow-query concurrency smoke did not report success"
             exit 1
           fi
       - name: Pull Emby image (kill-switch smoke)
@@ -550,14 +673,20 @@ jobs:
           fi
       - name: Deploy assertion test
         run: bash tests/deploy_assertion_test.sh
+      - name: Deploy TOCTOU test
+        run: bash tests/deploy_toctou_test.sh
       - name: Observability count check
         run: bash tests/check_obs_counts.sh
       - name: ABI obsolete config ops test
         run: bash tests/abi_obsolete_config_ops_test.sh "${docker_library_image}"
       - name: Regenerate deploy pins test
         run: bash tests/regen_deploy_pins_test.sh
+      - name: Regenerate deploy pins custom template test
+        run: bash tests/regen_deploy_pins_custom_template_test.sh
       - name: Assemble library pins test
         run: bash tests/assemble_library_pins_test.sh
+      - name: Assemble library pins fatal propagation test
+        run: bash tests/assemble_library_pins_fatal_propagation_test.sh
 
   release:
     if: startsWith(github.ref, 'refs/tags/v')
