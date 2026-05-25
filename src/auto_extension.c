@@ -26,9 +26,14 @@ __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
  * is written exactly once during single-threaded library load and read later;
  * int writes are atomic on all supported targets, so no locking is needed. */
 static int g_sorterref_cfg_rc = SQLITE_OK;
+static int g_pmasz_cfg_rc = SQLITE_OK;
 
 int auto_extension_sorterref_cfg_rc(void) {
     return g_sorterref_cfg_rc;
+}
+
+int auto_extension_pmasz_cfg_rc(void) {
+    return g_pmasz_cfg_rc;
 }
 
 static int sqlite_log_should_route(int err_code, const char *msg) {
@@ -221,5 +226,25 @@ static void register_autopragma(void) {
          * auto-extension registration still applies the rest of its tuning. */
         sqlite3_log(cfg_rc,
             "auto_extension: SORTERREF_SIZE config failed: rc=%d", cfg_rc);
+    }
+
+    /* WHY: 8192 pages (= 128 MiB at 16 KiB page size) raises the sorter
+     * in-memory partial-merge-area cap. Aligns with the project's
+     * generous-resource tuning posture; media-server library / search
+     * sorts up to ~128 MiB stay in memory before partitioning to k-way
+     * merge. Multi-threaded sorter workers each hold their own PMA --
+     * up to PRAGMA threads=8 concurrent per connection. Compile-time
+     * default is also -DSQLITE_SORTER_PMASZ=8192 in build/Build.sh; this
+     * runtime config re-asserts the value at priority-102 for visibility
+     * and as protection against accidental compile-time drift. */
+    int pmasz_rc = sqlite3_config(SQLITE_CONFIG_PMASZ, 8192);
+    g_pmasz_cfg_rc = pmasz_rc;
+    if (pmasz_rc != SQLITE_OK) {
+        /* WHY: Config failure leaves szPma at whatever the compile-time
+         * default is (currently 8192, matching the intended runtime value).
+         * Logging surfaces the divergence if the compile-time pin ever
+         * drifts from the runtime intent. */
+        sqlite3_log(pmasz_rc,
+            "auto_extension: PMASZ config failed: rc=%d", pmasz_rc);
     }
 }

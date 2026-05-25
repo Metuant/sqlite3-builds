@@ -8,3 +8,4 @@
 !tools/sqlite-amalgamation.patch
 !tools/expected-sqlite-config-count.txt
 !tools/expected-sqlite-dbconfig-count.txt
+!tools/libsqlite3-version-script.ld

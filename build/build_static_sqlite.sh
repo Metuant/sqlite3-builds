@@ -5,6 +5,9 @@ SQLITE_AMALG_URL='https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip'
 SQLITE_AMALG_SHA3_256='3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114'
 SQLITE_SRC_URL='https://www.sqlite.org/2026/sqlite-src-3530100.zip'
 SQLITE_SRC_SHA3_256='27cfc9264b2188fd17f811a8c03424eb65391c2ef9874cbfc860ea25f4322363'
+MIMALLOC_VERSION='3.3.2'
+MIMALLOC_URL='https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz'
+MIMALLOC_SHA512='226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1'
 LIBRARY_VARIANT="${LIBRARY_VARIANT:-generic}"
 SQLite_compressor='upx'  # Program to use for compressing compiled sqlite
                          # Keep it empty as "" to disable compression
@@ -75,6 +78,9 @@ if [ "${LIBRARY_VARIANT}" = 'plex' ]; then
     --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"             \
     --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}"                           \
     --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}"                 \
+    --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}"                       \
+    --build-arg MIMALLOC_URL="${MIMALLOC_URL}"                               \
+    --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"                         \
     -f docker-library/Dockerfile .
 else
   $SUDO $DOCKER build --rm --no-cache=true -t "${DockerLibraryImage}"        \
@@ -82,6 +88,9 @@ else
     --build-arg MARCH="${MARCH:-x86-64-v3}"                                  \
     --build-arg LIBRARY_VARIANT="${LIBRARY_VARIANT}"                         \
     --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"             \
+    --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}"                       \
+    --build-arg MIMALLOC_URL="${MIMALLOC_URL}"                               \
+    --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"                         \
     -f docker-library/Dockerfile .
 fi
 

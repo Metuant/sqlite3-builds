@@ -37,6 +37,9 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/regen_deploy_pins_test.sh` | Round-trip harness for `tools/regen-deploy-pins.sh`: placeholder substitution, metadata rewriting, `bash -n` validation, and identity against the committed snapshot. |
 | `tests/assemble_library_pins_test.sh` | Unit tests for `tools/assemble-library-pins.sh`: synthetic SHA256SUMS parsing, plex/emby artifact mapping, prior-post carryover filtering, count-parity guard, and `validate_row` checks; `validate_row` also enforces semantic shape: kind (`pre`|`post`), non-empty target, and `/`-prefixed target_path. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `tools/expected-sqlite-*-count.txt`. |
+| `tests/check_mimalloc_pin_alignment.sh` | Pre-build lint: asserts the full mimalloc VERSION + URL + SHA512 tuple stays aligned across `build/Build.sh`, `build/build_static_sqlite.sh`, `docker-library/Dockerfile`, and `.github/workflows/sqlite-build.yml`. |
+| `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled in library images and executed only with `RUN_BENCH=1`. |
+| `tools/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
 | `scripts/update-sqlite-library.sh` | LSIO/container deploy helper for replacing bundled SQLite libraries. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
@@ -71,6 +74,9 @@ Two shared-library variants are built from the same source tree.
 | `plex` | `LIBRARY_VARIANT=plex` | Generic source plus SQLite `ext/icu/icu.c`, `SQLITE_ENABLE_ICU`, and Plex-style ICU libs | Plex |
 
 The intentional variant delta is ICU support for Plex.
+
+Both library variants also link mimalloc v3.3.2 by link-time interposition;
+the static CLI remains on the platform allocator.
 
 Everything else is shared: the SQLite amalgamation pin, auto-extension source,
 feature families, tuning defaults, high-capacity limits, shared-cache omission,
@@ -125,6 +131,15 @@ The Plex library image also pins ICU 69.1:
 | ICU build prefix | `/opt/icu-69-plex` |
 | ICU configure suffix | `--with-library-suffix=plex` |
 
+The library build also pins mimalloc v3.3.2:
+
+| Input | Current value |
+|---|---|
+| Mimalloc version | `3.3.2` |
+| Mimalloc URL | `https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz` |
+| Mimalloc SHA-512 | `226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1` |
+| Mimalloc install prefix | `/opt/mimalloc` |
+
 The same SQLite pins must stay aligned across:
 
 - `build/build_static_sqlite.sh`.
@@ -133,6 +148,11 @@ The same SQLite pins must stay aligned across:
 - `docker-cli/Dockerfile`.
 - `docker-library/Dockerfile`.
 - `build/Build.sh`.
+
+The mimalloc VERSION + URL + SHA512 tuple must stay aligned across
+`build/Build.sh`, `build/build_static_sqlite.sh`, `docker-library/Dockerfile`,
+and `.github/workflows/sqlite-build.yml`; `tests/check_mimalloc_pin_alignment.sh`
+fails on any drift in the full tuple.
 
 ## Build Pipeline
 
@@ -148,6 +168,9 @@ the temporary images.
 `LIBRARY_VARIANT=plex` switches the local library output directory to
 `release/library-plex` and passes the extra SQLite source inputs needed for
 `ext/icu/icu.c`.
+
+For library builds, it also forwards the mimalloc VERSION + URL + SHA512 pins
+into `docker-library/Dockerfile`.
 
 ### Build Driver
 
@@ -171,6 +194,18 @@ For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c`, links a
 shared object, applies library-only feature defaults, and writes
 `dist/libsqlite3.so`.
 
+For `library`, the link line prepends `MIMALLOC_OBJ`
+(`/opt/mimalloc/lib/mimalloc.o`) and `MIMALLOC_LIB`
+(`/opt/mimalloc/lib/libmimalloc.a`) so both shared-library variants interpose
+mimalloc at link time while the CLI target stays unchanged.
+
+The same library-only link adds
+`-Wl,--version-script=/app/tools/libsqlite3-version-script.ld`. The script
+enumerates the pinned public `sqlite3` API exports from `sqlite3.h` plus
+`auto_extension_path_is_target`, `auto_extension_sorterref_cfg_rc`,
+`auto_extension_pmasz_cfg_rc`, and `sqlite3_enable_shared_cache`, then ends
+with `local: *;`.
+
 For `library`, it also applies `tools/sqlite-amalgamation.patch` to the
 extracted SQLite amalgamation with `patch -p1` before compile. The patch
 renames the six wrapped SQLite API definitions to hidden `*_real` symbols:
@@ -192,6 +227,10 @@ After the library compile, `build/Build.sh` checks every
 `SQLITE_CONFIG_*` and `SQLITE_DBCONFIG_*` define in the pinned `sqlite3.h`
 against the decode tables in `/app/observability.c`. Missing table entries are
 build failures.
+
+Adjacent to the preserved `sqlite3_*_real` and lazy-helper symbol gates,
+post-link checks now fail on leaked `mi_*` or malloc-family exports, require
+local mimalloc implementation symbols to be present.
 
 For the Plex variant, it additionally requires `SQLITE_SRC_URL`, verifies the
 SQLite full source archive, adds `ext/icu/icu.c`, enables ICU, and links with
@@ -215,6 +254,11 @@ It installs the shared-library build toolchain and copies `build/Build.sh`,
 `tools/expected-sqlite-config-count.txt`, and
 `tools/expected-sqlite-dbconfig-count.txt` into `/app`, with the tools files
 under `/app/tools/`.
+
+The same Dockerfile builds mimalloc v3.3.2 in a dedicated stage, installs it
+under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
+`MIMALLOC_OBJ` plus `MIMALLOC_LIB` into `Build.sh`. The Plex branch adds
+`-DMI_LIBC_MUSL=ON`; the generic branch does not.
 
 For the generic variant, it builds the shared library and runs the new
 config-after-dlopen, shutdown/reinit, and auto-extension smokes.
@@ -268,7 +312,8 @@ post-row, current-release post-row, unknown-SHA, and target-kind isolation
 behavior without Docker or network access. It covers Plex, the dormant Jellyfin
 skip, and Emby pre-row, managed-window post-row, and unknown-SHA fatal cases.
 The shell coverage also includes `tests/regen_deploy_pins_test.sh`,
-`tests/assemble_library_pins_test.sh`, and `tests/check_obs_counts.sh`.
+`tests/assemble_library_pins_test.sh`, `tests/check_obs_counts.sh`, and
+`tests/check_mimalloc_pin_alignment.sh`.
 
 ### Release Job
 
@@ -317,6 +362,12 @@ Plex ICU linkage.
 The CLI target adds interactive diagnostics such as database-stat and bytecode
 virtual tables. The library target keeps those out of application processes.
 
+The library profile also pins `-DSQLITE_SORTER_PMASZ=8192` in `build/Build.sh`,
+up from the repository's prior 1024-page tuning and SQLite's stock 250-page
+default. At the 16 KiB compile-default page size, that yields a 128 MiB PMA cap
+per active sort worker; with `PRAGMA threads=8`, a connection may drive up to
+eight concurrent sort workers at that cap.
+
 ## Per-Connection PRAGMA Injection
 
 `src/auto_extension.c` is compiled into both library variants.
@@ -332,6 +383,11 @@ before the hidden real open function. That helper calls
 `sqlite3AutoLoadExtensions(db)` and runs the callback for the new connection.
 Embedders may call startup-only `sqlite3_config()` verbs after `dlopen` and
 before their first public open.
+
+The same constructor also re-asserts `sqlite3_config(SQLITE_CONFIG_PMASZ, 8192)`
+and stores the rc in `auto_extension_pmasz_cfg_rc()`, mirroring
+`auto_extension_sorterref_cfg_rc()` for smoke verification and keeping the
+runtime PMA target aligned with the compile default.
 
 The callback is best-effort:
 
@@ -530,8 +586,10 @@ export paths.
 Docker build compiles + runs `slow_query_smoke`, `slow_query_atexit_smoke`,
 `slow_query_concurrency_smoke`. CI re-runs positive, disabled-mode, atexit,
 and concurrency checks. Bench binaries (`slow_query_select1_bench`,
-`slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`) compile
-unconditionally; execute only with `RUN_BENCH=1`.
+`slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`, and
+`alloc_latency_bench` compile unconditionally; execute only with `RUN_BENCH=1`.
+For Bundle-2's mimalloc Wire-2 acceptance gate, `alloc_latency_bench` remains
+advisory only.
 
 ## Smoke Tests
 
@@ -549,6 +607,8 @@ It proves:
 - Read-only opens skip tuning.
 - Overlong paths that truncate inside the filter buffer miss the filter instead
   of receiving PRAGMA tuning.
+- Constructor-only `SQLITE_CONFIG_SORTERREF_SIZE` and `SQLITE_CONFIG_PMASZ`
+  both report `SQLITE_OK` before first SQLite initialization.
 - Observable PRAGMA values match the active and disabled profiles.
 - Setup and SQLite API failures print concrete diagnostics.
 
@@ -670,9 +730,9 @@ for readiness by polling startup logs for the prefix-agnostic
 After readiness, the smoke verifies the logged SQLite version equals the
 workflow `SQLITE_VERSION` converted from the upstream archive form to dotted
 form. It also prints Emby's logged SQLite compiler options and verifies the
-16 curated `compile_options` used by the tuned library are present. The
-workflow prints full Emby logs and fails when logs contain the same bad-signal
-set as §PMS first-init smoke.
+16 curated `compile_options` used by the tuned library are present, including
+`SORTER_PMASZ=8192`. The workflow prints full Emby logs and fails when logs
+contain the same bad-signal set as §PMS first-init smoke.
 
 The smoke also requires observability marker lines for an open wrapper and
 `SQLITE_TRACE_STMT`. Positive-mode logs must not contain startup

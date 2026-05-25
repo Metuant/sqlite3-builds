@@ -17,6 +17,9 @@ env:
   SQLITE_AMALG_SHA3_256: "3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114"
   SQLITE_SRC_URL: "https://www.sqlite.org/2026/sqlite-src-3530100.zip"
   SQLITE_SRC_SHA3_256: "27cfc9264b2188fd17f811a8c03424eb65391c2ef9874cbfc860ea25f4322363"
+  MIMALLOC_VERSION: "3.3.2"
+  MIMALLOC_URL: "https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz"
+  MIMALLOC_SHA512: "226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1"
   docker_cli_image: "sqlite3-cli"
   docker_library_image: "sqlite3-library"
   docker_library_plex_image: "sqlite3-library-plex"
@@ -41,6 +44,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Mimalloc pin alignment check
+        run: bash tests/check_mimalloc_pin_alignment.sh
+      - name: Build.sh precheck paths
+        run: bash tests/check_build_sh_prechecks.sh
       - name: Build sqlite CLI
         run: sudo docker build --rm -t "${docker_cli_image}" -f docker-cli/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg COMPRESS_SQLITE3="upx" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"
       - name: Extract binary from docker image
@@ -57,7 +64,7 @@ jobs:
           name: sqlite-${{env.SQLITE_VERSION}}-cli-${{ matrix.arch_suffix }}
           retention-days: 90
       - name: Build sqlite library
-        run: sudo docker build --rm -t "${docker_library_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"
+        run: sudo docker build --rm -t "${docker_library_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" --build-arg MIMALLOC_URL="${MIMALLOC_URL}" --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"
       - name: Extract binary from docker image
         uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
         id: extract_library
@@ -72,7 +79,7 @@ jobs:
           name: sqlite-${{env.SQLITE_VERSION}}-library-${{ matrix.arch_suffix }}
           retention-days: 90
       - name: Build sqlite Plex library
-        run: sudo docker build --rm -t "${docker_library_plex_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" --build-arg LIBRARY_VARIANT=plex
+        run: sudo docker build --rm -t "${docker_library_plex_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" --build-arg LIBRARY_VARIANT=plex --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" --build-arg MIMALLOC_URL="${MIMALLOC_URL}" --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"
       - name: Extract Plex library from docker image
         uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
         id: extract_library_plex
@@ -477,7 +484,7 @@ jobs:
             "THREADSAFE=2"
             "DEFAULT_WAL_AUTOCHECKPOINT=16000"
             "DEFAULT_JOURNAL_SIZE_LIMIT=67108864"
-            "SORTER_PMASZ=1024"
+            "SORTER_PMASZ=8192"
             "DEFAULT_CACHE_SIZE=-1048576"
             "DEFAULT_MMAP_SIZE=34359738368"
             "MAX_MMAP_SIZE=1099511627776"

@@ -21,6 +21,9 @@ RUN echo "**** Install Dependencies ****" && \
     add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
     apt-get -y upgrade && \
     apt-get -y install --no-install-recommends \
+        cmake \
+        make \
+        g++ \
         gcc \
         binutils \
         patch \
@@ -35,6 +38,7 @@ RUN echo "**** Install Dependencies ****" && \
         bash \
         binutils \
         ca-certificates \
+        cmake \
         coreutils \
         file \
         g++ \
@@ -67,6 +71,7 @@ COPY src/slow_query_tracker.c /app/slow_query_tracker.c
 COPY tools/sqlite-amalgamation.patch /app/tools/sqlite-amalgamation.patch
 COPY tools/expected-sqlite-config-count.txt /app/tools/expected-sqlite-config-count.txt
 COPY tools/expected-sqlite-dbconfig-count.txt /app/tools/expected-sqlite-dbconfig-count.txt
+COPY tools/libsqlite3-version-script.ld /app/tools/libsqlite3-version-script.ld
 COPY tests/ /app/tests/
 
 RUN chmod +x /app/Build.sh
@@ -91,22 +96,66 @@ ENV PLEX_ICU_INCLUDE=/opt/icu-69-plex/include
 ENV PLEX_ICU_LIB=/opt/icu-69-plex/lib
 ENV PLEX_ICU_LDFLAGS="-L${PLEX_ICU_LIB} -Wl,-rpath-link,${PLEX_ICU_LIB}"
 
+ARG MIMALLOC_VERSION=3.3.2
+ARG MIMALLOC_URL=https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz
+ARG MIMALLOC_SHA512=226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1
+RUN set -euo pipefail; \
+    mimalloc_archive="/tmp/mimalloc-${MIMALLOC_VERSION}.tar.gz"; \
+    mimalloc_src_dir="/tmp/mimalloc-${MIMALLOC_VERSION}"; \
+    mimalloc_build_dir="${mimalloc_src_dir}/build"; \
+    mimalloc_extra_cmake_flags=""; \
+    if [ "$LIBRARY_VARIANT" = "plex" ]; then \
+      mimalloc_extra_cmake_flags="-DMI_LIBC_MUSL=ON"; \
+    fi; \
+    wget -O "${mimalloc_archive}" "${MIMALLOC_URL}"; \
+    echo "${MIMALLOC_SHA512}  ${mimalloc_archive}" | sha512sum -c -; \
+    tar -xzf "${mimalloc_archive}" -C /tmp; \
+    cmake -S "${mimalloc_src_dir}" -B "${mimalloc_build_dir}" \
+      -DCMAKE_BUILD_TYPE=Release \
+      -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+      -DMI_INSTALL_TOPLEVEL=ON \
+      -DMI_OVERRIDE=ON \
+      -DMI_BUILD_SHARED=OFF \
+      -DMI_BUILD_STATIC=ON \
+      -DMI_BUILD_OBJECT=ON \
+      -DMI_BUILD_TESTS=OFF \
+      -DMI_PADDING=OFF \
+      -DMI_SECURE=0 \
+      ${mimalloc_extra_cmake_flags}; \
+    cmake --build "${mimalloc_build_dir}" --parallel "$(nproc)"; \
+    cmake --install "${mimalloc_build_dir}" --prefix /opt/mimalloc; \
+    printf "%s\n" "${MIMALLOC_SHA512}" > /opt/mimalloc/SHA512; \
+    rm -rf "${mimalloc_archive}" "${mimalloc_src_dir}"
+
+ENV MIMALLOC_VERSION="${MIMALLOC_VERSION}"
+ENV MIMALLOC_URL="${MIMALLOC_URL}"
+ENV MIMALLOC_SHA512="${MIMALLOC_SHA512}"
+ENV MIMALLOC_OBJ=/opt/mimalloc/lib/mimalloc.o
+ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a
+
 ARG MARCH
 ARG SQLITE_AMALG_URL
 ARG SQLITE_AMALG_SHA3_256
 ARG SQLITE_SRC_URL=""
 ARG SQLITE_SRC_SHA3_256=""
+ARG RUN_BENCH=0
 
 ENV SQLITE_AMALG_URL="${SQLITE_AMALG_URL}"
 ENV SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"
 ENV SQLITE_SRC_URL="${SQLITE_SRC_URL}"
 ENV SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}"
+ENV RUN_BENCH="${RUN_BENCH}"
 
 RUN LIBRARY_VARIANT="$LIBRARY_VARIANT" \
     MARCH="$MARCH" \
     SQLITE_AMALG_SHA3_256="$SQLITE_AMALG_SHA3_256" \
     SQLITE_SRC_URL="$SQLITE_SRC_URL" \
     SQLITE_SRC_SHA3_256="$SQLITE_SRC_SHA3_256" \
+    MIMALLOC_VERSION="$MIMALLOC_VERSION" \
+    MIMALLOC_URL="$MIMALLOC_URL" \
+    MIMALLOC_SHA512="$MIMALLOC_SHA512" \
+    MIMALLOC_OBJ="$MIMALLOC_OBJ" \
+    MIMALLOC_LIB="$MIMALLOC_LIB" \
     /app/Build.sh library "$SQLITE_AMALG_URL"
 
 # WHY: ldd and nm catch wrong ICU sonames or unsuffixed symbols before extraction.
@@ -166,7 +215,12 @@ RUN set -euo pipefail; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/shutdown_reinit_smoke; \
     gcc -O2 -o /app/config_after_dlopen_concurrent_bench \
         /app/tests/config_after_dlopen_concurrent_bench.c \
-        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    gcc -O2 -o /app/alloc_latency_bench /app/tests/alloc_latency_bench.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    if [ "$RUN_BENCH" = "1" ]; then \
+      LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/alloc_latency_bench; \
+    fi
 
 RUN set -euo pipefail; \
     LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)"); \

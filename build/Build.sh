@@ -14,6 +14,10 @@ sqlite_amalg_sha3="${SQLITE_AMALG_SHA3_256}"
 sqlite_src_sha3="${SQLITE_SRC_SHA3_256:-}"
 LIBRARY_VARIANT="${LIBRARY_VARIANT:-generic}"
 MARCH="${MARCH:-x86-64-v3}"
+MIMALLOC_VERSION="${MIMALLOC_VERSION:-3.3.2}"
+MIMALLOC_URL="${MIMALLOC_URL:-https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz}"
+MIMALLOC_SHA512="${MIMALLOC_SHA512:-226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1}"
+mimalloc_link_inputs=""
 
 if [ "${LIBRARY_VARIANT}" = "plex" ] && [ -z "${SQLITE_SRC_URL:-}" ]; then
   echo 'plex variant requires SQLITE_SRC_URL'; exit 1
@@ -29,8 +33,11 @@ case "${target}" in
   library)
     target_cflags="-DSQLITE_ENABLE_NORMALIZE -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS -DSQLITE_ENABLE_UNLOCK_NOTIFY -DSQLITE_DEFAULT_PCACHE_INITSZ=256 -DSQLITE_DEFAULT_MEMSTATUS=0"
     sources="sqlite3.c /app/auto_extension.c /app/observability.c /app/slow_query_tracker.c"
-    target_ldflags="-fPIC -shared -Wl,-z,defs -lm -ldl -pthread"
+    target_ldflags="-fPIC -shared -Wl,-z,defs -Wl,--version-script=/app/tools/libsqlite3-version-script.ld -lm -ldl -pthread"
     output="dist/libsqlite3.so"
+    MIMALLOC_OBJ="${MIMALLOC_OBJ:-/opt/mimalloc/lib/mimalloc.o}"
+    MIMALLOC_LIB="${MIMALLOC_LIB:-/opt/mimalloc/lib/libmimalloc.a}"
+    mimalloc_link_inputs="${MIMALLOC_OBJ} ${MIMALLOC_LIB}"
     case "${LIBRARY_VARIANT}" in
       generic)
         ;;
@@ -106,6 +113,27 @@ fi
 mkdir -p dist
 
 if [ "${target}" = "library" ]; then
+  if [ -z "${MIMALLOC_VERSION}" ] || [ -z "${MIMALLOC_URL}" ] || [ -z "${MIMALLOC_SHA512}" ]; then
+    printf "FATAL: MIMALLOC_VERSION, MIMALLOC_URL, and MIMALLOC_SHA512 are required for library builds\n" >&2
+    exit 1
+  fi
+  if [ ! -f /opt/mimalloc/SHA512 ]; then
+    printf "FATAL: mimalloc SHA512 sentinel not found at /opt/mimalloc/SHA512; ensure the Dockerfile mimalloc stage ran\n" >&2
+    exit 1
+  fi
+  if [ "$(cat /opt/mimalloc/SHA512)" != "${MIMALLOC_SHA512}" ]; then
+    printf "FATAL: mimalloc SHA512 sentinel drift at /opt/mimalloc/SHA512; ensure the Dockerfile mimalloc stage used the current MIMALLOC_SHA512\n" >&2
+    exit 1
+  fi
+  if [ ! -f "${MIMALLOC_OBJ}" ]; then
+    printf "FATAL: mimalloc object not found at %s; ensure the Dockerfile mimalloc stage ran\n" "${MIMALLOC_OBJ}" >&2
+    exit 1
+  fi
+  if [ ! -f "${MIMALLOC_LIB}" ]; then
+    printf "FATAL: mimalloc static library not found at %s; ensure the Dockerfile mimalloc stage ran\n" "${MIMALLOC_LIB}" >&2
+    exit 1
+  fi
+
   patch -p1 < /app/tools/sqlite-amalgamation.patch
 fi
 
@@ -174,13 +202,14 @@ if ! ${CC:-gcc} \
   -DSQLITE_MAX_VARIABLE_NUMBER=250000 \
   -DSQLITE_MAX_WORKER_THREADS=8 \
   -DSQLITE_OMIT_SHARED_CACHE \
-  -DSQLITE_SORTER_PMASZ=1024 \
+  -DSQLITE_SORTER_PMASZ=8192 \
   -DSQLITE_STMTJRNL_SPILL=-1 \
   -DSQLITE_TEMP_STORE=3 \
   -DSQLITE_THREADSAFE=2 \
   -DSQLITE_USE_ALLOCA \
   -DSQLITE_USE_URI=1 \
   ${target_cflags} \
+  ${mimalloc_link_inputs} \
   ${sources} \
   ${target_ldflags} \
   -o "${output}"; then
@@ -204,18 +233,27 @@ if [ "${target}" = "library" ]; then
     printf "FATAL: unresolved sqlite3_*_real symbols in %s:\n%s\n" "${output}" "${undefined_real_symbols}" >&2
     exit 1
   fi
-  exported_real_symbols="$(nm -D --defined-only "${output}" | awk '$NF ~ /^sqlite3_.*_real$/ { print }')"
+  exported_real_symbols="$(readelf --dyn-syms -W "${output}" | awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" && $8 ~ /^sqlite3_.*_real$/ { print }')"
   if [ -n "${exported_real_symbols}" ]; then
     printf "FATAL: exported sqlite3_*_real symbols in %s:\n%s\n" "${output}" "${exported_real_symbols}" >&2
     exit 1
   fi
-  exported_lazy_helper="$(nm -D --defined-only "${output}" | awk '$NF == "auto_extension_register_for_open" { print }')"
+  exported_lazy_helper="$(readelf --dyn-syms -W "${output}" | awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" && $8 == "auto_extension_register_for_open" { print }')"
   if [ -n "${exported_lazy_helper}" ]; then
     printf "FATAL: exported auto_extension_register_for_open symbol in %s:\n%s\n" "${output}" "${exported_lazy_helper}" >&2
     exit 1
   fi
-  if readelf --dyn-syms -Ws "${output}" | awk '$8 == "auto_extension_register_for_open" { found=1 } END { exit found ? 0 : 1 }'; then
+  if readelf --dyn-syms -W "${output}" | awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" && $8 == "auto_extension_register_for_open" { found=1 } END { exit found ? 0 : 1 }'; then
     printf "FATAL: auto_extension_register_for_open present in dynamic symbol table for %s\n" "${output}" >&2
+    exit 1
+  fi
+  leaked_allocator_symbols="$(readelf --dyn-syms -W "${output}" | awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" && ($8 ~ /^(mi_|_mi_|mimalloc)/ || $8 ~ /^(malloc|calloc|realloc|free|aligned_alloc|posix_memalign)$/) { print }')"
+  if [ -n "${leaked_allocator_symbols}" ]; then
+    printf "FATAL: leaked allocator symbol in %s:\n%s\n" "${output}" "${leaked_allocator_symbols}" >&2
+    exit 1
+  fi
+  if ! nm --defined-only "${output}" | awk '$NF ~ /^_mi_/ || $NF ~ /^mi_/ || $NF == "malloc" { found=1 } END { exit found ? 0 : 1 }'; then
+    printf "FATAL: no local mimalloc implementation symbols found in %s\n" "${output}" >&2
     exit 1
   fi
 

@@ -17,14 +17,20 @@ milestone lands.
 - SQLite and ICU pins must stay aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `.github/workflows/sqlite-build.yml`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`.
+- Mimalloc v3.3.2 Wire-2 link-time interposition applies to both library
+  variants only; CLI stays on the platform allocator. Keep the full
+  VERSION + URL + SHA512 pin tuple aligned across `build/Build.sh`,
+  `build/build_static_sqlite.sh`, `docker-library/Dockerfile`, and
+  `.github/workflows/sqlite-build.yml`; Plex adds `-DMI_LIBC_MUSL=ON` to
+  the mimalloc CMake invocation.
 - CLI variant excluded from observability; both library variants (Plex +
   generic) carry it.
 - `SQLITE_THREADSAFE=2` (Multi-thread) is the compile default at
-  `build/Build.sh:180`. Emby compile-options required-flag array contains
+  `build/Build.sh:208`. Emby compile-options required-flag array contains
   `THREADSAFE=2` so any drift fails CI.
 - Plex variant build fails if `libsqlite3.so` carries `fcntl64` or any
   `@GLIBC_`-versioned undefined symbol (gate at
-  `docker-library/Dockerfile:131-138`, conditional on
+  `docker-library/Dockerfile:180-187`, conditional on
   `LIBRARY_VARIANT=plex`). Generic variant is glibc-linked and does NOT
   run this gate.
 - Matrix rows are v2 / v3 / arm64 only; **no x86-64-v4 row** (v4 lib
@@ -32,13 +38,19 @@ milestone lands.
   `resolve_arch` in `scripts/update-sqlite-library.sh.template` downgrades
   v4-capable hosts to v3.
 - `SQLITE_TEMP_STORE=3` (memory) is a compile-time pin at
-  `build/Build.sh:179`. `PRAGMA temp_store=2` is documentation-only
+  `build/Build.sh:207`. `PRAGMA temp_store=2` is documentation-only
   under that profile (no-op).
 - `SQLITE_DEFAULT_PAGE_SIZE=16384` (16 KiB) is the compile-default
   page-size pin in `build/Build.sh`.
 - `SQLITE_DEFAULT_MMAP_SIZE=34359738368` (32 GiB) is the compile-default
   mmap-size pin in `build/Build.sh`; CI compile-option assertions keep it
   aligned with the runtime auto-PRAGMA target.
+- `SQLITE_SORTER_PMASZ=8192` is the compile default in
+  `build/Build.sh:205`; constructor-102 re-asserts
+  `sqlite3_config(SQLITE_CONFIG_PMASZ, 8192)` in
+  `src/auto_extension.c:212-249`. Emby's compile-options required-flag
+  array in `.github/workflows/sqlite-build.yml:476-496` keeps the value
+  pinned in CI.
 
 ## 2. Deploy
 
@@ -84,6 +96,13 @@ milestone lands.
   fails on rename-drift.
 - `sqlite3_enable_shared_cache` no-op stub at `src/auto_extension.c:6-15`
   is load-bearing for the Plex variant. **KEEP byte-for-byte intact.**
+- `tools/libsqlite3-version-script.ld` is load-bearing for symbol-export
+  discipline: exact list from the pinned `sqlite3.h` plus
+  `auto_extension_path_is_target`, `auto_extension_sorterref_cfg_rc`,
+  `auto_extension_pmasz_cfg_rc`, and `sqlite3_enable_shared_cache`, then
+  `local: *;` to deny everything else including `mi_*`. The post-link
+  deny gate in `build/Build.sh:230-277` stays adjacent to the preserved
+  `build/Build.sh:230-248` gates as belt-and-braces.
 - Six `SQLITE_API` wrappers in `src/observability.c` MUST chain to
   `*_real` and return its result UNMODIFIED.
 - Every `obs_forward_config` / `obs_forward_db_config` case-arm
@@ -121,6 +140,11 @@ milestone lands.
   uses its own cap to prevent collision; `tests/check_obs_counts.sh`
   decode-count gate references only `OBS_SQL_CAP`.
 - `SLOW_QUERY_MAX_ENTRIES=2048` is the tracker LRU entry cap.
+- `auto_extension_pmasz_cfg_rc()` mirrors
+  `auto_extension_sorterref_cfg_rc()` in `src/auto_extension.c:31-37`;
+  both remain default-visibility C getters consumed by
+  `tests/auto_extension_smoke.c:426-459` through `-lsqlite3` linkage and
+  both MUST stay in the version-script `global:` allowlist.
 - Tracker registration via `sqlite3_trace_v2` MUST stay in the
   per-connection init path (`autopragma_init` in `src/auto_extension.c`)
   that runs BEFORE the connection escapes to application code. Do not move
@@ -164,6 +188,11 @@ milestone lands.
 - Auto-PRAGMA runtime `mmap_size` is 32 GiB (`34359738368`) for supported
   media-server database connections; compile default and runtime target stay
   aligned at 32 GiB.
+- Mimalloc replaces the default glibc/musl allocator for all
+  SQLite-internal allocations in both library variants; the CLI continues
+  using the platform allocator. `MIMALLOC_ALLOW_THP=1` is the v3.3.2
+  default and fits the deploy environment's THP=always + defer+madvise
+  posture.
 
 ## 5. Workflow
 

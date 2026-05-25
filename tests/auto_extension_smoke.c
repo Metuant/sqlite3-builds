@@ -424,6 +424,7 @@ static int run_path_filter_unit_cases(void) {
  * Log capture is infeasible because the constructor runs at libsqlite3.so
  * dlopen time, before main() can install a log handler. */
 extern int auto_extension_sorterref_cfg_rc(void);
+extern int auto_extension_pmasz_cfg_rc(void);
 
 static int run_sorterref_config_case(void) {
     int rc = auto_extension_sorterref_cfg_rc();
@@ -437,12 +438,25 @@ static int run_sorterref_config_case(void) {
     return 0;
 }
 
+static int run_pmasz_config_case(void) {
+    int rc = auto_extension_pmasz_cfg_rc();
+    if (rc == SQLITE_OK) {
+        printf("PASS [pmasz-config]: cfg_rc=0\n");
+        return 1;
+    }
+    fprintf(stderr,
+            "FAIL [pmasz-config]: cfg_rc=%d "
+            "(SQLITE_CONFIG_PMASZ config failed at dlopen)\n", rc);
+    return 0;
+}
+
 int main(void) {
     int failures = 0;
 
     if (safe_unsetenv("SQLITE3_DISABLE_AUTOPRAGMA") != 0) failures++;
 
     failures += !run_sorterref_config_case();
+    failures += !run_pmasz_config_case();
     failures += !run_rw_case("filter-hit-emby", "/tmp/library.db", EXPECT_ACTIVE);
     failures += !run_rw_case("filter-hit-jf", "/tmp/jellyfin.db", EXPECT_ACTIVE);
     failures += !run_rw_case(

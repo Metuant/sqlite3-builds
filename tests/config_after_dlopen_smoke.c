@@ -14,6 +14,7 @@
 #define RW_FLAGS (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
 
 int auto_extension_sorterref_cfg_rc(void);
+int auto_extension_pmasz_cfg_rc(void);
 
 typedef struct {
     const char *name;
@@ -259,6 +260,15 @@ static int run_pre_open_config_case(void) {
         return 0;
     }
     printf("PASS [pre-open-config]: SORTERREF_SIZE constructor rc=0\n");
+
+    rc = auto_extension_pmasz_cfg_rc();
+    if (rc != SQLITE_OK) {
+        fprintf(stderr,
+                "FAIL [pre-open-config]: PMASZ constructor rc=%d expected=%d\n",
+                rc, SQLITE_OK);
+        return 0;
+    }
+    printf("PASS [pre-open-config]: PMASZ constructor rc=0\n");
 
     rc = sqlite3_config(SQLITE_CONFIG_MULTITHREAD);
     if (rc != SQLITE_OK) {
