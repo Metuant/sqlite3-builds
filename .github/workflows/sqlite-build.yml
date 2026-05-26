@@ -334,10 +334,112 @@ jobs:
             echo "FATAL: PMS observability positive-mode marker count check failed: open=$pms_open_marker_count"
             exit 1
           fi
+          echo "PMS_OPEN_MARKER_COUNT(unpatched)=${pms_open_marker_count}"
           if printf "%s\n" "$pms_logs" | grep -E '\[sqlite3-builds-obs\] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21' >/dev/null; then
             echo "FATAL: PMS logs contain startup sqlite3_config rc=21 after lazy auto-extension registration"
             exit 1
           fi
+      - name: Pull Plex image (PMS pool-patched smoke)
+        if: matrix.arch_suffix != 'linux-arm64'
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/plex:1.42.2
+      - name: PMS first-init smoke (Plex, pool-patched)
+        if: matrix.arch_suffix != 'linux-arm64'
+        env:
+          ARTIFACT_DIR: ${{ steps.extract_library_plex.outputs.destination }}
+          PLEX_IMG: "lscr.io/linuxserver/plex:1.42.2"
+          EXPECTED_ICU_MAJOR: "69"
+        run: |
+          set -euo pipefail
+          : "Plex image ${PLEX_IMG} with expected ICU major ${EXPECTED_ICU_MAJOR}"
+          ARTIFACT_DIR_ABS="$(realpath "$ARTIFACT_DIR")"
+          if [ ! -f "$ARTIFACT_DIR_ABS/libsqlite3.so" ]; then
+            echo "FATAL: missing extracted Plex library at $ARTIFACT_DIR_ABS/libsqlite3.so"
+            exit 1
+          fi
+          PATCH_SCRIPT="tools/cont-init-patch-plex-pool.sh"
+          if [ ! -f "$PATCH_SCRIPT" ]; then
+            echo "FATAL: missing cont-init script at $PATCH_SCRIPT"
+            exit 1
+          fi
+          PATCH_SCRIPT_ABS="$(realpath "$PATCH_SCRIPT")"
+          PMS_CONFIG_DIR="$(mktemp -d)"
+          PMS_DB_COPY_DIR="$(mktemp -d)"
+          PMS_DB_COPY="${PMS_DB_COPY_DIR}/com.plexapp.plugins.library.db"
+          PMS_CONTAINER="pms-smoke-pool-patched-${{ github.run_id }}-${{ matrix.arch_suffix }}"
+          trap 'status=$?; docker logs "$PMS_CONTAINER" 2>&1 || true; docker stop "$PMS_CONTAINER" 2>/dev/null || true; exit "$status"' EXIT
+          docker run --detach \
+            --name "$PMS_CONTAINER" \
+            -e PUID=1000 \
+            -e PGID=1000 \
+            -e VERSION=docker \
+            --mount "type=bind,src=${PMS_CONFIG_DIR},dst=/config" \
+            --mount "type=bind,src=${ARTIFACT_DIR_ABS}/libsqlite3.so,dst=/usr/lib/plexmediaserver/lib/libsqlite3.so,readonly" \
+            --mount "type=bind,src=${PATCH_SCRIPT_ABS},dst=/custom-cont-init.d/10-patch-plex-pool.sh,readonly" \
+            --network host \
+            "$PLEX_IMG"
+          pms_ready=0
+          for attempt in $(seq 1 30); do
+            if bash -c 'echo > /dev/tcp/localhost/32400' 2>/dev/null; then
+              pms_ready=1
+              break
+            fi
+            sleep 3
+          done
+          if [ "$pms_ready" -ne 1 ]; then
+            echo "FATAL: PMS did not open TCP 32400 within 90 seconds"
+            docker logs "$PMS_CONTAINER" 2>&1 || true
+            exit 1
+          fi
+          wait_for_pms_table_count() {
+            local attempt table_count
+            table_count=0
+            for attempt in $(seq 1 30); do
+              if docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY" >/dev/null 2>&1; then
+                table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
+                case "$table_count" in
+                  "" | *[!0-9]*) table_count=0 ;;
+                esac
+                if [ "$table_count" -ge 20 ]; then
+                  return 0
+                fi
+              fi
+              sleep 1
+            done
+            echo "FATAL: expected at least 20 PMS tables within 30 seconds, got $table_count"
+            return 1
+          }
+          wait_for_pms_table_count
+          bad_signal_re='\bSQLITE_(ERROR|INTERNAL|NOMEM|IOERR|CORRUPT|FULL|CANTOPEN|PROTOCOL|MISMATCH|MISUSE|NOTADB|FORMAT|AUTH)\b|database disk image is malformed|Cannot create table|no such function|no such collation|Failed to open'
+          if docker logs "$PMS_CONTAINER" 2>&1 | grep -Ev '^\[sqlite3-builds-obs\]' | grep -E "$bad_signal_re"; then
+            echo "FATAL: PMS logs contain SQLite/runtime bad signal"
+            exit 1
+          fi
+          pms_logs="$(docker logs "$PMS_CONTAINER" 2>&1 || true)"
+          if ! printf "%s\n" "$pms_logs" | grep -E '\[sqlite3-builds-obs\].*SQLITE_TRACE_STMT' >/dev/null; then
+            echo "FATAL: PMS logs missing SQLITE_TRACE_STMT observability marker"
+            exit 1
+          fi
+          pms_open_marker_count="$(printf "%s\n" "$pms_logs" | grep -Ec '\[sqlite3-builds-obs\].* sqlite3_open(_v2|16)? ' || true)"
+          if [ "$pms_open_marker_count" -lt 1 ]; then
+            echo "FATAL: PMS observability positive-mode marker count check failed: open=$pms_open_marker_count"
+            exit 1
+          fi
+          if printf "%s\n" "$pms_logs" | grep -E '\[sqlite3-builds-obs\] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21' >/dev/null; then
+            echo "FATAL: PMS logs contain startup sqlite3_config rc=21 after lazy auto-extension registration"
+            exit 1
+          fi
+          for site in \
+            "/usr/lib/plexmediaserver/Plex Media Server @ 0xae4a17" \
+            "/usr/lib/plexmediaserver/Plex Media Scanner @ 0x36f06d" \
+            "/usr/lib/plexmediaserver/Plex Media Scanner @ 0x38b37b"; do
+            if ! grep -qE "^(patched|already patched): ${site}( 20 -> 16)?$" <<< "$pms_logs"; then
+              echo "FATAL: cont-init did not report success at ${site}"
+              exit 1
+            fi
+          done
+          echo "PMS_OPEN_MARKER_COUNT(patched)=${pms_open_marker_count}"
       - name: Pull Plex image (PMS kill-switch smoke)
         uses: ./.github/actions/retry-pull
         with:
