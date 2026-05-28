@@ -50,10 +50,15 @@ run_assemble() {
   local release_tag=$1 sha256sums=$2 output_file=$3 stderr_file=$4
   shift 4
   set +e
-  bash "${repo_root}/tools/assemble-library-pins.sh" \
-    --release-tag "${release_tag}" \
-    --sha256sums "${sha256sums}" \
-    "$@" >"${output_file}" 2>"${stderr_file}"
+  SQLITE_VERSION_DOTTED="3.53.1" \
+    MIMALLOC_VERSION="3.3.2" \
+    ICU_VERSION="69.1" \
+    PLEX_IMAGE_TAG="1.42.2" \
+    EMBY_IMAGE_TAG="version-4.9.3.0" \
+    bash "${repo_root}/tools/assemble-library-pins.sh" \
+      --release-tag "${release_tag}" \
+      --sha256sums "${sha256sums}" \
+      "$@" >"${output_file}" 2>"${stderr_file}"
   local status=$?
   set -e
   run_status="${status}"
@@ -80,16 +85,24 @@ prior_a_sha="eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
 prior_b_sha="ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
 
 cat > "${sha256sums}" <<EOF
-1111111111111111111111111111111111111111111111111111111111111111  sqlite-vtag-cli-linux-x86_64-v2.tar.gz
-${plex_post_sha}  sqlite-vtag-library-plex-linux-x86_64-v2.so
-${generic_post_sha}  sqlite-vtag-library-linux-x86_64-v2.so
+1111111111111111111111111111111111111111111111111111111111111111  sqlite-2026.05.26-r1-cli-linux-x86_64-v2.tar.gz
+${plex_post_sha}  sqlite-2026.05.26-r1-library-plex-linux-x86_64-v2.so
+${generic_post_sha}  sqlite-2026.05.26-r1-library-linux-x86_64-v2.so
 EOF
 write_pre_fragment "${pre_fragment}" "${plex_pre_sha}" "${emby_pre_sha}"
-run_assemble "vtag" "${sha256sums}" "${stdout}" "${stderr}" "${pre_fragment}"
+run_assemble "2026.05.26-r1" "${sha256sums}" "${stdout}" "${stderr}" "${pre_fragment}"
 assert_status "${run_status}" 0 "happy path assemble"
-assert_contains "${stdout}" "version|1|managed_window|5|release_tag|vtag|generated_at|vtag" "happy path metadata"
-assert_contains "${stdout}" "post|1|plex|linux-x86_64-v2|release|vtag|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-vtag-library-plex-linux-x86_64-v2.so|${plex_post_sha}" "happy path plex post row"
-assert_contains "${stdout}" "post|1|emby|linux-x86_64-v2|release|vtag|/app/emby/lib/libsqlite3.so.3.49.2|sqlite-vtag-library-linux-x86_64-v2.so|${generic_post_sha}" "happy path emby post row"
+assert_contains "${stdout}" "# SQLITE_LIBRARY_PINS schema=2" "happy path schema banner"
+grep -Eq '^version\|2\|managed_window\|5\|release_tag\|2026\.05\.26-r1\|generated_at\|[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$' "${stdout}" || fatal "happy path metadata: generated_at row missing"
+for row in "component|sqlite|3.53.1" "component|mimalloc|3.3.2" "component|icu|69.1" "component|plex|1.42.2" "component|emby|version-4.9.3.0"; do
+  assert_contains "${stdout}" "${row}" "component row ${row}"
+done
+component_order="$(awk -F'|' '$1 == "component" { print $2 }' "${stdout}" | paste -sd ' ' -)"
+[[ "${component_order}" == "sqlite mimalloc icu plex emby" ]] || fatal "component order mismatch: ${component_order}"
+generated_at="$(awk -F'|' '$1 == "version" { print $8; exit }' "${stdout}")"
+[[ "${generated_at}" != "2026.05.26-r1" ]] || fatal "generated_at must not equal release tag"
+assert_contains "${stdout}" "post|1|plex|linux-x86_64-v2|release|2026.05.26-r1|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-2026.05.26-r1-library-plex-linux-x86_64-v2.so|${plex_post_sha}" "happy path plex post row"
+assert_contains "${stdout}" "post|1|emby|linux-x86_64-v2|release|2026.05.26-r1|/app/emby/lib/libsqlite3.so.3.49.2|sqlite-2026.05.26-r1-library-linux-x86_64-v2.so|${generic_post_sha}" "happy path emby post row"
 
 prior_pins="${tmpdir}/prior-pins.txt"
 cat > "${prior_pins}" <<EOF
@@ -98,10 +111,51 @@ version|1|managed_window|5|release_tag|vprior|generated_at|vprior
 post|1|plex|linux-x86_64-v2|release|vprior|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-vprior-library-plex-linux-x86_64-v2.so|${prior_a_sha}
 post|1|plex|linux-x86_64-v2|release|vother|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-vother-library-plex-linux-x86_64-v2.so|${prior_b_sha}
 EOF
-run_assemble "vtag" "${sha256sums}" "${stdout}" "${stderr}" --prior "${prior_pins}" "${pre_fragment}"
+run_assemble "2026.05.26-r1" "${sha256sums}" "${stdout}" "${stderr}" --prior "${prior_pins}" "${pre_fragment}"
 assert_status "${run_status}" 0 "prior carryover"
 assert_contains "${stdout}" "post|1|plex|linux-x86_64-v2|release|vprior|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-vprior-library-plex-linux-x86_64-v2.so|${prior_a_sha}" "prior owning-release carryover"
 assert_not_contains "${stdout}" "sqlite-vother-library-plex-linux-x86_64-v2.so" "prior non-owning-release filtering"
+
+cat > "${tmpdir}/prior-schema2.txt" <<EOF
+# SQLITE_LIBRARY_PINS schema=2
+version|2|managed_window|5|release_tag|2026.05.25-r1|generated_at|2026-05-25T18:44:37Z
+component|sqlite|3.53.1
+component|mimalloc|3.3.2
+component|icu|69.1
+component|plex|1.42.2
+component|emby|version-4.9.3.0
+post|1|emby|linux-x86_64-v2|release|2026.05.25-r1|/app/emby/lib/libsqlite3.so.3.49.2|sqlite-2026.05.25-r1-library-linux-x86_64-v2.so|${prior_b_sha}
+EOF
+run_assemble "2026.05.26-r1" "${sha256sums}" "${stdout}" "${stderr}" --prior "${tmpdir}/prior-schema2.txt" "${pre_fragment}"
+assert_status "${run_status}" 0 "schema-2 prior carryover"
+assert_contains "${stdout}" "sqlite-2026.05.25-r1-library-linux-x86_64-v2.so" "schema-2 prior carryover row"
+cat > "${tmpdir}/prior-schema1.txt" <<EOF
+# SQLITE_LIBRARY_PINS schema=1
+version|1|managed_window|5|release_tag|2026.05.24-r1|generated_at|2026.05.24-r1
+post|1|plex|linux-x86_64-v2|release|2026.05.24-r1|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-2026.05.24-r1-library-plex-linux-x86_64-v2.so|${prior_a_sha}
+post|1|plex|linux-x86_64-v2|release|2026.05.23-r1|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-2026.05.23-r1-library-plex-linux-x86_64-v2.so|${prior_b_sha}
+EOF
+run_assemble "2026.05.26-r1" "${sha256sums}" "${stdout}" "${stderr}" --prior "${tmpdir}/prior-schema1.txt" "${pre_fragment}"
+assert_status "${run_status}" 0 "schema-1 prior carryover"
+assert_contains "${stdout}" "sqlite-2026.05.24-r1-library-plex-linux-x86_64-v2.so" "schema-1 prior owning-release carryover"
+assert_not_contains "${stdout}" "sqlite-2026.05.23-r1-library-plex-linux-x86_64-v2.so" "schema-1 prior non-owning-release filtering"
+for missing_env in SQLITE_VERSION_DOTTED MIMALLOC_VERSION ICU_VERSION PLEX_IMAGE_TAG EMBY_IMAGE_TAG; do
+  component_env=()
+  [[ "${missing_env}" != "SQLITE_VERSION_DOTTED" ]] && component_env+=(SQLITE_VERSION_DOTTED=3.53.1)
+  [[ "${missing_env}" != "MIMALLOC_VERSION" ]] && component_env+=(MIMALLOC_VERSION=3.3.2)
+  [[ "${missing_env}" != "ICU_VERSION" ]] && component_env+=(ICU_VERSION=69.1)
+  [[ "${missing_env}" != "PLEX_IMAGE_TAG" ]] && component_env+=(PLEX_IMAGE_TAG=1.42.2)
+  [[ "${missing_env}" != "EMBY_IMAGE_TAG" ]] && component_env+=(EMBY_IMAGE_TAG=version-4.9.3.0)
+  set +e
+  env -i PATH="${PATH}" "${component_env[@]}" bash "${repo_root}/tools/assemble-library-pins.sh" \
+    --release-tag "2026.05.26-r1" \
+    --sha256sums "${sha256sums}" \
+    "${pre_fragment}" >"${stdout}" 2>"${stderr}"
+  run_status=$?
+  set -e
+  assert_nonzero "${run_status}" "missing ${missing_env}"
+  assert_contains "${stderr}" "${missing_env} not set" "missing ${missing_env} stderr"
+done
 
 count_pre="${tmpdir}/count-pre.txt"
 cat > "${count_pre}" <<EOF

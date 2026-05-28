@@ -1,5 +1,22 @@
 # This file is sourced-only, not executed directly.
-# It defines assert_pre_replacement_sha.
+# It defines deploy assertion helpers.
+
+emit_component_summary() {
+  local target=$1
+  local _summary_sqlite="" _summary_mimalloc="" _summary_icu=""
+  while IFS='|' read -r _kind _name _value; do
+    case "${_name}" in
+      sqlite) _summary_sqlite="${_value}" ;;
+      mimalloc) _summary_mimalloc="${_value}" ;;
+      icu) _summary_icu="${_value}" ;;
+    esac
+  done < <(printf "%s\n" "${SQLITE_LIBRARY_PINS}" | awk -F'|' '$1=="component"{print}')
+  if [ "${target}" = "plex" ]; then
+    echo "Deployed sqlite=${_summary_sqlite} mimalloc=${_summary_mimalloc} icu=${_summary_icu} (plex variant)"
+  else
+    echo "Deployed sqlite=${_summary_sqlite} mimalloc=${_summary_mimalloc} (generic variant)"
+  fi
+}
 
 assert_pre_replacement_sha() {
   # >>> ASSERT_PRE_REPLACEMENT_SHA BEGIN <<<
@@ -69,6 +86,7 @@ assert_pre_replacement_sha() {
       ;;
     current-post\|*)
       echo "${target_path} already deployed at ${current_sha}."
+      emit_component_summary "${target}"
       already_current=1
       ;;
     *)
@@ -80,7 +98,7 @@ assert_pre_replacement_sha() {
     target_dir="${target_path%/*}"
     for so in libicuucplex.so.69 libicui18nplex.so.69 libicudataplex.so.69; do
       icu_path="${target_dir}/${so}"
-      [[ -f "${icu_path}" ]] || continue
+      [[ -f "${icu_path}" ]] || fatal "missing Plex ICU runtime file beside ${target_path}: ${icu_path}"
       icu_sha="$(sha256_of "${icu_path}")"
       if ! printf "%s\n" "${SQLITE_LIBRARY_PINS}" | tr -d '\r' | awk -F'|' \
         -v arch="${arch}" \

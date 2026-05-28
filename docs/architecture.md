@@ -34,13 +34,13 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
 | `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
-| `tests/regen_deploy_pins_test.sh` | Round-trip harness for `tools/regen-deploy-pins.sh`: placeholder substitution, metadata rewriting, `bash -n` validation, and identity against the committed snapshot. |
+| `tests/regen_deploy_pins_test.sh` | Round-trip harness for `tools/regen-deploy-pins.sh`: placeholder substitution, metadata rewriting, `bash -n` validation, and executable rendered-artifact checks. |
 | `tests/assemble_library_pins_test.sh` | Unit tests for `tools/assemble-library-pins.sh`: synthetic SHA256SUMS parsing, plex/emby artifact mapping, prior-post carryover filtering, count-parity guard, and `validate_row` checks; `validate_row` also enforces semantic shape: kind (`pre`|`post`), non-empty target, and `/`-prefixed target_path. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `tools/expected-sqlite-*-count.txt`. |
-| `tests/check_mimalloc_pin_alignment.sh` | Pre-build lint: asserts the full mimalloc VERSION + URL + SHA512 tuple stays aligned across `build/Build.sh`, `build/build_static_sqlite.sh`, `docker-library/Dockerfile`, and `.github/workflows/sqlite-build.yml`. |
+| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment and ICU workflow/Dockerfile alignment. |
 | `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled in library images and executed only with `RUN_BENCH=1`. |
 | `tools/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
-| `scripts/update-sqlite-library.sh` | LSIO/container deploy helper for replacing bundled SQLite libraries. |
+| `scripts/update-sqlite-library.sh.template` | Source template for the rendered LSIO/container deploy helper that replaces bundled SQLite libraries. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
 | `.dockerignore` | Tight Docker context allowlist for build, Dockerfile, source, script, and test inputs. |
@@ -113,6 +113,10 @@ not need ICU for their current schemas, so they use the generic library.
 
 The SQLite source pins are carried in both the local wrapper and the workflow:
 
+The workflow carries the release-component sources of truth as top-level envs:
+`SQLITE_VERSION`, `SQLITE_VERSION_DOTTED`, `MIMALLOC_VERSION`,
+`ICU_VERSION`, `PLEX_IMAGE_TAG`, and `EMBY_IMAGE_TAG`.
+
 | Input | Current value |
 |---|---|
 | SQLite version | `3530100` |
@@ -151,7 +155,7 @@ The same SQLite pins must stay aligned across:
 
 The mimalloc VERSION + URL + SHA512 tuple must stay aligned across
 `build/Build.sh`, `build/build_static_sqlite.sh`, `docker-library/Dockerfile`,
-and `.github/workflows/sqlite-build.yml`; `tests/check_mimalloc_pin_alignment.sh`
+and `.github/workflows/sqlite-build.yml`; `tests/check_pin_alignment.sh`
 fails on any drift in the full tuple.
 
 ## Build Pipeline
@@ -276,8 +280,11 @@ carries `fcntl64` or any other glibc-versioned symbol.
 
 ### Workflow Matrix
 
-`.github/workflows/sqlite-build.yml` builds on pushes to `main`, tag pushes
-matching `v*`, pull requests to `main`, and manual dispatch.
+`.github/workflows/sqlite-build.yml` builds on pushes to `main`,
+digit-prefixed tag pushes matching `[0-9]*`, pull requests to `main`, and
+manual dispatch. The release job validates `YYYY.MM.DD-rN` before archive
+assembly, manifest assembly, deploy-script regeneration, or release asset
+publication.
 
 The build job uses an architecture matrix:
 
@@ -313,7 +320,7 @@ behavior without Docker or network access. It covers Plex, the dormant Jellyfin
 skip, and Emby pre-row, managed-window post-row, and unknown-SHA fatal cases.
 The shell coverage also includes `tests/regen_deploy_pins_test.sh`,
 `tests/assemble_library_pins_test.sh`, `tests/check_obs_counts.sh`, and
-`tests/check_mimalloc_pin_alignment.sh`.
+`tests/check_pin_alignment.sh`.
 
 ### Release Job
 
@@ -327,11 +334,12 @@ The deploy script consumes this naming contract directly.
 
 The release job downloads the matrix `sqlite-pins-pre-*` fragments, fetches up
 to four prior managed-release `SQLITE_LIBRARY_PINS` assets, assembles a new
-`SQLITE_LIBRARY_PINS` manifest, and regenerates `update-sqlite-library.sh`
-before publishing release assets. Missing prior pin assets warn and skip; GitHub
-release API failures fail the job. The pre-replacement SHA emission step pulls
-each pinned LSIO image through the `retry-pull` composite action before calling
-`emit_pre_row`, so transient registry failures are retried with backoff.
+`SQLITE_LIBRARY_PINS` manifest, and regenerates `update-sqlite-library.sh` into
+the release-asset workspace before publishing release assets. Missing prior pin
+assets warn and skip; GitHub release API failures fail the job. The
+pre-replacement SHA emission step pulls each pinned LSIO image through the
+`retry-pull` composite action before calling `emit_pre_row`, so transient
+registry failures are retried with backoff.
 
 `tools/assemble-library-pins.sh` derives current-release post rows from
 `SHA256SUMS`, carries current pre rows from matrix fragments, and carries only
@@ -342,13 +350,19 @@ grow transitively.
 `scripts/update-sqlite-library.sh.template`, substitutes the
 `__SQLITE_LIBRARY_PINS_BLOCK__` placeholder inside the
 `cat <<'PINS_EOF' ... PINS_EOF` heredoc with the assembled manifest content,
-substitutes `__ASSERT_PRE_REPLACEMENT_SHA__` with the inline assertion
-function, and writes the rendered deploy script in place. The write is atomic:
+substitutes `__INJECTED_HELPERS__` with the inline deploy helper block
+containing `emit_component_summary` and `assert_pre_replacement_sha`, and
+writes the rendered deploy script to the caller-supplied output path. The
+rendered file is a build artifact, not tracked source; the published release
+asset copy is the authoritative operator artifact for its tag. Operator note:
+run `tools/regen-deploy-pins.sh` with an explicit output path to produce the
+rendered deploy script locally. The write is atomic:
 the tool writes to a pid-suffixed tmp file, verifies the rendered content
 (size, closing sentinel, metadata assignment), then replaces the target via
-`os.replace()`. The release tag is the deterministic `generated_at` value. The
-post-render syntax check uses `bash -n` because the rendered deploy script uses
-Bash array syntax.
+`os.replace()`. The release tag comes from the release tag input; `generated_at`
+is captured independently by the assembler or remains `unreleased` for local
+unreleased renders. The post-render syntax check uses `bash -n` because the
+rendered deploy script uses Bash array syntax.
 
 ## Compile Profile
 
@@ -672,18 +686,15 @@ The CI stage also verifies that the smoke binary resolves `libsqlite3.so` to
 the just-built artifact mounted at Plex's deployed library path rather than a
 system library.
 
-The CI runtime smoke pins the Plex image to
-`lscr.io/linuxserver/plex:1.42.2` and expects `EXPECTED_ICU_MAJOR=69`. The
-stage-2 step bind-mounts the extracted Plex artifacts into that container,
-replacing `/usr/lib/plexmediaserver/lib/libsqlite3.so` for the smoke process and
-mounting the extracted `icu_smoke` binary read-only. The smoke is invoked
-through Plex's bundled `ld-musl-*.so.1` loader with Plex's library directory as
-the loader path, so `libsqlite3.so` and Plex-renamed ICU resolution use the same
-runtime closure as deployment.
-
-The workflow fails when any ICU major discovered in the pinned Plex image
-differs from `EXPECTED_ICU_MAJOR`. When bumping the Plex image pin, update
-`EXPECTED_ICU_MAJOR` if the bundled ICU major changes.
+The CI runtime smoke derives `EXPECTED_ICU_MAJOR` from `ICU_VERSION` and pins
+the Plex image through `PLEX_IMAGE_TAG`. The stage-2 step bind-mounts the
+extracted Plex artifacts into that container, replacing
+`/usr/lib/plexmediaserver/lib/libsqlite3.so` for the smoke process and mounting
+the extracted `icu_smoke` binary read-only. The smoke is invoked through Plex's
+bundled `ld-musl-*.so.1` loader with Plex's library directory as the loader
+path, so `libsqlite3.so` and Plex-renamed ICU resolution use the same runtime
+closure as deployment. When bumping the Plex image pin, update `ICU_VERSION` if
+the bundled ICU major changes.
 
 ### PMS first-init smoke
 
@@ -693,8 +704,8 @@ It proves the extracted Plex `libsqlite3.so` can replace PMS's runtime library
 at `/usr/lib/plexmediaserver/lib/libsqlite3.so` and survive PMS first
 initialization against a fresh `/config`.
 
-The smoke pins the runtime image to `lscr.io/linuxserver/plex:1.42.2`, matching
-the stage-2 ICU smoke image pin. It starts PMS with the extracted Plex library
+The smoke pins the runtime image through `PLEX_IMAGE_TAG`, matching the stage-2
+ICU smoke image pin. It starts PMS with the extracted Plex library
 bind-mounted read-only over the deployed library path and waits for readiness
 by probing TCP port 32400 for up to 90 seconds.
 
@@ -721,15 +732,14 @@ It proves the extracted generic `libsqlite3.so` can replace Emby's bundled
 runtime library at `/app/emby/lib/libsqlite3.so.3.49.2` and survive Emby first
 initialization against a fresh `/config`.
 
-The smoke pins the runtime image to
-`lscr.io/linuxserver/emby:version-4.9.3.0`. It starts Emby with the extracted
-generic library bind-mounted read-only over the deployed library path and waits
-for readiness by polling startup logs for the prefix-agnostic
+The smoke pins the runtime image through `EMBY_IMAGE_TAG`. It starts Emby with
+the extracted generic library bind-mounted read-only over the deployed library
+path and waits for readiness by polling startup logs for the prefix-agnostic
 `Sqlite version:` message for up to 90 seconds.
 
 After readiness, the smoke verifies the logged SQLite version equals the
-workflow `SQLITE_VERSION` converted from the upstream archive form to dotted
-form. It also prints Emby's logged SQLite compiler options and verifies the
+workflow `SQLITE_VERSION_DOTTED`. It also prints Emby's logged SQLite compiler
+options and verifies the
 16 curated `compile_options` used by the tuned library are present, including
 `SORTER_PMASZ=8192`. The workflow prints full Emby logs and fails when logs
 contain the same bad-signal set as §PMS first-init smoke.
@@ -744,14 +754,16 @@ A duplicate disabled-mode smoke starts Emby with
 
 ## Deploy Architecture
 
-`scripts/update-sqlite-library.sh` is the deployment helper.
+`scripts/update-sqlite-library.sh.template` is the deployment-helper source
+template. Releases publish a rendered `update-sqlite-library.sh` asset with the
+tag-specific `SQLITE_LIBRARY_PINS` manifest embedded.
 
 It requires exactly one positional target:
 
 ```text
-scripts/update-sqlite-library.sh emby
-scripts/update-sqlite-library.sh jellyfin
-scripts/update-sqlite-library.sh plex
+update-sqlite-library.sh emby
+update-sqlite-library.sh jellyfin
+update-sqlite-library.sh plex
 ```
 
 The `jellyfin` branch is retained but not validated in this cycle.
@@ -794,19 +806,25 @@ those runtime ICU libraries directly, and the Plex SQLite variant only replaces
 
 ### Library Pin Manifest
 
-`SQLITE_LIBRARY_PINS` is a release asset and is also embedded in the release
-asset copy of `update-sqlite-library.sh`.
+`SQLITE_LIBRARY_PINS` is a release asset and is also embedded in the generated
+release asset copy of `update-sqlite-library.sh`.
 
 The manifest schema is pipe-delimited:
 
 ```text
-kind|schema|target|arch|source|source_digest|target_path|artifact|sha256
+# SQLITE_LIBRARY_PINS schema=2
+version|2|managed_window|5|release_tag|<tag>|generated_at|<iso8601-utc-or-unreleased>
+component|sqlite|3.53.1
+component|mimalloc|3.3.2
+component|icu|69.1
+component|plex|1.42.2
+component|emby|version-4.9.3.0
 ```
 
-The first data row is metadata:
+`pre` and `post` data rows keep the 9-column row schema:
 
 ```text
-version|1|managed_window|5|release_tag|<tag>|generated_at|<tag>
+kind|schema|target|arch|source|source_digest|target_path|artifact|sha256
 ```
 
 `pre` rows describe the bundled library SHA in the pinned LSIO runtime image
@@ -816,7 +834,7 @@ releases: the current release plus four prior managed releases.
 
 ### Pre-replacement Assertion
 
-Before downloading release artifacts, `scripts/update-sqlite-library.sh`
+Before downloading release artifacts, the rendered `update-sqlite-library.sh`
 computes the current target library SHA and checks it against
 `SQLITE_LIBRARY_PINS`.
 
@@ -828,12 +846,13 @@ SHA is fatal with no bypass environment variable.
 The dormant Jellyfin branch warns and skips the pin assertion because this
 cycle does not validate JF deployment.
 
-`tools/regen-deploy-pins.sh` inlines the assertion function into the deploy
-script at render time through the `__ASSERT_PRE_REPLACEMENT_SHA__` placeholder,
-so the release asset has zero runtime file dependencies beyond the script
-itself. After the assertion passes, the deploy script captures the verified SHA
-and performs a TOCTOU recheck immediately before backup and replacement to guard
-against concurrent mutations.
+`tools/regen-deploy-pins.sh` inlines the deploy helper block containing
+`emit_component_summary` and `assert_pre_replacement_sha` into the deploy script
+at render time through the `__INJECTED_HELPERS__` placeholder, so the release
+asset has zero runtime file dependencies beyond the script itself. After the
+assertion passes, the deploy script captures the verified SHA and performs a
+TOCTOU recheck immediately before backup and replacement to guard against
+concurrent mutations.
 
 ## Deploy Tool Surface
 
@@ -1004,14 +1023,17 @@ M-series invariants:
 Pin manifest:
 
 - The managed deploy window is current plus four prior releases.
-- `SQLITE_LIBRARY_PINS` uses schema version 1 with the 9-column data shape and
-  metadata row.
-- `generated_at` equals the release tag.
+- `SQLITE_LIBRARY_PINS` uses schema version 2: metadata row
+  `version|2|managed_window|5|release_tag|<tag>|generated_at|<iso8601-utc-or-unreleased>`,
+  then five component rows in fixed order: sqlite, mimalloc, icu, plex, emby.
+- `generated_at` is independent of the release tag: published manifests use an
+  ISO 8601 UTC timestamp, local unreleased renders use `unreleased`, and
+  release-tag equality is rejected.
 - Missing `docker image inspect` repo digest for a pinned LSIO image is a CI
   failure.
 - Deploy-script SHA mismatch has no bypass environment variable.
 - The release asset copy of `update-sqlite-library.sh` is the authoritative
-  script for a release tag.
+  script for a release tag; the rendered script is a build artifact.
 
 ## Out of Scope
 

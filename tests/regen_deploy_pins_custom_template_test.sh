@@ -63,8 +63,13 @@ pre_sha="aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 post_sha="bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 
 cat > "${pins_file}" <<EOF
-# SQLITE_LIBRARY_PINS schema=1
-version|1|managed_window|5|release_tag|custom-tag|generated_at|custom-tag
+# SQLITE_LIBRARY_PINS schema=2
+version|2|managed_window|5|release_tag|custom-tag|generated_at|2026-05-26T18:44:37Z
+component|sqlite|3.53.1
+component|mimalloc|3.3.2
+component|icu|69.1
+component|plex|1.42.2
+component|emby|version-4.9.3.0
 pre|1|plex|linux-x86_64-v2|lscr.io/linuxserver/plex:test|lscr.io/linuxserver/plex@sha256:test|/usr/lib/plexmediaserver/lib/libsqlite3.so|runtime|${pre_sha}
 post|1|plex|linux-x86_64-v2|release|custom-tag|/usr/lib/plexmediaserver/lib/libsqlite3.so|sqlite-custom-tag-library-plex-linux-x86_64-v2.so|${post_sha}
 EOF
@@ -72,14 +77,15 @@ EOF
 cp "${repo_root}/scripts/update-sqlite-library.sh.template" "${external_template}"
 run_regen "${repo_root}/tools/regen-deploy-pins.sh" "${pins_file}" "${rendered}" "${stderr}" "${external_template}"
 assert_status "${run_status}" 0 "external template happy path"
+assert_contains "${rendered}" 'emit_component_summary()' "external template happy path summary body"
 assert_contains "${rendered}" 'assert_pre_replacement_sha()' "external template happy path assertion body"
-assert_not_contains "${rendered}" "__ASSERT_PRE_REPLACEMENT_SHA__" "external template happy path assertion placeholder"
+assert_not_contains "${rendered}" "__INJECTED_HELPERS__" "external template happy path helpers placeholder"
 
 missing_placeholder_template="${tmpdir}/missing-placeholder.template"
-grep -vF "__ASSERT_PRE_REPLACEMENT_SHA__" "${external_template}" > "${missing_placeholder_template}"
+grep -vF "__INJECTED_HELPERS__" "${external_template}" > "${missing_placeholder_template}"
 run_regen "${repo_root}/tools/regen-deploy-pins.sh" "${pins_file}" "${tmpdir}/missing.sh" "${stderr}" "${missing_placeholder_template}"
-assert_nonzero "${run_status}" "missing assertion placeholder"
-assert_contains "${stderr}" "FATAL: template missing or has duplicate __ASSERT_PRE_REPLACEMENT_SHA__ placeholder" "missing assertion placeholder stderr"
+assert_nonzero "${run_status}" "missing helpers placeholder"
+assert_contains "${stderr}" "FATAL: template missing or has duplicate __INJECTED_HELPERS__ placeholder" "missing helpers placeholder stderr"
 
 copied_tool_dir="${tmpdir}/copied-tool"
 mkdir -p "${copied_tool_dir}"

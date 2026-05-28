@@ -14,9 +14,12 @@ milestone lands.
   dormant JF) stays Ubuntu/glibc. Multi-stage `docker-library/Dockerfile`
   selects via `LIBRARY_VARIANT`.
 - `LIBRARY_VARIANT=plex` is limited to the Plex ICU build path.
-- SQLite and ICU pins must stay aligned across `build/Build.sh`,
+- SQLite pins must stay aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `.github/workflows/sqlite-build.yml`,
-  `docker-cli/Dockerfile`, `docker-library/Dockerfile`.
+  `docker-cli/Dockerfile`, and `docker-library/Dockerfile`.
+- ICU pin alignment is limited to `docker-library/Dockerfile`
+  `ARG ICU_VERSION` plus workflow `ICU_VERSION` and is enforced by
+  `tests/check_pin_alignment.sh`.
 - Mimalloc v3.3.2 Wire-2 link-time interposition applies to both library
   variants only; CLI stays on the platform allocator. Keep the full
   VERSION + URL + SHA512 pin tuple aligned across `build/Build.sh`,
@@ -45,6 +48,15 @@ milestone lands.
 - `SQLITE_DEFAULT_MMAP_SIZE=34359738368` (32 GiB) is the compile-default
   mmap-size pin in `build/Build.sh`; CI compile-option assertions keep it
   aligned with the runtime auto-PRAGMA target.
+- `SQLITE_MAX_MMAP_SIZE=1099511627776` (1 TiB) is the compile-time
+  mmap ceiling in `build/Build.sh:197`; the Emby compile-options
+  required-flag array in `.github/workflows/sqlite-build.yml:582-601`
+  asserts `MAX_MMAP_SIZE=1099511627776` in CI. The runtime
+  `PRAGMA mmap_size=34359738368` (32 GiB) only takes effect because this
+  compile ceiling stays above 32 GiB; reducing it below 32 GiB silently
+  caps the PRAGMA and breaks the Bundle-1 observability + performance
+  objective. Changes to the build pin or the workflow assertion must
+  update both.
 - `SQLITE_SORTER_PMASZ=8192` is the compile default in
   `build/Build.sh:205`; constructor-102 re-asserts
   `sqlite3_config(SQLITE_CONFIG_PMASZ, 8192)` in
@@ -69,11 +81,11 @@ milestone lands.
   those ICU files.
 - N=5 bounded upgrade window: deploy assertion accepts current + 4 prior
   managed-release post SHAs in addition to LSIO-original pre SHAs.
-- Pin manifest schema: 9 columns
-  `kind|schema|target|arch|source|source_digest|target_path|artifact|sha256`
-  plus a leading
-  `version|1|managed_window|5|release_tag|<tag>|generated_at|<tag>`
-  metadata row.
+- Pin manifest schema: metadata row
+  `version|2|managed_window|5|release_tag|<tag>|generated_at|<iso8601-utc-or-unreleased>`,
+  then component rows for sqlite, mimalloc, icu, plex, and emby. `pre` and
+  `post` rows keep the 9-column row schema with row schema token `1`. See
+  Section 8.
 - `assert_pre_replacement_sha` exports `OUT_ASSERTED_SHA`. Callers MUST
   reuse it (no re-hashing). TOCTOU recheck compares against the exported
   value.
@@ -234,3 +246,12 @@ milestone lands.
 - Kill-switch fast-paths (early-return before any work) preserve this
   invariant under disabled workloads and should be the default for any
   new feature with a runtime kill switch.
+
+## 8. Versioning
+
+- Release identity uses CalVer tags matching `^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-r[1-9][0-9]*$`; no `v` prefix; always include `-rN`.
+- Every schema-2 manifest MUST include component rows in sqlite, mimalloc, icu, plex, emby order.
+- `generated_at` is an ISO 8601 UTC timestamp; generated unreleased deploy
+  script artifacts use `unreleased`.
+- `tests/check_pin_alignment.sh` enforces mimalloc tuple alignment and ICU workflow env vs Dockerfile ARG/URL-construction alignment.
+- The first CalVer release is a cold start for the managed deploy window.

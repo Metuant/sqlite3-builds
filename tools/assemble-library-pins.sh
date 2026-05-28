@@ -15,6 +15,12 @@ release_tag=""
 sha256sums=""
 prior_files=()
 pre_files=()
+SQLITE_VERSION_DOTTED="${SQLITE_VERSION_DOTTED:-}"
+MIMALLOC_VERSION="${MIMALLOC_VERSION:-}"
+ICU_VERSION="${ICU_VERSION:-}"
+PLEX_IMAGE_TAG="${PLEX_IMAGE_TAG:-}"
+EMBY_IMAGE_TAG="${EMBY_IMAGE_TAG:-}"
+generated_at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -50,6 +56,12 @@ done
 [[ -n "${release_tag}" ]] || fatal "missing --release-tag"
 [[ -n "${sha256sums}" ]] || fatal "missing --sha256sums"
 [[ -f "${sha256sums}" ]] || fatal "SHA256SUMS not found: ${sha256sums}"
+[[ -n "${SQLITE_VERSION_DOTTED:-}" ]] || fatal "SQLITE_VERSION_DOTTED not set"
+[[ -n "${MIMALLOC_VERSION:-}" ]] || fatal "MIMALLOC_VERSION not set"
+[[ -n "${ICU_VERSION:-}" ]] || fatal "ICU_VERSION not set"
+[[ -n "${PLEX_IMAGE_TAG:-}" ]] || fatal "PLEX_IMAGE_TAG not set"
+[[ -n "${EMBY_IMAGE_TAG:-}" ]] || fatal "EMBY_IMAGE_TAG not set"
+[[ -n "${generated_at}" ]] || fatal "generated_at capture returned empty"
 for pre_file in "${pre_files[@]}"; do
   [[ -f "${pre_file}" ]] || fatal "pre fragment not found: ${pre_file}"
 done
@@ -109,7 +121,7 @@ emit_current_post_rows() {
 emit_prior_post_rows() {
   local pins_file=$1 metadata_tag
   metadata_tag="$(
-    tr -d '\r' < "${pins_file}" | awk -F'|' '$1 == "version" && $2 == "1" && $5 == "release_tag" { print $6; exit }'
+    tr -d '\r' < "${pins_file}" | awk -F'|' '$1 == "version" && ($2 == "1" || $2 == "2") && $5 == "release_tag" { print $6; exit }'
   )"
   [[ -n "${metadata_tag}" ]] || fatal "prior pins missing metadata release tag: ${pins_file}"
   tr -d '\r' < "${pins_file}" | awk -F'|' -v tag="${metadata_tag}" '
@@ -133,8 +145,17 @@ if [[ "${current_post_count}" -ne "${pre_target_arch_count}" ]]; then
   fatal "current post row count ${current_post_count} does not match pre target/arch count ${pre_target_arch_count}"
 fi
 
-echo "# SQLITE_LIBRARY_PINS schema=1"
-printf "version|1|managed_window|5|release_tag|%s|generated_at|%s\n" "${release_tag}" "${release_tag}"
+emit_component_rows() {
+  printf "component|sqlite|%s\n" "${SQLITE_VERSION_DOTTED}"
+  printf "component|mimalloc|%s\n" "${MIMALLOC_VERSION}"
+  printf "component|icu|%s\n" "${ICU_VERSION}"
+  printf "component|plex|%s\n" "${PLEX_IMAGE_TAG}"
+  printf "component|emby|%s\n" "${EMBY_IMAGE_TAG}"
+}
+
+echo "# SQLITE_LIBRARY_PINS schema=2"
+printf "version|2|managed_window|5|release_tag|%s|generated_at|%s\n" "${release_tag}" "${generated_at}"
+emit_component_rows
 
 for pre_file in "${pre_files[@]}"; do
   while IFS= read -r row; do
@@ -151,16 +172,14 @@ while IFS= read -r row; do
 done <<< "${current_post_rows}"
 
 for prior_file in "${prior_files[@]}"; do
+  prior_rows=""
   [[ -f "${prior_file}" ]] || fatal "prior pins not found: ${prior_file}"
-  _tmp_prior="$(mktemp)"
-  emit_prior_post_rows "${prior_file}" > "${_tmp_prior}" || {
-    rm -f "${_tmp_prior}"
+  prior_rows="$(emit_prior_post_rows "${prior_file}")" || {
     fatal "emit_prior_post_rows failed for ${prior_file}"
   }
   while IFS= read -r row; do
     [[ -n "${row}" ]] || continue
     validate_row "${row}" "${prior_file}"
     printf "%s\n" "${row}"
-  done < "${_tmp_prior}"
-  rm -f "${_tmp_prior}"
+  done <<< "${prior_rows}"
 done

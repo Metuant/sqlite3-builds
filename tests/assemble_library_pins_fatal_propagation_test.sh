@@ -40,11 +40,16 @@ run_assemble() {
   local output_file=$1 stderr_file=$2
   shift 2
   set +e
-  bash "${repo_root}/tools/assemble-library-pins.sh" \
-    --release-tag vtag \
-    --sha256sums "${tmpdir}/SHA256SUMS" \
-    "$@" \
-    "${tmpdir}/pre.txt" >"${output_file}" 2>"${stderr_file}"
+  SQLITE_VERSION_DOTTED="3.53.1" \
+    MIMALLOC_VERSION="3.3.2" \
+    ICU_VERSION="69.1" \
+    PLEX_IMAGE_TAG="1.42.2" \
+    EMBY_IMAGE_TAG="version-4.9.3.0" \
+    bash "${repo_root}/tools/assemble-library-pins.sh" \
+      --release-tag vtag \
+      --sha256sums "${tmpdir}/SHA256SUMS" \
+      "$@" \
+      "${tmpdir}/pre.txt" >"${output_file}" 2>"${stderr_file}"
   local status=$?
   set -e
   run_status="${status}"

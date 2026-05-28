@@ -45,28 +45,11 @@ escape_sed() {
 
 write_rendered_script() {
   local target_path=$1 pins_file=$2 output_file=$3
+  local raw_output="${output_file}.raw"
   local target_path_escaped
   target_path_escaped="$(escape_sed "${target_path}")"
-  awk -v pins_file="${pins_file}" '
-    BEGIN { replacing_pins = 0 }
-    index($0, "SQLITE_LIBRARY_PINS=$(cat <<'\''PINS_EOF'\''") == 1 {
-      print
-      while ((getline line < pins_file) > 0) {
-        print line
-      }
-      close(pins_file)
-      replacing_pins = 1
-      next
-    }
-    replacing_pins && /^PINS_EOF$/ {
-      print
-      replacing_pins = 0
-      next
-    }
-    replacing_pins { next }
-    { print }
-  ' "${repo_root}/scripts/update-sqlite-library.sh" \
-    | sed "s|/app/emby/lib/libsqlite3.so.3.49.2|${target_path_escaped}|g" \
+  bash "${repo_root}/tools/regen-deploy-pins.sh" "${pins_file}" "${raw_output}" "unreleased"
+  sed "s|/app/emby/lib/libsqlite3.so.3.49.2|${target_path_escaped}|g" "${raw_output}" \
     > "${output_file}"
   chmod +x "${output_file}"
 }
@@ -209,8 +192,13 @@ pre_sha="$("${real_sha256sum}" "${target_path}" | awk '{print $1}')"
 release_so_sha="$("${real_sha256sum}" "${release_so}" | awk '{print $1}')"
 
 cat > "${pins_file}" <<EOF
-# SQLITE_LIBRARY_PINS schema=1
-version|1|managed_window|5|release_tag|unreleased|generated_at|unreleased
+# SQLITE_LIBRARY_PINS schema=2
+version|2|managed_window|5|release_tag|unreleased|generated_at|unreleased
+component|sqlite|3.53.1
+component|mimalloc|3.3.2
+component|icu|69.1
+component|plex|1.42.2
+component|emby|version-4.9.3.0
 pre|1|emby|linux-arm64|lscr.io/linuxserver/emby:test|lscr.io/linuxserver/emby@sha256:test|${target_path}|runtime|${pre_sha}
 post|1|emby|linux-arm64|release|unreleased|${target_path}|sqlite-unreleased-library-linux-arm64.so|${release_so_sha}
 EOF
@@ -236,6 +224,7 @@ actual_post_sha="$("${real_sha256sum}" "${target_path}" | awk '{print $1}')"
 if [[ "${actual_post_sha}" != "${release_so_sha}" ]]; then
   fatal "stable SHA control path: expected deployed sha ${release_so_sha}, got ${actual_post_sha}"
 fi
+assert_contains "${stdout}" "Deployed sqlite=3.53.1 mimalloc=3.3.2 (generic variant)" "stable replacement summary stdout"
 
 printf 'managed pre image\n' > "${target_path}"
 run_case "change-on-second" "${rendered_script}" "${stdout}" "${stderr}"
@@ -247,6 +236,23 @@ run_case "delete-on-second" "${rendered_script}" "${stdout}" "${stderr}"
 assert_nonzero "${run_status}" "target disappearance"
 if [[ -f "${target_path}" ]]; then
   fatal "target disappearance: expected ${target_path} to be absent after simulated deletion"
+fi
+
+printf 'managed pre image\n' > "${target_path}"
+printf 'mutable replacement library\n' > "${release_so}"
+mutable_so_sha="$("${real_sha256sum}" "${release_so}" | awk '{print $1}')"
+tar -C "${tmpdir}/release" -czf "${archive_path}" libsqlite3.so
+mutable_archive_sha="$("${real_sha256sum}" "${archive_path}" | awk '{print $1}')"
+cat > "${tmpdir}/release/SHA256SUMS" <<EOF
+${mutable_archive_sha}  sqlite-unreleased-library-linux-arm64.tar.gz
+${mutable_so_sha}  sqlite-unreleased-library-linux-arm64.so
+EOF
+run_case "stable" "${rendered_script}" "${stdout}" "${stderr}"
+assert_nonzero "${run_status}" "mutable SHA256SUMS post-pin rejection"
+assert_contains "${stderr}" "embedded post pin" "mutable SHA256SUMS post-pin rejection stderr"
+actual_after_mutable="$("${real_sha256sum}" "${target_path}" | awk '{print $1}')"
+if [[ "${actual_after_mutable}" != "${pre_sha}" ]]; then
+  fatal "mutable SHA256SUMS post-pin rejection: expected target to remain at pre sha ${pre_sha}, got ${actual_after_mutable}"
 fi
 
 echo "deploy TOCTOU tests passed"

@@ -76,12 +76,17 @@ COPY tests/ /app/tests/
 
 RUN chmod +x /app/Build.sh
 
+ARG ICU_VERSION=69.1
 ARG ICU_SHA512=d4aeb781715144ea6e3c6b98df5bbe0490bfa3175221a1d667f3e6851b7bd4a638fa4a37d4a921ccb31f02b5d15a6dded9464d98051964a86f7b1cde0ff0aab7
 RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       set -euo pipefail; \
-      wget -O /tmp/icu4c-69_1-src.tgz https://github.com/unicode-org/icu/releases/download/release-69-1/icu4c-69_1-src.tgz; \
-      echo "${ICU_SHA512}  /tmp/icu4c-69_1-src.tgz" | sha512sum -c -; \
-      tar -xzf /tmp/icu4c-69_1-src.tgz -C /tmp; \
+      icu_release_version="$(printf '%s' "${ICU_VERSION}" | tr '.' '-')"; \
+      icu_archive_version="$(printf '%s' "${ICU_VERSION}" | tr '.' '_')"; \
+      icu_archive="/tmp/icu4c-${icu_archive_version}-src.tgz"; \
+      icu_url="https://github.com/unicode-org/icu/releases/download/release-${icu_release_version}/icu4c-${icu_archive_version}-src.tgz"; \
+      wget -O "${icu_archive}" "${icu_url}"; \
+      echo "${ICU_SHA512}  ${icu_archive}" | sha512sum -c -; \
+      tar -xzf "${icu_archive}" -C /tmp; \
       cd /tmp/icu/source; \
       ./configure \
         --prefix=/opt/icu-69-plex \
