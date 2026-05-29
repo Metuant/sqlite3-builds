@@ -1,29 +1,31 @@
 # sqlite3-builds
 
 This repository builds tuned SQLite artifacts for media-server containers: a
-static CLI, a generic shared library, a Plex shared library, deployment helpers,
-and planned-downtime maintenance scripts.
+static CLI, a generic shared library, a Plex shared library, LSIO Docker mod
+images for Plex and Emby SQLite replacement, and planned-downtime maintenance
+scripts.
 
 Read docs/architecture.md first.
 
 Project-specific guidance:
 
 - The global kernel still applies; read `~/.claude/CLAUDE.md`.
-- Treat `docs/architecture.md` as the current repository map for build, deploy,
-  smoke-test, and maintenance behavior.
-- JF is deferred. Its deploy branch is retained but not current-cycle
-  validated; JF maintenance is absent from `scripts/optimize_media_servers.sh`
-  and requires design and validation before use.
-- Plex uses renamed ICU 69 runtime files. Deploy scripts MUST NOT touch
-  `libicu*plex.so.69`.
+- Treat `docs/architecture.md` as the current repository map for build, LSIO
+  mod, smoke-test, and maintenance behavior.
+- JF deployment is unsupported until a current binding design and validation
+  plan land.
+- Plex uses renamed ICU 69 runtime files. LSIO mod code MUST NOT replace,
+  rename, move, delete, or overwrite `libicu*plex.so.69`; it may only read and
+  verify them.
 - Plex library replacement targets only
   `/usr/lib/plexmediaserver/lib/libsqlite3.so`.
-- The LSIO archive surface is `tar` and `gunzip` only.
-- LSIO startup hooks assume the POSIX/coreutils baseline `mktemp`, `mkdir`,
-  `cp`, `mv`, `rm`, standard `sh`, and `bash`; non-standard tools must be
-  preflight-checked before use.
+- LSIO mods perform no runtime archive download or extraction. Common runtime
+  command surface: `awk`, `cp`, `grep`, `mkdir`, `mktemp`, `mv`, `rm`, `sed`,
+  `sha256sum`, `tr`, and `uname`; Plex amd64 pool patch additionally uses
+  `dd`, `od`, and `printf`.
 - Keep `LIBRARY_VARIANT=plex` limited to the Plex ICU build path.
-- Keep SQLite and ICU pins aligned across wrapper, workflow, Dockerfiles, and
-  `build/Build.sh`.
+- Keep SQLite pins aligned across wrapper, workflow, Dockerfiles, and
+  `build/Build.sh`; keep ICU pins aligned across
+  `.github/workflows/sqlite-build.yml` and `docker-library/Dockerfile`.
 - Do not create or modify `AGENTS.md` here unless explicitly asked; the root
   convention is a symlink to this file.

@@ -1,0 +1,23 @@
+#!/usr/bin/with-contenv bash
+set -u
+phase_name="02-verify"
+. /opt/sqlite3-lsio-mod/lib/logging.sh
+. /opt/sqlite3-lsio-mod/lib/sha.sh
+. /opt/sqlite3-lsio-mod/lib/arch.sh
+sqlite3_mod_init_logging
+baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
+selected_arch="$(resolve_arch)" || exit 0
+artifact="/opt/sqlite3-lsio-mod/artifacts/${selected_arch}/libsqlite3.so"
+target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
+expected="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="plex" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || log_fatal "mod=plex phase=${phase_name} event=missing-current-row arch=${selected_arch}"
+[ -f "$artifact" ] || log_fatal "mod=plex phase=${phase_name} event=missing-artifact path=${artifact}"
+actual="$(sha256_of "$artifact")"
+[ "$actual" = "$expected" ] || log_fatal "mod=plex phase=${phase_name} event=baked-sha-mismatch expected=${expected} actual=${actual}"
+for so in libicuucplex.so.69 libicui18nplex.so.69 libicudataplex.so.69; do
+  runtime="/usr/lib/plexmediaserver/lib/${so}"
+  expected_icu="$(awk -F'|' -v arch="$selected_arch" -v path="$runtime" '$1=="pre" && $3=="plex" && $4==arch && $7==path { print $9; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || { log_warn "mod=plex phase=${phase_name} event=missing-icu-row path=${runtime}"; exit 0; }
+  [ -f "$runtime" ] || { log_warn "mod=plex phase=${phase_name} event=missing-runtime-icu path=${runtime}"; exit 0; }
+  actual_icu="$(sha256_of "$runtime")"
+  [ "$actual_icu" = "$expected_icu" ] || { log_warn "mod=plex phase=${phase_name} event=runtime-icu-mismatch path=${runtime}"; exit 0; }
+done
+log_info "mod=plex phase=${phase_name} event=verified arch=${selected_arch}"

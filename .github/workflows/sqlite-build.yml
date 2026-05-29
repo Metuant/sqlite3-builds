@@ -97,86 +97,6 @@ jobs:
           path: ${{ steps.extract_library_plex.outputs.destination }}
           name: sqlite-${{env.SQLITE_VERSION}}-library-plex-${{ matrix.arch_suffix }}
           retention-days: 90
-      - name: Pull Plex image (pre-replacement SHA)
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}
-      - name: Pull Emby image (pre-replacement SHA)
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/emby:${{ env.EMBY_IMAGE_TAG }}
-      - name: Emit pre-replacement SHAs
-        run: |
-          set -euo pipefail
-          pins_dir="sqlite-pins-pre-${{ matrix.arch_suffix }}"
-          fragment="${pins_dir}/SQLITE_LIBRARY_PINS_PRE"
-          mkdir -p "$pins_dir"
-          : > "$fragment"
-
-          emit_pre_row() {
-            local target="$1" image="$2" target_path="$3"
-            local cid="" copy_path pre_sha img_digest
-            cleanup_container() {
-              if [ -n "$cid" ]; then
-                docker rm -f "$cid" >/dev/null 2>&1 || true
-              fi
-            }
-            trap cleanup_container RETURN
-
-            cid="$(docker create --entrypoint /bin/sh "$image" -c true)"
-            copy_path="${pins_dir}/${target}-${target_path##*/}"
-            docker cp "${cid}:${target_path}" "$copy_path"
-            test -f "$copy_path" || { echo "FATAL: docker cp produced non-regular file at $copy_path" >&2; exit 1; }
-            pre_sha="$(sha256sum "$copy_path" | awk '{print $1}')"
-            [ -n "$pre_sha" ] || { echo "FATAL: sha256sum returned empty for $copy_path" >&2; exit 1; }
-            img_digest="$(
-              docker image inspect \
-                --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' \
-                "$image"
-            )"
-            if [ -z "$img_digest" ]; then
-              echo "FATAL: docker image inspect returned no repo digest" >&2
-              echo "       image: $image" >&2
-              exit 1
-            fi
-            printf "pre|1|%s|%s|%s|%s|%s|runtime|%s\n" \
-              "$target" \
-              "${{ matrix.arch_suffix }}" \
-              "$image" \
-              "$img_digest" \
-              "$target_path" \
-              "$pre_sha" \
-              >> "$fragment"
-            cleanup_container
-            trap - RETURN
-          }
-
-          emit_pre_row \
-            "plex" \
-            "lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}" \
-            "/usr/lib/plexmediaserver/lib/libsqlite3.so"
-          emit_pre_row \
-            "plex" \
-            "lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}" \
-            "/usr/lib/plexmediaserver/lib/libicuucplex.so.69"
-          emit_pre_row \
-            "plex" \
-            "lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}" \
-            "/usr/lib/plexmediaserver/lib/libicui18nplex.so.69"
-          emit_pre_row \
-            "plex" \
-            "lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}" \
-            "/usr/lib/plexmediaserver/lib/libicudataplex.so.69"
-          emit_pre_row \
-            "emby" \
-            "lscr.io/linuxserver/emby:${EMBY_IMAGE_TAG}" \
-            "/app/emby/lib/libsqlite3.so.3.49.2"
-      - name: Upload pre-replacement SHA artifact
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          path: sqlite-pins-pre-${{ matrix.arch_suffix }}/SQLITE_LIBRARY_PINS_PRE
-          name: sqlite-pins-pre-${{ matrix.arch_suffix }}
-          retention-days: 90
       - name: Pull Plex image (ICU smoke)
         uses: ./.github/actions/retry-pull
         with:
@@ -356,108 +276,6 @@ jobs:
             echo "FATAL: PMS logs contain startup sqlite3_config rc=21 after lazy auto-extension registration"
             exit 1
           fi
-      - name: Pull Plex image (PMS pool-patched smoke)
-        if: matrix.arch_suffix != 'linux-arm64'
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}
-      - name: PMS first-init smoke (Plex, pool-patched)
-        if: matrix.arch_suffix != 'linux-arm64'
-        env:
-          ARTIFACT_DIR: ${{ steps.extract_library_plex.outputs.destination }}
-          PLEX_IMG: "lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}"
-          ICU_VERSION: ${{ env.ICU_VERSION }}
-        run: |
-          set -euo pipefail
-          EXPECTED_ICU_MAJOR="${ICU_VERSION%%.*}"
-          : "Plex image ${PLEX_IMG} with expected ICU major ${EXPECTED_ICU_MAJOR}"
-          ARTIFACT_DIR_ABS="$(realpath "$ARTIFACT_DIR")"
-          if [ ! -f "$ARTIFACT_DIR_ABS/libsqlite3.so" ]; then
-            echo "FATAL: missing extracted Plex library at $ARTIFACT_DIR_ABS/libsqlite3.so"
-            exit 1
-          fi
-          PATCH_SCRIPT="tools/cont-init-patch-plex-pool.sh"
-          if [ ! -f "$PATCH_SCRIPT" ]; then
-            echo "FATAL: missing cont-init script at $PATCH_SCRIPT"
-            exit 1
-          fi
-          PATCH_SCRIPT_ABS="$(realpath "$PATCH_SCRIPT")"
-          PMS_CONFIG_DIR="$(mktemp -d)"
-          PMS_DB_COPY_DIR="$(mktemp -d)"
-          PMS_DB_COPY="${PMS_DB_COPY_DIR}/com.plexapp.plugins.library.db"
-          PMS_CONTAINER="pms-smoke-pool-patched-${{ github.run_id }}-${{ matrix.arch_suffix }}"
-          trap 'status=$?; docker logs "$PMS_CONTAINER" 2>&1 || true; docker stop "$PMS_CONTAINER" 2>/dev/null || true; exit "$status"' EXIT
-          docker run --detach \
-            --name "$PMS_CONTAINER" \
-            -e PUID=1000 \
-            -e PGID=1000 \
-            -e VERSION=docker \
-            --mount "type=bind,src=${PMS_CONFIG_DIR},dst=/config" \
-            --mount "type=bind,src=${ARTIFACT_DIR_ABS}/libsqlite3.so,dst=/usr/lib/plexmediaserver/lib/libsqlite3.so,readonly" \
-            --mount "type=bind,src=${PATCH_SCRIPT_ABS},dst=/custom-cont-init.d/10-patch-plex-pool.sh,readonly" \
-            --network host \
-            "$PLEX_IMG"
-          pms_ready=0
-          for attempt in $(seq 1 30); do
-            if bash -c 'echo > /dev/tcp/localhost/32400' 2>/dev/null; then
-              pms_ready=1
-              break
-            fi
-            sleep 3
-          done
-          if [ "$pms_ready" -ne 1 ]; then
-            echo "FATAL: PMS did not open TCP 32400 within 90 seconds"
-            docker logs "$PMS_CONTAINER" 2>&1 || true
-            exit 1
-          fi
-          wait_for_pms_table_count() {
-            local attempt table_count
-            table_count=0
-            for attempt in $(seq 1 30); do
-              if docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY" >/dev/null 2>&1; then
-                table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
-                case "$table_count" in
-                  "" | *[!0-9]*) table_count=0 ;;
-                esac
-                if [ "$table_count" -ge 20 ]; then
-                  return 0
-                fi
-              fi
-              sleep 1
-            done
-            echo "FATAL: expected at least 20 PMS tables within 30 seconds, got $table_count"
-            return 1
-          }
-          wait_for_pms_table_count
-          bad_signal_re='\bSQLITE_(ERROR|INTERNAL|NOMEM|IOERR|CORRUPT|FULL|CANTOPEN|PROTOCOL|MISMATCH|MISUSE|NOTADB|FORMAT|AUTH)\b|database disk image is malformed|Cannot create table|no such function|no such collation|Failed to open'
-          if docker logs "$PMS_CONTAINER" 2>&1 | grep -Ev '^\[sqlite3-builds-obs\]' | grep -E "$bad_signal_re"; then
-            echo "FATAL: PMS logs contain SQLite/runtime bad signal"
-            exit 1
-          fi
-          pms_logs="$(docker logs "$PMS_CONTAINER" 2>&1 || true)"
-          if ! printf "%s\n" "$pms_logs" | grep -E '\[sqlite3-builds-obs\].*SQLITE_TRACE_STMT' >/dev/null; then
-            echo "FATAL: PMS logs missing SQLITE_TRACE_STMT observability marker"
-            exit 1
-          fi
-          pms_open_marker_count="$(printf "%s\n" "$pms_logs" | grep -Ec '\[sqlite3-builds-obs\].* sqlite3_open(_v2|16)? ' || true)"
-          if [ "$pms_open_marker_count" -lt 1 ]; then
-            echo "FATAL: PMS observability positive-mode marker count check failed: open=$pms_open_marker_count"
-            exit 1
-          fi
-          if printf "%s\n" "$pms_logs" | grep -E '\[sqlite3-builds-obs\] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21' >/dev/null; then
-            echo "FATAL: PMS logs contain startup sqlite3_config rc=21 after lazy auto-extension registration"
-            exit 1
-          fi
-          for site in \
-            "/usr/lib/plexmediaserver/Plex Media Server @ 0xae4a17" \
-            "/usr/lib/plexmediaserver/Plex Media Scanner @ 0x36f06d" \
-            "/usr/lib/plexmediaserver/Plex Media Scanner @ 0x38b37b"; do
-            if ! grep -qE "^(patched|already patched): ${site}( 20 -> 16)?$" <<< "$pms_logs"; then
-              echo "FATAL: cont-init did not report success at ${site}"
-              exit 1
-            fi
-          done
-          echo "PMS_OPEN_MARKER_COUNT(patched)=${pms_open_marker_count}"
       - name: Pull Plex image (PMS kill-switch smoke)
         uses: ./.github/actions/retry-pull
         with:
@@ -788,27 +606,31 @@ jobs:
             echo "FATAL: Emby observability kill switch emitted marker lines"
             exit 1
           fi
-      - name: Deploy assertion test
-        run: bash tests/deploy_assertion_test.sh
-      - name: Deploy TOCTOU test
-        run: bash tests/deploy_toctou_test.sh
       - name: Observability count check
         run: bash tests/check_obs_counts.sh
       - name: ABI obsolete config ops test
         run: bash tests/abi_obsolete_config_ops_test.sh "${docker_library_image}"
-      - name: Regenerate deploy pins test
-        run: bash tests/regen_deploy_pins_test.sh
-      - name: Regenerate deploy pins custom template test
-        run: bash tests/regen_deploy_pins_custom_template_test.sh
-      - name: Assemble library pins test
-        run: bash tests/assemble_library_pins_test.sh
-      - name: Assemble library pins fatal propagation test
-        run: bash tests/assemble_library_pins_fatal_propagation_test.sh
+
+  mod-static-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Run LSIO mod repo-only tests
+        run: |
+          set -euo pipefail
+          bash tests/plex_pool_patch_lib_test.sh
+          bash tests/cont_init_fragments_test.sh
+          bash tests/lsio_mod_phase03_bak_creation_failure_test.sh
+          bash tests/render_lsio_mod_baked_pins_test.sh
+          bash tests/sqlite_build_workflow_mod_only_test.sh
+          bash tests/docs_mod_only_direction_c_test.sh
 
   release:
     if: startsWith(github.ref, 'refs/tags/')
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: write
@@ -834,8 +656,6 @@ jobs:
         run: |
           set -euo pipefail
           cd release
-          # WHY: Separate archive globs preserve the CLI/library naming
-          # contract consumed by deploy hooks.
           for artifact in sqlite-*-cli-*; do
             suffix="${artifact#sqlite-${SQLITE_VERSION}-cli-}"
             tar -czf "../sqlite-${GITHUB_REF_NAME}-cli-${suffix}.tar.gz" -C "${artifact}" .
@@ -853,6 +673,7 @@ jobs:
           cd ..
           : > SHA256SUMS
           for artifact in sqlite-*.tar.gz; do
+            [ -f "$artifact" ] || continue
             sha256sum "$artifact" >> SHA256SUMS
             if [[ "$artifact" == sqlite-*-library-*.tar.gz ]]; then
               tmp="$(mktemp -d)"
@@ -863,96 +684,6 @@ jobs:
               rm -rf "$tmp"
             fi
           done
-      - name: Download pre-replacement SHA artifacts
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          pattern: sqlite-pins-pre-*
-          path: pins-pre
-          merge-multiple: false
-          digest-mismatch: warn
-      - name: Fetch prior library pins
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          mkdir -p prior-pins
-          if ! gh release list \
-            --repo "$GITHUB_REPOSITORY" \
-            --limit 30 \
-            --json tagName \
-            --jq '.[].tagName' > prior-pins/tags; then
-            echo "FATAL: gh release list failed" >&2
-            exit 1
-          fi
-
-          fetched_count=0
-          while IFS= read -r prior_tag; do
-            if [ "$prior_tag" = "$GITHUB_REF_NAME" ]; then
-              continue
-            fi
-            if [ "$fetched_count" -ge 4 ]; then
-              break
-            fi
-            if ! assets="$(
-              gh release view "$prior_tag" \
-                --repo "$GITHUB_REPOSITORY" \
-                --json assets \
-                --jq '.assets[].name'
-            )"; then
-              echo "FATAL: gh release view failed for $prior_tag" >&2
-              exit 1
-            fi
-            if ! printf "%s\n" "$assets" | grep -Fxq "SQLITE_LIBRARY_PINS"; then
-              echo "::warning::missing SQLITE_LIBRARY_PINS on $prior_tag"
-              continue
-            fi
-            mkdir -p "prior-pins/$prior_tag"
-            if ! gh release download "$prior_tag" \
-              --repo "$GITHUB_REPOSITORY" \
-              --pattern "SQLITE_LIBRARY_PINS" \
-              --dir "prior-pins/$prior_tag" \
-              --clobber; then
-              echo "FATAL: failed to download SQLITE_LIBRARY_PINS" >&2
-              echo "       release: $prior_tag" >&2
-              exit 1
-            fi
-            fetched_count=$((fetched_count + 1))
-          done < prior-pins/tags
-          echo "Fetched $fetched_count prior SQLITE_LIBRARY_PINS asset(s)."
-      - name: Assemble deploy library pins
-        run: |
-          set -euo pipefail
-          pre_args=()
-          while IFS= read -r pre_file; do
-            pre_args+=("$pre_file")
-          done < <(
-            find pins-pre -type f -name SQLITE_LIBRARY_PINS_PRE | sort
-          )
-          if [ "${#pre_args[@]}" -eq 0 ]; then
-            echo "FATAL: no pre-replacement SHA fragments found" >&2
-            exit 1
-          fi
-
-          prior_args=()
-          while IFS= read -r prior_file; do
-            prior_args+=(--prior "$prior_file")
-          done < <(
-            find prior-pins -type f -name SQLITE_LIBRARY_PINS | sort
-          )
-
-          bash tools/assemble-library-pins.sh \
-            --release-tag "$GITHUB_REF_NAME" \
-            --sha256sums SHA256SUMS \
-            "${prior_args[@]}" \
-            "${pre_args[@]}" > SQLITE_LIBRARY_PINS
-      - name: Regenerate deploy script pins
-        run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          bash tools/regen-deploy-pins.sh \
-            SQLITE_LIBRARY_PINS \
-            release-assets/update-sqlite-library.sh \
-            "$GITHUB_REF_NAME"
       - name: Create release
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
         with:
@@ -965,7 +696,282 @@ jobs:
           files: |
             sqlite-${{ github.ref_name }}-*.tar.gz
             SHA256SUMS
-            SQLITE_LIBRARY_PINS
-            release-assets/update-sqlite-library.sh
           draft: false
           prerelease: false
+
+  mod-build:
+    needs: build
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mod: plex
+            runner: ubuntu-24.04
+            image_name: linuxserver-mod-sqlite3-plex
+            arch_suffix: amd64
+          - mod: plex
+            runner: ubuntu-24.04-arm
+            image_name: linuxserver-mod-sqlite3-plex
+            arch_suffix: arm64
+          - mod: emby
+            runner: ubuntu-24.04
+            image_name: linuxserver-mod-sqlite3-emby
+            arch_suffix: amd64
+          - mod: emby
+            runner: ubuntu-24.04-arm
+            image_name: linuxserver-mod-sqlite3-emby
+            arch_suffix: arm64
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set OWNER_NAME Variable
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "OWNER_NAME=$(echo "${REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')" >> "${GITHUB_ENV}"
+      - name: Download sqlite artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: sqlite-*
+          path: sqlite-artifacts
+          merge-multiple: false
+          digest-mismatch: warn
+      - name: Pull Plex base image
+        if: matrix.mod == 'plex'
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}
+      - name: Pull Emby base image
+        if: matrix.mod == 'emby'
+        uses: ./.github/actions/retry-pull
+        with:
+          image: lscr.io/linuxserver/emby:${{ env.EMBY_IMAGE_TAG }}
+      - name: Build, bake-smoke, and export mod image
+        run: |
+          set -euo pipefail
+          case "${{ matrix.mod }}" in
+            plex)
+              lsio_image="lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}"
+              target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
+              artifact_kind="library-plex"
+              ;;
+            emby)
+              lsio_image="lscr.io/linuxserver/emby:${EMBY_IMAGE_TAG}"
+              target_path="/app/emby/lib/libsqlite3.so.3.49.2"
+              artifact_kind="library"
+              ;;
+            *)
+              echo "FATAL: unsupported mod: ${{ matrix.mod }}" >&2
+              exit 1
+              ;;
+          esac
+          case "${{ matrix.arch_suffix }}" in
+            amd64) runtime_arches=(linux-x86_64-v2 linux-x86_64-v3); expected_arch_re='arch=linux-x86_64-v(2|3)' ;;
+            arm64) runtime_arches=(linux-arm64); expected_arch_re='arch=linux-arm64' ;;
+            *)
+              echo "FATAL: unsupported arch suffix: ${{ matrix.arch_suffix }}" >&2
+              exit 1
+              ;;
+          esac
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            mod_release_tag="$GITHUB_REF_NAME"
+          else
+            mod_release_tag="run-${GITHUB_RUN_ID}"
+          fi
+
+          tmpdir="$(mktemp -d)"
+          staged="${tmpdir}/staged"
+          pre_fragment="${tmpdir}/pre-fragment.txt"
+          sha256sums="${tmpdir}/SHA256SUMS"
+          baked_pins="${tmpdir}/baked-pins.txt"
+          : > "$pre_fragment"
+          : > "$sha256sums"
+
+          image_digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' "$lsio_image")"
+          if [ -z "$image_digest" ]; then
+            echo "FATAL: docker image inspect returned no repo digest for $lsio_image" >&2
+            exit 1
+          fi
+          emit_pre_row() {
+            local target="$1" arch="$2" image="$3" digest="$4" path="$5" pre_sha
+            pre_sha="$(docker run --rm --entrypoint sha256sum "$image" "$path" | awk '{print $1}')"
+            [[ "$pre_sha" =~ ^[0-9A-Fa-f]{64}$ ]] || {
+              echo "FATAL: invalid runtime SHA for $path from $image: $pre_sha" >&2
+              exit 1
+            }
+            printf 'pre|1|%s|%s|%s|%s|%s|runtime|%s\n' \
+              "$target" "$arch" "$image" "$digest" "$path" "$pre_sha" >> "$pre_fragment"
+          }
+          for arch in "${runtime_arches[@]}"; do
+            emit_pre_row "${{ matrix.mod }}" "$arch" "$lsio_image" "$image_digest" "$target_path"
+            if [ "${{ matrix.mod }}" = "plex" ]; then
+              emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicuucplex.so.69
+              emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicui18nplex.so.69
+              emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicudataplex.so.69
+            fi
+          done
+
+          render_args=()
+          stage_args=()
+          for arch in "${runtime_arches[@]}"; do
+            artifact_dir="sqlite-artifacts/sqlite-${SQLITE_VERSION}-${artifact_kind}-${arch}"
+            artifact_path="${artifact_dir}/libsqlite3.so"
+            artifact_name="sqlite-${mod_release_tag}-${artifact_kind}-${arch}.so"
+            if [ ! -f "$artifact_path" ]; then
+              echo "FATAL: missing sqlite artifact: $artifact_path" >&2
+              exit 1
+            fi
+            artifact_sha="$(sha256sum "$artifact_path" | awk '{print $1}')"
+            printf '%s  %s\n' "$artifact_sha" "$artifact_name" >> "$sha256sums"
+            render_args+=(--artifact "${arch}:${artifact_name}:${artifact_path}:${target_path}")
+            stage_args+=(--artifact "${arch}:${artifact_path}")
+          done
+
+          if [ "${{ matrix.mod }}" = "plex" ]; then
+            bash tools/render-lsio-mod-baked-pins.sh \
+              --mod plex \
+              --release-tag "$mod_release_tag" \
+              --generated-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --sha256sums "$sha256sums" \
+              --pre-fragment "$pre_fragment" \
+              --pool-baselines pins/plex-pool-patch-baselines.txt \
+              --output "$baked_pins" \
+              "${render_args[@]}"
+            bash tools/stage-lsio-mod.sh \
+              --mod plex \
+              --output-dir "$staged" \
+              --baked-pins "$baked_pins" \
+              --plex-pool-lib lib/plex-pool-patch.sh \
+              "${stage_args[@]}"
+          else
+            bash tools/render-lsio-mod-baked-pins.sh \
+              --mod emby \
+              --release-tag "$mod_release_tag" \
+              --generated-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+              --sha256sums "$sha256sums" \
+              --pre-fragment "$pre_fragment" \
+              --output "$baked_pins" \
+              "${render_args[@]}"
+            bash tools/stage-lsio-mod.sh \
+              --mod emby \
+              --output-dir "$staged" \
+              --baked-pins "$baked_pins" \
+              "${stage_args[@]}"
+          fi
+
+          smoke_ref="ghcr.io/${OWNER_NAME}/${{ matrix.image_name }}:${{ github.run_id }}-${{ matrix.mod }}-${{ matrix.arch_suffix }}-smoke"
+          mod_ref="ghcr.io/${OWNER_NAME}/${{ matrix.image_name }}:${{ github.run_id }}-${{ matrix.mod }}-${{ matrix.arch_suffix }}"
+          # Why: mod-build has no registry credentials, so smoke bakes root-fs into a derived image instead of coupling validation to post-publish install flow.
+          printf 'FROM %s\nCOPY root-fs /\n' "$lsio_image" > "${tmpdir}/Dockerfile.smoke"
+          docker build --rm -t "$smoke_ref" -f "${tmpdir}/Dockerfile.smoke" "$staged"
+          docker build --rm -t "$mod_ref" "$staged"
+
+          smoke_container="sqlite-mod-smoke-${{ github.run_id }}-${{ matrix.mod }}-${{ matrix.arch_suffix }}"
+          logs_file="${tmpdir}/smoke.log"
+          trap 'docker logs "$smoke_container" 2>&1 || true; docker rm -f "$smoke_container" >/dev/null 2>&1 || true' EXIT
+          docker run --detach \
+            --name "$smoke_container" \
+            -e PUID=1000 \
+            -e PGID=1000 \
+            "$smoke_ref"
+          installed_re='event=(installed|skip-already-current)'
+          smoke_ready=0
+          for attempt in $(seq 1 30); do
+            docker logs "$smoke_container" > "$logs_file" 2>&1 || true
+            if grep -Fq 'component=sqlite3-lsio-mod' "$logs_file" && grep -Eq "$installed_re" "$logs_file"; then
+              smoke_ready=1
+              break
+            fi
+            sleep 3
+          done
+          if [ "$smoke_ready" -ne 1 ]; then
+            cat "$logs_file"
+            echo "FATAL: LSIO mod bake-in smoke did not reach install/skip marker" >&2
+            exit 1
+          fi
+          cat "$logs_file"
+          grep -Fq 'component=sqlite3-lsio-mod' "$logs_file"
+          grep -Eq "$installed_re" "$logs_file"
+          grep -Eq "$expected_arch_re" "$logs_file"
+          if [ "${{ matrix.mod }}" = "plex" ] && [ "${{ matrix.arch_suffix }}" = "arm64" ]; then
+            grep -Fq 'event=pool-patch-deferred' "$logs_file"
+          fi
+          bad_signal_re='\bSQLITE_(ERROR|INTERNAL|NOMEM|IOERR|CORRUPT|FULL|CANTOPEN|PROTOCOL|MISMATCH|MISUSE|NOTADB|FORMAT|AUTH)\b|database disk image is malformed|Cannot create table|no such function|no such collation|Failed to open'
+          if grep -Ev '^\[sqlite3-builds-obs\]' "$logs_file" | grep -E "$bad_signal_re"; then
+            echo "FATAL: LSIO mod smoke logs contain SQLite/runtime bad signal" >&2
+            exit 1
+          fi
+          docker rm -f "$smoke_container" >/dev/null 2>&1 || true
+          trap - EXIT
+
+          mkdir -p "mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}"
+          docker save "$mod_ref" -o "mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}/image.tar"
+          printf '%s\n' "$mod_ref" > "mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}/image-ref.txt"
+      - name: Upload mod image artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          path: mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}
+          name: mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}
+          retention-days: 90
+
+  mod-publish:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [release, mod-build]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - name: Set OWNER_NAME Variable
+        env:
+          REPOSITORY_OWNER: ${{ github.repository_owner }}
+        run: |
+          echo "OWNER_NAME=$(echo "${REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')" >> "${GITHUB_ENV}"
+      - name: Login to GHCR
+        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Download mod image artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: mod-image-*
+          path: mod-images
+          merge-multiple: false
+          digest-mismatch: error
+      - name: Promote smoked mod images
+        run: |
+          set -euo pipefail
+          promote_image() {
+            local mod="$1" arch="$2" image_dir source_ref stable_ref
+            image_dir="mod-images/mod-image-${mod}-${arch}"
+            docker load -i "${image_dir}/image.tar"
+            source_ref="$(sed -n '1p' "${image_dir}/image-ref.txt")"
+            stable_ref="ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-${mod}:${GITHUB_REF_NAME}-${arch}"
+            docker tag "$source_ref" "$stable_ref"
+            docker push "$stable_ref"
+          }
+          promote_image plex amd64
+          promote_image plex arm64
+          promote_image emby amd64
+          promote_image emby arm64
+
+          docker manifest create \
+            "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-plex:${GITHUB_REF_NAME}" \
+            "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-plex:${GITHUB_REF_NAME}-amd64" \
+            "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-plex:${GITHUB_REF_NAME}-arm64"
+          docker manifest push "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-plex:${GITHUB_REF_NAME}"
+
+          docker manifest create \
+            "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-emby:${GITHUB_REF_NAME}" \
+            "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-emby:${GITHUB_REF_NAME}-amd64" \
+            "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-emby:${GITHUB_REF_NAME}-arm64"
+          docker manifest push "ghcr.io/${OWNER_NAME}/linuxserver-mod-sqlite3-emby:${GITHUB_REF_NAME}"

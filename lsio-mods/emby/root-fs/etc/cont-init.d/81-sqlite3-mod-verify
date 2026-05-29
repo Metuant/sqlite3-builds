@@ -1,0 +1,16 @@
+#!/usr/bin/with-contenv bash
+set -u
+phase_name="02-verify"
+. /opt/sqlite3-lsio-mod/lib/logging.sh
+. /opt/sqlite3-lsio-mod/lib/sha.sh
+. /opt/sqlite3-lsio-mod/lib/arch.sh
+sqlite3_mod_init_logging
+baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
+selected_arch="$(resolve_arch)" || exit 0
+artifact="/opt/sqlite3-lsio-mod/artifacts/${selected_arch}/libsqlite3.so"
+target_path="/app/emby/lib/libsqlite3.so.3.49.2"
+expected="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="emby" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || log_fatal "mod=emby phase=${phase_name} event=missing-current-row arch=${selected_arch}"
+[ -f "$artifact" ] || log_fatal "mod=emby phase=${phase_name} event=missing-artifact path=${artifact}"
+actual="$(sha256_of "$artifact")"
+[ "$actual" = "$expected" ] || log_fatal "mod=emby phase=${phase_name} event=baked-sha-mismatch expected=${expected} actual=${actual}"
+log_info "mod=emby phase=${phase_name} event=verified arch=${selected_arch}"

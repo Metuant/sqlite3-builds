@@ -10,9 +10,9 @@ milestone lands.
 
 ## 1. Build / variant
 
-- Plex variant builds under **Alpine/musl**; generic variant (Emby +
-  dormant JF) stays Ubuntu/glibc. Multi-stage `docker-library/Dockerfile`
-  selects via `LIBRARY_VARIANT`.
+- Plex variant builds under **Alpine/musl**; generic variant stays
+  Ubuntu/glibc. Multi-stage `docker-library/Dockerfile` selects via
+  `LIBRARY_VARIANT`.
 - `LIBRARY_VARIANT=plex` is limited to the Plex ICU build path.
 - SQLite pins must stay aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `.github/workflows/sqlite-build.yml`,
@@ -38,8 +38,7 @@ milestone lands.
   run this gate.
 - Matrix rows are v2 / v3 / arm64 only; **no x86-64-v4 row** (v4 lib
   SIGILLs in the auto-extension constructor on non-AVX-512 Zen hosts).
-  `resolve_arch` in `scripts/update-sqlite-library.sh.template` downgrades
-  v4-capable hosts to v3.
+  v4-capable amd64 hosts use the v3 artifact.
 - `SQLITE_TEMP_STORE=3` (memory) is a compile-time pin at
   `build/Build.sh:207`. `PRAGMA temp_store=2` is documentation-only
   under that profile (no-op).
@@ -64,39 +63,58 @@ milestone lands.
   array in `.github/workflows/sqlite-build.yml:476-496` keeps the value
   pinned in CI.
 
-## 2. Deploy
+## 2. LSIO mods
 
 - Plex library replacement target: exactly
   `/usr/lib/plexmediaserver/lib/libsqlite3.so`.
 - Emby library replacement target: exactly
   `/app/emby/lib/libsqlite3.so.3.49.2`.
-- Jellyfin replacement target would be
-  `/usr/lib/jellyfin/bin/libe_sqlite3.so`. JF is deferred; deploy-script
-  branch retained but `WARN+continue`.
-- Plex ICU runtime files: deploy scripts MUST NOT touch
-  `libicu*plex.so.69`. Only `libsqlite3.so` is replaced.
-- Plex deploy verifies existing `libicu*plex.so.69` runtime file SHAs
-  against Plex-only manifest rows. Mismatch or missing pin is `FATAL` and
-  exits non-zero; verification MUST NOT replace, rename, move, or delete
-  those ICU files.
-- N=5 bounded upgrade window: deploy assertion accepts current + 4 prior
-  managed-release post SHAs in addition to LSIO-original pre SHAs.
-- Pin manifest schema: metadata row
-  `version|2|managed_window|5|release_tag|<tag>|generated_at|<iso8601-utc-or-unreleased>`,
-  then component rows for sqlite, mimalloc, icu, plex, and emby. `pre` and
-  `post` rows keep the 9-column row schema with row schema token `1`. See
-  Section 8.
-- `assert_pre_replacement_sha` exports `OUT_ASSERTED_SHA`. Callers MUST
-  reuse it (no re-hashing). TOCTOU recheck compares against the exported
-  value.
-- LSIO archive surface is `tar` and `gunzip` only.
-- LSIO `/init` hijacks user commands: `docker run --rm <lsio-image>
-  <user-cmd>` does NOT actually run `<user-cmd>`; use
-  `--entrypoint <cmd>` to bypass.
-- LSIO Emby tagging differs from Plex: Plex `<upstream>`; Emby
-  `version-<upstream>`.
-- LSIO startup hooks assume POSIX/coreutils baseline (`mktemp`, `mkdir`,
-  `cp`, `mv`, `rm`, `sh`, `bash`); non-standard tools preflight-checked.
+- JF deployment is unsupported until a current design and validation plan land.
+- Plex ICU runtime files MUST NOT be replaced, renamed, moved, deleted, or
+  overwritten. Mod code may only read and verify `libicu*plex.so.69`.
+- baked-pins.txt is the only runtime SHA source consumed by LSIO mod scripts.
+- `baked-pins.txt` includes current SQLite rows, per-arch pre rows, Plex ICU
+  runtime pre rows, and Plex PMS / Scanner baseline rows.
+- `baked-pins.txt` row kinds:
+  - `version|2|release_tag|<tag>|generated_at|<iso8601-utc>` is the single
+    metadata row.
+  - `current|1|<target>|<arch>|<artifact_name>|<target_path>|<sha256>` gives
+    each baked `libsqlite3.so` candidate and its runtime replacement path.
+  - `pre|1|<target>|<arch>|<source_image>|<image_digest>|<target_path>|runtime|<sha256>`
+    gives bundled runtime baselines, including Plex ICU siblings.
+  - `pool-pre|1|plex|<arch>|<binary_path>|<sha256>` gives PMS and Plex Media
+    Scanner binary baselines from `pins/plex-pool-patch-baselines.txt`.
+  - `unsupported|<arch>|<reason>` keeps all-arch manifests complete when a
+    supported artifact is unavailable.
+- Runtime mod scripts read no custom env vars. `MOD_INFO` is log-only and
+  `uname -m` is the architecture input.
+- Phase scripts use 80-range names and `#!/usr/bin/with-contenv bash`.
+- LSIO runtime command surface:
+  | Scope | Commands |
+  |---|---|
+  | Common phases | `awk cp grep mkdir mktemp mv rm sed sha256sum tr uname` |
+  | Plex amd64 pool patch only | `dd od printf` |
+- LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
+  package managers, or network access.
+- Phase posture: malformed or missing `baked-pins.txt`, baked artifact
+  mismatch, and selected baked artifact absence are fatal. Unsupported arch,
+  missing target path, runtime Plex ICU mismatch, unknown current target SHA,
+  backup failure, temp-copy failure, and pool-patch drift warn and exit 0.
+- Phase 03 swap skips an unrecognized current target even when a
+  `.bundled.bak` exists; it restores a verified backup only after a failed
+  install attempt.
+- Pool patch is args-only: callers pass every path, SHA, and site tuple.
+  `lib/plex-pool-patch.sh` reads no environment variables and carries no SHA
+  constants.
+- Pool-patch site tuples are
+  `label|offset|write_seek|original_hex|patched_hex`. The writer derives one
+  byte from `patched_hex` at `write_seek - offset` and applies it with
+  `dd conv=notrunc`; original and patched contexts remain per-binary and
+  per-site coupled.
+- Pool patch skips a binary when any site is mixed or unknown. It patches only
+  when all sites are original and the binary SHA matches the `pool-pre` row;
+  it skips when all sites are already patched.
+- Plex arm64 swaps SQLite but does not patch PMS / Scanner pool size.
 
 ## 3. Source
 
@@ -213,16 +231,18 @@ milestone lands.
 - Smoke-step positive-mode marker assertions: aggregate count guard
   `sqlite3_open(_v2|16)?` AND `SQLITE_TRACE_STMT`. Do NOT assert
   `sqlite3_initialize` marker emission.
-- TOCTOU recheck in `scripts/update-sqlite-library.sh.template` MUST
-  stay.
-- `tools/regen-deploy-pins.sh` MUST write atomically; never write
-  directly to the output path.
+- `release` publishes `sqlite-<tag>-*.tar.gz` and `SHA256SUMS`.
+- `mod-build` builds and smokes run-scoped temporary tags only.
+- `mod-publish` is tag-gated, depends on `release` and `mod-build`, and is
+  the only job that pushes stable mod tags or multi-arch manifests.
+- Native arm64 mod lanes use `ubuntu-24.04-arm`; no native arm64 lane uses
+  `--platform`.
 
 ## 6. Scope
 
 - User's "build scripts" scope = `build/` directory ONLY. Does NOT
-  include `scripts/` (deploy + maintenance) or `tools/` (amalgamation
-  patch + CI manifest helpers).
+  include `scripts/` (maintenance helper only) or `tools/` (amalgamation
+  patch + version script + expected-count helpers + LSIO mod tooling).
 - `AGENTS.md` at project root is a symlink to `CLAUDE.md`. Do not
   modify unless explicitly asked.
 
@@ -249,9 +269,14 @@ milestone lands.
 
 ## 8. Versioning
 
-- Release identity uses CalVer tags matching `^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-r[1-9][0-9]*$`; no `v` prefix; always include `-rN`.
-- Every schema-2 manifest MUST include component rows in sqlite, mimalloc, icu, plex, emby order.
-- `generated_at` is an ISO 8601 UTC timestamp; generated unreleased deploy
-  script artifacts use `unreleased`.
-- `tests/check_pin_alignment.sh` enforces mimalloc tuple alignment and ICU workflow env vs Dockerfile ARG/URL-construction alignment.
-- The first CalVer release is a cold start for the managed deploy window.
+- Release identity uses CalVer tags matching
+  `^[0-9]{4}\.[0-9]{2}\.[0-9]{2}-r[1-9][0-9]*$`; no `v` prefix; always
+  include `-rN`.
+- LSIO mod tags mirror repository CalVer release tags one-to-one.
+- No LSIO mod publishes `latest`.
+- `baked-pins.txt` metadata row shape is
+  `version|2|release_tag|<tag>|generated_at|<iso8601-utc>`.
+- `baked-pins.txt` contains no managed-window fields and no `post` rows.
+- Plex runtime ICU `pre` rows live in `baked-pins.txt`.
+- `tests/check_pin_alignment.sh` enforces mimalloc tuple alignment and ICU
+  workflow env vs Dockerfile ARG/URL-construction alignment.

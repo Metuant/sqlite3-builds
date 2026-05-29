@@ -10,10 +10,16 @@
 
 [![Build sqlite](https://github.com/darthShadow/sqlite3-builds/actions/workflows/sqlite-build.yml/badge.svg?event=push)](https://github.com/darthShadow/sqlite3-builds/actions/workflows/sqlite-build.yml)
 
-This fork builds both:
+This fork builds tuned SQLite artifacts for Linux media-server containers:
 
-1. A statically-linked `sqlite3` CLI shell binary (Alpine/musl, x86_64-v3, UPX-compressed)
-2. A `libsqlite3.so` shared library (Ubuntu 24.04/glibc, x86_64-v3)
+- A statically linked `sqlite3` CLI shell binary.
+- A generic `libsqlite3.so` shared library for Emby.
+- A Plex-specific `libsqlite3.so` linked against Plex-renamed ICU 69.
+- Release tarballs plus `SHA256SUMS`.
+- LSIO Docker mod images that replace SQLite in Plex and Emby containers.
+
+CI builds x86-64-v2, x86-64-v3, and arm64 artifacts. x86-64-v4 is not built;
+amd64 hosts that support v4 use the v3 artifact.
 
 ## Compilation Requirements
 
@@ -24,30 +30,50 @@ Docker.
 ```bash
 git clone https://github.com/darthShadow/sqlite3-builds.git
 cd sqlite3-builds
-./build_static_sqlite.sh
+./build/build_static_sqlite.sh
 ```
 
 Compiled files are placed in your local `release` directory:
 
 - `release/cli/` contains `sqlite3` and `sqlite3_orig`
 - `release/library/` contains `libsqlite3.so`
+- `release/library-plex/` contains the Plex `libsqlite3.so` when
+  `LIBRARY_VARIANT=plex` is used
+
+Build the Plex variant locally with:
+
+```bash
+LIBRARY_VARIANT=plex ./build/build_static_sqlite.sh
+```
+
+The LSIO Docker mod path is CI-owned. `mod-build` stages the Plex and Emby mod
+roots, bakes the selected `libsqlite3.so` and `baked-pins.txt` into scratch mod
+images, and smokes the staged root filesystem inside the pinned LSIO base
+images. `mod-publish` publishes stable multi-arch mod tags only for release
+tags.
 
 ## Pre-compiled binary
 
-Pre-compiled artifacts are published on [GitHub Releases][1] when a `v*` tag is pushed, for example `v3.51.0`.
+Pre-compiled artifacts are published on [GitHub Releases][1] for CalVer tags
+matching `YYYY.MM.DD-rN`, for example `2026.05.28-r1`. Tags have no `v`
+prefix and always include `-rN`.
 
 Signing: TODO.
 
 ## Customization
 
-- Change the SQLite version by editing `SQLITE_ZIP_URL` in `build_static_sqlite.sh`.
-- Change CLI compile-time flags in `docker-cli/Build.sh`.
-- Change library compile-time flags in `docker-library/Build.sh`.
-- Keep `SQLite_compressor` empty in `build_static_sqlite.sh` to disable CLI compression.
+- Change SQLite source pins in `build/build_static_sqlite.sh` and keep them
+  aligned with `.github/workflows/sqlite-build.yml`:
+  `SQLITE_AMALG_URL`, `SQLITE_AMALG_SHA3_256`, `SQLITE_SRC_URL`, and
+  `SQLITE_SRC_SHA3_256`.
+- Change CLI and library compile-time flags in `build/Build.sh`.
+- Keep `SQLite_compressor` empty in `build/build_static_sqlite.sh` to disable
+  CLI compression.
 
 ## Motivation
 
-Make a portable optimized `sqlite3` CLI and `libsqlite3.so` library for Linux x86_64-v3 hosts.
+Make portable optimized SQLite CLI, library, and LSIO mod artifacts for Plex
+and Emby on current amd64 and arm64 Linux media-server containers.
 
 
 [1]: https://github.com/darthShadow/sqlite3-builds/releases

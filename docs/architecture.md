@@ -8,11 +8,11 @@ containers.
 It produces:
 
 - A static SQLite CLI binary.
-- A generic `libsqlite3.so` shared library for Emby and the retained JF deploy
-  branch.
+- A generic `libsqlite3.so` shared library for Emby.
 - A Plex-specific `libsqlite3.so` shared library linked to Plex-style ICU 69.
-- Release archives and SHA-256 manifests for deploy hooks.
-- Host and container scripts for library replacement and database maintenance.
+- Release archives and SHA-256 manifests for build outputs.
+- LSIO Docker mod images for Plex and Emby SQLite replacement.
+- Host scripts for planned-downtime database maintenance.
 
 The repository is centered on replacing bundled SQLite libraries while keeping
 the application-owned database semantics intact. Runtime tuning lives in the
@@ -34,13 +34,18 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
 | `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
-| `tests/regen_deploy_pins_test.sh` | Round-trip harness for `tools/regen-deploy-pins.sh`: placeholder substitution, metadata rewriting, `bash -n` validation, and executable rendered-artifact checks. |
-| `tests/assemble_library_pins_test.sh` | Unit tests for `tools/assemble-library-pins.sh`: synthetic SHA256SUMS parsing, plex/emby artifact mapping, prior-post carryover filtering, count-parity guard, and `validate_row` checks; `validate_row` also enforces semantic shape: kind (`pre`|`post`), non-empty target, and `/`-prefixed target_path. |
+| `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/render-lsio-mod-baked-pins.sh`: current rows, pre rows, Plex ICU rows, pool-patch baselines, unsupported rows, and malformed-input rejection. |
+| `tests/cont_init_fragments_test.sh` | Static and unit checks for LSIO mod runtime fragments, phase-script shebangs, no custom env-var surface, and Plex ICU read-only posture. |
+| `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for minimal release assets and split `mod-build` / `mod-publish` jobs. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `tools/expected-sqlite-*-count.txt`. |
 | `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment and ICU workflow/Dockerfile alignment. |
 | `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled in library images and executed only with `RUN_BENCH=1`. |
 | `tools/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
-| `scripts/update-sqlite-library.sh.template` | Source template for the rendered LSIO/container deploy helper that replaces bundled SQLite libraries. |
+| `tools/render-lsio-mod-baked-pins.sh` | Host-runnable renderer for per-mod `baked-pins.txt` runtime SHA data. |
+| `tools/stage-lsio-mod.sh` | Local and CI staging helper that assembles an ephemeral LSIO mod Docker context under `mktemp -d`. |
+| `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared cont-init fragments, and parent README. |
+| `lib/plex-pool-patch.sh` | Args-only shared Plex pool-patch core used by the Plex mod. |
+| `pins/plex-pool-patch-baselines.txt` | PMS and Plex Media Scanner baseline SHA source data rendered into Plex `baked-pins.txt`. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
 | `.dockerignore` | Tight Docker context allowlist for build, Dockerfile, source, script, and test inputs. |
@@ -50,9 +55,11 @@ host application loads SQLite by handle rather than by symbol interposition.
 | Artifact | Source path | Output shape | Consumer |
 |---|---|---|---|
 | Static CLI | `docker-cli/Dockerfile` + `build/Build.sh cli` | `sqlite3`, `sqlite3_orig`, CLI archive | Host-side diagnostics and maintenance |
-| Generic library | `docker-library/Dockerfile` + `build/Build.sh library` | `libsqlite3.so`, library archive | Emby, retained JF deploy branch |
+| Generic library | `docker-library/Dockerfile` + `build/Build.sh library` | `libsqlite3.so`, library archive | Emby |
 | Plex library | `docker-library/Dockerfile` + `LIBRARY_VARIANT=plex` | `libsqlite3.so`, Plex library archive | Plex |
-| `SHA256SUMS` | Release job | Archive SHA plus extracted `.so` SHA for library archives | Deploy script |
+| `SHA256SUMS` | Release job | Archive SHA plus extracted `.so` SHA for library archives | Release users and mod-build verification |
+| Plex LSIO mod image | `lsio-mods/plex` staged by `tools/stage-lsio-mod.sh` | GHCR image `linuxserver-mod-sqlite3-plex:<tag>` | LSIO Plex containers |
+| Emby LSIO mod image | `lsio-mods/emby` staged by `tools/stage-lsio-mod.sh` | GHCR image `linuxserver-mod-sqlite3-emby:<tag>` | LSIO Emby containers |
 
 ## Runtime Targets
 
@@ -60,7 +67,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 |---|---|---|---|---|
 | Plex | Native process using bundled `libsqlite3.so` | `/usr/lib/plexmediaserver/lib/libsqlite3.so` | `plex` | Active |
 | Emby | .NET P/Invoke into bundled SQLite | `/app/emby/lib/libsqlite3.so.3.49.2` | `generic` | Active |
-| JF | .NET SQLitePCLRaw name lookup | `/usr/lib/jellyfin/bin/libe_sqlite3.so` | `generic` | Retained branch, not validated |
+| JF | .NET SQLitePCLRaw name lookup | `/usr/lib/jellyfin/bin/libe_sqlite3.so` | `generic` | Unsupported / out of scope |
 
 See §Out of Scope.
 
@@ -70,7 +77,7 @@ Two shared-library variants are built from the same source tree.
 
 | Variant | Build selector | Added source or linkage | Runtime purpose |
 |---|---|---|---|
-| `generic` | default `LIBRARY_VARIANT=generic` | Amalgamation plus `src/auto_extension.c` | Emby and retained JF deploy branch |
+| `generic` | default `LIBRARY_VARIANT=generic` | Amalgamation plus `src/auto_extension.c` | Emby |
 | `plex` | `LIBRARY_VARIANT=plex` | Generic source plus SQLite `ext/icu/icu.c`, `SQLITE_ENABLE_ICU`, and Plex-style ICU libs | Plex |
 
 The intentional variant delta is ICU support for Plex.
@@ -106,8 +113,9 @@ Plex `icu.c` is compiled with `-DU_HAVE_LIB_SUFFIX=1` and
 names so ICU calls resolve to the `_69_plex`-suffixed symbols exported by the
 suffix-built ICU libraries.
 
-No other target in this repository requires Plex-renamed ICU. Emby and JF do
-not need ICU for their current schemas, so they use the generic library.
+No supported LSIO target in this repository requires Plex-renamed ICU except
+Plex. Emby uses the generic library. JF deployment is out of scope until a
+current design and validation plan land.
 
 ## Build Inputs
 
@@ -283,8 +291,8 @@ carries `fcntl64` or any other glibc-versioned symbol.
 `.github/workflows/sqlite-build.yml` builds on pushes to `main`,
 digit-prefixed tag pushes matching `[0-9]*`, pull requests to `main`, and
 manual dispatch. The release job validates `YYYY.MM.DD-rN` before archive
-assembly, manifest assembly, deploy-script regeneration, or release asset
-publication.
+assembly and release asset publication; `mod-build` and `mod-publish` handle
+LSIO mod images.
 
 The build job uses an architecture matrix:
 
@@ -299,70 +307,56 @@ library.
 
 x86-64-v4 is intentionally absent. GitHub `ubuntu-24.04` runners commonly use
 AMD Zen 3 hosts without AVX-512, and a v4 library SIGILLs in the
-auto-extension constructor. v4-capable hosts receive the v3 artifact through
-the deploy script's `resolve_arch` function.
+auto-extension constructor. v4-capable amd64 hosts receive the v3 artifact.
 
 Each build output is extracted with the pinned Docker-extract action and
 uploaded as a workflow artifact.
 
-Each matrix row also emits a `sqlite-pins-pre-<arch>` artifact containing
-pre-replacement SHA rows for the pinned Plex and Emby LSIO images. The row
-includes target kind, manifest schema, architecture suffix, source image,
-resolved image repo digest, target path, artifact marker, and current bundled
-library SHA. The pinned LSIO images are pulled through `retry-pull` composite
-action steps before `emit_pre_row` reads the cached images.
+The build job no longer emits deploy pre-row fragments. Mod runtime SHA data is
+rendered later by `tools/render-lsio-mod-baked-pins.sh` from same-run build
+artifacts, same-run runtime baseline extraction, and
+`pins/plex-pool-patch-baselines.txt`.
 
-The matrix runs `tests/deploy_assertion_test.sh` after the Emby first-init
-smoke. The test sources `scripts/lib/deploy-assertion.sh` directly and uses a
-synthetic in-script manifest fixture to exercise pre-row, managed-window
-post-row, current-release post-row, unknown-SHA, and target-kind isolation
-behavior without Docker or network access. It covers Plex, the dormant Jellyfin
-skip, and Emby pre-row, managed-window post-row, and unknown-SHA fatal cases.
-The shell coverage also includes `tests/regen_deploy_pins_test.sh`,
-`tests/assemble_library_pins_test.sh`, `tests/check_obs_counts.sh`, and
-`tests/check_pin_alignment.sh`.
+The workflow keeps observability count and ABI obsolete-config checks after
+runtime smokes. Static coverage for the LSIO mod direction lives in
+`tests/render_lsio_mod_baked_pins_test.sh`,
+`tests/cont_init_fragments_test.sh`, and
+`tests/sqlite_build_workflow_mod_only_test.sh`.
 
 ### Release Job
 
-On tag builds, the release job downloads all `sqlite-*` artifacts, archives each
-artifact directory as `.tar.gz`, writes `SHA256SUMS`, adds archive SHAs and
-library extracted-`.so` SHAs, and publishes archives plus `SHA256SUMS`. In
-Plex library deploy archives, `icu_smoke` is excluded so only `libsqlite3.so`
-is published as the deploy artifact.
+The release job runs only for CalVer tags matching
+`YYYY.MM.DD-rN`. It downloads same-run sqlite artifacts, creates the public
+CLI and library tarballs, writes `SHA256SUMS`, and publishes only:
 
-The deploy script consumes this naming contract directly.
+- `sqlite-<tag>-*.tar.gz`
+- `SHA256SUMS`
 
-The release job downloads the matrix `sqlite-pins-pre-*` fragments, fetches up
-to four prior managed-release `SQLITE_LIBRARY_PINS` assets, assembles a new
-`SQLITE_LIBRARY_PINS` manifest, and regenerates `update-sqlite-library.sh` into
-the release-asset workspace before publishing release assets. Missing prior pin
-assets warn and skip; GitHub release API failures fail the job. The
-pre-replacement SHA emission step pulls each pinned LSIO image through the
-`retry-pull` composite action before calling `emit_pre_row`, so transient
-registry failures are retried with backoff.
+It does not fetch prior release metadata, assemble runtime manifests, or
+publish runtime mod metadata.
 
-`tools/assemble-library-pins.sh` derives current-release post rows from
-`SHA256SUMS`, carries current pre rows from matrix fragments, and carries only
-the owning-release post rows from prior manifests so the bounded window does not
-grow transitively.
+### LSIO Mod Jobs
 
-`tools/regen-deploy-pins.sh` reads
-`scripts/update-sqlite-library.sh.template`, substitutes the
-`__SQLITE_LIBRARY_PINS_BLOCK__` placeholder inside the
-`cat <<'PINS_EOF' ... PINS_EOF` heredoc with the assembled manifest content,
-substitutes `__INJECTED_HELPERS__` with the inline deploy helper block
-containing `emit_component_summary` and `assert_pre_replacement_sha`, and
-writes the rendered deploy script to the caller-supplied output path. The
-rendered file is a build artifact, not tracked source; the published release
-asset copy is the authoritative operator artifact for its tag. Operator note:
-run `tools/regen-deploy-pins.sh` with an explicit output path to produce the
-rendered deploy script locally. The write is atomic:
-the tool writes to a pid-suffixed tmp file, verifies the rendered content
-(size, closing sentinel, metadata assignment), then replaces the target via
-`os.replace()`. The release tag comes from the release tag input; `generated_at`
-is captured independently by the assembler or remains `unreleased` for local
-unreleased renders. The post-render syntax check uses `bash -n` because the
-rendered deploy script uses Bash array syntax.
+`mod-build` runs on every push, pull request, and tag; depends on `build`, not
+`release`. It uses a four-lane matrix:
+
+| Mod | Runner | Arch suffix |
+|---|---|---|
+| Plex | `ubuntu-24.04` | `amd64` |
+| Plex | `ubuntu-24.04-arm` | `arm64` |
+| Emby | `ubuntu-24.04` | `amd64` |
+| Emby | `ubuntu-24.04-arm` | `arm64` |
+
+Each lane renders `baked-pins.txt`, stages an ephemeral Docker context under
+`mktemp -d`, builds a run-scoped temporary image tag, and smokes by building a
+throwaway image `FROM` the pinned LSIO base with the staged `root-fs/` copied
+in, then running it so the cont-init phase scripts execute in the real LSIO
+environment. `mod-build` pushes nothing and uploads each mod image as a workflow
+artifact.
+
+`mod-publish` is tag-gated; depends on `release` and `mod-build`. It pushes
+stable per-arch tags and the final multi-arch manifests. It never pushes
+`latest`.
 
 ## Compile Profile
 
@@ -416,7 +410,7 @@ the supported media-server database suffixes:
 |---|---|
 | `com.plexapp.plugins.library.db` | Plex |
 | `/library.db` | Emby and any same-name current target |
-| `/jellyfin.db` | Retained JF branch |
+| `/jellyfin.db` | Legacy JF-style filename filter; deployment unsupported |
 
 Filter details:
 
@@ -460,12 +454,13 @@ Per-connection injection sets `analysis_limit=1024`.
 re-sets `analysis_limit=0` during planned-downtime runs so maintenance
 `optimize()` calls execute without the per-connection ceiling.
 
-The same callback runs for Plex, Emby, and the retained-but-unvalidated JF
-target. PMS issues its own per-connect PRAGMAs after 2-arg `sqlite3_open`
-returns with implicit `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE`, so the
-injected settings are best-effort for Plex and sticky for Emby/JF connections
-that do not run an app-side PRAGMA pass. Analysis and optimization remain in the
-planned-downtime maintenance lifecycle.
+The same callback recognizes Plex, Emby, and the legacy JF-style filename.
+JF deployment is unsupported; the filter remains a library behavior, not a
+current deployment promise. PMS issues its own per-connect PRAGMAs after 2-arg
+`sqlite3_open` returns with implicit `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE`,
+so the injected settings are best-effort for Plex and sticky for Emby
+connections that do not run an app-side PRAGMA pass. Analysis and optimization
+remain in the planned-downtime maintenance lifecycle.
 
 `synchronous` is not set by the callback. The compile profile already gives WAL
 databases the desired synchronous mode, and a connection-level PRAGMA would
@@ -614,7 +609,7 @@ library Docker image.
 
 It proves:
 
-- Plex, Emby, and JF-style database filenames hit the filter.
+- Plex, Emby, and legacy JF-style database filenames hit the filter.
 - A non-target filename misses the filter.
 - Literal kill-switch value `1` disables tuning.
 - A non-`1` kill-switch value does not disable tuning.
@@ -752,130 +747,117 @@ A duplicate disabled-mode smoke starts Emby with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
 `[sqlite3-builds-obs]` line is emitted.
 
-## Deploy Architecture
+## LSIO Mod Architecture
 
-`scripts/update-sqlite-library.sh.template` is the deployment-helper source
-template. Releases publish a rendered `update-sqlite-library.sh` asset with the
-tag-specific `SQLITE_LIBRARY_PINS` manifest embedded.
+The LSIO mods are the supported deployment surface for SQLite replacement.
+There is no non-LSIO runtime replacement path in the current architecture.
 
-It requires exactly one positional target:
+Each mod image is `FROM scratch` and contains a staged `root-fs/` copied into
+the LSIO container by the Docker Mods loader. Phase scripts run from
+`/etc/cont-init.d/` with `#!/usr/bin/with-contenv bash`.
+
+Runtime installed files:
 
 ```text
-update-sqlite-library.sh emby
-update-sqlite-library.sh jellyfin
-update-sqlite-library.sh plex
+/opt/sqlite3-lsio-mod/baked-pins.txt
+/opt/sqlite3-lsio-mod/artifacts/<arch>/libsqlite3.so
+/opt/sqlite3-lsio-mod/lib/logging.sh
+/opt/sqlite3-lsio-mod/lib/arch.sh
+/opt/sqlite3-lsio-mod/lib/sha.sh
+/opt/sqlite3-lsio-mod/lib/swap.sh
 ```
 
-The `jellyfin` branch is retained but not validated in this cycle.
+Plex also installs:
 
-Target table:
+```text
+/opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh
+```
 
-| Target | Archive | Destination |
+`baked-pins.txt` is the only runtime SHA source. It includes current SQLite
+artifact rows, per-architecture bundled target pre rows, Plex ICU runtime pre
+rows, and PMS / Plex Media Scanner pool-patch baseline rows.
+
+Row kinds:
+
+| Row kind | Key fields | Runtime use |
 |---|---|---|
-| `emby` | `sqlite-${TAG}-library-${arch}.tar.gz` | `/app/emby/lib/libsqlite3.so.3.49.2` |
-| `jellyfin` | `sqlite-${TAG}-library-${arch}.tar.gz` | `/usr/lib/jellyfin/bin/libe_sqlite3.so` |
-| `plex` | `sqlite-${TAG}-library-plex-${arch}.tar.gz` | `/usr/lib/plexmediaserver/lib/libsqlite3.so` |
+| `version` | schema version, release tag, generation timestamp | Schema and release identity |
+| `current` | target, arch, artifact name, target path, SHA-256 | Select and verify the baked `libsqlite3.so` |
+| `pre` | target, arch, source image, image digest, runtime path, SHA-256 | Classify bundled runtime files and verify Plex ICU closure |
+| `pool-pre` | target, arch, PMS or Scanner binary path, SHA-256 | Verify Plex pool-patch binary baselines |
+| `unsupported` | arch, reason | Keep all-arch manifests complete when an artifact is unavailable |
 
-Deploy flow:
+The manifest is all-arches. It contains no managed-window fields and no `post`
+rows.
 
-1. Preflight required commands.
-2. Resolve `TAG` from the latest GitHub release redirect when `TAG` is unset.
-3. Resolve the architecture suffix from `uname -m` and CPU features.
-4. Select the target archive and destination path.
-5. Warn and exit successfully when the destination path is absent.
-6. Assert the current destination SHA against the embedded
-   `SQLITE_LIBRARY_PINS` manifest before any release-asset download.
-7. Exit successfully when the current SHA matches the current-release post row.
-8. Download `SHA256SUMS` and look up archive plus extracted-`.so` SHAs.
-9. Download and verify the archive.
-10. Reject unsafe tar members before extraction.
-11. Extract and verify `libsqlite3.so`.
-12. Back up the current destination.
-13. Copy to a same-directory temp path, verify it, replace with `mv`, verify the
-    destination, and roll back from the fresh backup on replacement failure.
+The phase order is:
 
-The missing-target skip is deliberate because a shared LSIO hook can run in a
-container filesystem that does not expose another app's library path.
+| Script | Purpose | Failure posture |
+|---|---|---|
+| `80-sqlite3-mod-preflight` | logging setup, command checks, target detection, arch selection | Fatal on missing or malformed `baked-pins.txt`; warn and exit 0 for unsupported arch, missing target, or missing non-fatal common command |
+| `81-sqlite3-mod-verify` | baked artifact SHA checks and Plex ICU runtime closure verification | Fatal on missing selected artifact, baked artifact SHA mismatch, or missing current row; warn and exit 0 on runtime Plex ICU mismatch |
+| `82-sqlite3-mod-swap` | target classification, backup preservation, SQLite replacement | Warn and exit 0 on missing target, unknown target SHA, backup failure, temp-copy failure, or final move failure |
+| `83-sqlite3-mod-pool-patch` | Plex-only amd64 pool patch; arm64 logs deferred | Warn and exit 0 when SQLite is not current, pool rows are missing, binary state is unknown, or patch verification fails |
 
-The atomic replacement step uses a temp file in the destination directory so
-the final `mv` stays on the same filesystem.
+The mod preserves one `.bundled.bak` beside every mutated target. It never
+overwrites or deletes that backup.
 
-The script must not touch Plex's `libicu*plex.so.69` files. Plex keeps using
-those runtime ICU libraries directly, and the Plex SQLite variant only replaces
-`libsqlite3.so`.
+Phase 03 swap behavior:
 
-### Library Pin Manifest
+| Current target SHA | Backup state | Action |
+|---|---|---|
+| Matches current mod SHA | Any | Skip; already applied |
+| Matches bundled baseline | Absent | Copy backup with `cp -n`, then install from a same-directory temp file |
+| Matches bundled baseline | Present | Reuse backup, then install from a same-directory temp file |
+| Unknown | Any | Warn and skip without restoring or reclassifying |
+| Install failure after mutation attempt | Verified bundled backup present | Restore backup, warn on restore mismatch, exit 0 |
 
-`SQLITE_LIBRARY_PINS` is a release asset and is also embedded in the generated
-release asset copy of `update-sqlite-library.sh`.
+Plex ICU runtime files are read-only inputs to LSIO mod code. The Plex mod
+checks `libicuucplex.so.69`, `libicui18nplex.so.69`, and
+`libicudataplex.so.69` against `pre` rows before SQLite replacement. It must
+not replace, rename, move, delete, or overwrite those files.
 
-The manifest schema is pipe-delimited:
+Phase 04 pool patch runs only in the Plex mod. Arm64 logs
+`event=pool-patch-deferred` and exits 0. On amd64, the phase first verifies
+that the SQLite target is already current, then calls
+`lib/plex-pool-patch.sh` with all paths, expected SHAs, and patch sites as
+arguments. The library reads no environment variables and carries no SHA
+constants.
 
-```text
-# SQLITE_LIBRARY_PINS schema=2
-version|2|managed_window|5|release_tag|<tag>|generated_at|<iso8601-utc-or-unreleased>
-component|sqlite|3.53.1
-component|mimalloc|3.3.2
-component|icu|69.1
-component|plex|1.42.2
-component|emby|version-4.9.3.0
-```
+Pool-patch site tuples are
+`label|offset|write_seek|original_hex|patched_hex`. Each tuple binds the site
+label, the 16-byte read offset, the byte write offset, and the full original
+and patched contexts for one binary. The writer derives the single byte to
+write from `patched_hex` at `write_seek - offset` and writes it with
+`dd conv=notrunc`.
 
-`pre` and `post` data rows keep the 9-column row schema:
+Current amd64 sites:
 
-```text
-kind|schema|target|arch|source|source_digest|target_path|artifact|sha256
-```
+| Binary | Offset label | Offset decimal | Write seek |
+|---|---:|---:|---:|
+| `/usr/lib/plexmediaserver/Plex Media Server` | `0xae4a17` | `11422231` | `11422232` |
+| `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x36f06d` | `3600493` | `3600494` |
+| `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x38b37b` | `3715963` | `3715964` |
 
-`pre` rows describe the bundled library SHA in the pinned LSIO runtime image
-before replacement. `post` rows describe managed deployed library SHAs derived
-from release `SHA256SUMS` extracted-`.so` entries. The managed window is five
-releases: the current release plus four prior managed releases.
+Pool-patch per-binary behavior:
 
-### Pre-replacement Assertion
+| Site state | Baseline SHA / backup state | Action |
+|---|---|---|
+| All sites patched | Any | Skip; already patched |
+| All sites original | Current binary SHA matches `pool-pre`; backup absent | Copy backup, then patch each site in place |
+| All sites original | Current binary SHA matches `pool-pre`; verified backup present | Reuse backup, then patch each site in place |
+| Mixed or unknown | Any | Warn and skip that binary |
+| Write or verify failure | Verified backup present | Restore backup, warn, and continue to the next binary |
 
-Before downloading release artifacts, the rendered `update-sqlite-library.sh`
-computes the current target library SHA and checks it against
-`SQLITE_LIBRARY_PINS`.
+Runtime command surface:
 
-The assertion passes only when the current SHA matches a same-target,
-same-architecture, same-path `pre` row or a managed-window `post` row. A
-current-release `post` row exits successfully as already deployed. An unknown
-SHA is fatal with no bypass environment variable.
+| Scope | Commands |
+|---|---|
+| Common phases | `awk cp grep mkdir mktemp mv rm sed sha256sum tr uname` |
+| Plex amd64 pool patch only | `dd od printf` |
 
-The dormant Jellyfin branch warns and skips the pin assertion because this
-cycle does not validate JF deployment.
-
-`tools/regen-deploy-pins.sh` inlines the deploy helper block containing
-`emit_component_summary` and `assert_pre_replacement_sha` into the deploy script
-at render time through the `__INJECTED_HELPERS__` placeholder, so the release
-asset has zero runtime file dependencies beyond the script itself. After the
-assertion passes, the deploy script captures the verified SHA and performs a
-TOCTOU recheck immediately before backup and replacement to guard against
-concurrent mutations.
-
-## Deploy Tool Surface
-
-Release archives are `.tar.gz` because LSIO containers provide `tar` and
-`gunzip` as the reliable archive surface.
-
-The deploy script assumes this POSIX/coreutils baseline is present in LSIO
-containers and does not preflight it:
-
-```text
-mktemp mkdir cp mv rm sh bash
-```
-
-LSIO-non-standard startup-hook tools are not guaranteed. The current deploy
-script explicitly preflights:
-
-```text
-curl sha256sum awk tar uname grep sed
-```
-
-Any added LSIO-non-standard deploy-time tool must be explicitly preflighted. Do
-not assume LSIO images contain `unzip`, `jq`, Python, or package managers at
-startup.
+LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
+package managers, or network access.
 
 ## Maintenance Architecture
 
@@ -949,8 +931,9 @@ mismatch.
 Plex ICU:
 
 - Plex's renamed ICU 69 files are runtime dependencies.
-- Deploy scripts must not replace, delete, move, or rename `libicu*plex.so.69`.
-- The Plex variant may link to those files but only deploys `libsqlite3.so`.
+- LSIO mod code must not replace, delete, move, rename, or overwrite
+  `libicu*plex.so.69`; it may only read and verify those files.
+- The Plex variant may link to those files but only replaces `libsqlite3.so`.
 - The Plex variant links `-licuucplex -licui18nplex -licudataplex` inside
   `-Wl,--push-state,--no-as-needed` and `-Wl,--pop-state` so modern binutils
   default `--as-needed` does not drop the ICU `DT_NEEDED` entries.
@@ -971,11 +954,12 @@ SHA pins:
 - ICU pins drive only the Plex variant.
 - Workflow, local wrapper, Dockerfiles, and `Build.sh` must stay aligned.
 
-Archive naming:
+Release artifacts:
 
-- Deploy archive names must match workflow release output.
+- Release archive names must match workflow release output.
 - Library archives must have extracted-`.so` SHA entries in `SHA256SUMS`.
-- The deploy script's synthetic `.so` lookup depends on archive basename rules.
+- LSIO mod runtime verification uses `baked-pins.txt`, not release archive
+  basename rules.
 
 Plex target path:
 
@@ -985,11 +969,12 @@ Plex target path:
 
 LSIO tool surface:
 
-- Use `.tar.gz` archives.
-- Rely on `tar` and `gunzip` for extraction.
-- Assume the LSIO POSIX/coreutils baseline: `mktemp`, `mkdir`, `cp`, `mv`,
-  `rm`, standard `sh`, and `bash`.
-- Preflight LSIO-non-standard startup-hook tools before use.
+- Perform no runtime archive download or extraction.
+- Common phases use `awk`, `cp`, `grep`, `mkdir`, `mktemp`, `mv`, `rm`, `sed`,
+  `sha256sum`, `tr`, and `uname`.
+- Plex amd64 pool patch additionally uses `dd`, `od`, and `printf`.
+- Do not depend on `curl`, `tar`, `gunzip`, Python, `jq`, package managers, or
+  network access at runtime.
 
 Auto-extension:
 
@@ -1020,22 +1005,20 @@ M-series invariants:
   build with patch's native error message. `tools/sqlite-amalgamation.patch` is
   the single locus of amalgamation modifications.
 
-Pin manifest:
+Baked pin manifest:
 
-- The managed deploy window is current plus four prior releases.
-- `SQLITE_LIBRARY_PINS` uses schema version 2: metadata row
-  `version|2|managed_window|5|release_tag|<tag>|generated_at|<iso8601-utc-or-unreleased>`,
-  then five component rows in fixed order: sqlite, mimalloc, icu, plex, emby.
-- `generated_at` is independent of the release tag: published manifests use an
-  ISO 8601 UTC timestamp, local unreleased renders use `unreleased`, and
-  release-tag equality is rejected.
+- `baked-pins.txt` uses schema version 2: metadata row
+  `version|2|release_tag|<tag>|generated_at|<iso8601-utc>`.
+- It contains current SQLite artifact rows, per-architecture bundled target
+  pre rows, Plex ICU runtime pre rows, and PMS / Plex Media Scanner pool-patch
+  baseline rows.
 - Missing `docker image inspect` repo digest for a pinned LSIO image is a CI
   failure.
-- Deploy-script SHA mismatch has no bypass environment variable.
-- The release asset copy of `update-sqlite-library.sh` is the authoritative
-  script for a release tag; the rendered script is a build artifact.
+- Runtime SHA mismatch has no bypass environment variable.
+- LSIO mod images are the authoritative SQLite replacement artifact for a
+  release tag.
 
 ## Out of Scope
 
-JF deploy is retained but not validated in this cycle. JF maintenance is absent;
-adding it requires design and validation before use.
+JF deployment is unsupported until a current design and validation plan land. JF
+maintenance is absent; adding it requires design and validation before use.

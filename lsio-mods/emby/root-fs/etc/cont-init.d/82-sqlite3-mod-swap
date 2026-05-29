@@ -1,0 +1,38 @@
+#!/usr/bin/with-contenv bash
+set -u
+phase_name="03-swap"
+. /opt/sqlite3-lsio-mod/lib/logging.sh
+. /opt/sqlite3-lsio-mod/lib/sha.sh
+. /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/swap.sh
+sqlite3_mod_init_logging
+baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
+target_path="/app/emby/lib/libsqlite3.so.3.49.2"
+selected_arch="$(resolve_arch)" || exit 0
+artifact="/opt/sqlite3-lsio-mod/artifacts/${selected_arch}/libsqlite3.so"
+current_sha="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="emby" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || exit 0
+baseline_sha="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="pre" && $3=="emby" && $4==arch && $7==target { print $9; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || exit 0
+[ -f "$target_path" ] || { log_warn "mod=emby phase=${phase_name} event=missing-target target_path=${target_path}"; exit 0; }
+target_sha="$(sha256_of "$target_path")"
+# Why: a verified .bundled.bak stays immutable so recovery keeps a known-good bundled binary.
+bak="${target_path}.bundled.bak"
+if [ "$target_sha" = "$current_sha" ]; then log_info "mod=emby phase=${phase_name} event=skip-already-current target_path=${target_path}"; exit 0; fi
+# Why: unknown target SHAs skip instead of restoring so we do not downgrade a legitimately updated binary.
+if [ "$target_sha" != "$baseline_sha" ]; then
+  log_warn "mod=emby phase=${phase_name} event=unknown-target-sha target_path=${target_path} current_sha=${target_sha}"
+  exit 0
+elif [ ! -f "$bak" ]; then
+  cp "$target_path" "$bak" || { log_warn "mod=emby phase=${phase_name} event=bak-write-failed target_path=${target_path}"; exit 0; }
+fi
+if ! install_sqlite_artifact "$artifact" "$target_path" "$current_sha"; then
+  if [ -f "$bak" ] && [ "$(sha256_of "$bak")" = "$baseline_sha" ]; then
+    if cp -f "$bak" "$target_path"; then
+      restored_sha="$(sha256_of "$target_path")"
+      [ "$restored_sha" = "$baseline_sha" ] || log_warn "mod=emby phase=${phase_name} event=restore-reclassify-mismatch target_path=${target_path} expected=${baseline_sha} actual=${restored_sha}"
+    else
+      log_warn "mod=emby phase=${phase_name} event=restore-failed target_path=${target_path}"
+    fi
+  fi
+  exit 0
+fi
+log_info "mod=emby phase=${phase_name} event=installed target_path=${target_path} sha256=${current_sha}"
