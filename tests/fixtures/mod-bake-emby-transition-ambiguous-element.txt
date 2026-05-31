@@ -1,0 +1,2 @@
+event=config-updated tag=MaxLibraryDbConnections
+event=config-updated tag=MaxLibraryDatabaseConnections

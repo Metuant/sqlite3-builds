@@ -1,6 +1,10 @@
 #!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# shellcheck source=/dev/null
 set -u
 phase_name="01-preflight"
+# validate_baked_pins_schema reads mod_target when this script runs in-place.
+# shellcheck disable=SC2034
 mod_target="emby"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh

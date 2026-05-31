@@ -1,0 +1,2 @@
+[sqlite3-builds-obs] api sqlite3_open_v2 path=/config/library.db rc=0
+Sqlite version: 3.53.1

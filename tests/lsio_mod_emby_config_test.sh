@@ -104,6 +104,7 @@ setup_case() {
   cp lsio-mods/shared/cont-init-fragments/sha.sh "$lib_root/sha.sh"
   cp lsio-mods/shared/cont-init-fragments/arch.sh "$lib_root/arch.sh"
   cp lsio-mods/shared/cont-init-fragments/atomic-write.sh "$lib_root/atomic-write.sh"
+  # shellcheck source=/dev/null
   . "$lib_root/atomic-write.sh"
 
   cat > "$runtime_lib_dir/libsqlite3.so.3.49.2" <<'EOF_SQLITE'

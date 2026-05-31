@@ -1,0 +1,2 @@
+application boot
+[sqlite3-builds-obs] trace SQLITE_TRACE_STMT select 1

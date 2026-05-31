@@ -1,0 +1,2 @@
+component=sqlite3-lsio-mod phase=03-swap event=skip-already-current arch=linux-x86_64-v2
+component=sqlite3-lsio-mod phase=03-swap event=installed arch=linux-x86_64-v2

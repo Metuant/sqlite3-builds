@@ -68,10 +68,10 @@ COPY build/Build.sh /app/Build.sh
 COPY src/auto_extension.c /app/auto_extension.c
 COPY src/observability.c /app/observability.c
 COPY src/slow_query_tracker.c /app/slow_query_tracker.c
-COPY tools/sqlite-amalgamation.patch /app/tools/sqlite-amalgamation.patch
-COPY tools/expected-sqlite-config-count.txt /app/tools/expected-sqlite-config-count.txt
-COPY tools/expected-sqlite-dbconfig-count.txt /app/tools/expected-sqlite-dbconfig-count.txt
-COPY tools/libsqlite3-version-script.ld /app/tools/libsqlite3-version-script.ld
+COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
+COPY build/expected-sqlite-config-count.txt /app/build/expected-sqlite-config-count.txt
+COPY build/expected-sqlite-dbconfig-count.txt /app/build/expected-sqlite-dbconfig-count.txt
+COPY build/libsqlite3-version-script.ld /app/build/libsqlite3-version-script.ld
 COPY tests/ /app/tests/
 
 RUN chmod +x /app/Build.sh

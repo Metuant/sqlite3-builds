@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 set -euo pipefail
 
 find lsio-mods -type f \( -name '*.sh' -o -name run \) -print -exec bash -n {} \;
-bash -n tools/stage-lsio-mod.sh
+bash -n tools/lsio-mod/stage-lsio-mod.sh
 
 for script in \
   lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-preflight/run \

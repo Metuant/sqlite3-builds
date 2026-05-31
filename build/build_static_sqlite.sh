@@ -1,4 +1,6 @@
 #!/bin/sh
+# Intentionally unquoted command fragments preserve optional sudo invocation.
+# shellcheck disable=SC2086
 set -eu
 
 SQLITE_AMALG_URL='https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip'
@@ -18,6 +20,8 @@ DockerLibraryImage='static-sqlite3-library'
 ### No user intervention below this point ######################################
 
 onErr(){
+  # Existing /bin/sh wrapper relies on shell-local support where it runs.
+  # shellcheck disable=SC3043
   local msg errNum
   msg="${1}"
   errNum=$2

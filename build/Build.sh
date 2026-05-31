@@ -33,7 +33,7 @@ case "${target}" in
   library)
     target_cflags="-DSQLITE_ENABLE_NORMALIZE -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS -DSQLITE_ENABLE_UNLOCK_NOTIFY -DSQLITE_DEFAULT_PCACHE_INITSZ=256 -DSQLITE_DEFAULT_MEMSTATUS=0"
     sources="sqlite3.c /app/auto_extension.c /app/observability.c /app/slow_query_tracker.c"
-    target_ldflags="-fPIC -shared -Wl,-z,defs -Wl,--version-script=/app/tools/libsqlite3-version-script.ld -lm -ldl -pthread"
+    target_ldflags="-fPIC -shared -Wl,-z,defs -Wl,--version-script=/app/build/libsqlite3-version-script.ld -lm -ldl -pthread"
     output="dist/libsqlite3.so"
     MIMALLOC_OBJ="${MIMALLOC_OBJ:-/opt/mimalloc/lib/mimalloc.o}"
     MIMALLOC_LIB="${MIMALLOC_LIB:-/opt/mimalloc/lib/libmimalloc.a}"
@@ -134,7 +134,7 @@ if [ "${target}" = "library" ]; then
     exit 1
   fi
 
-  patch -p1 < /app/tools/sqlite-amalgamation.patch
+  patch -p1 < /app/build/sqlite-amalgamation.patch
 fi
 
 printf "\n\n===== Compiling... Please wait... ==============================================\n\n"
@@ -143,6 +143,8 @@ printf "\n\n===== Compiling... Please wait... ==================================
 # SQLITE_ENABLE_UPDATE_DELETE_LIMIT is inactive on amalgamation builds (requires Lemon parser regen).
 # SQLITE_MAX_EXPR_DEPTH=0 disables runtime depth checks; relies on MAX_LENGTH/MAX_SQL_LENGTH for DoS protection.
 # SQLITE_THREADSAFE=2 is Multi-thread (no per-connection mutex); PMS and Emby call sqlite3_config(SQLITE_CONFIG_MULTITHREAD) at startup, Emby calls it twice per startup and also passes SQLITE_OPEN_NOMUTEX -- neither shares sqlite3* handles across threads.
+# Build flag groups are space-delimited argument vectors.
+# shellcheck disable=SC2086
 if ! ${CC:-gcc} \
   -O3 \
   -march="${MARCH}" \
@@ -260,19 +262,19 @@ if [ "${target}" = "library" ]; then
   missing_obs_entry=0
   config_names="$(grep -E '^#define SQLITE_CONFIG_[A-Z0-9_]+[[:space:]]+[0-9]+' sqlite3.h | awk '$2 !~ /_MAX$/ {print $2}')"
   config_count="$(printf "%s\n" "${config_names}" | awk 'NF { count++ } END { print count + 0 }')"
-  if [ ! -f /app/tools/expected-sqlite-config-count.txt ]; then
-    printf "FATAL: /app/tools/expected-sqlite-config-count.txt not found (regenerate from sqlite3.h #define SQLITE_CONFIG_* count if SQLite was bumped)\n" >&2
+  if [ ! -f /app/build/expected-sqlite-config-count.txt ]; then
+    printf "FATAL: /app/build/expected-sqlite-config-count.txt not found (regenerate from sqlite3.h #define SQLITE_CONFIG_* count if SQLite was bumped)\n" >&2
     exit 1
   fi
-  expected_config_count="$(tr -d '[:space:]' < /app/tools/expected-sqlite-config-count.txt)"
+  expected_config_count="$(tr -d '[:space:]' < /app/build/expected-sqlite-config-count.txt)"
   case "${expected_config_count}" in
     ''|*[!0-9]*)
-      printf "FATAL: /app/tools/expected-sqlite-config-count.txt contains non-numeric content: '%s' (regenerate from sqlite3.h #define SQLITE_CONFIG_* count)\n" "${expected_config_count}" >&2
+      printf "FATAL: /app/build/expected-sqlite-config-count.txt contains non-numeric content: '%s' (regenerate from sqlite3.h #define SQLITE_CONFIG_* count)\n" "${expected_config_count}" >&2
       exit 1
       ;;
   esac
   if [ "${config_count}" -ne "${expected_config_count}" ]; then
-    printf "FATAL: extracted %s SQLITE_CONFIG_* names from sqlite3.h; expected exactly %s (regenerate tools/expected-sqlite-config-count.txt if SQLite was bumped)\n" \
+    printf "FATAL: extracted %s SQLITE_CONFIG_* names from sqlite3.h; expected exactly %s (regenerate build/expected-sqlite-config-count.txt if SQLite was bumped)\n" \
       "${config_count}" "${expected_config_count}" >&2
     exit 1
   fi
@@ -288,19 +290,19 @@ if [ "${target}" = "library" ]; then
   done
   dbconfig_names="$(grep -E '^#define SQLITE_DBCONFIG_[A-Z0-9_]+[[:space:]]+[0-9]+' sqlite3.h | awk '$2 != "SQLITE_DBCONFIG_MAX" {print $2}')"
   dbconfig_count="$(printf "%s\n" "${dbconfig_names}" | awk 'NF { count++ } END { print count + 0 }')"
-  if [ ! -f /app/tools/expected-sqlite-dbconfig-count.txt ]; then
-    printf "FATAL: /app/tools/expected-sqlite-dbconfig-count.txt not found (regenerate from sqlite3.h #define SQLITE_DBCONFIG_* count if SQLite was bumped)\n" >&2
+  if [ ! -f /app/build/expected-sqlite-dbconfig-count.txt ]; then
+    printf "FATAL: /app/build/expected-sqlite-dbconfig-count.txt not found (regenerate from sqlite3.h #define SQLITE_DBCONFIG_* count if SQLite was bumped)\n" >&2
     exit 1
   fi
-  expected_dbconfig_count="$(tr -d '[:space:]' < /app/tools/expected-sqlite-dbconfig-count.txt)"
+  expected_dbconfig_count="$(tr -d '[:space:]' < /app/build/expected-sqlite-dbconfig-count.txt)"
   case "${expected_dbconfig_count}" in
     ''|*[!0-9]*)
-      printf "FATAL: /app/tools/expected-sqlite-dbconfig-count.txt contains non-numeric content: '%s' (regenerate from sqlite3.h #define SQLITE_DBCONFIG_* count)\n" "${expected_dbconfig_count}" >&2
+      printf "FATAL: /app/build/expected-sqlite-dbconfig-count.txt contains non-numeric content: '%s' (regenerate from sqlite3.h #define SQLITE_DBCONFIG_* count)\n" "${expected_dbconfig_count}" >&2
       exit 1
       ;;
   esac
   if [ "${dbconfig_count}" -ne "${expected_dbconfig_count}" ]; then
-    printf "FATAL: extracted %s SQLITE_DBCONFIG_* names from sqlite3.h; expected exactly %s (regenerate tools/expected-sqlite-dbconfig-count.txt if SQLite was bumped)\n" \
+    printf "FATAL: extracted %s SQLITE_DBCONFIG_* names from sqlite3.h; expected exactly %s (regenerate build/expected-sqlite-dbconfig-count.txt if SQLite was bumped)\n" \
       "${dbconfig_count}" "${expected_dbconfig_count}" >&2
     exit 1
   fi

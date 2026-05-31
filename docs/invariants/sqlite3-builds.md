@@ -125,7 +125,7 @@ milestone lands.
 
 ## 3. Source
 
-- `tools/sqlite-amalgamation.patch` is the M7 invariant: source-level
+- `build/sqlite-amalgamation.patch` is the M7 invariant: source-level
   amalgamation patching via a checked-in unified diff.
 - Six wrapper-target functions (`sqlite3_initialize`, `sqlite3_config`,
   `sqlite3_db_config`, `sqlite3_open`, `sqlite3_open_v2`,
@@ -133,7 +133,7 @@ milestone lands.
   fails on rename-drift.
 - `sqlite3_enable_shared_cache` no-op stub at `src/auto_extension.c:6-15`
   is load-bearing for the Plex variant. **KEEP byte-for-byte intact.**
-- `tools/libsqlite3-version-script.ld` is load-bearing for symbol-export
+- `build/libsqlite3-version-script.ld` is load-bearing for symbol-export
   discipline: exact list from the pinned `sqlite3.h` plus
   `auto_extension_path_is_target`, `auto_extension_sorterref_cfg_rc`,
   `auto_extension_pmasz_cfg_rc`, and `sqlite3_enable_shared_cache`, then
@@ -148,8 +148,8 @@ milestone lands.
   require an explicit case with verified arity; consolidating,
   reordering, or dropping any existing case-arm corrupts the va_list
   dispatch for the affected opcodes. `tests/check_obs_counts.sh` plus
-  expected-count files (`tools/expected-sqlite-config-count.txt`,
-  `tools/expected-sqlite-dbconfig-count.txt`) are the drift detector.
+  expected-count files (`build/expected-sqlite-config-count.txt`,
+  `build/expected-sqlite-dbconfig-count.txt`) are the drift detector.
 - Observability constructor priority: 101.
 - Auto-extension callback must NEVER make `sqlite3_open*` fail.
 - Read-only opens stay quiet for PRAGMA emission; observability is

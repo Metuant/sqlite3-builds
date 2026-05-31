@@ -1,4 +1,6 @@
 #!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+# shellcheck source=/dev/null
 set -u
 phase_name="02-verify"
 . /opt/sqlite3-lsio-mod/lib/logging.sh

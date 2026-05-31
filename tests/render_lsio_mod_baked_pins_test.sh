@@ -24,7 +24,7 @@ cat > "$tmp/pool" <<'EOF_POOL'
 plex|linux-x86_64-v3|/usr/lib/plexmediaserver/Plex Media Server|4444444444444444444444444444444444444444444444444444444444444444
 EOF_POOL
 
-bash tools/render-lsio-mod-baked-pins.sh \
+bash tools/lsio-mod/render-lsio-mod-baked-pins.sh \
   --mod plex \
   --release-tag 2026.05.28-r1 \
   --generated-at 2026-05-28T00:00:00Z \
@@ -49,7 +49,7 @@ if grep -Eq 'managed_window|post[|]' "$tmp/baked-pins.txt"; then
   exit 1
 fi
 
-bash tools/render-lsio-mod-baked-pins.sh \
+bash tools/lsio-mod/render-lsio-mod-baked-pins.sh \
   --mod emby \
   --release-tag 2026.05.28-r1 \
   --generated-at 2026-05-28T00:00:00Z \
@@ -69,7 +69,7 @@ if grep -Fq 'pool-pre|' "$tmp/baked-pins-emby.txt"; then
   exit 1
 fi
 
-bash tools/stage-lsio-mod.sh \
+bash tools/lsio-mod/stage-lsio-mod.sh \
   --mod emby \
   --output-dir "$tmp/staged-emby" \
   --baked-pins "$tmp/baked-pins-emby.txt" \
@@ -83,7 +83,7 @@ if [ -d "$tmp/staged-emby/root-fs/etc/cont-init.d" ]; then
   exit 1
 fi
 
-bash tools/stage-lsio-mod.sh \
+bash tools/lsio-mod/stage-lsio-mod.sh \
   --mod plex \
   --output-dir "$tmp/staged-plex" \
   --baked-pins "$tmp/baked-pins.txt" \
@@ -91,7 +91,7 @@ bash tools/stage-lsio-mod.sh \
 test -f "$tmp/staged-plex/root-fs/opt/sqlite3-lsio-mod/lib/atomic-write.sh"
 test -f "$tmp/staged-plex/root-fs/opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh"
 
-bash tools/render-lsio-mod-baked-pins.sh \
+bash tools/lsio-mod/render-lsio-mod-baked-pins.sh \
   --mod emby \
   --release-tag 2026.05.28-r1 \
   --generated-at 2026-05-28T00:00:00Z \
@@ -105,7 +105,7 @@ grep -Fxq 'unsupported|linux-x86_64-v2|missing-artifact:sqlite-2026.05.28-r1-lib
 cat > "$tmp/bad-pre" <<'EOF_BAD_PRE'
 pre|1|emby|linux-x86_64-v3|lscr.io/linuxserver/emby:version-4.9.3.0|sha256:image|/app/emby/lib/libsqlite3.so.3.49.2|runtime|not-a-sha
 EOF_BAD_PRE
-if bash tools/render-lsio-mod-baked-pins.sh \
+if bash tools/lsio-mod/render-lsio-mod-baked-pins.sh \
   --mod emby \
   --release-tag 2026.05.28-r1 \
   --generated-at 2026-05-28T00:00:00Z \
@@ -118,12 +118,12 @@ if bash tools/render-lsio-mod-baked-pins.sh \
 fi
 grep -Fq 'FATAL: invalid pre row SHA:' "$tmp/bad-pre.err"
 
-if bash tools/render-lsio-mod-baked-pins.sh --mod >"$tmp/render-dangling.out" 2>"$tmp/render-dangling.err"; then
+if bash tools/lsio-mod/render-lsio-mod-baked-pins.sh --mod >"$tmp/render-dangling.out" 2>"$tmp/render-dangling.err"; then
   echo "FATAL: dangling renderer option was accepted" >&2
   exit 1
 fi
 
-if bash tools/stage-lsio-mod.sh --mod >"$tmp/stage-dangling.out" 2>"$tmp/stage-dangling.err"; then
+if bash tools/lsio-mod/stage-lsio-mod.sh --mod >"$tmp/stage-dangling.out" 2>"$tmp/stage-dangling.err"; then
   echo "FATAL: dangling stager option was accepted" >&2
   exit 1
 fi

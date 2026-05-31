@@ -1,0 +1,2 @@
+component=sqlite3-lsio-mod arch=linux-x86_64-v2
+database disk image is malformed

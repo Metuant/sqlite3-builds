@@ -24,6 +24,8 @@ declare -a EMBY_INSTANCES=()
 PLEX_BINARY="/home/darthshadow/plex-sql/Plex SQLite"
 HOST_SQLITE3="${HOST_SQLITE3:-${HOME}/bin/sqlite3}"
 PLEX_DB="com.plexapp.plugins.library.db"
+# Blob DB maintenance remains dormant with the commented block below.
+# shellcheck disable=SC2034
 PLEX_BLOB_DB="com.plexapp.plugins.library.blobs.db"
 
 EMBY_BINARY="/home/darthshadow/bin/sqlite3"
@@ -131,6 +133,8 @@ do
             # Restore the original journal_mode (which is what the application expects).
             "${HOST_SQLITE3}" "${DB}" "PRAGMA journal_mode=${ORIG_MODE};" >/dev/null
         ); then
+            # Status is kept for operator diagnostics while the script continues.
+            # shellcheck disable=SC2034
             page_size_status="failed"
             echo "WARNING: Plex page-size migration failed; continuing with remaining maintenance" >&2
             echo "WARNING: remaining maintenance runs at the existing page size; investigate before retrying page-size migration" >&2

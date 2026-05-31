@@ -1,0 +1,5 @@
+event=config-already-set tag=MaxLibraryDbConnections
+event=missing-element tag=MaxLibraryDbConnections
+event=config-already-set tag=MaxAuthDbConnections
+event=config-already-set tag=MaxOtherDbConnections
+event=missing-element tag=EnableSqLiteMmio

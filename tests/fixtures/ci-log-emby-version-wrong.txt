@@ -1,0 +1,1 @@
+Sqlite version: 3.52.0

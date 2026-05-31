@@ -1,0 +1,3 @@
+component=sqlite3-lsio-mod phase=03-swap event=installed arch=linux-x86_64-v2
+[sqlite3-builds-obs] 2026-05-31 sqlite3_open filename=/plex.db rc=0
+[sqlite3-builds-obs] 2026-05-31 trace SQLITE_TRACE_STMT sql=select 1

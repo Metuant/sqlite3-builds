@@ -1,4 +1,5 @@
 #!/bin/sh
+# shellcheck disable=SC1007,SC2016
 set -eu
 
 # Strategy: invoke a temporary copy of Build.sh with a minimal local

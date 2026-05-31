@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# phase_name is supplied by each s6 run script before sourcing this fragment.
+# shellcheck disable=SC2154
 sqlite3_mod_copy_artifact() {
   local tmp=$1
   local _target=$2
@@ -27,6 +29,8 @@ install_sqlite_artifact() {
   local installed_sha
   sqlite3_mod_install_failure_event=""
   sqlite3_mod_install_failure_actual=""
+  # Retained as install-failure context for sourced callers.
+  # shellcheck disable=SC2034
   sqlite3_mod_install_failure_target="$target"
   if ! sqlite3_mod_atomic_replace "$target" sqlite3_mod_copy_artifact "$src" "$expected_sha" "$target"; then
     case "${sqlite3_mod_install_failure_event:-}" in

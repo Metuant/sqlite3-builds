@@ -34,15 +34,15 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
 | `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
-| `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/render-lsio-mod-baked-pins.sh`: current rows, pre rows, Plex ICU rows, pool-patch baselines, unsupported rows, and malformed-input rejection. |
+| `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: current rows, pre rows, Plex ICU rows, pool-patch baselines, unsupported rows, and malformed-input rejection. |
 | `tests/cont_init_fragments_test.sh` | Static and unit checks for LSIO mod runtime fragments, phase-script shebangs, no custom env-var surface, and Plex ICU read-only posture. |
 | `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for minimal release assets and split `mod-build` / `mod-publish` jobs. |
-| `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `tools/expected-sqlite-*-count.txt`. |
+| `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `build/expected-sqlite-*-count.txt`. |
 | `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment and ICU workflow/Dockerfile alignment. |
 | `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled in library images and executed only with `RUN_BENCH=1`. |
-| `tools/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
-| `tools/render-lsio-mod-baked-pins.sh` | Host-runnable renderer for per-mod `baked-pins.txt` runtime SHA data. |
-| `tools/stage-lsio-mod.sh` | Local and CI staging helper that assembles an ephemeral LSIO mod Docker context under `mktemp -d`. |
+| `build/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
+| `tools/lsio-mod/render-lsio-mod-baked-pins.sh` | Host-runnable renderer for per-mod `baked-pins.txt` runtime SHA data. |
+| `tools/lsio-mod/stage-lsio-mod.sh` | Local and CI staging helper that assembles an ephemeral LSIO mod Docker context under `mktemp -d`. |
 | `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared runtime fragments, and parent README. |
 | `lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh` | Args-only shared Plex pool-patch core staged into the Plex mod. |
 | `pins/plex-pool-patch-baselines.txt` | PMS and Plex Media Scanner baseline SHA source data rendered into Plex `baked-pins.txt`. |
@@ -58,8 +58,8 @@ host application loads SQLite by handle rather than by symbol interposition.
 | Generic library | `docker-library/Dockerfile` + `build/Build.sh library` | `libsqlite3.so`, library archive | Emby |
 | Plex library | `docker-library/Dockerfile` + `LIBRARY_VARIANT=plex` | `libsqlite3.so`, Plex library archive | Plex |
 | `SHA256SUMS` | Release job | Archive SHA plus extracted `.so` SHA for library archives | Release users and mod-build verification |
-| Plex LSIO mod image | `lsio-mods/plex` staged by `tools/stage-lsio-mod.sh` | GHCR image `linuxserver-mod-sqlite3-plex:<tag>` | LSIO Plex containers |
-| Emby LSIO mod image | `lsio-mods/emby` staged by `tools/stage-lsio-mod.sh` | GHCR image `linuxserver-mod-sqlite3-emby:<tag>` | LSIO Emby containers |
+| Plex LSIO mod image | `lsio-mods/plex` staged by `tools/lsio-mod/stage-lsio-mod.sh` | GHCR image `linuxserver-mod-sqlite3-plex:<tag>` | LSIO Plex containers |
+| Emby LSIO mod image | `lsio-mods/emby` staged by `tools/lsio-mod/stage-lsio-mod.sh` | GHCR image `linuxserver-mod-sqlite3-emby:<tag>` | LSIO Emby containers |
 
 ## Runtime Targets
 
@@ -212,13 +212,13 @@ For `library`, the link line prepends `MIMALLOC_OBJ`
 mimalloc at link time while the CLI target stays unchanged.
 
 The same library-only link adds
-`-Wl,--version-script=/app/tools/libsqlite3-version-script.ld`. The script
+`-Wl,--version-script=/app/build/libsqlite3-version-script.ld`. The script
 enumerates the pinned public `sqlite3` API exports from `sqlite3.h` plus
 `auto_extension_path_is_target`, `auto_extension_sorterref_cfg_rc`,
 `auto_extension_pmasz_cfg_rc`, and `sqlite3_enable_shared_cache`, then ends
 with `local: *;`.
 
-For `library`, it also applies `tools/sqlite-amalgamation.patch` to the
+For `library`, it also applies `build/sqlite-amalgamation.patch` to the
 extracted SQLite amalgamation with `patch -p1` before compile. The patch
 renames the six wrapped SQLite API definitions to hidden `*_real` symbols:
 
@@ -262,10 +262,10 @@ and SHA pin. The CLI image is only responsible for the static CLI artifact.
 and an Alpine/musl base for the Plex variant.
 
 It installs the shared-library build toolchain and copies `build/Build.sh`,
-`src/auto_extension.c`, `tests/`, `tools/sqlite-amalgamation.patch`,
-`tools/expected-sqlite-config-count.txt`, and
-`tools/expected-sqlite-dbconfig-count.txt` into `/app`, with the tools files
-under `/app/tools/`.
+`src/auto_extension.c`, `tests/`, `build/sqlite-amalgamation.patch`,
+`build/expected-sqlite-config-count.txt`, and
+`build/expected-sqlite-dbconfig-count.txt` into `/app`, with the build files
+under `/app/build/`.
 
 The same Dockerfile builds mimalloc v3.3.2 in a dedicated stage, installs it
 under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
@@ -313,7 +313,7 @@ Each build output is extracted with the pinned Docker-extract action and
 uploaded as a workflow artifact.
 
 The build job no longer emits deploy pre-row fragments. Mod runtime SHA data is
-rendered later by `tools/render-lsio-mod-baked-pins.sh` from same-run build
+rendered later by `tools/lsio-mod/render-lsio-mod-baked-pins.sh` from same-run build
 artifacts, same-run runtime baseline extraction, and
 `pins/plex-pool-patch-baselines.txt`.
 
@@ -1010,7 +1010,7 @@ M-series invariants:
 - M7: Source-level amalgamation patching via a checked-in unified-diff `.patch`
   file applied with `patch -p1` after unzip; SQLite version bumps that change
   any of the six target signatures cause `patch` to reject hunks and fail the
-  build with patch's native error message. `tools/sqlite-amalgamation.patch` is
+  build with patch's native error message. `build/sqlite-amalgamation.patch` is
   the single locus of amalgamation modifications.
 
 Baked pin manifest:

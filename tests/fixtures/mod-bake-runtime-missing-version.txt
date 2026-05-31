@@ -1,0 +1,4 @@
+component=sqlite3-lsio-mod phase=03-swap event=skip-already-current arch=linux-x86_64-v2
+Sqlite compiler options: MAX_MMAP_SIZE=1099511627776
+[sqlite3-builds-obs] 2026-05-31 sqlite3_open_v2 filename=/config/data/library.db rc=0
+[sqlite3-builds-obs] 2026-05-31 trace SQLITE_TRACE_STMT sql=select 1

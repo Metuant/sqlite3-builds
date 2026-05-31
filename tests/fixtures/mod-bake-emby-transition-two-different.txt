@@ -1,0 +1,2 @@
+event=config-updated tag=MaxLibraryDbConnections
+event=missing-element tag=MaxLibraryDbConnections

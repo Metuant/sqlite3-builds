@@ -123,7 +123,7 @@ else
   cp "${repo_root}/src/observability.c" "${tmpdir}/observability.c"
   (
     cd "${amalg_dir}"
-    patch -p1 < "${repo_root}/tools/sqlite-amalgamation.patch" >/dev/null
+    patch -p1 < "${repo_root}/build/sqlite-amalgamation.patch" >/dev/null
   )
 
   case "${host_os}" in
@@ -141,6 +141,8 @@ else
       ;;
   esac
 
+  # shared_flags is a platform-specific compiler flag vector.
+  # shellcheck disable=SC2086
   cc -O0 ${shared_flags} \
     -I"${amalg_dir}" \
     -DSQLITE_CORE \
