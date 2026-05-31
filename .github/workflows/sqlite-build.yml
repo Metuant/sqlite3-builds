@@ -223,7 +223,7 @@ jobs:
             "$PLEX_IMG"
 
           pms_ready=0
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if bash -c 'echo > /dev/tcp/localhost/32400' 2>/dev/null; then
               pms_ready=1
               break
@@ -237,9 +237,9 @@ jobs:
           fi
 
           wait_for_pms_table_count() {
-            local attempt table_count
+            local table_count
             table_count=0
-            for attempt in $(seq 1 30); do
+            for _ in $(seq 1 30); do
               if docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY" >/dev/null 2>&1; then
                 table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
                 case "$table_count" in
@@ -308,7 +308,7 @@ jobs:
             "$PLEX_IMG"
 
           pms_ready=0
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             if bash -c 'echo > /dev/tcp/localhost/32400' 2>/dev/null; then
               pms_ready=1
               break
@@ -322,9 +322,9 @@ jobs:
           fi
 
           wait_for_pms_table_count() {
-            local attempt table_count
+            local table_count
             table_count=0
-            for attempt in $(seq 1 30); do
+            for _ in $(seq 1 30); do
               if docker cp "${PMS_CONTAINER}:/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db" "$PMS_DB_COPY" >/dev/null 2>&1; then
                 table_count="$(sqlite3 "$PMS_DB_COPY" "SELECT COUNT(*) FROM sqlite_master WHERE type='table';" 2>/dev/null || true)"
                 case "$table_count" in
@@ -379,7 +379,7 @@ jobs:
 
           sqlite_version_line=""
           emby_logs=""
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             emby_logs="$(docker logs "$EMBY_CONTAINER" 2>&1 || true)"
             sqlite_version_line="$(printf "%s\n" "$emby_logs" | grep "Sqlite version:" | tail -n 1 || true)"
             if [ -n "$sqlite_version_line" ]; then
@@ -579,7 +579,7 @@ jobs:
 
           sqlite_version_line=""
           emby_logs=""
-          for attempt in $(seq 1 30); do
+          for _ in $(seq 1 30); do
             emby_logs="$(docker logs "$EMBY_CONTAINER" 2>&1 || true)"
             sqlite_version_line="$(printf "%s\n" "$emby_logs" | grep "Sqlite version:" | tail -n 1 || true)"
             if [ -n "$sqlite_version_line" ]; then
@@ -623,6 +623,7 @@ jobs:
           bash tests/plex_pool_patch_lib_test.sh
           bash tests/cont_init_fragments_test.sh
           bash tests/lsio_mod_phase03_bak_creation_failure_test.sh
+          bash tests/lsio_mod_emby_config_test.sh
           bash tests/render_lsio_mod_baked_pins_test.sh
           bash tests/sqlite_build_workflow_mod_only_test.sh
           bash tests/docs_mod_only_direction_c_test.sh
@@ -657,11 +658,11 @@ jobs:
           set -euo pipefail
           cd release
           for artifact in sqlite-*-cli-*; do
-            suffix="${artifact#sqlite-${SQLITE_VERSION}-cli-}"
+            suffix="${artifact#sqlite-"${SQLITE_VERSION}"-cli-}"
             tar -czf "../sqlite-${GITHUB_REF_NAME}-cli-${suffix}.tar.gz" -C "${artifact}" .
           done
           for artifact in sqlite-*-library-*; do
-            suffix="${artifact#sqlite-${SQLITE_VERSION}-library-}"
+            suffix="${artifact#sqlite-"${SQLITE_VERSION}"-library-}"
             if [[ "${suffix}" == plex-* ]]; then
               tar -czf "../sqlite-${GITHUB_REF_NAME}-library-${suffix}.tar.gz" \
                 --exclude=icu_smoke -C "${artifact}" .
@@ -690,7 +691,17 @@ jobs:
           tag_name: ${{ github.ref_name }}
           name: ${{ github.ref_name }}
           body: |
-            SQLite upstream version: ${{env.SQLITE_VERSION}}
+            SQLite: ${{env.SQLITE_VERSION_DOTTED}} (upstream ${{env.SQLITE_VERSION}})
+            mimalloc: ${{env.MIMALLOC_VERSION}}
+            ICU (Plex variant): ${{env.ICU_VERSION}}
+
+            Base image baselines:
+              Plex: ${{env.PLEX_IMAGE_TAG}}
+              Emby: ${{env.EMBY_IMAGE_TAG}}
+
+            LSIO Docker mods (this tag):
+              linuxserver-mod-sqlite3-plex
+              linuxserver-mod-sqlite3-emby
 
             Changes: https://www.sqlite.org/changes.html
           files: |
@@ -751,9 +762,13 @@ jobs:
         with:
           image: lscr.io/linuxserver/emby:${{ env.EMBY_IMAGE_TAG }}
       - name: Build, bake-smoke, and export mod image
+        env:
+          MATRIX_ARCH_SUFFIX: ${{ matrix.arch_suffix }}
+          MATRIX_IMAGE_NAME: ${{ matrix.image_name }}
+          MATRIX_MOD: ${{ matrix.mod }}
         run: |
           set -euo pipefail
-          case "${{ matrix.mod }}" in
+          case "$MATRIX_MOD" in
             plex)
               lsio_image="lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}"
               target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
@@ -765,15 +780,15 @@ jobs:
               artifact_kind="library"
               ;;
             *)
-              echo "FATAL: unsupported mod: ${{ matrix.mod }}" >&2
+              echo "FATAL: unsupported mod: $MATRIX_MOD" >&2
               exit 1
               ;;
           esac
-          case "${{ matrix.arch_suffix }}" in
+          case "$MATRIX_ARCH_SUFFIX" in
             amd64) runtime_arches=(linux-x86_64-v2 linux-x86_64-v3); expected_arch_re='arch=linux-x86_64-v(2|3)' ;;
             arm64) runtime_arches=(linux-arm64); expected_arch_re='arch=linux-arm64' ;;
             *)
-              echo "FATAL: unsupported arch suffix: ${{ matrix.arch_suffix }}" >&2
+              echo "FATAL: unsupported arch suffix: $MATRIX_ARCH_SUFFIX" >&2
               exit 1
               ;;
           esac
@@ -807,8 +822,8 @@ jobs:
               "$target" "$arch" "$image" "$digest" "$path" "$pre_sha" >> "$pre_fragment"
           }
           for arch in "${runtime_arches[@]}"; do
-            emit_pre_row "${{ matrix.mod }}" "$arch" "$lsio_image" "$image_digest" "$target_path"
-            if [ "${{ matrix.mod }}" = "plex" ]; then
+            emit_pre_row "$MATRIX_MOD" "$arch" "$lsio_image" "$image_digest" "$target_path"
+            if [ "$MATRIX_MOD" = "plex" ]; then
               emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicuucplex.so.69
               emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicui18nplex.so.69
               emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicudataplex.so.69
@@ -831,7 +846,7 @@ jobs:
             stage_args+=(--artifact "${arch}:${artifact_path}")
           done
 
-          if [ "${{ matrix.mod }}" = "plex" ]; then
+          if [ "$MATRIX_MOD" = "plex" ]; then
             bash tools/render-lsio-mod-baked-pins.sh \
               --mod plex \
               --release-tag "$mod_release_tag" \
@@ -845,7 +860,6 @@ jobs:
               --mod plex \
               --output-dir "$staged" \
               --baked-pins "$baked_pins" \
-              --plex-pool-lib lib/plex-pool-patch.sh \
               "${stage_args[@]}"
           else
             bash tools/render-lsio-mod-baked-pins.sh \
@@ -863,54 +877,385 @@ jobs:
               "${stage_args[@]}"
           fi
 
-          smoke_ref="ghcr.io/${OWNER_NAME}/${{ matrix.image_name }}:${{ github.run_id }}-${{ matrix.mod }}-${{ matrix.arch_suffix }}-smoke"
-          mod_ref="ghcr.io/${OWNER_NAME}/${{ matrix.image_name }}:${{ github.run_id }}-${{ matrix.mod }}-${{ matrix.arch_suffix }}"
+          if [ ! -d "$staged/root-fs/etc/s6-overlay/s6-rc.d" ]; then
+            echo "FATAL: staged mod is missing native s6-rc init-mod tree" >&2
+            exit 1
+          fi
+          legacy_init_dir="${staged}/root-fs/etc/cont"'-init.d'
+          if [ -d "$legacy_init_dir" ]; then
+            echo "FATAL: staged mod still contains legacy init scripts" >&2
+            exit 1
+          fi
+
+          smoke_ref="ghcr.io/${OWNER_NAME}/${MATRIX_IMAGE_NAME}:${GITHUB_RUN_ID}-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}-smoke"
+          mod_ref="ghcr.io/${OWNER_NAME}/${MATRIX_IMAGE_NAME}:${GITHUB_RUN_ID}-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}"
           # Why: mod-build has no registry credentials, so smoke bakes root-fs into a derived image instead of coupling validation to post-publish install flow.
           printf 'FROM %s\nCOPY root-fs /\n' "$lsio_image" > "${tmpdir}/Dockerfile.smoke"
           docker build --rm -t "$smoke_ref" -f "${tmpdir}/Dockerfile.smoke" "$staged"
           docker build --rm -t "$mod_ref" "$staged"
 
-          smoke_container="sqlite-mod-smoke-${{ github.run_id }}-${{ matrix.mod }}-${{ matrix.arch_suffix }}"
-          logs_file="${tmpdir}/smoke.log"
+          smoke_container="sqlite-mod-smoke-${GITHUB_RUN_ID}-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}"
+          run1_logs="${tmpdir}/smoke-run1.log"
+          run2_logs="${tmpdir}/smoke-run2.log"
+          run3_logs="${tmpdir}/smoke-run3.log"
+          bad_signal_re='\bSQLITE_(ERROR|INTERNAL|NOMEM|IOERR|CORRUPT|FULL|CANTOPEN|PROTOCOL|MISMATCH|MISUSE|NOTADB|FORMAT|AUTH)\b|database disk image is malformed|Cannot create table|no such function|no such collation|Failed to open'
+
+          write_log_slice() {
+            local cursor="$1" output="$2"
+            # Use a line-count cursor instead of --since so same-second restarts cannot bleed terminal markers across slices.
+            docker logs "$smoke_container" 2>&1 | tail -n +$((cursor + 1)) > "$output" || true
+          }
+
+          debug_cat() {
+            local file="$1"
+            if [ -n "${RUNNER_DEBUG:-}" ]; then
+              cat "$file"
+            fi
+          }
+
+          capture_log_cursor() {
+            docker logs "$smoke_container" 2>&1 | wc -l | tr -d ' '
+          }
+
+          require_grep() {
+            local needle="$1" file="$2" message="$3"
+            if grep -Fq "$needle" "$file"; then
+              return 0
+            fi
+            cat "$file"
+            echo "$message" >&2
+            exit 1
+          }
+
+          require_egrep() {
+            local pattern="$1" file="$2" message="$3"
+            if grep -Eq "$pattern" "$file"; then
+              return 0
+            fi
+            cat "$file"
+            echo "$message" >&2
+            exit 1
+          }
+
+          reject_grep() {
+            local needle="$1" file="$2" message="$3"
+            if grep -Fq "$needle" "$file"; then
+              cat "$file"
+              echo "$message" >&2
+              exit 1
+            fi
+          }
+
+          fixed_count() {
+            local needle="$1" file="$2"
+            awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }' "$file"
+          }
+
+          wait_for_slice_marker() {
+            local cursor="$1" slice="$2" marker="$3" run_label="$4"
+            local ready=0
+            for _ in $(seq 1 30); do
+              write_log_slice "$cursor" "$slice"
+              if grep -Fq "$marker" "$slice"; then
+                ready=1
+                break
+              fi
+              sleep 3
+            done
+            if [ "$ready" -ne 1 ]; then
+              cat "$slice"
+              echo "FATAL: LSIO mod bake-in smoke did not reach ${run_label} terminal marker: ${marker}" >&2
+              exit 1
+            fi
+          }
+
+          wait_for_plex_slice() {
+            local cursor="$1" slice="$2" run_label="$3" pool_marker="$4"
+            local ready=0
+            for _ in $(seq 1 30); do
+              write_log_slice "$cursor" "$slice"
+              if grep -Fq "$pool_marker" "$slice"; then
+                if [ "$MATRIX_ARCH_SUFFIX" = "arm64" ] || grep -Fq 'mod=plex phase=04-pool-patch event=complete' "$slice"; then
+                  ready=1
+                  break
+                fi
+              fi
+              sleep 3
+            done
+            if [ "$ready" -ne 1 ]; then
+              cat "$slice"
+              echo "FATAL: LSIO mod bake-in smoke did not reach ${run_label} terminal marker: ${pool_marker}" >&2
+              exit 1
+            fi
+          }
+
+          assert_component_present() {
+            local slice="$1" run_label="$2"
+            if grep -Fq 'component=sqlite3-lsio-mod' "$slice"; then
+              return 0
+            fi
+            cat "$slice"
+            if [ "$run_label" = "run 2" ]; then
+              echo "FATAL: init-mod SQLite phase chain did not re-run on restart (3-run lifecycle assumption violated)" >&2
+            else
+              echo "FATAL: LSIO mod markers missing from ${run_label} log slice" >&2
+            fi
+            exit 1
+          }
+
+          assert_no_bad_signal() {
+            local slice="$1" run_label="$2"
+            if grep -Ev '^\[sqlite3-builds-obs\]' "$slice" | grep -E "$bad_signal_re"; then
+              echo "FATAL: LSIO mod smoke ${run_label} logs contain SQLite/runtime bad signal" >&2
+              exit 1
+            fi
+          }
+
+          assert_common_run() {
+            local slice="$1" run_label="$2"
+            assert_component_present "$slice" "$run_label"
+            require_egrep "$expected_arch_re" "$slice" "FATAL: ${run_label} log slice missing expected architecture marker"
+            assert_no_bad_signal "$slice" "$run_label"
+          }
+
+          assert_swap_run() {
+            local slice="$1" run_label="$2" expected="$3"
+            if [ "$expected" = "installed" ]; then
+              require_grep 'event=installed' "$slice" "FATAL: ${run_label} missing first-apply install marker"
+            else
+              require_grep 'event=skip-already-current' "$slice" "FATAL: ${run_label} missing already-current swap marker"
+              reject_grep 'event=installed' "$slice" "FATAL: ${run_label} unexpectedly reinstalled SQLite instead of skipping already-current"
+            fi
+          }
+
+          assert_runtime_load() {
+            local slice="$1" run_label="$2"
+            local open_marker_count
+            if [ "$MATRIX_MOD" = "emby" ]; then
+              local sqlite_version_line observed_version expected_version
+              sqlite_version_line="$(grep 'Sqlite version:' "$slice" | tail -n 1 || true)"
+              if [ -z "$sqlite_version_line" ]; then
+                cat "$slice"
+                echo "FATAL: ${run_label} Emby did not log Sqlite version after app readiness" >&2
+                exit 1
+              fi
+              observed_version="$(printf "%s\n" "$sqlite_version_line" | sed -n 's/.*Sqlite version:[[:space:]]*\([^[:space:]]\+\).*/\1/p')"
+              expected_version="${SQLITE_VERSION_DOTTED}"
+              if [ "$observed_version" != "$expected_version" ]; then
+                cat "$slice"
+                echo "FATAL: ${run_label} Emby logged Sqlite version ${observed_version}, expected ${expected_version}" >&2
+                exit 1
+              fi
+              require_grep 'MAX_MMAP_SIZE=1099511627776' "$slice" "FATAL: ${run_label} Emby logs missing tuned MAX_MMAP_SIZE compile option"
+            fi
+
+            require_egrep '\[sqlite3-builds-obs\].*SQLITE_TRACE_STMT' "$slice" "FATAL: ${run_label} ${MATRIX_MOD} logs missing SQLITE_TRACE_STMT observability marker"
+            open_marker_count="$(grep -Ec '\[sqlite3-builds-obs\].* sqlite3_open(_v2|16)? ' "$slice" || true)"
+            if [ "$open_marker_count" -lt 1 ]; then
+              cat "$slice"
+              echo "FATAL: ${run_label} ${MATRIX_MOD} observability open marker count check failed: open=${open_marker_count}" >&2
+              exit 1
+            fi
+            if grep -E '\[sqlite3-builds-obs\] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21' "$slice" >/dev/null; then
+              cat "$slice"
+              echo "FATAL: ${run_label} ${MATRIX_MOD} logs contain startup sqlite3_config rc=21 after lazy auto-extension registration" >&2
+              exit 1
+            fi
+          }
+
+          assert_plex_run() {
+            local slice="$1" run_label="$2" expected_swap="$3"
+            assert_common_run "$slice" "$run_label"
+            assert_swap_run "$slice" "$run_label" "$expected_swap"
+            if [ "$MATRIX_ARCH_SUFFIX" = "amd64" ]; then
+              if [ "$expected_swap" = "installed" ]; then
+                require_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} missing Plex pool patch apply marker"
+              else
+                require_grep 'pool_patch event=already-patched' "$slice" "FATAL: ${run_label} missing Plex pool already-patched marker"
+                reject_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} unexpectedly re-applied Plex pool patch"
+              fi
+            else
+              require_grep 'event=pool-patch-deferred' "$slice" "FATAL: ${run_label} missing Plex arm64 pool-patch-deferred marker"
+            fi
+          }
+
+          emby_tag_forms() {
+            case "$1" in
+              MaxLibraryDbConnections) printf '%s\n%s\n' MaxLibraryDbConnections MaxLibraryDatabaseConnections ;;
+              MaxAuthDbConnections) printf '%s\n%s\n' MaxAuthDbConnections MaxAuthDatabaseConnections ;;
+              MaxOtherDbConnections) printf '%s\n%s\n' MaxOtherDbConnections MaxOtherDatabaseConnections ;;
+              EnableSqLiteMmio) printf '%s\n' EnableSqLiteMmio ;;
+              *)
+                echo "FATAL: unsupported Emby config tag: $1" >&2
+                exit 1
+                ;;
+            esac
+          }
+
+          assert_emby_tag_transition() {
+            local slice="$1" tag="$2" run_label="$3"
+            local updated_count already_count missing_count total actual_tag
+            updated_count=0
+            already_count=0
+            while IFS= read -r actual_tag; do
+              updated_count=$((updated_count + $(fixed_count "event=config-updated tag=${actual_tag}" "$slice")))
+              already_count=$((already_count + $(fixed_count "event=config-already-set tag=${actual_tag}" "$slice")))
+              reject_grep "event=config-write-failed tag=${actual_tag}" "$slice" "FATAL: ${run_label} Emby config write failed for ${actual_tag}"
+            done < <(emby_tag_forms "$tag")
+            missing_count="$(fixed_count "event=missing-element tag=${tag}" "$slice")"
+            total=$((updated_count + already_count + missing_count))
+            if [ "$total" -ne 1 ]; then
+              cat "$slice"
+              echo "FATAL: ${run_label} Emby tag ${tag} expected exactly one config-updated/config-already-set/missing-element marker, found ${total}" >&2
+              exit 1
+            fi
+          }
+
+          assert_emby_run3_idempotent() {
+            local slice="$1"
+            local tag actual_tag total
+            for tag in MaxLibraryDbConnections MaxAuthDbConnections MaxOtherDbConnections EnableSqLiteMmio; do
+              total="$(fixed_count "event=missing-element tag=${tag}" "$slice")"
+              while IFS= read -r actual_tag; do
+                reject_grep "event=config-updated tag=${actual_tag}" "$slice" "FATAL: run 3 Emby config updated ${actual_tag} instead of staying idempotent"
+                reject_grep "event=config-write-failed tag=${actual_tag}" "$slice" "FATAL: run 3 Emby config write failed for ${actual_tag}"
+                total=$((total + $(fixed_count "event=config-already-set tag=${actual_tag}" "$slice")))
+              done < <(emby_tag_forms "$tag")
+              if [ "$total" -ne 1 ]; then
+                cat "$slice"
+                echo "FATAL: run 3 Emby tag ${tag} expected exactly one config-already-set/missing-element marker, found ${total}" >&2
+                exit 1
+              fi
+            done
+          }
+
+          wait_for_emby_system_xml() {
+            local ready=0
+            for _ in $(seq 1 40); do
+              if docker exec --user 0:0 "$smoke_container" test -f /config/config/system.xml; then
+                ready=1
+                break
+              fi
+              sleep 3
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "FATAL: Emby did not generate /config/config/system.xml within 120s" >&2
+              docker exec --user 0:0 "$smoke_container" ls -la /config || true
+              docker exec --user 0:0 "$smoke_container" ls -la /config/config || true
+              docker exec --user 0:0 "$smoke_container" cat /config/config/system.xml 2>/dev/null || true
+              exit 1
+            fi
+          }
+
+          wait_for_tcp_port() {
+            local port="$1" run_label="$2"
+            local ready=0
+            for _ in $(seq 1 60); do
+              if docker exec --user 0:0 "$smoke_container" bash -c "echo > /dev/tcp/127.0.0.1/${port}" 2>/dev/null; then
+                ready=1
+                break
+              fi
+              sleep 3
+            done
+            if [ "$ready" -ne 1 ]; then
+              echo "FATAL: ${run_label} app did not accept TCP on port ${port} within 180s" >&2
+              exit 1
+            fi
+          }
+
           trap 'docker logs "$smoke_container" 2>&1 || true; docker rm -f "$smoke_container" >/dev/null 2>&1 || true' EXIT
+
+          log_cursor=0
           docker run --detach \
             --name "$smoke_container" \
             -e PUID=1000 \
             -e PGID=1000 \
             "$smoke_ref"
-          installed_re='event=(installed|skip-already-current)'
-          smoke_ready=0
-          for attempt in $(seq 1 30); do
-            docker logs "$smoke_container" > "$logs_file" 2>&1 || true
-            if grep -Fq 'component=sqlite3-lsio-mod' "$logs_file" && grep -Eq "$installed_re" "$logs_file"; then
-              smoke_ready=1
-              break
+          if [ "$MATRIX_MOD" = "plex" ]; then
+            if [ "$MATRIX_ARCH_SUFFIX" = "amd64" ]; then
+              wait_for_plex_slice "$log_cursor" "$run1_logs" "run 1" 'pool_patch event=patched'
+            else
+              wait_for_plex_slice "$log_cursor" "$run1_logs" "run 1" 'event=pool-patch-deferred'
             fi
-            sleep 3
-          done
-          if [ "$smoke_ready" -ne 1 ]; then
-            cat "$logs_file"
-            echo "FATAL: LSIO mod bake-in smoke did not reach install/skip marker" >&2
-            exit 1
+            wait_for_slice_marker "$log_cursor" "$run1_logs" '[ls.io-init] done.' "run 1"
+            wait_for_tcp_port 32400 "run 1"
+            write_log_slice "$log_cursor" "$run1_logs"
+            debug_cat "$run1_logs"
+            assert_plex_run "$run1_logs" "run 1" installed
+            assert_runtime_load "$run1_logs" "run 1"
+          else
+            wait_for_slice_marker "$log_cursor" "$run1_logs" 'mod=emby phase=04-config event=missing-config' "run 1"
+            wait_for_slice_marker "$log_cursor" "$run1_logs" '[ls.io-init] done.' "run 1"
+            wait_for_tcp_port 8096 "run 1"
+            docker exec --user 0:0 "$smoke_container" test -f /config/config/system.xml || wait_for_emby_system_xml
+            write_log_slice "$log_cursor" "$run1_logs"
+            debug_cat "$run1_logs"
+            assert_common_run "$run1_logs" "run 1"
+            assert_swap_run "$run1_logs" "run 1" installed
+            require_grep 'mod=emby phase=04-config event=missing-config' "$run1_logs" "FATAL: run 1 missing Emby initial missing-config marker"
+            assert_runtime_load "$run1_logs" "run 1"
           fi
-          cat "$logs_file"
-          grep -Fq 'component=sqlite3-lsio-mod' "$logs_file"
-          grep -Eq "$installed_re" "$logs_file"
-          grep -Eq "$expected_arch_re" "$logs_file"
-          if [ "${{ matrix.mod }}" = "plex" ] && [ "${{ matrix.arch_suffix }}" = "arm64" ]; then
-            grep -Fq 'event=pool-patch-deferred' "$logs_file"
+
+          log_cursor="$(capture_log_cursor)"
+          docker stop -t 60 "$smoke_container" >/dev/null
+          docker start "$smoke_container" >/dev/null
+          if [ "$MATRIX_MOD" = "plex" ]; then
+            if [ "$MATRIX_ARCH_SUFFIX" = "amd64" ]; then
+              wait_for_plex_slice "$log_cursor" "$run2_logs" "run 2" 'pool_patch event=already-patched'
+            else
+              wait_for_plex_slice "$log_cursor" "$run2_logs" "run 2" 'event=pool-patch-deferred'
+            fi
+            wait_for_slice_marker "$log_cursor" "$run2_logs" '[ls.io-init] done.' "run 2"
+            wait_for_tcp_port 32400 "run 2"
+            write_log_slice "$log_cursor" "$run2_logs"
+            debug_cat "$run2_logs"
+            assert_plex_run "$run2_logs" "run 2" skip
+            assert_runtime_load "$run2_logs" "run 2"
+          else
+            wait_for_slice_marker "$log_cursor" "$run2_logs" 'mod=emby phase=04-config event=complete' "run 2"
+            wait_for_tcp_port 8096 "run 2"
+            write_log_slice "$log_cursor" "$run2_logs"
+            debug_cat "$run2_logs"
+            assert_common_run "$run2_logs" "run 2"
+            assert_swap_run "$run2_logs" "run 2" skip
+            for tag in MaxLibraryDbConnections MaxAuthDbConnections MaxOtherDbConnections EnableSqLiteMmio; do
+              assert_emby_tag_transition "$run2_logs" "$tag" "run 2"
+            done
+            assert_runtime_load "$run2_logs" "run 2"
           fi
-          bad_signal_re='\bSQLITE_(ERROR|INTERNAL|NOMEM|IOERR|CORRUPT|FULL|CANTOPEN|PROTOCOL|MISMATCH|MISUSE|NOTADB|FORMAT|AUTH)\b|database disk image is malformed|Cannot create table|no such function|no such collation|Failed to open'
-          if grep -Ev '^\[sqlite3-builds-obs\]' "$logs_file" | grep -E "$bad_signal_re"; then
-            echo "FATAL: LSIO mod smoke logs contain SQLite/runtime bad signal" >&2
-            exit 1
+
+          log_cursor="$(capture_log_cursor)"
+          docker stop -t 60 "$smoke_container" >/dev/null
+          docker start "$smoke_container" >/dev/null
+          if [ "$MATRIX_MOD" = "plex" ]; then
+            if [ "$MATRIX_ARCH_SUFFIX" = "amd64" ]; then
+              wait_for_plex_slice "$log_cursor" "$run3_logs" "run 3" 'pool_patch event=already-patched'
+            else
+              wait_for_plex_slice "$log_cursor" "$run3_logs" "run 3" 'event=pool-patch-deferred'
+            fi
+            wait_for_slice_marker "$log_cursor" "$run3_logs" '[ls.io-init] done.' "run 3"
+            wait_for_tcp_port 32400 "run 3"
+            write_log_slice "$log_cursor" "$run3_logs"
+            debug_cat "$run3_logs"
+            assert_plex_run "$run3_logs" "run 3" skip
+            assert_runtime_load "$run3_logs" "run 3"
+          else
+            wait_for_slice_marker "$log_cursor" "$run3_logs" 'mod=emby phase=04-config event=complete' "run 3"
+            wait_for_tcp_port 8096 "run 3"
+            write_log_slice "$log_cursor" "$run3_logs"
+            debug_cat "$run3_logs"
+            assert_common_run "$run3_logs" "run 3"
+            assert_swap_run "$run3_logs" "run 3" skip
+            assert_emby_run3_idempotent "$run3_logs"
+            assert_runtime_load "$run3_logs" "run 3"
           fi
+
           docker rm -f "$smoke_container" >/dev/null 2>&1 || true
           trap - EXIT
 
-          mkdir -p "mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}"
-          docker save "$mod_ref" -o "mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}/image.tar"
-          printf '%s\n' "$mod_ref" > "mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}/image-ref.txt"
+          mkdir -p "mod-image-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}"
+          docker save "$mod_ref" -o "mod-image-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}/image.tar"
+          printf '%s\n' "$mod_ref" > "mod-image-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}/image-ref.txt"
       - name: Upload mod image artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -935,7 +1280,7 @@ jobs:
         run: |
           echo "OWNER_NAME=$(echo "${REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')" >> "${GITHUB_ENV}"
       - name: Login to GHCR
-        uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}

@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-. ./lib/plex-pool-patch.sh
+. ./lsio-mods/shared/cont-init-fragments/atomic-write.sh
+. ./lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh
 
-tmp="$(mktemp -d)"
+tmp_parent="${TMPDIR:-/tmp}"
+tmp="$(mktemp -d "${tmp_parent%/}/sqlite3-plex-pool.XXXXXX" 2>/dev/null || mktemp -d /tmp/sqlite3-plex-pool.XXXXXX)"
 cleanup() {
   chmod -R u+w "$tmp" 2>/dev/null || true
   rm -rf "$tmp"
@@ -55,9 +57,11 @@ site="0x0|0|1|$orig_hex|$patched_hex"
 
 bin="$tmp/pms"
 write_hex_file "$bin" "$orig_hex"
+chmod 0640 "$bin"
 pre_sha="$(sha256_file "$bin")"
 run_patch "$tmp/original.log" "$bin" "$pre_sha" "$site"
 assert_file_hex "$bin" "$patched_hex" "original state was not patched"
+assert_eq "640" "$(sqlite3_mod_stat_mode "$bin")" "patched binary mode was not preserved"
 [ -f "$bin.bundled.bak" ] || { echo "FATAL: backup not created" >&2; exit 1; }
 grep -Fq 'event=patched' "$tmp/original.log" || { echo "FATAL: patch log missing" >&2; exit 1; }
 
@@ -152,6 +156,21 @@ if [ -n "${FAIL_DD_OF:-}" ] && [ "$out" = "$FAIL_DD_OF" ]; then
       ;;
   esac
 fi
+case "$out" in
+  "${FAIL_DD_OF_PREFIX:-}"*)
+    [ -n "${FAIL_DD_OF_PREFIX:-}" ] || exec "$REAL_DD" "$@"
+  case "${FAIL_DD_MODE:-}" in
+    fail-after-corrupt)
+      printf '\377' | "$REAL_DD" of="$out" bs=1 seek=1 count=1 conv=notrunc 2>/dev/null
+      exit 1
+      ;;
+    wrong-byte-success)
+      printf '\377' | "$REAL_DD" of="$out" bs=1 seek=1 count=1 conv=notrunc 2>/dev/null
+      exit 0
+      ;;
+  esac
+  ;;
+esac
 exec "$REAL_DD" "$@"
 EOF_DD
 chmod +x "$fake_bin/dd"
@@ -160,14 +179,14 @@ write_fail="$tmp/write-fail"
 write_hex_file "$write_fail" "$orig_hex"
 export REAL_DD="$real_dd"
 export REAL_CP="$real_cp"
-export FAIL_DD_OF="$write_fail"
+export FAIL_DD_OF_PREFIX="$write_fail.sqlite3-mod."
 export FAIL_DD_MODE="fail-after-corrupt"
 PATH="$fake_bin:$PATH"
 hash -r
 run_patch "$tmp/write-fail.log" "$write_fail" "$pre_sha" "$site"
 PATH=$old_path
 hash -r
-unset REAL_DD REAL_CP FAIL_DD_OF FAIL_DD_MODE
+unset REAL_DD REAL_CP FAIL_DD_OF_PREFIX FAIL_DD_MODE
 assert_file_hex "$write_fail" "$orig_hex" "write failure did not restore bundled backup"
 grep -Fq 'event=write-failed' "$tmp/write-fail.log" || { echo "FATAL: write-failed log missing" >&2; exit 1; }
 
@@ -175,14 +194,14 @@ verify_fail="$tmp/verify-fail"
 write_hex_file "$verify_fail" "$orig_hex"
 export REAL_DD="$real_dd"
 export REAL_CP="$real_cp"
-export FAIL_DD_OF="$verify_fail"
+export FAIL_DD_OF_PREFIX="$verify_fail.sqlite3-mod."
 export FAIL_DD_MODE="wrong-byte-success"
 PATH="$fake_bin:$PATH"
 hash -r
 run_patch "$tmp/verify-fail.log" "$verify_fail" "$pre_sha" "$site"
 PATH=$old_path
 hash -r
-unset REAL_DD REAL_CP FAIL_DD_OF FAIL_DD_MODE
+unset REAL_DD REAL_CP FAIL_DD_OF_PREFIX FAIL_DD_MODE
 assert_file_hex "$verify_fail" "$orig_hex" "verify failure did not restore bundled backup"
 grep -Fq 'event=verify-failed' "$tmp/verify-fail.log" || { echo "FATAL: verify-failed log missing" >&2; exit 1; }
 

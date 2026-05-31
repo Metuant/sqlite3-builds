@@ -43,8 +43,8 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tools/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
 | `tools/render-lsio-mod-baked-pins.sh` | Host-runnable renderer for per-mod `baked-pins.txt` runtime SHA data. |
 | `tools/stage-lsio-mod.sh` | Local and CI staging helper that assembles an ephemeral LSIO mod Docker context under `mktemp -d`. |
-| `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared cont-init fragments, and parent README. |
-| `lib/plex-pool-patch.sh` | Args-only shared Plex pool-patch core used by the Plex mod. |
+| `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared runtime fragments, and parent README. |
+| `lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh` | Args-only shared Plex pool-patch core staged into the Plex mod. |
 | `pins/plex-pool-patch-baselines.txt` | PMS and Plex Media Scanner baseline SHA source data rendered into Plex `baked-pins.txt`. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
@@ -350,9 +350,9 @@ publish runtime mod metadata.
 Each lane renders `baked-pins.txt`, stages an ephemeral Docker context under
 `mktemp -d`, builds a run-scoped temporary image tag, and smokes by building a
 throwaway image `FROM` the pinned LSIO base with the staged `root-fs/` copied
-in, then running it so the cont-init phase scripts execute in the real LSIO
-environment. `mod-build` pushes nothing and uploads each mod image as a workflow
-artifact.
+in, then running it so the native s6-rc `init-mod-sqlite3-*` oneshots execute
+in the real LSIO environment before the app service starts. `mod-build` pushes
+nothing and uploads each mod image as a workflow artifact.
 
 `mod-publish` is tag-gated; depends on `release` and `mod-build`. It pushes
 stable per-arch tags and the final multi-arch manifests. It never pushes
@@ -753,8 +753,9 @@ The LSIO mods are the supported deployment surface for SQLite replacement.
 There is no non-LSIO runtime replacement path in the current architecture.
 
 Each mod image is `FROM scratch` and contains a staged `root-fs/` copied into
-the LSIO container by the Docker Mods loader. Phase scripts run from
-`/etc/cont-init.d/` with `#!/usr/bin/with-contenv bash`.
+the LSIO container by the Docker Mods loader. Phase scripts run as native
+s6-rc oneshots under `/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-*/run` with
+`#!/usr/bin/with-contenv bash`.
 
 Runtime installed files:
 
@@ -777,40 +778,46 @@ Plex also installs:
 artifact rows, per-architecture bundled target pre rows, Plex ICU runtime pre
 rows, and PMS / Plex Media Scanner pool-patch baseline rows.
 
-Row kinds:
+Row-kind schema and the all-arches/no-`post` manifest rule are pinned in
+`docs/invariants/sqlite3-builds.md` §2 and §8. The architecture-local point is
+that this manifest is the runtime map consumed by the staged LSIO files listed
+above.
 
-| Row kind | Key fields | Runtime use |
-|---|---|---|
-| `version` | schema version, release tag, generation timestamp | Schema and release identity |
-| `current` | target, arch, artifact name, target path, SHA-256 | Select and verify the baked `libsqlite3.so` |
-| `pre` | target, arch, source image, image digest, runtime path, SHA-256 | Classify bundled runtime files and verify Plex ICU closure |
-| `pool-pre` | target, arch, PMS or Scanner binary path, SHA-256 | Verify Plex pool-patch binary baselines |
-| `unsupported` | arch, reason | Keep all-arch manifests complete when an artifact is unavailable |
+The phase oneshots are registered with empty
+`/etc/s6-overlay/s6-rc.d/user/contents.d/init-mod-sqlite3-*` markers and are
+chained with dependency marker files:
 
-The manifest is all-arches. It contains no managed-window fields and no `post`
-rows.
+```text
+init-mods
+  -> init-mod-sqlite3-preflight
+  -> init-mod-sqlite3-verify
+  -> init-mod-sqlite3-swap
+  -> init-mod-sqlite3-config        (Emby)
+  -> init-mods-end
 
-The phase order is:
+init-mods
+  -> init-mod-sqlite3-preflight
+  -> init-mod-sqlite3-verify
+  -> init-mod-sqlite3-swap
+  -> init-mod-sqlite3-poolpatch     (Plex)
+  -> init-mods-end
+```
 
-| Script | Purpose | Failure posture |
-|---|---|---|
-| `80-sqlite3-mod-preflight` | logging setup, command checks, target detection, arch selection | Fatal on missing or malformed `baked-pins.txt`; warn and exit 0 for unsupported arch, missing target, or missing non-fatal common command |
-| `81-sqlite3-mod-verify` | baked artifact SHA checks and Plex ICU runtime closure verification | Fatal on missing selected artifact, baked artifact SHA mismatch, or missing current row; warn and exit 0 on runtime Plex ICU mismatch |
-| `82-sqlite3-mod-swap` | target classification, backup preservation, SQLite replacement | Warn and exit 0 on missing target, unknown target SHA, backup failure, temp-copy failure, or final move failure |
-| `83-sqlite3-mod-pool-patch` | Plex-only amd64 pool patch; arm64 logs deferred | Warn and exit 0 when SQLite is not current, pool rows are missing, binary state is unknown, or patch verification fails |
+Because `init-mods-end` precedes `init-services` in the LSIO s6-overlay v3
+graph, the SQLite replacement chain completes before `svc-emby` or `svc-plex`
+starts.
+
+Phase order and failure posture are pinned in
+`docs/invariants/sqlite3-builds.md` §2. The repo-map context here is that the
+native s6-rc chain above is how the Plex and Emby mod roots enter that invariant
+phase sequence.
 
 The mod preserves one `.bundled.bak` beside every mutated target. It never
 overwrites or deletes that backup.
 
-Phase 03 swap behavior:
-
-| Current target SHA | Backup state | Action |
-|---|---|---|
-| Matches current mod SHA | Any | Skip; already applied |
-| Matches bundled baseline | Absent | Copy backup with `cp -n`, then install from a same-directory temp file |
-| Matches bundled baseline | Present | Reuse backup, then install from a same-directory temp file |
-| Unknown | Any | Warn and skip without restoring or reclassifying |
-| Install failure after mutation attempt | Verified bundled backup present | Restore backup, warn on restore mismatch, exit 0 |
+Phase 03 swap behavior is pinned in `docs/invariants/sqlite3-builds.md` §2.
+This repository map retains the file placement and target context; the invariant
+doc owns the row-by-row classification rules.
 
 Plex ICU runtime files are read-only inputs to LSIO mod code. The Plex mod
 checks `libicuucplex.so.69`, `libicui18nplex.so.69`, and
@@ -819,17 +826,18 @@ not replace, rename, move, delete, or overwrite those files.
 
 Phase 04 pool patch runs only in the Plex mod. Arm64 logs
 `event=pool-patch-deferred` and exits 0. On amd64, the phase first verifies
-that the SQLite target is already current, then calls
-`lib/plex-pool-patch.sh` with all paths, expected SHAs, and patch sites as
-arguments. The library reads no environment variables and carries no SHA
+that the SQLite target is already current, then calls the staged
+`plex-pool-patch.sh` fragment with all paths, expected SHAs, and patch sites as
+arguments. The fragment reads no environment variables and carries no SHA
 constants.
 
 Pool-patch site tuples are
 `label|offset|write_seek|original_hex|patched_hex`. Each tuple binds the site
 label, the 16-byte read offset, the byte write offset, and the full original
 and patched contexts for one binary. The writer derives the single byte to
-write from `patched_hex` at `write_seek - offset` and writes it with
-`dd conv=notrunc`.
+write from `patched_hex` at `write_seek - offset`, writes it to a same-fs temp
+copy with `dd conv=notrunc`, restores the original owner and mode on the temp,
+and atomically replaces the target.
 
 Current amd64 sites:
 
@@ -844,16 +852,16 @@ Pool-patch per-binary behavior:
 | Site state | Baseline SHA / backup state | Action |
 |---|---|---|
 | All sites patched | Any | Skip; already patched |
-| All sites original | Current binary SHA matches `pool-pre`; backup absent | Copy backup, then patch each site in place |
-| All sites original | Current binary SHA matches `pool-pre`; verified backup present | Reuse backup, then patch each site in place |
+| All sites original | Current binary SHA matches `pool-pre`; backup absent | Copy backup, patch a same-fs temp copy, restore owner/mode, then atomically replace |
+| All sites original | Current binary SHA matches `pool-pre`; verified backup present | Reuse backup, patch a same-fs temp copy, restore owner/mode, then atomically replace |
 | Mixed or unknown | Any | Warn and skip that binary |
-| Write or verify failure | Verified backup present | Restore backup, warn, and continue to the next binary |
+| Write, verify, or atomic replace failure | Verified backup present | Leave target unchanged, warn, and continue to the next binary |
 
 Runtime command surface:
 
 | Scope | Commands |
 |---|---|
-| Common phases | `awk cp grep mkdir mktemp mv rm sed sha256sum tr uname` |
+| Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |
 | Plex amd64 pool patch only | `dd od printf` |
 
 LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
@@ -970,8 +978,8 @@ Plex target path:
 LSIO tool surface:
 
 - Perform no runtime archive download or extraction.
-- Common phases use `awk`, `cp`, `grep`, `mkdir`, `mktemp`, `mv`, `rm`, `sed`,
-  `sha256sum`, `tr`, and `uname`.
+- Common phases use `awk`, `chmod`, `chown`, `cp`, `grep`, `mkdir`, `mktemp`,
+  `mv`, `rm`, `sed`, `sha256sum`, `stat`, `tr`, and `uname`.
 - Plex amd64 pool patch additionally uses `dd`, `od`, and `printf`.
 - Do not depend on `curl`, `tar`, `gunzip`, Python, `jq`, package managers, or
   network access at runtime.

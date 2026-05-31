@@ -37,8 +37,7 @@ file's runtime SHA matches the baked baseline row.
 Running an older mod tag against a newer LSIO base image may warn and skip the
 swap. Bump the mod tag to the matching repository release tag.
 
-For troubleshooting, check `/tmp/sqlite3-lsio-mod/sqlite3-lsio-mod.log` and
-look for stable event names such as `event=installed`,
+For troubleshooting, check container stdout for stable event names such as `event=installed`,
 `event=skip-already-current`, `event=unknown-target-sha`,
 `event=pool-patch-deferred`, and `pool_patch event=patched`.
 

@@ -9,6 +9,7 @@ for forbidden in \
   regen-deploy-pins \
   assemble-library-pins \
   cont-init-patch-plex-pool \
+  /etc/cont-init.d \
   sqlite-pins-pre \
   "PMS first-init smoke (Plex, pool-patched)" \
   "Fetch prior library pins" \
@@ -31,9 +32,11 @@ grep -Fq 'linuxserver-mod-sqlite3-emby' "$workflow"
 grep -Fq 'tools/render-lsio-mod-baked-pins.sh' "$workflow"
 grep -Fq 'tools/stage-lsio-mod.sh' "$workflow"
 grep -Fq 'COPY root-fs /' "$workflow"
-grep -Fq '${{ github.run_id }}-${{ matrix.mod }}-${{ matrix.arch_suffix }}-smoke' "$workflow"
+grep -Fq 'root-fs/etc/s6-overlay/s6-rc.d' "$workflow"
+grep -Fq '${GITHUB_RUN_ID}-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}-smoke' "$workflow"
 grep -Fq 'docker save "$mod_ref"' "$workflow"
 grep -Fq 'mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}' "$workflow"
+grep -Fq 'assert_runtime_load "$run1_logs" "run 1"' "$workflow"
 
 if grep -Fq ':latest' "$workflow"; then
   echo "FATAL: workflow publishes latest tag" >&2
@@ -65,6 +68,8 @@ if "${{ matrix.platform }}" in mod_build:
     raise SystemExit("mod-build still uses matrix.platform in image refs")
 if "DOCKER_MODS" in mod_build:
     raise SystemExit("mod-build still uses registry-fetch smoke")
+if "cont-init" in mod_build:
+    raise SystemExit("mod-build still references legacy cont-init")
 if "printf 'FROM %s\\nCOPY root-fs /\\n' \"$lsio_image\"" not in mod_build:
     raise SystemExit("mod-build missing bake-in smoke Dockerfile")
 if 'docker build --rm -t "$mod_ref" "$staged"' not in mod_build:
@@ -73,6 +78,8 @@ if "docker save \"$mod_ref\"" not in mod_build:
     raise SystemExit("mod-build missing real image export")
 if "docker run --rm --entrypoint sha256sum" not in mod_build:
     raise SystemExit("mod-build missing runtime pre-SHA derivation")
+if "assert_runtime_load" not in mod_build:
+    raise SystemExit("mod-build missing app runtime-load assertion")
 
 needs_match = re.search(r'(?ms)^\s+needs:\s*(\[[^\n]+\]|(?:\n(?:\s+- .+\n?)+))', mod_publish)
 if not needs_match:

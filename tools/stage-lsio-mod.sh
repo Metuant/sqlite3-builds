@@ -5,14 +5,13 @@ usage() {
   cat >&2 <<'USAGE'
 Usage:
   stage-lsio-mod.sh --mod plex|emby --output-dir DIR --baked-pins FILE \
-    --artifact ARCH:SOURCE_PATH [--artifact ...] [--plex-pool-lib FILE]
+    --artifact ARCH:SOURCE_PATH [--artifact ...]
 USAGE
 }
 
 mod=""
 output_dir=""
 baked_pins=""
-plex_pool_lib=""
 artifacts=()
 
 require_value() {
@@ -29,7 +28,6 @@ while [ "$#" -gt 0 ]; do
     --output-dir) require_value "$1" "${2:-}"; output_dir="$2"; shift 2 ;;
     --baked-pins) require_value "$1" "${2:-}"; baked_pins="$2"; shift 2 ;;
     --artifact) require_value "$1" "${2:-}"; artifacts+=("$2"); shift 2 ;;
-    --plex-pool-lib) require_value "$1" "${2:-}"; plex_pool_lib="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) usage; exit 2 ;;
   esac
@@ -44,11 +42,6 @@ mkdir -p "$output_dir/root-fs/opt/sqlite3-lsio-mod/lib"
 cp lsio-mods/shared/cont-init-fragments/*.sh "$output_dir/root-fs/opt/sqlite3-lsio-mod/lib/"
 cp "$baked_pins" "$output_dir/root-fs/opt/sqlite3-lsio-mod/baked-pins.txt"
 
-if [ "$mod" = "plex" ]; then
-  [ -f "$plex_pool_lib" ] || { echo "FATAL: missing --plex-pool-lib for plex" >&2; exit 2; }
-  cp "$plex_pool_lib" "$output_dir/root-fs/opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh"
-fi
-
 for artifact in "${artifacts[@]}"; do
   IFS=':' read -r arch source_path <<EOF_ART
 $artifact
@@ -59,6 +52,6 @@ EOF_ART
   chmod 0644 "$output_dir/root-fs/opt/sqlite3-lsio-mod/artifacts/${arch}/libsqlite3.so"
 done
 
-find "$output_dir/root-fs/etc/cont-init.d" -type f -exec chmod 0755 {} +
+find "$output_dir/root-fs/etc/s6-overlay/s6-rc.d" -path '*/run' -type f -exec chmod 0755 {} +
 find "$output_dir/root-fs/opt/sqlite3-lsio-mod/lib" -type f -exec chmod 0644 {} +
 printf '%s\n' "$output_dir"

@@ -4,6 +4,8 @@ set -euo pipefail
 grep -Fq '## LSIO Mod Architecture' docs/architecture.md
 grep -Fq '## 2. LSIO mods' docs/invariants/sqlite3-builds.md
 grep -Fq 'baked-pins.txt is the only runtime SHA source' docs/invariants/sqlite3-builds.md
+grep -Fq 'init-mod-sqlite3-preflight' docs/architecture.md
+grep -Fq 'before `init-services` and `svc-*` startup' docs/invariants/sqlite3-builds.md
 grep -Fq '## ARM64 PMS pool-patch re-derivation' docs/deferred.md
 
 for forbidden in \

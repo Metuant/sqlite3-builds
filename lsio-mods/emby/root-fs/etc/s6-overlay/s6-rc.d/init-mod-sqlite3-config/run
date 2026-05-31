@@ -1,0 +1,100 @@
+#!/usr/bin/with-contenv bash
+set -u
+phase_name="04-config"
+. /opt/sqlite3-lsio-mod/lib/logging.sh
+. /opt/sqlite3-lsio-mod/lib/sha.sh
+. /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/atomic-write.sh
+sqlite3_mod_init_logging
+if ! require_all_or_warn awk chmod chown grep sed sha256sum mktemp mv rm stat uname; then exit 0; fi
+baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
+target_path="/app/emby/lib/libsqlite3.so.3.49.2"
+selected_arch="$(resolve_arch)" || { log_warn "mod=emby phase=${phase_name} event=unsupported-arch machine=$(uname -m)"; exit 0; }
+current_sha="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="emby" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || exit 0
+[ -f "$target_path" ] && [ "$(sha256_of "$target_path")" = "$current_sha" ] || { log_warn "mod=emby phase=${phase_name} event=skip-sqlite-not-current"; exit 0; }
+config="/config/config/system.xml"
+[ -f "$config" ] || { log_warn "mod=emby phase=${phase_name} event=missing-config config=${config}"; exit 0; }
+
+sqlite3_mod_active_count() {
+  tag="$1"
+  sed -E '/^[[:space:]]*<!--.*-->[[:space:]]*$/d' "$config" | grep -cE "^[[:space:]]*<${tag}>[^<]*</${tag}>[[:space:]]*$"
+}
+
+sqlite3_mod_current_value() {
+  tag="$1"
+  sed -nE -e "s|^[[:space:]]*<${tag}>([^<]*)</${tag}>[[:space:]]*$|\1|" -e "t found" -e "b" -e ":found" -e "p" -e "q" "$config"
+}
+
+sqlite3_mod_temp_value() {
+  tag="$1"
+  path="$2"
+  sed -nE -e "s|^[[:space:]]*<${tag}>([^<]*)</${tag}>[[:space:]]*$|\1|" -e "t found" -e "b" -e ":found" -e "p" -e "q" "$path"
+}
+
+sqlite3_mod_write_tuned_config() {
+  local tmp=$1
+  local _config=$2
+  local tag=$3
+  local target_value=$4
+  sed -E "s|^([[:space:]]*)<${tag}>[^<]*</${tag}>([[:space:]]*)$|\1<${tag}>${target_value}</${tag}>\2|" "$config" > "$tmp" &&
+    [ "$(sqlite3_mod_temp_value "$tag" "$tmp")" = "$target_value" ]
+}
+
+sqlite3_mod_tune_tag() {
+  tag="$1"
+  target="$2"
+  active="$(sqlite3_mod_active_count "$tag")"
+  case "$active" in
+    0) log_warn "mod=emby phase=${phase_name} event=missing-element tag=${tag}"; return 0 ;;
+    1) ;;
+    *) log_warn "mod=emby phase=${phase_name} event=ambiguous-element tag=${tag} count=${active}"; return 0 ;;
+  esac
+
+  cur="$(sqlite3_mod_current_value "$tag")"
+  if [ "$cur" = "$target" ]; then
+    log_info "mod=emby phase=${phase_name} event=config-already-set tag=${tag} value=${target}"
+    return 0
+  fi
+
+  if sqlite3_mod_atomic_replace "$config" sqlite3_mod_write_tuned_config "$tag" "$target"; then
+    log_info "mod=emby phase=${phase_name} event=config-updated tag=${tag} old=${cur} new=${target}"
+  else
+    log_warn "mod=emby phase=${phase_name} event=config-write-failed tag=${tag}"
+  fi
+}
+
+sqlite3_mod_tune_tag_pair() {
+  tag_a="$1"
+  tag_b="$2"
+  target="$3"
+  active_a="$(sqlite3_mod_active_count "$tag_a")"
+  active_b="$(sqlite3_mod_active_count "$tag_b")"
+  active=$((active_a + active_b))
+
+  case "$active" in
+    0) log_warn "mod=emby phase=${phase_name} event=missing-element tag=${tag_a} alternate_tag=${tag_b}"; return 0 ;;
+    1)
+      if [ "$active_a" -eq 1 ]; then
+        sqlite3_mod_tune_tag "$tag_a" "$target"
+      else
+        sqlite3_mod_tune_tag "$tag_b" "$target"
+      fi
+      return 0
+      ;;
+  esac
+
+  if [ "$active_a" -gt 1 ] && [ "$active_b" -eq 0 ]; then
+    ambiguous_tag="$tag_a"
+  elif [ "$active_b" -gt 1 ] && [ "$active_a" -eq 0 ]; then
+    ambiguous_tag="$tag_b"
+  else
+    ambiguous_tag="${tag_a}|${tag_b}"
+  fi
+  log_warn "mod=emby phase=${phase_name} event=ambiguous-element tag=${ambiguous_tag} count=${active}"
+}
+
+sqlite3_mod_tune_tag_pair MaxLibraryDbConnections MaxLibraryDatabaseConnections 16
+sqlite3_mod_tune_tag_pair MaxAuthDbConnections MaxAuthDatabaseConnections 4
+sqlite3_mod_tune_tag_pair MaxOtherDbConnections MaxOtherDatabaseConnections 2
+sqlite3_mod_tune_tag EnableSqLiteMmio true
+log_info "mod=emby phase=${phase_name} event=complete"

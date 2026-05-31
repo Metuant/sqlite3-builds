@@ -4,8 +4,10 @@ phase_name="03-swap"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/atomic-write.sh
 . /opt/sqlite3-lsio-mod/lib/swap.sh
 sqlite3_mod_init_logging
+if ! require_all_or_warn awk chmod chown cp mktemp mv rm sha256sum stat uname; then exit 0; fi
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
 target_path="/app/emby/lib/libsqlite3.so.3.49.2"
 selected_arch="$(resolve_arch)" || exit 0

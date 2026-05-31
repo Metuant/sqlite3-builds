@@ -40,7 +40,7 @@ if [ ! -f "$target_path" ]; then log_warn "mod=plex phase=${phase_name} event=mi
 if [ ! -f "$baked_pins" ]; then log_fatal "mod=plex phase=${phase_name} event=missing-baked-pins"; fi
 validate_baked_pins_schema || log_fatal "mod=plex phase=${phase_name} event=malformed-baked-pins"
 # Phase 01 command checks are a best-effort early warning; later phases re-check their mutation prerequisites.
-if ! require_all_or_warn awk cp grep mkdir mktemp mv rm sed sha256sum tr uname; then exit 0; fi
+if ! require_all_or_warn awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname; then exit 0; fi
 selected_arch="$(resolve_arch)" || { log_warn "mod=plex phase=${phase_name} event=unsupported-arch machine=$(uname -m)"; exit 0; }
 release_tag="$(awk -F'|' '$1=="version" && $2=="2" { for (i=3; i<=NF; i+=2) if ($i=="release_tag") print $(i+1) }' "$baked_pins")"
 log_info "mod=plex phase=${phase_name} event=selected arch=${selected_arch} release_tag=${release_tag:-unknown} target_path=${target_path}"

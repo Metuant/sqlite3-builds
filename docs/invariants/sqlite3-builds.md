@@ -88,11 +88,17 @@ milestone lands.
     supported artifact is unavailable.
 - Runtime mod scripts read no custom env vars. `MOD_INFO` is log-only and
   `uname -m` is the architecture input.
-- Phase scripts use 80-range names and `#!/usr/bin/with-contenv bash`.
+- Phase scripts run as native s6-rc oneshots under
+  `/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-*/run` and use
+  `#!/usr/bin/with-contenv bash`.
+- SQLite mod oneshots are chained after `init-mods` and before
+  `init-mods-end`: preflight -> verify -> swap -> config (Emby) or
+  poolpatch (Plex). `init-mods-end` depends on the final SQLite oneshot, so
+  the chain completes before `init-services` and `svc-*` startup.
 - LSIO runtime command surface:
   | Scope | Commands |
   |---|---|
-  | Common phases | `awk cp grep mkdir mktemp mv rm sed sha256sum tr uname` |
+  | Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |
   | Plex amd64 pool patch only | `dd od printf` |
 - LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
   package managers, or network access.
@@ -104,13 +110,14 @@ milestone lands.
   `.bundled.bak` exists; it restores a verified backup only after a failed
   install attempt.
 - Pool patch is args-only: callers pass every path, SHA, and site tuple.
-  `lib/plex-pool-patch.sh` reads no environment variables and carries no SHA
-  constants.
+  The staged `plex-pool-patch.sh` fragment reads no environment variables and
+  carries no SHA constants.
 - Pool-patch site tuples are
   `label|offset|write_seek|original_hex|patched_hex`. The writer derives one
-  byte from `patched_hex` at `write_seek - offset` and applies it with
-  `dd conv=notrunc`; original and patched contexts remain per-binary and
-  per-site coupled.
+  byte from `patched_hex` at `write_seek - offset`, applies it to a same-fs
+  temp copy with `dd conv=notrunc`, restores target owner/mode metadata, and
+  atomically replaces the target; original and patched contexts remain
+  per-binary and per-site coupled.
 - Pool patch skips a binary when any site is mixed or unknown. It patches only
   when all sites are original and the binary SHA matches the `pool-pre` row;
   it skips when all sites are already patched.

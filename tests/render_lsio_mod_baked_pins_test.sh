@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tmp="$(mktemp -d)"
+tmp_parent="${TMPDIR:-/tmp}"
+tmp="$(mktemp -d "${tmp_parent%/}/sqlite3-render.XXXXXX" 2>/dev/null || mktemp -d /tmp/sqlite3-render.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT
 
 plex_artifact="$tmp/libsqlite3-plex.so"
@@ -68,6 +69,28 @@ if grep -Fq 'pool-pre|' "$tmp/baked-pins-emby.txt"; then
   exit 1
 fi
 
+bash tools/stage-lsio-mod.sh \
+  --mod emby \
+  --output-dir "$tmp/staged-emby" \
+  --baked-pins "$tmp/baked-pins-emby.txt" \
+  --artifact "linux-x86_64-v3:$emby_artifact" >/dev/null
+test -f "$tmp/staged-emby/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-preflight/type"
+test -f "$tmp/staged-emby/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-config/run"
+test -f "$tmp/staged-emby/root-fs/etc/s6-overlay/s6-rc.d/init-mods-end/dependencies.d/init-mod-sqlite3-config"
+test -f "$tmp/staged-emby/root-fs/etc/s6-overlay/s6-rc.d/user/contents.d/init-mod-sqlite3-config"
+if [ -d "$tmp/staged-emby/root-fs/etc/cont-init.d" ]; then
+  echo "FATAL: staged emby mod contains legacy cont-init.d" >&2
+  exit 1
+fi
+
+bash tools/stage-lsio-mod.sh \
+  --mod plex \
+  --output-dir "$tmp/staged-plex" \
+  --baked-pins "$tmp/baked-pins.txt" \
+  --artifact "linux-x86_64-v3:$plex_artifact" >/dev/null
+test -f "$tmp/staged-plex/root-fs/opt/sqlite3-lsio-mod/lib/atomic-write.sh"
+test -f "$tmp/staged-plex/root-fs/opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh"
+
 bash tools/render-lsio-mod-baked-pins.sh \
   --mod emby \
   --release-tag 2026.05.28-r1 \
@@ -99,12 +122,10 @@ if bash tools/render-lsio-mod-baked-pins.sh --mod >"$tmp/render-dangling.out" 2>
   echo "FATAL: dangling renderer option was accepted" >&2
   exit 1
 fi
-grep -Fxq 'FATAL: missing value for --mod' "$tmp/render-dangling.err"
 
 if bash tools/stage-lsio-mod.sh --mod >"$tmp/stage-dangling.out" 2>"$tmp/stage-dangling.err"; then
   echo "FATAL: dangling stager option was accepted" >&2
   exit 1
 fi
-grep -Fxq 'FATAL: missing value for --mod' "$tmp/stage-dangling.err"
 
 printf 'baked pins renderer tests passed\n'

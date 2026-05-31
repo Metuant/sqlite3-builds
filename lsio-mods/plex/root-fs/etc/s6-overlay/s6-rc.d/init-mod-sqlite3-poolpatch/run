@@ -4,12 +4,13 @@ phase_name="04-pool-patch"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/atomic-write.sh
 . /opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh
 sqlite3_mod_init_logging
 case "$(uname -m)" in
   aarch64|arm64) log_warn "mod=plex phase=${phase_name} event=pool-patch-deferred arch=linux-arm64"; exit 0 ;;
 esac
-if ! require_all_or_warn awk cp dd grep od printf sha256sum tr uname; then exit 0; fi
+if ! require_all_or_warn awk chmod chown cp dd grep mktemp mv od printf rm sha256sum stat tr uname; then exit 0; fi
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
 target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
 selected_arch="$(resolve_arch)" || exit 0

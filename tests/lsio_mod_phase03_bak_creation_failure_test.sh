@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-tmp_root="$(mktemp -d)"
+tmp_parent="${TMPDIR:-/tmp}"
+tmp_root="$(mktemp -d "${tmp_parent%/}/sqlite3-phase03.XXXXXX" 2>/dev/null || mktemp -d /tmp/sqlite3-phase03.XXXXXX)"
 cleanup() {
   chmod -R u+w "$tmp_root" 2>/dev/null || true
   rm -rf "$tmp_root"
@@ -17,6 +18,7 @@ mkdir -p "$lib_root" "$artifact_dir" "$runtime_lib_dir"
 cp lsio-mods/shared/cont-init-fragments/logging.sh "$lib_root/logging.sh"
 cp lsio-mods/shared/cont-init-fragments/sha.sh "$lib_root/sha.sh"
 cp lsio-mods/shared/cont-init-fragments/arch.sh "$lib_root/arch.sh"
+cp lsio-mods/shared/cont-init-fragments/atomic-write.sh "$lib_root/atomic-write.sh"
 cp lsio-mods/shared/cont-init-fragments/swap.sh "$lib_root/swap.sh"
 
 cat > "$artifact_dir/libsqlite3.so" <<'EOF_ARTIFACT'
@@ -44,8 +46,8 @@ pre|1|plex|linux-arm64|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture
 pre|1|plex|linux-arm64|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libicudataplex.so.69|runtime|$icu_data_sha
 EOF_PINS
 
-script_copy="$tmp_root/82-sqlite3-mod-swap"
-cp lsio-mods/plex/root-fs/etc/cont-init.d/82-sqlite3-mod-swap "$script_copy"
+script_copy="$tmp_root/init-mod-sqlite3-swap-run"
+cp lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-swap/run "$script_copy"
 python3 - "$script_copy" "$fixture" <<'PY'
 from pathlib import Path
 import sys
