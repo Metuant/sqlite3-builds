@@ -2,7 +2,7 @@
 [sqlite3-builds-obs] event slow_query elapsed_ms=12 sql=select
 [sqlite3-builds-obs] api sqlite3_open_v2 path=/config/library.db rc=0
 [sqlite3-builds-obs] api sqlite3_config op=SQLITE_CONFIG_LOG rc=0
-Sqlite version: 3.53.1
+Sqlite version: @SQLITE_VERSION_DOTTED@
 Sqlite compiler options: DQS=1, DEFAULT_WORKER_THREADS=8, MAX_WORKER_THREADS=8, THREADSAFE=2, DEFAULT_WAL_AUTOCHECKPOINT=16000, DEFAULT_JOURNAL_SIZE_LIMIT=67108864, SORTER_PMASZ=8192, DEFAULT_CACHE_SIZE=-1048576, DEFAULT_MMAP_SIZE=34359738368, MAX_MMAP_SIZE=1099511627776, ENABLE_FTS3_TOKENIZER, ENABLE_SETLK_TIMEOUT, ENABLE_NULL_TRIM, ENABLE_PERCENTILE, ENABLE_FTS5, ENABLE_RTREE
 slow query smoke passed
 slow query concurrency smoke passed

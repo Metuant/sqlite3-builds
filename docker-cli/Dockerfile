@@ -1,8 +1,11 @@
 # syntax=docker/dockerfile:1.5
 # WHY: BuildKit syntax enables the cache mount used by the CLI build step.
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+FROM ghcr.io/linuxserver/baseimage-alpine:3.23
 
 LABEL org.sqlite.static.binary.linux.x86_64.dockerfile.version="2.0.0"
+
+ENTRYPOINT []
+CMD ["/bin/sh"]
 
 ARG SQLITE_AMALG_URL
 ARG COMPRESS_SQLITE3

@@ -10,9 +10,9 @@ milestone lands.
 
 ## 1. Build / variant
 
-- Plex variant builds under **Alpine/musl**; generic variant stays
-  Ubuntu/glibc. Multi-stage `docker-library/Dockerfile` selects via
-  `LIBRARY_VARIANT`.
+- Plex variant builds under the LSIO Alpine 3.23/musl base; generic variant
+  stays on the LSIO Ubuntu/glibc base. Multi-stage
+  `docker-library/Dockerfile` selects via `LIBRARY_VARIANT`.
 - `LIBRARY_VARIANT=plex` is limited to the Plex ICU build path.
 - SQLite pins must stay aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `.github/workflows/sqlite-build.yml`,

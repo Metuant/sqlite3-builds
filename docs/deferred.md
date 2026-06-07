@@ -15,15 +15,16 @@ Plex Media Scanner pool-size sites there. The active Phase 04 entrypoint,
 
 The amd64 patch sites live in `lib/plex-pool-patch.sh` as caller-provided site
 tuples from `83-sqlite3-mod-pool-patch`. The current baseline SHA source is
-`pins/plex-pool-patch-baselines.txt`.
+`pins/plex-pool-patch-baselines.txt`; the active Plex image tag is tracked as
+`PLEX_IMAGE_TAG` in `pins/versions.env`.
 
 ### Why deferred
 
-`lscr.io/linuxserver/plex:1.42.2` is a multi-arch image, so the arm64 runner
-pulls arm64 PMS binaries. The current amd64 sites were derived from x86_64
-instruction contexts where the pool-size immediate appears as `mov esi, 0x14`.
-ARM64 encodes the same constant differently, so arm64 requires fresh binary
-extraction and site derivation.
+The LSIO Plex image tracked by `PLEX_IMAGE_TAG` in `pins/versions.env` is a
+multi-arch image, so the arm64 runner pulls arm64 PMS binaries. The current
+amd64 sites were derived from x86_64 instruction contexts where the pool-size
+immediate appears as `mov esi, 0x14`. ARM64 encodes the same constant
+differently, so arm64 requires fresh binary extraction and site derivation.
 
 The pre-staged `plex.binaries/` artifacts at `.claude.local/plex.binaries/`
 are amd64-only. Do not reuse them for arm64.
@@ -31,9 +32,9 @@ are amd64-only. Do not reuse them for arm64.
 ### Prerequisites to resume
 
 1. Extract arm64 `Plex Media Server` and `Plex Media Scanner` binaries from the
-   `linuxserver/plex:1.42.2` arm64 manifest with
-   `docker pull --platform=linux/arm64 lscr.io/linuxserver/plex:1.42.2`, then
-   copy the binaries from a container.
+   arm64 manifest for `lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}`, using the
+   `PLEX_IMAGE_TAG` value from `pins/versions.env`, then copy the binaries from
+   a container.
 2. Adapt the EMBY-PLEX-MEMORY-INVESTIGATION methodology from section 9:
    RTTI string -> typeinfo struct -> vtable refs -> caller's
    connection-pool-size immediate-load site. The x86_64 `mov esi, 0x14` site

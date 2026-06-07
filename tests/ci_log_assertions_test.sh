@@ -8,6 +8,11 @@ fail() {
   exit 1
 }
 
+. ./pins/versions.env
+
+[ -n "${SQLITE_VERSION_DOTTED:-}" ] || fail "SQLITE_VERSION_DOTTED is not set in pins/versions.env"
+sqlite_version_dotted_re="${SQLITE_VERSION_DOTTED//./\\.}"
+
 assert_eq() {
   expected=$1
   actual=$2
@@ -33,18 +38,22 @@ fixture() {
   printf 'tests/fixtures/%s\n' "$1"
 }
 
-pass_log="$(cat "$(fixture ci-log-pass.txt)")"
-missing_marker_log="$(cat "$(fixture ci-log-missing-marker.txt)")"
+fixture_text() {
+  sed "s/@SQLITE_VERSION_DOTTED@/${SQLITE_VERSION_DOTTED}/g" "$(fixture "$1")"
+}
+
+pass_log="$(fixture_text ci-log-pass.txt)"
+missing_marker_log="$(fixture_text ci-log-missing-marker.txt)"
 unexpected_marker_log="$(cat "$(fixture ci-log-unexpected-marker.txt)")"
 bad_signal_log="$(cat "$(fixture ci-log-bad-signal.txt)")"
-open_missing_log="$(cat "$(fixture ci-log-open-missing.txt)")"
+open_missing_log="$(fixture_text ci-log-open-missing.txt)"
 config_rc21_log="$(cat "$(fixture ci-log-config-rc21.txt)")"
 wrong_version_log="$(cat "$(fixture ci-log-emby-version-wrong.txt)")"
-compiler_missing_line_log="$(cat "$(fixture ci-log-compiler-missing-line.txt)")"
+compiler_missing_line_log="$(fixture_text ci-log-compiler-missing-line.txt)"
 compiler_missing_flag_log="$(cat "$(fixture ci-log-compiler-missing-flag.txt)")"
 
-cursor_slice="$(slice_log_after_cursor 2 < "$(fixture ci-log-cursor-same-second.txt)")"
-assert_marker_present "$cursor_slice" 'new-run Sqlite version: 3\.53\.1' "cursor slice missing new run"
+cursor_slice="$(fixture_text ci-log-cursor-same-second.txt | slice_log_after_cursor 2)"
+assert_marker_present "$cursor_slice" "new-run Sqlite version: ${sqlite_version_dotted_re}" "cursor slice missing new run"
 assert_marker_absent "$cursor_slice" 'old-run' "cursor slice retained old run"
 
 assert_marker_present "$pass_log" '\[sqlite3-builds-obs\].*SQLITE_TRACE_STMT' "marker should be present"
@@ -64,8 +73,8 @@ run_expect_fail "assert_open_marker_count missing open marker" assert_open_marke
 assert_no_startup_config_rc21 "$pass_log" "Emby"
 run_expect_fail "assert_no_startup_config_rc21 detects rc21" assert_no_startup_config_rc21 "$config_rc21_log" "Emby"
 
-assert_emby_sqlite_version "Sqlite version: 3.53.1" "3.53.1"
-run_expect_fail "assert_emby_sqlite_version wrong version" assert_emby_sqlite_version "$wrong_version_log" "3.53.1"
+assert_emby_sqlite_version "Sqlite version: ${SQLITE_VERSION_DOTTED}" "$SQLITE_VERSION_DOTTED"
+run_expect_fail "assert_emby_sqlite_version wrong version" assert_emby_sqlite_version "$wrong_version_log" "$SQLITE_VERSION_DOTTED"
 
 assert_emby_compile_options "$pass_log" >/tmp/ci-compile.out
 run_expect_fail "assert_emby_compile_options missing line" assert_emby_compile_options "$compiler_missing_line_log"

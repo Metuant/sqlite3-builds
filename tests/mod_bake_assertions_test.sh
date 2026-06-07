@@ -10,6 +10,10 @@ fail() {
   exit 1
 }
 
+. ./pins/versions.env
+
+[ -n "${SQLITE_VERSION_DOTTED:-}" ] || fail "SQLITE_VERSION_DOTTED is not set in pins/versions.env"
+
 assert_eq() {
   expected=$1
   actual=$2
@@ -19,6 +23,16 @@ assert_eq() {
 
 fixture() {
   printf 'tests/fixtures/%s\n' "$1"
+}
+
+tmpdir="$(mktemp -d /tmp/mod-bake-assertions-test.XXXXXX)"
+trap 'rm -rf "$tmpdir"' EXIT
+
+render_fixture() {
+  name=$1
+  rendered="${tmpdir}/${name}"
+  sed "s/@SQLITE_VERSION_DOTTED@/${SQLITE_VERSION_DOTTED}/g" "$(fixture "$name")" > "$rendered"
+  printf '%s\n' "$rendered"
 }
 
 run_expect_fail() {
@@ -35,8 +49,8 @@ run_expect_fail() {
   fi
 }
 
-emby_run2="$(fixture mod-bake-emby-run2-pass.txt)"
-emby_run3="$(fixture mod-bake-emby-run3-pass.txt)"
+emby_run2="$(render_fixture mod-bake-emby-run2-pass.txt)"
+emby_run3="$(render_fixture mod-bake-emby-run3-pass.txt)"
 plex_run1="$(fixture mod-bake-plex-amd64-run1-pass.txt)"
 
 assert_eq "1" "$(fixed_count 'event=config-updated tag=MaxLibraryDbConnections' "$emby_run2")" "fixed_count"
@@ -47,7 +61,7 @@ assert_component_present "$emby_run2" "run 2"
 assert_no_bad_signal "$emby_run2" "run 2" "$bad_signal_re"
 assert_common_run "$emby_run2" "run 2" 'arch=linux-x86_64-v(2|3)' "$bad_signal_re"
 assert_swap_run "$emby_run2" "run 2" skip
-assert_runtime_load "$emby_run2" "run 2" emby "3.53.1"
+assert_runtime_load "$emby_run2" "run 2" emby "$SQLITE_VERSION_DOTTED"
 assert_plex_run "$plex_run1" "run 1" installed amd64 'arch=linux-x86_64-v(2|3)' "$bad_signal_re"
 assert_emby_tag_transition "$emby_run2" MaxLibraryDbConnections "run 2"
 assert_emby_tag_transition "$emby_run2" MaxAuthDbConnections "run 2"
@@ -66,12 +80,12 @@ run_expect_fail "assert_swap_run installed missing installed" assert_swap_run "$
 run_expect_fail "assert_swap_run skip missing skip" assert_swap_run "$(fixture mod-bake-swap-missing-skip.txt)" "run 2" skip
 run_expect_fail "assert_swap_run skip reinstalled" assert_swap_run "$(fixture mod-bake-swap-reinstalled.txt)" "run 2" skip
 
-run_expect_fail "assert_runtime_load missing version" assert_runtime_load "$(fixture mod-bake-runtime-missing-version.txt)" "run 1" emby "3.53.1"
-run_expect_fail "assert_runtime_load wrong version" assert_runtime_load "$(fixture mod-bake-runtime-wrong-version.txt)" "run 1" emby "3.53.1"
-run_expect_fail "assert_runtime_load missing mmap" assert_runtime_load "$(fixture mod-bake-runtime-missing-mmap.txt)" "run 1" emby "3.53.1"
-run_expect_fail "assert_runtime_load missing trace" assert_runtime_load "$(fixture mod-bake-runtime-missing-trace.txt)" "run 1" emby "3.53.1"
-run_expect_fail "assert_runtime_load missing open" assert_runtime_load "$(fixture mod-bake-runtime-missing-open.txt)" "run 1" emby "3.53.1"
-run_expect_fail "assert_runtime_load rc21" assert_runtime_load "$(fixture mod-bake-runtime-rc21.txt)" "run 1" emby "3.53.1"
+run_expect_fail "assert_runtime_load missing version" assert_runtime_load "$(fixture mod-bake-runtime-missing-version.txt)" "run 1" emby "$SQLITE_VERSION_DOTTED"
+run_expect_fail "assert_runtime_load wrong version" assert_runtime_load "$(fixture mod-bake-runtime-wrong-version.txt)" "run 1" emby "$SQLITE_VERSION_DOTTED"
+run_expect_fail "assert_runtime_load missing mmap" assert_runtime_load "$(render_fixture mod-bake-runtime-missing-mmap.txt)" "run 1" emby "$SQLITE_VERSION_DOTTED"
+run_expect_fail "assert_runtime_load missing trace" assert_runtime_load "$(render_fixture mod-bake-runtime-missing-trace.txt)" "run 1" emby "$SQLITE_VERSION_DOTTED"
+run_expect_fail "assert_runtime_load missing open" assert_runtime_load "$(render_fixture mod-bake-runtime-missing-open.txt)" "run 1" emby "$SQLITE_VERSION_DOTTED"
+run_expect_fail "assert_runtime_load rc21" assert_runtime_load "$(render_fixture mod-bake-runtime-rc21.txt)" "run 1" emby "$SQLITE_VERSION_DOTTED"
 run_expect_fail "assert_plex_run missing pool patch" assert_plex_run "$(fixture mod-bake-plex-missing-patched.txt)" "run 1" installed amd64 'arch=linux-x86_64-v(2|3)' "$bad_signal_re"
 
 run_expect_fail "assert_emby_tag_transition zero markers" assert_emby_tag_transition "$(fixture mod-bake-emby-transition-zero.txt)" MaxLibraryDbConnections "run 2"

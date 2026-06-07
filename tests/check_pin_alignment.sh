@@ -1,106 +1,139 @@
 #!/bin/sh
-# shellcheck disable=SC2016
 set -eu
 
-expected_url_for_version() {
-  printf 'https://github.com/microsoft/mimalloc/archive/refs/tags/v%s.tar.gz\n' "$1"
-}
+repo_root="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd -P)"
+cd "${repo_root}"
 
 fail() {
   printf 'FATAL: %s\n' "$1" >&2
   exit 1
 }
 
-extract_build_sh() {
-  key="$1"
-  sed -n "s/^${key}=\"\${${key}:-\\([^\}]*\\)}\".*/\\1/p" build/Build.sh
+require_line() {
+  file="$1"
+  line="$2"
+  grep -Fxq "$line" "$file" || fail "$file missing exact line: $line"
 }
 
-extract_wrapper() {
-  key="$1"
-  sed -n "s/^${key}='\\([^']*\\)'.*/\\1/p" build/build_static_sqlite.sh
-}
-
-extract_dockerfile() {
-  key="$1"
-  sed -n "s/^ARG ${key}=\\(.*\\)$/\\1/p" docker-library/Dockerfile
-}
-
-extract_workflow() {
-  key="$1"
-  sed -n "s/^[[:space:]]*${key}: \"\\([^\"]*\\)\"[[:space:]]*$/\\1/p" .github/workflows/sqlite-build.yml
-}
-
-require_dockerfile_text() {
-  needle="$1"
-  grep -Fq "$needle" docker-library/Dockerfile || fail "ICU URL drift: missing ${needle}"
-}
-
-check_site() {
-  site="$1"
-  version="$2"
-  url="$3"
-  sha="$4"
-
-  [ -n "$version" ] || fail "$site missing MIMALLOC_VERSION"
-  [ -n "$url" ] || fail "$site missing MIMALLOC_URL"
-  [ -n "$sha" ] || fail "$site missing MIMALLOC_SHA512"
-
-  expected_url="$(expected_url_for_version "$version")"
-  if [ "$url" != "$expected_url" ]; then
-    fail "$site MIMALLOC_URL mismatch: observed=$url expected=$expected_url"
+reject_pattern() {
+  file="$1"
+  pattern="$2"
+  if grep -Eq "$pattern" "$file"; then
+    fail "$file contains rejected pattern: $pattern"
   fi
 }
 
-build_version="$(extract_build_sh MIMALLOC_VERSION)"
-build_url="$(extract_build_sh MIMALLOC_URL)"
-build_sha="$(extract_build_sh MIMALLOC_SHA512)"
-wrapper_version="$(extract_wrapper MIMALLOC_VERSION)"
-wrapper_url="$(extract_wrapper MIMALLOC_URL)"
-wrapper_sha="$(extract_wrapper MIMALLOC_SHA512)"
-docker_version="$(extract_dockerfile MIMALLOC_VERSION)"
-docker_url="$(extract_dockerfile MIMALLOC_URL)"
-docker_sha="$(extract_dockerfile MIMALLOC_SHA512)"
-workflow_version="$(extract_workflow MIMALLOC_VERSION)"
-workflow_url="$(extract_workflow MIMALLOC_URL)"
-workflow_sha="$(extract_workflow MIMALLOC_SHA512)"
+pin_file="pins/versions.env"
+[ -r "$pin_file" ] || fail "$pin_file not readable"
+. "$pin_file"
 
-check_site "build/Build.sh" "$build_version" "$build_url" "$build_sha"
-check_site "build/build_static_sqlite.sh" "$wrapper_version" "$wrapper_url" "$wrapper_sha"
-check_site "docker-library/Dockerfile" "$docker_version" "$docker_url" "$docker_sha"
-check_site ".github/workflows/sqlite-build.yml" "$workflow_version" "$workflow_url" "$workflow_sha"
+required_pins='
+SQLITE_VERSION
+SQLITE_VERSION_DOTTED
+SQLITE_AMALG_URL
+SQLITE_AMALG_SHA3_256
+SQLITE_SRC_URL
+SQLITE_SRC_SHA3_256
+MIMALLOC_VERSION
+MIMALLOC_URL
+MIMALLOC_SHA512
+ICU_VERSION
+ICU_SHA512
+PLEX_IMAGE_TAG
+EMBY_IMAGE_TAG
+SQLITE_EXPECTED_CONFIG_COUNT
+SQLITE_EXPECTED_DBCONFIG_COUNT
+BASEIMAGE_UBUNTU
+BASEIMAGE_ALPINE
+'
 
-expected_version="$build_version"
-expected_url="$build_url"
-expected_sha="$build_sha"
-
-for row in \
-  "build/build_static_sqlite.sh|$wrapper_version|$wrapper_url|$wrapper_sha" \
-  "docker-library/Dockerfile|$docker_version|$docker_url|$docker_sha" \
-  ".github/workflows/sqlite-build.yml|$workflow_version|$workflow_url|$workflow_sha"
-do
-  site="${row%%|*}"
-  rest="${row#*|}"
-  version="${rest%%|*}"
-  rest="${rest#*|}"
-  url="${rest%%|*}"
-  sha="${rest#*|}"
-
-  [ "$version" = "$expected_version" ] || fail "$site MIMALLOC_VERSION drift: observed=$version expected=$expected_version"
-  [ "$url" = "$expected_url" ] || fail "$site MIMALLOC_URL drift: observed=$url expected=$expected_url"
-  [ "$sha" = "$expected_sha" ] || fail "$site MIMALLOC_SHA512 drift: observed=$sha expected=$expected_sha"
+for key in $required_pins; do
+  eval "value=\${${key}-}"
+  [ -n "$value" ] || fail "$pin_file missing non-empty $key"
 done
 
-dockerfile_icu="$(extract_dockerfile ICU_VERSION)"
-workflow_icu="$(extract_workflow ICU_VERSION)"
-[ -n "$dockerfile_icu" ] || fail "docker-library/Dockerfile missing ICU_VERSION ARG default"
-[ -n "$workflow_icu" ] || fail ".github/workflows/sqlite-build.yml missing ICU_VERSION env"
-[ "$dockerfile_icu" = "$workflow_icu" ] || \
-  fail "ICU_VERSION drift: Dockerfile=$dockerfile_icu workflow=$workflow_icu"
+assert_eq() {
+  label="$1"
+  expected="$2"
+  actual="$3"
+  [ -n "$actual" ] || fail "$label missing"
+  [ "$actual" = "$expected" ] || fail "$label drift: observed=$actual expected=$expected"
+}
 
-require_dockerfile_text 'icu_release_version="$(printf '\''%s'\'' "${ICU_VERSION}" | tr '\''.'\'' '\''-'\'')"'
-require_dockerfile_text 'icu_archive_version="$(printf '\''%s'\'' "${ICU_VERSION}" | tr '\''.'\'' '\''_'\'')"'
-require_dockerfile_text 'icu_archive="/tmp/icu4c-${icu_archive_version}-src.tgz"'
-require_dockerfile_text 'icu_url="https://github.com/unicode-org/icu/releases/download/release-${icu_release_version}/icu4c-${icu_archive_version}-src.tgz"'
+extract_build_sh_default() {
+  key="$1"
+  value="$(sed -n "s/^${key}=\"\${${key}:-\\([^\}]*\\)}\"$/\\1/p" build/Build.sh)"
+  [ -n "$value" ] || fail "build/Build.sh missing ${key} default"
+  printf '%s\n' "$value"
+}
 
-printf 'pins aligned: mimalloc=%s icu=%s\n' "$expected_version" "$workflow_icu"
+assert_wrapper_pin_default() {
+  key="$1"
+  needle="${key}=\"\${${key}-\$(pin_default ${key})}\""
+  grep -Fq "$needle" build/build_static_sqlite.sh || \
+    fail "build/build_static_sqlite.sh does not default $key from pins/versions.env"
+}
+
+for key in \
+  SQLITE_AMALG_URL \
+  SQLITE_AMALG_SHA3_256 \
+  SQLITE_SRC_URL \
+  SQLITE_SRC_SHA3_256 \
+  MIMALLOC_VERSION \
+  MIMALLOC_URL \
+  MIMALLOC_SHA512 \
+  ICU_VERSION \
+  ICU_SHA512
+do
+  assert_wrapper_pin_default "$key"
+done
+
+require_line build/build_static_sqlite.sh 'pins_file="${script_dir}/../pins/versions.env"'
+require_line .github/workflows/sqlite-build.yml '        run: grep -E '\''^[A-Za-z_][A-Za-z0-9_]*='\'' pins/versions.env >> "$GITHUB_ENV"'
+
+load_step_count="$(grep -Fc "run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> \"\$GITHUB_ENV\"" .github/workflows/sqlite-build.yml)"
+assert_eq '.github/workflows/sqlite-build.yml Load version pins step count' '3' "$load_step_count"
+
+top_env_pins="$(awk '
+  /^env:/ { in_env=1; next }
+  /^jobs:/ { in_env=0 }
+  in_env && /^[[:space:]]+[A-Z_]+:/ { print }
+' .github/workflows/sqlite-build.yml | grep -E 'SQLITE_|MIMALLOC_|ICU_|PLEX_IMAGE_TAG|EMBY_IMAGE_TAG' || true)"
+[ -z "$top_env_pins" ] || fail ".github/workflows/sqlite-build.yml keeps pin keys in top-level env: $top_env_pins"
+
+assert_eq 'build/Build.sh MIMALLOC_VERSION' "$MIMALLOC_VERSION" "$(extract_build_sh_default MIMALLOC_VERSION)"
+assert_eq 'build/Build.sh MIMALLOC_URL' "$MIMALLOC_URL" "$(extract_build_sh_default MIMALLOC_URL)"
+assert_eq 'build/Build.sh MIMALLOC_SHA512' "$MIMALLOC_SHA512" "$(extract_build_sh_default MIMALLOC_SHA512)"
+
+for key in ICU_VERSION ICU_SHA512 MIMALLOC_VERSION MIMALLOC_URL MIMALLOC_SHA512; do
+  require_line docker-library/Dockerfile "ARG $key"
+  reject_pattern docker-library/Dockerfile "^ARG ${key}="
+done
+
+require_line docker-cli/Dockerfile "FROM ${BASEIMAGE_ALPINE}"
+require_line docker-cli/Dockerfile 'ENTRYPOINT []'
+require_line docker-cli/Dockerfile 'CMD ["/bin/sh"]'
+require_line docker-library/Dockerfile "FROM ${BASEIMAGE_UBUNTU} AS base-generic"
+require_line docker-library/Dockerfile "FROM ${BASEIMAGE_ALPINE} AS base-plex"
+require_line docker-library/Dockerfile 'ENTRYPOINT []'
+require_line docker-library/Dockerfile 'CMD ["/bin/sh"]'
+require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_URL'
+require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_SHA3_256'
+require_line docker-library/Dockerfile 'ARG SQLITE_SRC_URL=""'
+require_line docker-library/Dockerfile 'ARG SQLITE_SRC_SHA3_256=""'
+require_line docker-cli/Dockerfile 'ARG SQLITE_AMALG_URL'
+require_line docker-cli/Dockerfile 'ARG SQLITE_AMALG_SHA3_256'
+
+config_count="$(tr -d '[:space:]' < build/expected-sqlite-config-count.txt)"
+dbconfig_count="$(tr -d '[:space:]' < build/expected-sqlite-dbconfig-count.txt)"
+assert_eq 'build/expected-sqlite-config-count.txt' "$SQLITE_EXPECTED_CONFIG_COUNT" "$config_count"
+assert_eq 'build/expected-sqlite-dbconfig-count.txt' "$SQLITE_EXPECTED_DBCONFIG_COUNT" "$dbconfig_count"
+
+printf 'pins aligned: sqlite=%s mimalloc=%s icu=%s bases=%s,%s counts=%s/%s\n' \
+  "$SQLITE_VERSION_DOTTED" \
+  "$MIMALLOC_VERSION" \
+  "$ICU_VERSION" \
+  "$BASEIMAGE_UBUNTU" \
+  "$BASEIMAGE_ALPINE" \
+  "$SQLITE_EXPECTED_CONFIG_COUNT" \
+  "$SQLITE_EXPECTED_DBCONFIG_COUNT"

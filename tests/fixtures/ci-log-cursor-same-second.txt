@@ -1,5 +1,5 @@
 2026-05-31T12:00:00 old-run [sqlite3-builds-obs] trace SQLITE_TRACE_STMT select old
 2026-05-31T12:00:00 old-run [sqlite3-builds-obs] event slow_query elapsed_ms=99
 2026-05-31T12:00:00 restart container stopped and started
-2026-05-31T12:00:00 new-run Sqlite version: 3.53.1
+2026-05-31T12:00:00 new-run Sqlite version: @SQLITE_VERSION_DOTTED@
 2026-05-31T12:00:00 new-run [sqlite3-builds-obs] trace SQLITE_TRACE_STMT select new

@@ -119,20 +119,17 @@ current design and validation plan land.
 
 ## Build Inputs
 
-The SQLite source pins are carried in both the local wrapper and the workflow:
-
-The workflow carries the release-component sources of truth as top-level envs:
-`SQLITE_VERSION`, `SQLITE_VERSION_DOTTED`, `MIMALLOC_VERSION`,
-`ICU_VERSION`, `PLEX_IMAGE_TAG`, and `EMBY_IMAGE_TAG`.
+The source of truth for version and image pins is `pins/versions.env`; the
+local wrapper sources it and the workflow loads it into `$GITHUB_ENV`.
 
 | Input | Current value |
 |---|---|
-| SQLite version | `3530100` |
+| SQLite version | `3530200` |
 | SQLite release year | `2026` |
-| Amalgamation URL | `https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip` |
-| Amalgamation SHA3-256 | `3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114` |
-| Full source URL | `https://www.sqlite.org/2026/sqlite-src-3530100.zip` |
-| Full source SHA3-256 | `27cfc9264b2188fd17f811a8c03424eb65391c2ef9874cbfc860ea25f4322363` |
+| Amalgamation URL | `https://www.sqlite.org/2026/sqlite-amalgamation-3530200.zip` |
+| Amalgamation SHA3-256 | `81142986038e18f96c4a54e1a72562ae17e502a916f2a7701eff43388cbf1a40` |
+| Full source URL | `https://www.sqlite.org/2026/sqlite-src-3530200.zip` |
+| Full source SHA3-256 | `490ec7af32a6bfa5f3e05dc279c04286cfe3f328def4a8b7344e3fa20be18a4c` |
 
 The Plex library image also pins ICU 69.1:
 

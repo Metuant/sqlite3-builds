@@ -15,16 +15,24 @@ case "${machine}" in
     ;;
 esac
 
-sqlite_amalg_url="${SQLITE_AMALG_URL:-https://www.sqlite.org/2026/sqlite-amalgamation-3530100.zip}"
-sqlite_amalg_sha3_256="${SQLITE_AMALG_SHA3_256:-3c07136e4f6b5dd0c395be86455014039597bc65b6851f7111e88f71b6e06114}"
-
-tmpdir="$(mktemp -d /tmp/abi-obsolete-config-ops-test.XXXXXX 2>/dev/null || { mkdir -p /tmp/abi-obsolete-config-ops-test-$$; echo /tmp/abi-obsolete-config-ops-test-$$; })"
-trap 'rm -rf "${tmpdir}"' EXIT
-
 fatal() {
   echo "FATAL: $*" >&2
   exit 1
 }
+
+sqlite_amalg_url="${SQLITE_AMALG_URL:-}"
+sqlite_amalg_sha3_256="${SQLITE_AMALG_SHA3_256:-}"
+
+. "${repo_root}/pins/versions.env"
+
+[ -n "${SQLITE_AMALG_URL:-}" ] || fatal "SQLITE_AMALG_URL is not set in pins/versions.env"
+[ -n "${SQLITE_AMALG_SHA3_256:-}" ] || fatal "SQLITE_AMALG_SHA3_256 is not set in pins/versions.env"
+
+sqlite_amalg_url="${sqlite_amalg_url:-${SQLITE_AMALG_URL}}"
+sqlite_amalg_sha3_256="${sqlite_amalg_sha3_256:-${SQLITE_AMALG_SHA3_256}}"
+
+tmpdir="$(mktemp -d /tmp/abi-obsolete-config-ops-test.XXXXXX 2>/dev/null || { mkdir -p /tmp/abi-obsolete-config-ops-test-$$; echo /tmp/abi-obsolete-config-ops-test-$$; })"
+trap 'rm -rf "${tmpdir}"' EXIT
 
 cat > "${tmpdir}/abi_obsolete_config_ops.c" <<'EOF'
 #include <stdio.h>

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.5
 ARG LIBRARY_VARIANT=generic
 
-FROM ubuntu:24.04@sha256:c4a8d5503dfb2a3eb8ab5f807da5bc69a85730fb49b5cfca2330194ebcc41c7b AS base-generic
+FROM ghcr.io/linuxserver/baseimage-ubuntu:noble AS base-generic
 
 SHELL ["/bin/bash", "-c"]
 
@@ -30,7 +30,7 @@ RUN echo "**** Install Dependencies ****" && \
         zlib1g \
         zlib1g-dev
 
-FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS base-plex
+FROM ghcr.io/linuxserver/baseimage-alpine:3.23 AS base-plex
 
 RUN echo "**** Install Dependencies ****" && \
     apk add --no-cache \
@@ -60,6 +60,9 @@ LABEL org.sqlite.static.library.linux.x86_64.dockerfile.version="2.0.0"
 
 SHELL ["/bin/bash", "-c"]
 
+ENTRYPOINT []
+CMD ["/bin/sh"]
+
 ARG LIBRARY_VARIANT=generic
 
 WORKDIR /app
@@ -76,8 +79,8 @@ COPY tests/ /app/tests/
 
 RUN chmod +x /app/Build.sh
 
-ARG ICU_VERSION=69.1
-ARG ICU_SHA512=d4aeb781715144ea6e3c6b98df5bbe0490bfa3175221a1d667f3e6851b7bd4a638fa4a37d4a921ccb31f02b5d15a6dded9464d98051964a86f7b1cde0ff0aab7
+ARG ICU_VERSION
+ARG ICU_SHA512
 RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       set -euo pipefail; \
       icu_release_version="$(printf '%s' "${ICU_VERSION}" | tr '.' '-')"; \
@@ -101,9 +104,9 @@ ENV PLEX_ICU_INCLUDE=/opt/icu-69-plex/include
 ENV PLEX_ICU_LIB=/opt/icu-69-plex/lib
 ENV PLEX_ICU_LDFLAGS="-L${PLEX_ICU_LIB} -Wl,-rpath-link,${PLEX_ICU_LIB}"
 
-ARG MIMALLOC_VERSION=3.3.2
-ARG MIMALLOC_URL=https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz
-ARG MIMALLOC_SHA512=226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1
+ARG MIMALLOC_VERSION
+ARG MIMALLOC_URL
+ARG MIMALLOC_SHA512
 RUN set -euo pipefail; \
     mimalloc_archive="/tmp/mimalloc-${MIMALLOC_VERSION}.tar.gz"; \
     mimalloc_src_dir="/tmp/mimalloc-${MIMALLOC_VERSION}"; \

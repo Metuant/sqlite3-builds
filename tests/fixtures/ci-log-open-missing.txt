@@ -1,2 +1,2 @@
 [sqlite3-builds-obs] trace SQLITE_TRACE_STMT select 1
-Sqlite version: 3.53.1
+Sqlite version: @SQLITE_VERSION_DOTTED@
