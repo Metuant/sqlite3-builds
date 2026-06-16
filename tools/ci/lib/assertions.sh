@@ -223,15 +223,12 @@ assert_plex_run() {
   local slice="$1" run_label="$2" expected_swap="$3" matrix_arch_suffix="$4" expected_arch_re="$5" bad_signal_re="$6"
   assert_common_run "$slice" "$run_label" "$expected_arch_re" "$bad_signal_re"
   assert_swap_run "$slice" "$run_label" "$expected_swap"
-  if [ "$matrix_arch_suffix" = "amd64" ]; then
-    if [ "$expected_swap" = "installed" ]; then
-      require_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} missing Plex pool patch apply marker"
-    else
-      require_grep 'pool_patch event=already-patched' "$slice" "FATAL: ${run_label} missing Plex pool already-patched marker"
-      reject_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} unexpectedly re-applied Plex pool patch"
-    fi
+  case "$matrix_arch_suffix" in amd64|arm64) ;; *) echo "FATAL: unsupported Plex arch suffix: $matrix_arch_suffix" >&2; exit 1 ;; esac
+  if [ "$expected_swap" = "installed" ]; then
+    require_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} missing Plex pool patch apply marker"
   else
-    require_grep 'event=pool-patch-deferred' "$slice" "FATAL: ${run_label} missing Plex arm64 pool-patch-deferred marker"
+    require_grep 'pool_patch event=already-patched' "$slice" "FATAL: ${run_label} missing Plex pool already-patched marker"
+    reject_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} unexpectedly re-applied Plex pool patch"
   fi
 }
 

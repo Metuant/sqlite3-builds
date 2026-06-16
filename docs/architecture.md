@@ -551,14 +551,14 @@ would have skipped `sqlite3_trace_v2(SQLITE_TRACE_STMT)` registration in
 The accepted per-open mutex + dedup-scan cost preserves orthogonality between
 the two kill switches.
 
-`SQLITE3_SLOW_QUERY_THRESHOLD_MS` defaults to `100`. The parser accepts only
+`SQLITE3_SLOW_QUERY_THRESHOLD_MS` defaults to `500`. The parser accepts only
 unsigned decimal milliseconds, allows `0` for debug-only all-sample logging,
-and falls back to `100` for unset, empty, signed, non-digit, trailing-junk,
+and falls back to `500` for unset, empty, signed, non-digit, trailing-junk,
 ERANGE, or pre-conversion overflow values. PROFILE elapsed values come from
 SQLite's millisecond-quantized timing source and are scaled to nanoseconds by
 SQLite before the callback receives them.
 
-The tracker keeps a process-global 1024-entry LRU keyed by parameterized
+The tracker keeps a process-global 2048-entry LRU keyed by parameterized
 `sqlite3_sql()` text. It stores and displays at most 1024 SQL bytes per
 template, uses the full SQL FNV-1a hash as the probe accelerator, and uses that
 full hash as the equality proof for templates longer than 1024 bytes. Existing
@@ -821,9 +821,8 @@ checks `libicuucplex.so.69`, `libicui18nplex.so.69`, and
 `libicudataplex.so.69` against `pre` rows before SQLite replacement. It must
 not replace, rename, move, delete, or overwrite those files.
 
-Phase 04 pool patch runs only in the Plex mod. Arm64 logs
-`event=pool-patch-deferred` and exits 0. On amd64, the phase first verifies
-that the SQLite target is already current, then calls the staged
+Phase 04 pool patch runs only in the Plex mod. On amd64 and arm64, the phase
+first verifies that the SQLite target is already current, then calls the staged
 `plex-pool-patch.sh` fragment with all paths, expected SHAs, and patch sites as
 arguments. The fragment reads no environment variables and carries no SHA
 constants.
@@ -834,15 +833,30 @@ label, the 16-byte read offset, the byte write offset, and the full original
 and patched contexts for one binary. The writer derives the single byte to
 write from `patched_hex` at `write_seek - offset`, writes it to a same-fs temp
 copy with `dd conv=notrunc`, restores the original owner and mode on the temp,
-and atomically replaces the target.
+and atomically replaces the target. Purpose: every listed site changes the
+ConnectionPool size immediate from 20 to 16. On amd64, `original_hex` starts
+`be14...` and `patched_hex` starts `be10...`; on arm64, `original_hex` starts
+`81028052...` and `patched_hex` starts `01028052...`.
 
-Current amd64 sites:
+Current sites for `lscr.io/linuxserver/plex:1.43.2`:
 
-| Binary | Offset label | Offset decimal | Write seek |
-|---|---:|---:|---:|
-| `/usr/lib/plexmediaserver/Plex Media Server` | `0xae4a17` | `11422231` | `11422232` |
-| `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x36f06d` | `3600493` | `3600494` |
-| `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x38b37b` | `3715963` | `3715964` |
+| Arch | Binary | Offset label | Offset decimal | Write seek |
+|---|---|---:|---:|---:|
+| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xb175e7` | `11630055` | `11630056` |
+| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x37d4b7` | `3658935` | `3658936` |
+| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x3997bf` | `3774399` | `3774400` |
+| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xa18fd4` | `10588116` | `10588116` |
+| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x33ad9c` | `3386780` | `3386780` |
+| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x3575f8` | `3503608` | `3503608` |
+
+Pool-size-2 sites are for a different database and must not be patched:
+
+| Arch | Binary | File offset | VA |
+|---|---|---:|---:|
+| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xaf660b` | `0xaf760b` |
+| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x372be9` | `0x373be9` |
+| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Server` | `0x9f7868` | `0xa07868` |
+| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x32f6d0` | `0x33f6d0` |
 
 Pool-patch per-binary behavior:
 
@@ -859,7 +873,7 @@ Runtime command surface:
 | Scope | Commands |
 |---|---|
 | Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |
-| Plex amd64 pool patch only | `dd od printf` |
+| Plex pool patch | `dd od printf` |
 
 LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
 package managers, or network access.
@@ -977,7 +991,7 @@ LSIO tool surface:
 - Perform no runtime archive download or extraction.
 - Common phases use `awk`, `chmod`, `chown`, `cp`, `grep`, `mkdir`, `mktemp`,
   `mv`, `rm`, `sed`, `sha256sum`, `stat`, `tr`, and `uname`.
-- Plex amd64 pool patch additionally uses `dd`, `od`, and `printf`.
+- Plex pool patch additionally uses `dd`, `od`, and `printf`.
 - Do not depend on `curl`, `tar`, `gunzip`, Python, `jq`, package managers, or
   network access at runtime.
 

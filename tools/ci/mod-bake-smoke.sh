@@ -191,7 +191,7 @@ wait_for_plex_slice() {
   for _ in $(seq 1 30); do
     write_log_slice "$cursor" "$slice"
     if grep -Fq "$pool_marker" "$slice"; then
-      if [ "$MATRIX_ARCH_SUFFIX" = "arm64" ] || grep -Fq 'mod=plex phase=04-pool-patch event=complete' "$slice"; then
+      if grep -Fq 'mod=plex phase=04-pool-patch event=complete' "$slice"; then
         ready=1
         break
       fi
@@ -248,11 +248,7 @@ docker run --detach \
   -e PGID=1000 \
   "$smoke_ref"
 if [ "$MATRIX_MOD" = "plex" ]; then
-  if [ "$MATRIX_ARCH_SUFFIX" = "amd64" ]; then
-    wait_for_plex_slice "$log_cursor" "$run1_logs" "run 1" 'pool_patch event=patched'
-  else
-    wait_for_plex_slice "$log_cursor" "$run1_logs" "run 1" 'event=pool-patch-deferred'
-  fi
+  wait_for_plex_slice "$log_cursor" "$run1_logs" "run 1" 'pool_patch event=patched'
   wait_for_slice_marker "$log_cursor" "$run1_logs" '[ls.io-init] done.' "run 1"
   wait_for_tcp_port 32400 "run 1"
   write_log_slice "$log_cursor" "$run1_logs"
@@ -276,11 +272,7 @@ log_cursor="$(capture_log_cursor)"
 docker stop -t 60 "$smoke_container" >/dev/null
 docker start "$smoke_container" >/dev/null
 if [ "$MATRIX_MOD" = "plex" ]; then
-  if [ "$MATRIX_ARCH_SUFFIX" = "amd64" ]; then
-    wait_for_plex_slice "$log_cursor" "$run2_logs" "run 2" 'pool_patch event=already-patched'
-  else
-    wait_for_plex_slice "$log_cursor" "$run2_logs" "run 2" 'event=pool-patch-deferred'
-  fi
+  wait_for_plex_slice "$log_cursor" "$run2_logs" "run 2" 'pool_patch event=already-patched'
   wait_for_slice_marker "$log_cursor" "$run2_logs" '[ls.io-init] done.' "run 2"
   wait_for_tcp_port 32400 "run 2"
   write_log_slice "$log_cursor" "$run2_logs"
@@ -304,11 +296,7 @@ log_cursor="$(capture_log_cursor)"
 docker stop -t 60 "$smoke_container" >/dev/null
 docker start "$smoke_container" >/dev/null
 if [ "$MATRIX_MOD" = "plex" ]; then
-  if [ "$MATRIX_ARCH_SUFFIX" = "amd64" ]; then
-    wait_for_plex_slice "$log_cursor" "$run3_logs" "run 3" 'pool_patch event=already-patched'
-  else
-    wait_for_plex_slice "$log_cursor" "$run3_logs" "run 3" 'event=pool-patch-deferred'
-  fi
+  wait_for_plex_slice "$log_cursor" "$run3_logs" "run 3" 'pool_patch event=already-patched'
   wait_for_slice_marker "$log_cursor" "$run3_logs" '[ls.io-init] done.' "run 3"
   wait_for_tcp_port 32400 "run 3"
   write_log_slice "$log_cursor" "$run3_logs"

@@ -17,9 +17,8 @@ DOCKER_MODS=ghcr.io/<namespace>/linuxserver-mod-sqlite3-plex:<YYYY.MM.DD-rN>
 
 The Plex mod replaces `/usr/lib/plexmediaserver/lib/libsqlite3.so` when the
 target file's runtime SHA matches the baked baseline row. It verifies Plex ICU
-runtime files but never writes them. On amd64, it also pool-patches `Plex Media
-Server` and `Plex Media Scanner`. On arm64, the SQLite swap is supported and
-the pool patch logs a deferred warning.
+runtime files but never writes them. On amd64 and arm64, it also pool-patches
+`Plex Media Server` and `Plex Media Scanner`.
 
 ## Emby
 
@@ -39,7 +38,7 @@ swap. Bump the mod tag to the matching repository release tag.
 
 For troubleshooting, check container stdout for stable event names such as `event=installed`,
 `event=skip-already-current`, `event=unknown-target-sha`,
-`event=pool-patch-deferred`, and `pool_patch event=patched`.
+`pool_patch event=patched`, and `pool_patch event=already-patched`.
 
 ## Removal
 

@@ -162,15 +162,15 @@ static int child_accumulator(void) {
 }
 
 static void test_parser_cases(void) {
-    assert_u64("parser unset/default", slow_query_test_parse_threshold_ns(NULL), 100000000ULL);
-    assert_u64("parser empty/default", slow_query_test_parse_threshold_ns(""), 100000000ULL);
+    assert_u64("parser unset/default", slow_query_test_parse_threshold_ns(NULL), 500000000ULL);
+    assert_u64("parser empty/default", slow_query_test_parse_threshold_ns(""), 500000000ULL);
     assert_u64("parser zero", slow_query_test_parse_threshold_ns("0"), 0ULL);
-    assert_u64("parser leading sign/default", slow_query_test_parse_threshold_ns("-1"), 100000000ULL);
-    assert_u64("parser nondigit/default", slow_query_test_parse_threshold_ns("abc"), 100000000ULL);
-    assert_u64("parser trailing junk/default", slow_query_test_parse_threshold_ns("12ms"), 100000000ULL);
-    assert_u64("parser uint64max-overflow-guard/default", slow_query_test_parse_threshold_ns("18446744073709551615"), 100000000ULL);
-    assert_u64("parser erange/default", slow_query_test_parse_threshold_ns("18446744073709551616"), 100000000ULL);
-    assert_u64("parser overflow/default", slow_query_test_parse_threshold_ns("18446744073710"), 100000000ULL);
+    assert_u64("parser leading sign/default", slow_query_test_parse_threshold_ns("-1"), 500000000ULL);
+    assert_u64("parser nondigit/default", slow_query_test_parse_threshold_ns("abc"), 500000000ULL);
+    assert_u64("parser trailing junk/default", slow_query_test_parse_threshold_ns("12ms"), 500000000ULL);
+    assert_u64("parser uint64max-overflow-guard/default", slow_query_test_parse_threshold_ns("18446744073709551615"), 500000000ULL);
+    assert_u64("parser erange/default", slow_query_test_parse_threshold_ns("18446744073709551616"), 500000000ULL);
+    assert_u64("parser overflow/default", slow_query_test_parse_threshold_ns("18446744073710"), 500000000ULL);
 }
 
 static void test_lru_and_accumulator(void) {

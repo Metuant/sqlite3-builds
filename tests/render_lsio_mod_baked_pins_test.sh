@@ -16,8 +16,8 @@ $plex_artifact_sha  sqlite-2026.05.28-r1-library-plex-linux-x86_64-v3.so
 $emby_artifact_sha  sqlite-2026.05.28-r1-library-linux-x86_64-v3.so
 EOF_SUMS
 cat > "$tmp/pre" <<'EOF_PRE'
-pre|1|plex|linux-x86_64-v3|lscr.io/linuxserver/plex:1.42.2|sha256:image|/usr/lib/plexmediaserver/lib/libsqlite3.so|runtime|1111111111111111111111111111111111111111111111111111111111111111
-pre|1|plex|linux-x86_64-v3|lscr.io/linuxserver/plex:1.42.2|sha256:image|/usr/lib/plexmediaserver/lib/libicuucplex.so.69|runtime|2222222222222222222222222222222222222222222222222222222222222222
+pre|1|plex|linux-x86_64-v3|lscr.io/linuxserver/plex:1.43.2|sha256:image|/usr/lib/plexmediaserver/lib/libsqlite3.so|runtime|1111111111111111111111111111111111111111111111111111111111111111
+pre|1|plex|linux-x86_64-v3|lscr.io/linuxserver/plex:1.43.2|sha256:image|/usr/lib/plexmediaserver/lib/libicuucplex.so.69|runtime|2222222222222222222222222222222222222222222222222222222222222222
 pre|1|emby|linux-x86_64-v3|lscr.io/linuxserver/emby:version-4.9.3.0|sha256:image|/app/emby/lib/libsqlite3.so.3.49.2|runtime|3333333333333333333333333333333333333333333333333333333333333333
 EOF_PRE
 cat > "$tmp/pool" <<'EOF_POOL'

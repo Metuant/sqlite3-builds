@@ -21,7 +21,7 @@ Project-specific guidance:
   `/usr/lib/plexmediaserver/lib/libsqlite3.so`.
 - LSIO mods perform no runtime archive download or extraction. Common runtime
   command surface: `awk`, `cp`, `grep`, `mkdir`, `mktemp`, `mv`, `rm`, `sed`,
-  `sha256sum`, `tr`, and `uname`; Plex amd64 pool patch additionally uses
+  `sha256sum`, `tr`, and `uname`; Plex pool patch additionally uses
   `dd`, `od`, and `printf`.
 - Keep `LIBRARY_VARIANT=plex` limited to the Plex ICU build path.
 - Keep SQLite pins aligned across wrapper, workflow, Dockerfiles, and

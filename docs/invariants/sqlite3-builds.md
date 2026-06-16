@@ -99,7 +99,7 @@ milestone lands.
   | Scope | Commands |
   |---|---|
   | Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |
-  | Plex amd64 pool patch only | `dd od printf` |
+  | Plex pool patch | `dd od printf` |
 - LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
   package managers, or network access.
 - Phase posture: malformed or missing `baked-pins.txt`, baked artifact
@@ -121,7 +121,7 @@ milestone lands.
 - Pool patch skips a binary when any site is mixed or unknown. It patches only
   when all sites are original and the binary SHA matches the `pool-pre` row;
   it skips when all sites are already patched.
-- Plex arm64 swaps SQLite but does not patch PMS / Scanner pool size.
+- Plex amd64 and arm64 swap SQLite and patch PMS / Scanner pool size.
 
 ## 3. Source
 

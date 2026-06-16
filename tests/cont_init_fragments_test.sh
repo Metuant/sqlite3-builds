@@ -77,7 +77,7 @@ grep -Fq 'require_all_or_warn awk chmod chown cp grep mkdir mktemp mv rm sed sha
 grep -Fq 'require_all_or_warn awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname' lsio-mods/emby/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-preflight/run
 grep -Fq 'require_all_or_warn awk chmod chown cp dd grep mktemp mv od printf rm sha256sum stat tr uname' lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-poolpatch/run
 grep -Fq '| Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |' docs/invariants/sqlite3-builds.md
-grep -Fq '| Plex amd64 pool patch only | `dd od printf` |' docs/invariants/sqlite3-builds.md
+grep -Fq '| Plex pool patch | `dd od printf` |' docs/invariants/sqlite3-builds.md
 if grep -rEn '(>|mv |cp |rm |dd ).*libicu.*plex\.so\.69|libicu.*plex\.so\.69.*(>|mv |cp |rm |dd )' lsio-mods; then
   echo "FATAL: mod source writes Plex ICU runtime files" >&2
   exit 1

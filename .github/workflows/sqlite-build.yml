@@ -135,6 +135,7 @@ jobs:
           set -euo pipefail
           bash tests/plex_pool_patch_lib_test.sh
           bash tests/cont_init_fragments_test.sh
+          bash tests/resolve_arch_test.sh
           bash tests/lsio_mod_phase03_bak_creation_failure_test.sh
           bash tests/lsio_mod_emby_config_test.sh
           bash tests/render_lsio_mod_baked_pins_test.sh
