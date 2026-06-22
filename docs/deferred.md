@@ -34,4 +34,27 @@ clang/LLVM generally. Deferred because it is a toolchain swap (clang, not gcc):
 resuming requires re-validating codegen and the no-perf-regression benches,
 adapting the build pipeline (mimalloc CMake `CC`, the observability/slow-query C
 wrappers, the `@GLIBC_` floor gate) to zig cc, and confirming the
-x86-64-v2/v3 + arm64 matrix.
+x86-64-v2/v3 + arm64 matrix. A Nix-based alternative with the same floor target
+and different adoption trade-offs is tracked below.
+
+## Nix hermetic build environment
+
+Current state: this is an alternative to the zig cc toolchain swap above, with
+the same goal of decoupling the generic variant's glibc `<= 2.27` link floor
+from toolchain age so the EOL `ubuntu:18.04` pin and its old cmake, binutils,
+and awk are no longer needed. A pinned `nixpkgs` revision can provide a
+hermetic, content-hash-pinned build environment where the compiler (gcc or
+clang), binutils, cmake, and glibc are exact-pinned by hash rather than sourced
+from a mutable distro repo; the glibc 2.27 floor comes from pinning an
+old-enough nixpkgs glibc, or a sysroot, as the link target while running a
+modern toolchain, with `flake.lock` as reproducible, diffable version tracking.
+Compared with zig cc, this is a heavier adoption path because CI runners need
+Nix installed, the team needs Nix fluency, and the model is a larger shift from
+the current `pins/versions.env` workflow, but it buys full hermeticity and
+reproducibility and can keep gcc instead of mandating clang. Plex remains musl
+on `baseimage-alpine` and is unaffected; the produced DSO's glibc requirement
+is unchanged, only how cleanly it is targeted; the `@GLIBC_` floor gate remains
+the safety net. Resuming requires the same validation as the zig cc path:
+re-validating codegen and the no-perf-regression benches, adapting mimalloc
+CMake, the observability/slow-query C wrappers, and the floor gate, and
+confirming the x86-64-v2/v3 + arm64 matrix.

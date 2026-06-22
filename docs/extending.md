@@ -73,6 +73,63 @@ bash tests/selector_test.sh
 bash tests/selector_accessors_test.sh
 ```
 
+## Render And Stage A Local Mod
+
+Use the host-runnable helpers directly when validating a local mod context from
+already built library artifacts. The renderer consumes `pins/*.tsv` by default,
+validates the artifact SHA against the supplied `SHA256SUMS`, and writes
+`baked-pins.txt`; the stager copies the mod root, shared fragments, manifest,
+and matching `libsqlite3.so` artifacts into a Docker context.
+
+Example Emby render and stage flow:
+
+```bash
+tmpdir="$(mktemp -d)"
+tag="2026.05.28-r1"
+generated_at="2026-05-28T00:00:00Z"
+arch="linux-x86_64-v3"
+compat_group="generic"
+artifact_path="release/library/libsqlite3.so"
+artifact_name="sqlite-${tag}-library-generic-${arch}.so"
+target_path="/app/emby/lib/libsqlite3.so.3.49.2"
+sha256sums="${tmpdir}/SHA256SUMS"
+pre_fragment="path/to/pre-fragment.txt"
+baked_pins="${tmpdir}/baked-pins.txt"
+staged="${tmpdir}/emby-mod"
+
+artifact_sha="$(sha256sum "$artifact_path" | awk '{print $1}')"
+printf '%s  %s\n' "$artifact_sha" "$artifact_name" > "$sha256sums"
+
+tools/lsio-mod/render-lsio-mod-baked-pins.sh \
+  --mod emby \
+  --release-tag "$tag" \
+  --generated-at "$generated_at" \
+  --sha256sums "$sha256sums" \
+  --pre-fragment "$pre_fragment" \
+  --output "$baked_pins" \
+  --artifact "${arch}:${compat_group}:${artifact_name}:${artifact_path}:${target_path}"
+
+tools/lsio-mod/stage-lsio-mod.sh \
+  --mod emby \
+  --output-dir "$staged" \
+  --baked-pins "$baked_pins" \
+  --artifact "${arch}:${compat_group}:${artifact_path}"
+```
+
+The render helper accepts one or more `--artifact` values shaped as
+`ARCH:COMPAT_GROUP:NAME:PATH:TARGET_PATH`; the stage helper accepts matching
+`--artifact` values shaped as `ARCH:COMPAT_GROUP:SOURCE_PATH`. Set these
+environment variables before rendering to use non-default pin sources or local
+fixtures:
+
+| Variable | Default |
+|---|---|
+| `RENDER_LSIO_MOD_RUNTIME_SUPPORT` | `pins/runtime-support.tsv` |
+| `RENDER_LSIO_MOD_COMPAT_GROUPS` | `pins/library-compat-groups.tsv` |
+| `RENDER_LSIO_MOD_RUNTIME_BASELINES` | `pins/runtime-baselines.tsv` |
+| `RENDER_LSIO_MOD_POOL_SITES` | `pins/plex-pool-patch-sites.tsv` |
+| `RENDER_LSIO_MOD_POOL_REVIEWS` | `pins/plex-pool-patch-reviews.tsv` |
+
 ## Add A Compat Group
 
 Adding a compatibility group is a code and CI change in the current

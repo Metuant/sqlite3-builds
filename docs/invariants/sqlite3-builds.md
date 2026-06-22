@@ -32,9 +32,10 @@ milestone lands.
   the mimalloc CMake invocation.
 - CLI variant excluded from observability; both library variants (Plex +
   generic) carry it.
-- `SQLITE_THREADSAFE=2` (Multi-thread) is the compile default at
-  `build/Build.sh:208`. Emby compile-options required-flag array contains
-  `THREADSAFE=2` so any drift fails CI.
+- `SQLITE_THREADSAFE=2` (Multi-thread) is a `build/Build.sh` compile flag.
+  `assert_emby_compile_options` in `tools/ci/lib/assertions.sh` requires
+  `THREADSAFE=2`, and `tools/ci/emby-first-init-smoke.sh` invokes that gate so
+  any Emby-visible drift fails CI.
 - Plex variant build fails if `libsqlite3.so` carries `fcntl64` or any
   `@GLIBC_`-versioned undefined symbol (gate at
   `docker-library/Dockerfile`, conditional on `LIBRARY_VARIANT=plex`).
@@ -45,32 +46,29 @@ milestone lands.
 - Matrix rows are v2 / v3 / arm64 only; **no x86-64-v4 row** (v4 lib
   SIGILLs in the auto-extension constructor on non-AVX-512 Zen hosts).
   v4-capable amd64 hosts use the v3 artifact.
-- `SQLITE_TEMP_STORE=3` (memory) is a compile-time pin at
-  `build/Build.sh:207`. `PRAGMA temp_store=2` is documentation-only
-  under that profile (no-op).
+- `SQLITE_TEMP_STORE=3` (memory) is a `build/Build.sh` compile flag.
+  `PRAGMA temp_store=2` is documentation-only under that profile (no-op).
 - `SQLITE_DEFAULT_PAGE_SIZE=16384` (16 KiB) is the compile-default
   page-size pin in `build/Build.sh`.
 - `SQLITE_DEFAULT_AUTOVACUUM=0` is the compile-default autovacuum pin in
-  `build/Build.sh:162`; `scripts/optimize_media_servers.sh` sets
-  `auto_vacuum=INCREMENTAL` explicitly during planned-downtime rebuilds.
+  `build/Build.sh`; `scripts/optimize_media_servers.sh` passes
+  `auto_vacuum=NONE` during planned-downtime `VACUUM INTO` rebuilds and gates
+  the staged `PRAGMA auto_vacuum` result on `0`.
 - `SQLITE_DEFAULT_MMAP_SIZE=34359738368` (32 GiB) is the compile-default
   mmap-size pin in `build/Build.sh`; CI compile-option assertions keep it
   aligned with the runtime auto-PRAGMA target.
-- `SQLITE_MAX_MMAP_SIZE=1099511627776` (1 TiB) is the compile-time
-  mmap ceiling in `build/Build.sh:197`; the Emby compile-options
-  required-flag array in `.github/workflows/sqlite-build.yml:582-601`
-  asserts `MAX_MMAP_SIZE=1099511627776` in CI. The runtime
-  `PRAGMA mmap_size=34359738368` (32 GiB) only takes effect because this
-  compile ceiling stays above 32 GiB; reducing it below 32 GiB silently
-  caps the PRAGMA and breaks the Bundle-1 observability + performance
-  objective. Changes to the build pin or the workflow assertion must
-  update both.
-- `SQLITE_SORTER_PMASZ=8192` is the compile default in
-  `build/Build.sh:205`; constructor-102 re-asserts
-  `sqlite3_config(SQLITE_CONFIG_PMASZ, 8192)` in
-  `src/auto_extension.c:212-249`. Emby's compile-options required-flag
-  array in `.github/workflows/sqlite-build.yml:476-496` keeps the value
-  pinned in CI.
+- `SQLITE_MAX_MMAP_SIZE=1099511627776` (1 TiB) is the `build/Build.sh`
+  compile-time mmap ceiling; `assert_emby_compile_options` in
+  `tools/ci/lib/assertions.sh` asserts `MAX_MMAP_SIZE=1099511627776` in CI. The
+  runtime `PRAGMA mmap_size=34359738368` (32 GiB) only takes effect because this
+  compile ceiling stays above 32 GiB; reducing it below 32 GiB silently caps the
+  PRAGMA and breaks the Bundle-1 observability + performance objective. Changes
+  to the build pin or the Emby compile-options assertion must update both.
+- `SQLITE_SORTER_PMASZ=8192` is the `build/Build.sh` compile default;
+  constructor-102 re-asserts `sqlite3_config(SQLITE_CONFIG_PMASZ, 8192)` in
+  `src/auto_extension.c`. `assert_emby_compile_options` in
+  `tools/ci/lib/assertions.sh`, invoked by
+  `tools/ci/emby-first-init-smoke.sh`, keeps the value pinned in CI.
 
 ## 2. LSIO mods
 

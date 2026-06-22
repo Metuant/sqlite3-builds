@@ -121,8 +121,9 @@ current design and validation plan land.
 
 ## Build Inputs
 
-The source of truth for SQLite and mimalloc build pins is `pins/versions.env`;
-the local wrapper sources it and the workflow loads it into `$GITHUB_ENV`.
+The source of truth for SQLite, CMake, and mimalloc build pins is
+`pins/versions.env`; the local wrapper sources it and the workflow loads it into
+`$GITHUB_ENV`.
 Runtime support images live in `pins/runtime-support.tsv`. Library
 compatibility groups and Plex ICU source pins live in
 `pins/library-compat-groups.tsv`.
@@ -149,6 +150,15 @@ The current Plex library compatibility group pins ICU 69.1:
 | ICU build prefix | `/opt/icu-69-plex` |
 | ICU configure suffix | `--with-library-suffix=plex` |
 
+The generic library build pins Kitware CMake:
+
+| Input | Current value |
+|---|---|
+| CMake version | `3.31.12` |
+| CMake Linux x86_64 SHA-256 | `0dc2e9a6860f06bf10bd8fadc03e35d9eeb4df46e33763a7e480e987758f385c` |
+| CMake Linux aarch64 SHA-256 | `83f8fd91d2038a56556e1400390fcfe42f79602940c494f6c6f1cdae7f9e7f40` |
+| Build scope | Generic library Ubuntu base only |
+
 The library build also pins mimalloc v3.3.2:
 
 | Input | Current value |
@@ -171,6 +181,10 @@ The mimalloc VERSION + URL + SHA512 tuple must stay aligned across
 `build/Build.sh`, `build/build_static_sqlite.sh`, `docker-library/Dockerfile`,
 and `.github/workflows/sqlite-build.yml`; `tests/check_pin_alignment.sh`
 fails on any drift in the full tuple.
+
+`CMAKE_VERSION` and `CMAKE_SHA256_*` fields must stay aligned across
+`pins/versions.env`, the generic library workflow build args,
+`docker-library/Dockerfile`, and `tests/check_pin_alignment.sh`.
 
 Plex ICU source VERSION and SHA512 fields are group-owned by
 `pins/library-compat-groups.tsv`; the workflow passes those values as Plex
@@ -278,6 +292,10 @@ It installs the shared-library build toolchain and copies `build/Build.sh`,
 `build/expected-sqlite-dbconfig-count.txt` into `/app`, with the build files
 under `/app/build/`.
 
+The generic Ubuntu base downloads pinned Kitware CMake 3.31.12 with a
+per-architecture SHA-256 check before the mimalloc CMake stage. The Plex Alpine
+base uses its package CMake.
+
 The same Dockerfile builds mimalloc v3.3.2 in a dedicated stage, installs it
 under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
 `MIMALLOC_OBJ` plus `MIMALLOC_LIB` into `Build.sh`. The Plex branch adds
@@ -304,9 +322,10 @@ distinct from the generic variant's bounded glibc floor gate.
 
 `.github/workflows/sqlite-build.yml` builds on pushes to `main`,
 digit-prefixed tag pushes matching `[0-9]*`, pull requests to `main`, and
-manual dispatch. The release job validates `YYYY.MM.DD-rN` before archive
-assembly and release asset publication; `mod-build` and `mod-publish` handle
-LSIO mod images.
+manual dispatch. The workflow jobs are `build`, `mod-static-tests`, `release`,
+`mod-build`, and `mod-publish`. The release job validates `YYYY.MM.DD-rN`
+before archive assembly and release asset publication; `mod-build` and
+`mod-publish` handle LSIO mod images.
 
 The build job uses an architecture matrix:
 
@@ -332,7 +351,8 @@ artifacts, same-run runtime baseline extraction, and the Plex pool-patch pins
 (`pins/plex-pool-patch-sites.tsv` and `pins/plex-pool-patch-reviews.tsv`).
 
 The workflow keeps observability count and ABI obsolete-config checks after
-runtime smokes. Static coverage for the LSIO mod direction lives in
+runtime smokes. The `mod-static-tests` job runs the repo-only LSIO mod test
+suite, including
 `tests/render_lsio_mod_baked_pins_test.sh`,
 `tests/cont_init_fragments_test.sh`, and
 `tests/sqlite_build_workflow_mod_only_test.sh`.
@@ -396,14 +416,15 @@ per active sort worker; with `PRAGMA threads=8`, a connection may drive up to
 eight concurrent sort workers at that cap.
 
 The library profile pins `-DSQLITE_DEFAULT_AUTOVACUUM=0`.
-`scripts/optimize_media_servers.sh` sets `PRAGMA auto_vacuum=INCREMENTAL`
-explicitly during planned-downtime database rebuilds.
+`scripts/optimize_media_servers.sh` sets `PRAGMA auto_vacuum=NONE` explicitly
+during planned-downtime database rebuilds, matching the compile default.
 
 ## Per-Connection PRAGMA Injection
 
 `src/auto_extension.c` is compiled into both library variants.
 
-The priority-102 constructor still calls
+The priority-102 constructor first registers `SQLITE_CONFIG_LOG` with
+`sqlite_log_to_observability`, then calls
 `sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 16384)` before effective SQLite
 initialization so `SQLITE_ENABLE_SORTER_REFERENCES` is active. Auto-extension
 registration is lazy: the observability `sqlite3_open`, `sqlite3_open_v2`, and
@@ -716,8 +737,8 @@ Execution points:
   and run under Plex's bundled runtime loader.
 
 The bind-mount smoke exercises the same runtime closure as deployment: Plex's
-bundled `ld-musl-x86_64.so.1` loader resolves the produced library against
-Plex's renamed ICU.
+bundled `ld-musl-*.so.1` loader resolves the produced library against Plex's
+renamed ICU.
 
 The CI stage also verifies that the smoke binary resolves `libsqlite3.so` to
 the just-built artifact mounted at Plex's deployed library path rather than a
@@ -938,6 +959,16 @@ EMBY_INSTANCES=()
 
 Operators populate those arrays before a maintenance run.
 
+Maintenance defaults and optional subflows:
+
+| Control | Default | How to change | Effect |
+|---|---|---|---|
+| `PAGE_SIZE` | `16384` | Edit the top-level script default before the run | Rebuilt Plex and Emby databases target 16 KiB pages. |
+| `BACKUP_PATH` | `/mnt/media-backup` | Edit the top-level script default before the run | If the path exists, backups publish under an instance-specific subdirectory there; otherwise backups stay beside the source database. |
+| `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Edit the top-level script default before the run | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside this retention window. |
+| `PLEX_PROCESS_BLOB_DB` | `0` | Set the environment value to `1` before the run | Enables the optional Plex blob database rebuild pass. |
+| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Controlled by `STATS_BANDWIDTH_RETAIN_DAYS` | Runs on the staged database before swap; DELETE or VACUUM failures warn, but a post-deflate `integrity_check(1)` failure aborts before touching the live DB. |
+
 ### Planned-Downtime Gate
 
 For each configured Plex or Emby instance, the script queries Docker for an
@@ -948,38 +979,58 @@ operations remain operator-controlled.
 ### Plex Flow
 
 For each Plex instance, the script resolves the data and database paths, cleans
-selected caches, checks integrity, takes a dated backup, dumps to `dump.sql`,
-aborts on a dump rollback marker, rebuilds the database from the dump at the
-target page size with incremental auto-vacuum, reruns integrity, runs `REINDEX`,
-`PRAGMA analysis_limit=0`, `PRAGMA optimize=0x10002`, optimizes Plex FTS4
-segments, removes the dump, and runs Plex date repair SQL.
+selected caches, runs the sanity query, hard-gates source
+`PRAGMA integrity_check(1) == ok`, hard-gates source FTS integrity, warns on
+foreign-key rows, switches the source to `journal_mode=DELETE`, and publishes a
+dated `.original` backup.
 
-The rebuild runs under `Plex SQLite` and sets `PRAGMA page_size` and
-`PRAGMA auto_vacuum=INCREMENTAL` before reading the dump, so the fresh database
-is created at the target page size without a separate `VACUUM`. Plex SQLite is
-required because the dumped `CREATE INDEX` statements use the `icu_root`
-collation, which only the ICU-enabled Plex binary registers. A post-rebuild
-page-size check is warning-only, so it never blocks the later REINDEX and FTS work.
+The rebuild runs under `Plex SQLite` with `PRAGMA page_size=${PAGE_SIZE}`,
+`PRAGMA auto_vacuum=NONE`, and `VACUUM INTO` to a same-directory staged
+`<db>.new` file. The staged file must pass page-size and auto-vacuum checks,
+staged `integrity_check(1) == ok`, staged FTS integrity, and an exhaustive
+source-vs-staged per-table row-count sweep before any swap is attempted. If the
+main Plex database has `statistics_bandwidth`, the pre-swap hook can deflate it
+inside the staged file and then hard-gates post-deflate integrity.
+
+After validation, the script replaces the live database with `mv`, removes stale
+WAL/SHM siblings, then runs post-swap `REINDEX`, `PRAGMA analysis_limit=0`,
+`PRAGMA optimize=0x10002`, FTS maintenance, and Plex date repair SQL as
+warning-only maintenance. `PLEX_PROCESS_BLOB_DB=1` enables the same staged
+rebuild for the Plex blob database without the `statistics_bandwidth` hook.
+Plex SQLite is required because Plex data can require the ICU-enabled binary.
 
 ### Emby Flow
 
-For each Emby instance, the script resolves `/opt/<instance>/data`, checks
-integrity, takes a dated backup, dumps to `dump.sql`, aborts on a dump rollback
-marker, recreates the database, applies page size and VACUUM, reads the dump,
-reruns integrity, runs `REINDEX`, `PRAGMA analysis_limit=0`,
-`PRAGMA optimize=0x10002`, optimizes the Emby FTS5 table, and removes the dump.
+For each Emby instance, the script resolves `/opt/<instance>/data`, runs the
+sanity query, hard-gates source `integrity_check(1) == ok`, hard-gates source
+FTS integrity, warns on foreign-key rows, switches the source to
+`journal_mode=DELETE`, and publishes a dated `.original` backup.
+
+The rebuild runs under the configured host SQLite binary with
+`PRAGMA page_size=${PAGE_SIZE}`, `PRAGMA auto_vacuum=NONE`, and `VACUUM INTO` to
+a staged `<db>.new` file. The staged file must pass page-size and auto-vacuum
+checks, staged `integrity_check(1) == ok`, staged FTS integrity, and an
+exhaustive source-vs-staged per-table row-count sweep before the script replaces
+the live database with `mv` and removes stale WAL/SHM siblings.
+
+Post-swap `REINDEX`, `PRAGMA analysis_limit=0`, `PRAGMA optimize=0x10002`, and
+FTS maintenance are warning-only because the database has already passed the
+source and staged validation gates.
 
 ### Maintenance Posture
 
-Hard failures include Docker query failure, running containers, dump rollback
-markers, auto_vacuum post-condition mismatch after rebuild, and
-integrity-check command or SQL execution failures outside optional sub-steps.
-Integrity-check result content is subject to manual operator review because the
-script does not gate on the result row.
+Hard failures include Docker query failure, running containers, source
+integrity failure, source FTS integrity failure, `journal_mode=DELETE` failure,
+backup publication failure, `VACUUM INTO` failure, staged auto-vacuum mismatch
+against `NONE`, staged integrity failure, staged FTS integrity failure,
+per-table row-count mismatch, and pre-swap hook integrity failure. The source
+and staged integrity gates require the literal `ok` result from
+`PRAGMA integrity_check(1)`.
 
-Warning-and-continue cases include missing optional host SQLite for Plex
-page-size migration, page-size migration failure, and page-size post-condition
-mismatch.
+Warning-and-continue cases include source `foreign_key_check` rows, skipped
+missing instance directories, Plex `statistics_bandwidth` table absence or
+DELETE/VACUUM failure before a clean post-deflate integrity result, and
+post-swap SQL or FTS maintenance failures.
 
 ## Hard Constraints
 

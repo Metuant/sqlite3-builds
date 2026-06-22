@@ -66,7 +66,13 @@ Signing: TODO.
 
 ## Customization
 
-- Change SQLite and mimalloc pins in `pins/versions.env`.
+- Change SQLite source pins, the mimalloc tuple, generic CMake `CMAKE_*` pins,
+  base-image pins, `GENERIC_GLIBC_MAX`, and SQLite config-count pins in
+  `pins/versions.env`.
+- Keep `SQLITE_EXPECTED_CONFIG_COUNT` and `SQLITE_EXPECTED_DBCONFIG_COUNT`
+  aligned with `build/expected-sqlite-config-count.txt`,
+  `build/expected-sqlite-dbconfig-count.txt`, and `tests/check_pin_alignment.sh`
+  when an SQLite bump changes the decoded config surface.
 - Change ICU compatibility-group source fields in
   `pins/library-compat-groups.tsv`. Edit the canonical pin tables, not the
   wrapper, workflow, Dockerfile, or other derived consumers.
@@ -75,6 +81,19 @@ Signing: TODO.
 - Change CLI and library compile-time flags in `build/Build.sh`.
 - Keep `SQLite_compressor` empty in `build/build_static_sqlite.sh` to disable
   CLI compression.
+
+## Planned-Downtime Maintenance
+
+`scripts/optimize_media_servers.sh` operates only on instances added to its
+`PLEX_INSTANCES` and `EMBY_INSTANCES` arrays. Current operator controls:
+
+| Control | Default | Change path | Effect |
+|---|---|---|---|
+| `PAGE_SIZE` | `16384` | Edit the script default before the run | Target page size for staged Plex and Emby rebuilds. |
+| `BACKUP_PATH` | `/mnt/media-backup` | Edit the script default before the run | Existing path receives instance-scoped `.original` backups; otherwise backups stay beside the database. |
+| `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Edit the script default before the run | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside the retention window. |
+| `PLEX_PROCESS_BLOB_DB` | `0` | Set to `1` in the environment before the run | Opts into the Plex blob database rebuild pass. |
+| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Uses `STATS_BANDWIDTH_RETAIN_DAYS` | Deletes anonymous or older bandwidth rows on the staged database, runs `VACUUM`, and aborts before swap if post-deflate integrity is not `ok`. |
 
 ## Motivation
 
