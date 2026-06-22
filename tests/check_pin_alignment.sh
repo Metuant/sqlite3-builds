@@ -67,10 +67,14 @@ SQLITE_SRC_SHA3_256
 MIMALLOC_VERSION
 MIMALLOC_URL
 MIMALLOC_SHA512
+CMAKE_VERSION
+CMAKE_SHA256_X86_64
+CMAKE_SHA256_AARCH64
 SQLITE_EXPECTED_CONFIG_COUNT
 SQLITE_EXPECTED_DBCONFIG_COUNT
 BASEIMAGE_UBUNTU
 BASEIMAGE_ALPINE
+GENERIC_GLIBC_MAX
 '
 
 for key in $required_pins; do
@@ -185,11 +189,12 @@ generic_icu_source_sha512="$(compat_group_pin generic icu_source_sha512)"
 [ "$generic_icu_source_version" = "-" ] || fail "generic compat group must not carry ICU source version"
 [ "$generic_icu_source_sha512" = "-" ] || fail "generic compat group must not carry ICU source SHA512"
 
-for key in ICU_SOURCE_VERSION ICU_SOURCE_SHA512 MIMALLOC_VERSION MIMALLOC_URL MIMALLOC_SHA512; do
+for key in ICU_SOURCE_VERSION ICU_SOURCE_SHA512 MIMALLOC_VERSION MIMALLOC_URL MIMALLOC_SHA512 CMAKE_VERSION CMAKE_SHA256_X86_64 CMAKE_SHA256_AARCH64; do
   require_line docker-library/Dockerfile "ARG $key"
   reject_pattern docker-library/Dockerfile "^ARG ${key}="
 done
 reject_pattern .github/workflows/sqlite-build.yml '--build-arg ICU_(VERSION|SHA512)='
+require_pattern .github/workflows/sqlite-build.yml 'docker_library_image.*--build-arg CMAKE_VERSION="\$\{CMAKE_VERSION\}"' 'generic library CMake build arg'
 reject_pattern .github/workflows/sqlite-build.yml 'env\.(PLEX|EMBY)_.*TAG'
 reject_pattern .github/workflows/sqlite-build.yml '\$(PLEX|EMBY)_.*TAG'
 reject_pattern tools/ci/mod-bake-smoke.sh '(PLEX|EMBY)_.*TAG'
@@ -300,6 +305,7 @@ require_line docker-cli/Dockerfile 'ENTRYPOINT []'
 require_line docker-cli/Dockerfile 'CMD ["/bin/sh"]'
 require_line docker-library/Dockerfile "FROM ${BASEIMAGE_UBUNTU} AS base-generic"
 require_line docker-library/Dockerfile "FROM ${BASEIMAGE_ALPINE} AS base-plex"
+require_line docker-library/Dockerfile "      generic_glibc_max=\"${GENERIC_GLIBC_MAX}\"; \\"
 require_line docker-library/Dockerfile 'ENTRYPOINT []'
 require_line docker-library/Dockerfile 'CMD ["/bin/sh"]'
 require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_URL'
@@ -314,11 +320,13 @@ dbconfig_count="$(tr -d '[:space:]' < build/expected-sqlite-dbconfig-count.txt)"
 assert_eq 'build/expected-sqlite-config-count.txt' "$SQLITE_EXPECTED_CONFIG_COUNT" "$config_count"
 assert_eq 'build/expected-sqlite-dbconfig-count.txt' "$SQLITE_EXPECTED_DBCONFIG_COUNT" "$dbconfig_count"
 
-printf 'pins aligned: sqlite=%s mimalloc=%s icu_source=%s bases=%s,%s counts=%s/%s\n' \
+printf 'pins aligned: sqlite=%s mimalloc=%s cmake=%s icu_source=%s bases=%s,%s generic_glibc_max=%s counts=%s/%s\n' \
   "$SQLITE_VERSION_DOTTED" \
   "$MIMALLOC_VERSION" \
+  "$CMAKE_VERSION" \
   "$plex_icu_source_version" \
   "$BASEIMAGE_UBUNTU" \
   "$BASEIMAGE_ALPINE" \
+  "$GENERIC_GLIBC_MAX" \
   "$SQLITE_EXPECTED_CONFIG_COUNT" \
   "$SQLITE_EXPECTED_DBCONFIG_COUNT"

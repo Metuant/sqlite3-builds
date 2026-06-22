@@ -11,8 +11,8 @@ milestone lands.
 ## 1. Build / variant
 
 - Plex variant builds under the LSIO Alpine 3.23/musl base; generic variant
-  stays on the LSIO Ubuntu/glibc base. Multi-stage
-  `docker-library/Dockerfile` selects via `LIBRARY_VARIANT`.
+  builds under digest-pinned `ubuntu:18.04` (bionic, glibc 2.27).
+  Multi-stage `docker-library/Dockerfile` selects via `LIBRARY_VARIANT`.
 - `LIBRARY_VARIANT=plex` is limited to the Plex ICU build path.
 - SQLite pins must stay aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `.github/workflows/sqlite-build.yml`,
@@ -37,9 +37,11 @@ milestone lands.
   `THREADSAFE=2` so any drift fails CI.
 - Plex variant build fails if `libsqlite3.so` carries `fcntl64` or any
   `@GLIBC_`-versioned undefined symbol (gate at
-  `docker-library/Dockerfile:180-187`, conditional on
-  `LIBRARY_VARIANT=plex`). Generic variant is glibc-linked and does NOT
-  run this gate.
+  `docker-library/Dockerfile`, conditional on `LIBRARY_VARIANT=plex`).
+  Generic variant is glibc-linked and runs a bounded post-link floor gate:
+  it must observe at least one `@GLIBC_` reference, and every observed
+  reference must be `<= GENERIC_GLIBC_MAX` (`2.27`). This thresholded generic
+  gate stays distinct from the Plex zero-GLIBC gate.
 - Matrix rows are v2 / v3 / arm64 only; **no x86-64-v4 row** (v4 lib
   SIGILLs in the auto-extension constructor on non-AVX-512 Zen hosts).
   v4-capable amd64 hosts use the v3 artifact.

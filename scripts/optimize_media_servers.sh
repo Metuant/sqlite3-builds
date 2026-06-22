@@ -1,8 +1,5 @@
 #!/usr/bin/env bash
 
-set -ex
-set -o pipefail
-
 export SQLITE3_DISABLE_AUTOPRAGMA=1
 
 # Maintenance assumes planned downtime. Stop each container explicitly before
@@ -14,6 +11,7 @@ export SQLITE3_DISABLE_AUTOPRAGMA=1
 # This script intentionally covers only Plex and Emby.
 PAGE_SIZE="16384"
 BACKUP_PATH="/mnt/media-backup"
+STATS_BANDWIDTH_RETAIN_DAYS="90"
 
 declare -a PLEX_INSTANCES=()
 declare -a EMBY_INSTANCES=()
@@ -32,6 +30,450 @@ cleanup_staged_db() {
     rm -f "${staged_db}" "${staged_db}-wal" "${staged_db}-shm"
 }
 
+quote_sql_ident() {
+    local ident="${1}"
+
+    printf '"%s"' "${ident//\"/\"\"}"
+}
+
+has_control_chars() {
+    local value="${1}"
+
+    case "${value}" in
+        *[[:cntrl:]]*)
+            return 0
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+trim_sql_ws() {
+    local value="${1}"
+    local last_index
+
+    while [ -n "${value}" ]; do
+        case "${value:0:1}" in
+            " "|$'\t'|$'\r'|$'\n')
+                value="${value:1}"
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    while [ -n "${value}" ]; do
+        last_index=$((${#value} - 1))
+        case "${value:${last_index}:1}" in
+            " "|$'\t'|$'\r'|$'\n')
+                value="${value:0:${last_index}}"
+                ;;
+            *)
+                break
+                ;;
+        esac
+    done
+    printf '%s' "${value}"
+}
+
+extract_parenthesized_content() {
+    local value="${1}"
+    local depth=1
+    local quote=""
+    local out=""
+    local char
+    local next_char
+    local i
+
+    for ((i = 0; i < ${#value}; i++)); do
+        char="${value:i:1}"
+        if [ -n "${quote}" ]; then
+            out="${out}${char}"
+            if [ "${char}" = "${quote}" ]; then
+                next_char="${value:i+1:1}"
+                if [ "${next_char}" = "${quote}" ]; then
+                    out="${out}${next_char}"
+                    i=$((i + 1))
+                else
+                    quote=""
+                fi
+            fi
+            continue
+        fi
+
+        case "${char}" in
+            "'")
+                quote="'"
+                out="${out}${char}"
+                ;;
+            '"')
+                quote='"'
+                out="${out}${char}"
+                ;;
+            "(")
+                depth=$((depth + 1))
+                out="${out}${char}"
+                ;;
+            ")")
+                depth=$((depth - 1))
+                if [ "${depth}" = "0" ]; then
+                    printf '%s' "${out}"
+                    return 0
+                fi
+                out="${out}${char}"
+                ;;
+            *)
+                out="${out}${char}"
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+classify_fts5_option_content() {
+    local option
+    local key
+    local value
+    local char
+    local quote=""
+    local depth=0
+    local eq_index=-1
+    local next_char
+    local i
+
+    option="$(trim_sql_ws "${1}")"
+    [ -n "${option}" ] || return 0
+
+    for ((i = 0; i < ${#option}; i++)); do
+        char="${option:i:1}"
+        if [ -n "${quote}" ]; then
+            if [ "${char}" = "${quote}" ]; then
+                next_char="${option:i+1:1}"
+                if [ "${next_char}" = "${quote}" ]; then
+                    i=$((i + 1))
+                else
+                    quote=""
+                fi
+            fi
+            continue
+        fi
+
+        case "${char}" in
+            "'")
+                quote="'"
+                ;;
+            '"')
+                quote='"'
+                ;;
+            "(")
+                depth=$((depth + 1))
+                ;;
+            ")")
+                if [ "${depth}" -gt 0 ]; then
+                    depth=$((depth - 1))
+                fi
+                ;;
+            "=")
+                if [ "${depth}" = "0" ]; then
+                    eq_index="${i}"
+                    break
+                fi
+                ;;
+        esac
+    done
+
+    [ "${eq_index}" -ge 0 ] || return 0
+    key="$(trim_sql_ws "${option:0:${eq_index}}")"
+    value="$(trim_sql_ws "${option:$((eq_index + 1))}")"
+
+    case "${key}" in
+        [Cc][Oo][Nn][Tt][Ee][Nn][Tt])
+            if [ "${value}" = "''" ] || [ "${value}" = '""' ]; then
+                printf '%s' "contentless"
+            elif [ -n "${value}" ]; then
+                printf '%s' "external"
+            else
+                return 1
+            fi
+            ;;
+    esac
+}
+
+classify_fts5_content_mode() {
+    local arglist="${1}"
+    local option=""
+    local mode
+    local char
+    local quote=""
+    local depth=0
+    local next_char
+    local i
+
+    for ((i = 0; i <= ${#arglist}; i++)); do
+        if [ "${i}" -eq "${#arglist}" ]; then
+            char=","
+        else
+            char="${arglist:i:1}"
+        fi
+
+        if [ -n "${quote}" ]; then
+            option="${option}${char}"
+            if [ "${char}" = "${quote}" ]; then
+                next_char="${arglist:i+1:1}"
+                if [ "${next_char}" = "${quote}" ]; then
+                    option="${option}${next_char}"
+                    i=$((i + 1))
+                else
+                    quote=""
+                fi
+            fi
+            continue
+        fi
+
+        case "${char}" in
+            "'")
+                quote="'"
+                option="${option}${char}"
+                ;;
+            '"')
+                quote='"'
+                option="${option}${char}"
+                ;;
+            "(")
+                depth=$((depth + 1))
+                option="${option}${char}"
+                ;;
+            ")")
+                if [ "${depth}" -gt 0 ]; then
+                    depth=$((depth - 1))
+                fi
+                option="${option}${char}"
+                ;;
+            ",")
+                if [ "${depth}" = "0" ]; then
+                    if ! mode="$(classify_fts5_option_content "${option}")"; then
+                        return 1
+                    fi
+                    if [ -n "${mode}" ]; then
+                        printf '%s' "${mode}"
+                        return 0
+                    fi
+                    option=""
+                else
+                    option="${option}${char}"
+                fi
+                ;;
+            *)
+                option="${option}${char}"
+                ;;
+        esac
+    done
+
+    printf '%s' "normal"
+}
+
+classify_fts_table_sql() {
+    local sql_text="${1}"
+    local using_token_re='[Uu][Ss][Ii][Nn][Gg][[:space:]]+([[:alpha:]_][[:alnum:]_]*)'
+    local using_re='[Uu][Ss][Ii][Nn][Gg][[:space:]]+([[:alpha:]_][[:alnum:]_]*)[[:space:]]*\('
+    local matched
+    local module_token
+    local module
+    local rest
+    local arglist
+    local content_mode
+
+    if ! [[ "${sql_text}" =~ ^[[:space:]]*[Cc][Rr][Ee][Aa][Tt][Ee][[:space:]]+[Vv][Ii][Rr][Tt][Uu][Aa][Ll][[:space:]]+[Tt][Aa][Bb][Ll][Ee][[:space:]]+ ]]; then
+        return 2
+    fi
+    if ! [[ "${sql_text}" =~ ${using_token_re} ]]; then
+        return 1
+    fi
+
+    module_token="${BASH_REMATCH[1]}"
+    case "${module_token}" in
+        [Ff][Tt][Ss]3)
+            if ! [[ "${sql_text}" =~ ${using_re} ]]; then
+                return 1
+            fi
+            module="fts3"
+            content_mode="normal"
+            ;;
+        [Ff][Tt][Ss]4)
+            if ! [[ "${sql_text}" =~ ${using_re} ]]; then
+                return 1
+            fi
+            module="fts4"
+            content_mode="normal"
+            ;;
+        [Ff][Tt][Ss]5)
+            if ! [[ "${sql_text}" =~ ${using_re} ]]; then
+                return 1
+            fi
+            matched="${BASH_REMATCH[0]}"
+            module="fts5"
+            rest="${sql_text#*"${matched}"}"
+            if ! arglist="$(extract_parenthesized_content "${rest}")"; then
+                return 1
+            fi
+            if ! content_mode="$(classify_fts5_content_mode "${arglist}")"; then
+                return 1
+            fi
+            ;;
+        [Ff][Tt][Ss][0-9]*)
+            return 2
+            ;;
+        *)
+            return 2
+            ;;
+    esac
+
+    printf '%s\t%s' "${module}" "${content_mode}"
+}
+
+validate_fts_metadata() {
+    local table_name="${1}"
+    local module="${2}"
+    local content_mode="${3}"
+
+    if [ -z "${table_name}" ] || has_control_chars "${table_name}"; then
+        echo "ERROR: unsafe FTS table name discovered; aborting before maintenance" >&2
+        return 1
+    fi
+    if has_control_chars "${module}" || has_control_chars "${content_mode}"; then
+        echo "ERROR: unsafe FTS metadata discovered for ${table_name}; aborting before maintenance" >&2
+        return 1
+    fi
+    case "${module}" in
+        fts3|fts4|fts5)
+            ;;
+        *)
+            echo "ERROR: unclassified FTS module '${module}' for ${table_name}; aborting before maintenance" >&2
+            return 1
+            ;;
+    esac
+    case "${content_mode}" in
+        normal|external|contentless)
+            ;;
+        *)
+            echo "ERROR: unclassified FTS content mode '${content_mode}' for ${table_name}; aborting before maintenance" >&2
+            return 1
+            ;;
+    esac
+}
+
+# discover_fts_tables <binary> <db_path>
+# Emits: <name><tab><module><tab><content_mode>
+discover_fts_tables() {
+    local binary="${1}"
+    local db_path="${2}"
+    local field_sep=$'\t'
+    local query
+    local rows
+    local row
+    local table_name
+    local sql_text
+    local extra
+    local classification
+    local rc
+    local module
+    local content_mode
+    local metadata_extra
+
+    query="SELECT name, replace(replace(replace(sql, char(9), ' '), char(10), ' '), char(13), ' ') FROM sqlite_master WHERE type = 'table' AND sql IS NOT NULL AND lower(ltrim(replace(replace(replace(sql, char(9), ' '), char(10), ' '), char(13), ' '))) LIKE 'create virtual table%' AND name NOT GLOB 'sqlite_*' ORDER BY name;"
+    if ! rows=$("${binary}" -batch -noheader -separator "${field_sep}" "${db_path}" "${query}"); then
+        echo "ERROR: FTS discovery query failed for ${db_path}" >&2
+        return 1
+    fi
+
+    while IFS= read -r row
+    do
+        [ -n "${row}" ] || continue
+        IFS="${field_sep}" read -r table_name sql_text extra <<< "${row}"
+        if [ -n "${extra}" ] || [ -z "${sql_text}" ]; then
+            echo "ERROR: unsafe or malformed FTS metadata discovered in ${db_path}" >&2
+            return 1
+        fi
+
+        if classification="$(classify_fts_table_sql "${sql_text}")"; then
+            IFS="${field_sep}" read -r module content_mode metadata_extra <<< "${classification}"
+            if [ -n "${metadata_extra}" ]; then
+                echo "ERROR: malformed FTS classification for ${table_name}; aborting before maintenance" >&2
+                return 1
+            fi
+            if ! validate_fts_metadata "${table_name}" "${module}" "${content_mode}"; then
+                return 1
+            fi
+            printf '%s\t%s\t%s\n' "${table_name}" "${module}" "${content_mode}"
+        else
+            rc=$?
+            if [ "${rc}" = "2" ]; then
+                continue
+            fi
+            echo "ERROR: unclassified FTS metadata for ${table_name} in ${db_path}" >&2
+            return 1
+        fi
+    done <<< "${rows}"
+}
+
+run_fts_integrity_gate() {
+    local binary="${1}"
+    local db_path="${2}"
+    local phase="${3}"
+    local field_sep=$'\t'
+    local fts_rows
+    local row
+    local table_name
+    local module
+    local content_mode
+    local extra
+    local table_ident
+    local sql
+
+    if ! fts_rows="$(discover_fts_tables "${binary}" "${db_path}")"; then
+        echo "ERROR: ${phase} FTS discovery failed for ${db_path}" >&2
+        return 1
+    fi
+
+    while IFS= read -r row
+    do
+        [ -n "${row}" ] || continue
+        IFS="${field_sep}" read -r table_name module content_mode extra <<< "${row}"
+        if [ -n "${extra}" ] || ! validate_fts_metadata "${table_name}" "${module}" "${content_mode}"; then
+            echo "ERROR: ${phase} FTS metadata validation failed for ${db_path}" >&2
+            return 1
+        fi
+        table_ident="$(quote_sql_ident "${table_name}")"
+        if [ "${module}" = "fts5" ] && [ "${content_mode}" = "external" ]; then
+            sql="INSERT INTO ${table_ident}(${table_ident}, rank) VALUES('integrity-check', 1);"
+        else
+            sql="INSERT INTO ${table_ident}(${table_ident}) VALUES('integrity-check');"
+        fi
+        if ! "${binary}" "${db_path}" "${sql}"; then
+            echo "ERROR: ${phase} FTS integrity-check failed for ${table_name} in ${db_path}" >&2
+            return 1
+        fi
+    done <<< "${fts_rows}"
+}
+
+run_foreign_key_check_warn() {
+    local binary="${1}"
+    local db_path="${2}"
+    local fk_rows
+
+    if ! fk_rows=$("${binary}" "${db_path}" "PRAGMA foreign_key_check;" | tr -d '\r'); then
+        echo "WARNING: foreign_key_check failed to run for ${db_path}; continuing after source integrity and FTS gates" >&2
+        return 0
+    fi
+    if [ -n "${fk_rows}" ]; then
+        echo "WARNING: foreign_key_check returned rows for ${db_path}; continuing after source integrity and FTS gates" >&2
+        printf '%s\n' "${fk_rows}" >&2
+    fi
+    return 0
+}
+
 run_post_swap_sql() {
     local binary="${1}"
     local db_path="${2}"
@@ -43,6 +485,96 @@ run_post_swap_sql() {
     fi
 }
 
+run_post_swap_fts_maintenance() {
+    local binary="${1}"
+    local db_path="${2}"
+    local field_sep=$'\t'
+    local fts_rows
+    local row
+    local table_name
+    local module
+    local content_mode
+    local extra
+    local table_ident
+    local rebuild_sql
+    local optimize_sql
+
+    if ! fts_rows="$(discover_fts_tables "${binary}" "${db_path}")"; then
+        echo "WARNING: post-swap FTS discovery failed for ${db_path}; DB was already validated and swapped; continuing" >&2
+        return 0
+    fi
+
+    while IFS= read -r row
+    do
+        [ -n "${row}" ] || continue
+        IFS="${field_sep}" read -r table_name module content_mode extra <<< "${row}"
+        if [ -n "${extra}" ] || ! validate_fts_metadata "${table_name}" "${module}" "${content_mode}"; then
+            echo "WARNING: post-swap FTS metadata validation failed for ${db_path}; DB was already validated and swapped; continuing" >&2
+            continue
+        fi
+
+        table_ident="$(quote_sql_ident "${table_name}")"
+        rebuild_sql="INSERT INTO ${table_ident}(${table_ident}) VALUES('rebuild');"
+        optimize_sql="INSERT INTO ${table_ident}(${table_ident}) VALUES('optimize');"
+
+        if ! { [ "${module}" = "fts5" ] && [ "${content_mode}" = "contentless" ]; }; then
+            if ! "${binary}" "${db_path}" "${rebuild_sql}"; then
+                echo "WARNING: post-swap FTS rebuild failed for ${table_name} in ${db_path}; continuing" >&2
+                continue
+            fi
+        fi
+        if ! "${binary}" "${db_path}" "${optimize_sql}"; then
+            echo "WARNING: post-swap FTS optimize failed for ${table_name} in ${db_path}; continuing" >&2
+        fi
+    done <<< "${fts_rows}"
+
+    return 0
+}
+
+try_deflate_plex_statistics_bandwidth() {
+    local binary="${1}"
+    local staged_db="${2}"
+    local retain_days="${3}"
+    local table_exists
+    local delete_sql
+    local post_integrity
+
+    if ! table_exists=$("${binary}" "${staged_db}" "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'statistics_bandwidth' LIMIT 1;" | tr -d '\r\n'); then
+        echo "WARNING: could not check for statistics_bandwidth in ${staged_db}; skipping Plex bandwidth deflate" >&2
+        return 0
+    fi
+    if [ "${table_exists}" != "1" ]; then
+        echo "WARNING: statistics_bandwidth is absent in ${staged_db}; skipping Plex bandwidth deflate" >&2
+        return 0
+    fi
+    case "${retain_days}" in
+        ""|*[!0-9]*)
+            echo "WARNING: invalid statistics_bandwidth retention '${retain_days}'; skipping Plex bandwidth deflate" >&2
+            return 0
+            ;;
+    esac
+
+    echo "Deflating Plex statistics_bandwidth in ${staged_db}; retaining ${retain_days} days"
+    delete_sql="DELETE FROM statistics_bandwidth WHERE account_id IS NULL OR at < STRFTIME('%s','now','-' || ${retain_days} || ' days');"
+    if ! "${binary}" "${staged_db}" "${delete_sql}"; then
+        echo "WARNING: statistics_bandwidth deflate DELETE failed for ${staged_db}; continuing with validated staged DB" >&2
+        return 0
+    fi
+    if ! "${binary}" "${staged_db}" "VACUUM;"; then
+        echo "WARNING: post-deflate VACUUM failed for ${staged_db}; continuing to post-deflate integrity gate" >&2
+    fi
+    if ! post_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check(1);" | tr -d '\r\n'); then
+        echo "ERROR: post-deflate integrity_check(1) failed to run for ${staged_db}; live DB has NOT been touched" >&2
+        return 1
+    fi
+    if [ "${post_integrity}" != "ok" ]; then
+        echo "ERROR: post-deflate DB failed integrity_check(1): ${post_integrity}; live DB has NOT been touched" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 rebuild_db_vacuum_into() {
     local binary="${1}"
     local db_path="${2}"
@@ -51,6 +583,7 @@ rebuild_db_vacuum_into() {
     local auto_vacuum_mode="${5}"
     local sanity_sql="${6}"
     local optimize_sql="${7}"
+    local pre_swap_hook="${8:-}"
     local db_file="${db_path##*/}"
     local backup_path
     local backup_tmp
@@ -105,6 +638,11 @@ rebuild_db_vacuum_into() {
         echo "ERROR: source DB failed integrity_check(1): ${source_integrity}; live DB has NOT been touched" >&2
         exit 1
     fi
+    if ! run_fts_integrity_gate "${binary}" "${db_path}" "source"; then
+        echo "ERROR: source FTS integrity gate failed for ${db_path}; live DB has NOT been touched" >&2
+        exit 1
+    fi
+    run_foreign_key_check_warn "${binary}" "${db_path}"
 
     # Fold WAL data into the main file before the byte-for-byte filesystem backup.
     if ! new_mode=$("${binary}" "${db_path}" "PRAGMA journal_mode=DELETE;" | tr -d '\r\n'); then
@@ -235,6 +773,11 @@ rebuild_db_vacuum_into() {
         cleanup_staged_db "${staged_db}"
         exit 1
     fi
+    if ! run_fts_integrity_gate "${binary}" "${staged_db}" "staged"; then
+        echo "ERROR: staged FTS integrity gate failed for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
 
     # WHY: The exhaustive source-vs-staged row-count sweep is intentional
     # defense-in-depth before publishing the rebuilt DB.
@@ -265,17 +808,26 @@ rebuild_db_vacuum_into() {
         fi
     done <<< "${table_list}"
 
+    if [ -n "${pre_swap_hook}" ]; then
+        if ! "${pre_swap_hook}" "${binary}" "${staged_db}" "${STATS_BANDWIDTH_RETAIN_DAYS}"; then
+            echo "ERROR: pre-swap hook failed for ${staged_db}; live DB has NOT been touched" >&2
+            cleanup_staged_db "${staged_db}"
+            exit 1
+        fi
+    fi
+
     mv "${staged_db}" "${db_path}"
     rm -f "${db_path}-wal" "${db_path}-shm" "${staged_db}-wal" "${staged_db}-shm"
     if [ -n "${optimize_sql}" ]; then
         run_post_swap_sql "${binary}" "${db_path}" "post-swap maintenance SQL" "${optimize_sql}"
     fi
+    run_post_swap_fts_maintenance "${binary}" "${db_path}"
 }
 
 optimize_plex_db() {
     local db_file="${1}"
     local sanity_sql="${2}"
-    local fts_sql="${3}"
+    local pre_swap_hook="${3:-}"
     local db_path="${PLEX_DATABASES_PATH}/${db_file}"
     local backup_dir
     local optimize_sql
@@ -290,9 +842,6 @@ optimize_plex_db() {
 
     # NOTE: The 0x10000 bit of PRAGMA optimize=0x10002 is inert on Plex SQLite 3.39.4.
     optimize_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; PRAGMA optimize=0x10002;"
-    if [ -n "${fts_sql}" ]; then
-        optimize_sql="${optimize_sql} ${fts_sql}"
-    fi
 
     rebuild_db_vacuum_into \
       "${PLEX_BINARY}" \
@@ -301,7 +850,8 @@ optimize_plex_db() {
       "${PAGE_SIZE}" \
       "NONE" \
       "${sanity_sql}" \
-      "${optimize_sql}"
+      "${optimize_sql}" \
+      "${pre_swap_hook}"
 }
 
 
@@ -315,6 +865,10 @@ optimize_plex_db() {
 # docker cp plex:"/usr/lib/plexmediaserver/Plex SQLite" ${HOME}/plex-sql/
 # docker cp plex:"/usr/lib/plexmediaserver/Plex Media Server" ${HOME}/plex-sql/
 
+
+main() {
+    set -ex
+    set -o pipefail
 
 if [ "${#PLEX_INSTANCES[@]}" -gt 0 ]; then
     if ! plex_preflight_out=$("${PLEX_BINARY}" ":memory:" "SELECT 1;" 2>&1); then
@@ -359,7 +913,7 @@ do
     optimize_plex_db \
       "${PLEX_DB}" \
       "SELECT 1 FROM versioned_metadata_items LIMIT 1;" \
-      "INSERT INTO fts4_metadata_titles(fts4_metadata_titles) VALUES('optimize'); INSERT INTO fts4_metadata_titles_icu(fts4_metadata_titles_icu) VALUES('optimize'); INSERT INTO fts4_tag_titles(fts4_tag_titles) VALUES('optimize'); INSERT INTO fts4_tag_titles_icu(fts4_tag_titles_icu) VALUES('optimize');"
+      "try_deflate_plex_statistics_bandwidth"
 
     echo "Fixing Recently Added"
     run_post_swap_sql "${PLEX_BINARY}" "${PLEX_DATABASES_PATH}/${PLEX_DB}" "Plex originally_available_at lower-bound repair" "UPDATE metadata_items SET originally_available_at = STRFTIME('%s', 'now', '-7 days') WHERE originally_available_at < STRFTIME('%s', 'now', '-200 years');"
@@ -374,6 +928,15 @@ do
     # docker start ${PLEX_INSTANCE}
 done
 
+
+if [ "${#EMBY_INSTANCES[@]}" -gt 0 ]; then
+    if ! emby_preflight_out=$("${EMBY_BINARY}" ":memory:" "SELECT 1;" 2>&1); then
+        echo "WARNING: ${EMBY_BINARY} pre-flight failed; skipping all Emby maintenance" >&2
+        echo "WARNING: pre-flight output: ${emby_preflight_out}" >&2
+        echo "WARNING: the per-instance stopped-container gate was NOT evaluated for Emby this run" >&2
+        EMBY_INSTANCES=()
+    fi
+fi
 
 for EMBY_INSTANCE in "${EMBY_INSTANCES[@]}"
 do
@@ -408,10 +971,16 @@ do
       "${PAGE_SIZE}" \
       "NONE" \
       "SELECT 1 FROM SyncJobs2 LIMIT 1;" \
-      "REINDEX; PRAGMA analysis_limit=0; PRAGMA optimize=0x10002; INSERT INTO fts_search9(fts_search9) VALUES('optimize');"
+      "REINDEX; PRAGMA analysis_limit=0; PRAGMA optimize=0x10002;" \
+      ""
 
     # docker start ${EMBY_INSTANCE}
 done
 
 
 set +ex
+}
+
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+    main "$@"
+fi

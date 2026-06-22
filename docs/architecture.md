@@ -26,7 +26,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `build/Build.sh` | Container-internal build driver for CLI and library targets. |
 | `build/build_static_sqlite.sh` | Local wrapper that builds Docker images and extracts artifacts into `release/`. |
 | `docker-cli/Dockerfile` | Alpine-based static CLI build image. |
-| `docker-library/Dockerfile` | Shared-library build image: Ubuntu/glibc for the generic variant and Alpine/musl for the Plex variant. |
+| `docker-library/Dockerfile` | Shared-library build image: digest-pinned `ubuntu:18.04` (bionic, glibc 2.27) plus `gcc-13` for the generic variant, and LSIO Alpine/musl for the Plex variant. |
 | `docs/extending.md` | Cold-start runbook for adding runtime versions, compatibility groups, pool sites, and releases. |
 | `docs/baked-pins-schema.md` | Current schema v3 `baked-pins.txt` contract, validator reject list, and runtime keying rules. |
 | `src/auto_extension.c` | Built into both library variants; registers per-connection PRAGMA tuning. |
@@ -268,8 +268,9 @@ and SHA pin. The CLI image is only responsible for the static CLI artifact.
 
 ### Library Docker Image
 
-`docker-library/Dockerfile` uses an Ubuntu/glibc base for the generic variant
-and an Alpine/musl base for the Plex variant.
+`docker-library/Dockerfile` uses digest-pinned `ubuntu:18.04` (bionic,
+glibc 2.27) plus `gcc-13` from `ubuntu-toolchain-r` for the generic variant
+and the LSIO Alpine/musl base for the Plex variant.
 
 It installs the shared-library build toolchain and copies `build/Build.sh`,
 `src/auto_extension.c`, `tests/`, `build/sqlite-amalgamation.patch`,
@@ -282,8 +283,10 @@ under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
 `MIMALLOC_OBJ` plus `MIMALLOC_LIB` into `Build.sh`. The Plex branch adds
 `-DMI_LIBC_MUSL=ON`; the generic branch does not.
 
-For the generic variant, it builds the shared library and runs the new
-config-after-dlopen, shutdown/reinit, and auto-extension smokes.
+For the generic variant, it builds the shared library, requires at least one
+`@GLIBC_`-versioned undefined symbol, rejects any observed `@GLIBC_` reference
+above `GENERIC_GLIBC_MAX` (`2.27`), and runs the config-after-dlopen,
+shutdown/reinit, and auto-extension smokes.
 
 For the Plex variant, it also builds ICU 69.1 under `/opt/icu-69-plex`, exposes
 `PLEX_ICU_INCLUDE` and `PLEX_ICU_LIB`, checks ICU soname and symbol shape with
@@ -294,7 +297,8 @@ glibc-versioned symbols such as `fcntl64`, which Plex's `libgcompat` shim does
 not provide.
 
 For the Plex variant, the build stage fails if the produced `libsqlite3.so`
-carries `fcntl64` or any other glibc-versioned symbol.
+carries `fcntl64` or any other glibc-versioned symbol. This zero-GLIBC gate is
+distinct from the generic variant's bounded glibc floor gate.
 
 ### Workflow Matrix
 

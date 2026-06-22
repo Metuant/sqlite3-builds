@@ -137,7 +137,7 @@ jobs:
           name: sqlite-${{env.SQLITE_VERSION}}-cli-${{ matrix.arch_suffix }}
           retention-days: 90
       - name: Build sqlite library
-        run: sudo docker build --rm -t "${docker_library_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" --build-arg MIMALLOC_URL="${MIMALLOC_URL}" --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"
+        run: sudo docker build --rm -t "${docker_library_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" --build-arg MIMALLOC_URL="${MIMALLOC_URL}" --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" --build-arg CMAKE_VERSION="${CMAKE_VERSION}" --build-arg CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64}" --build-arg CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64}"
       - name: Extract binary from docker image
         uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
         id: extract_library

@@ -1,11 +1,16 @@
 # syntax=docker/dockerfile:1.5
 ARG LIBRARY_VARIANT=generic
 
-FROM ghcr.io/linuxserver/baseimage-ubuntu:noble AS base-generic
+FROM ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98 AS base-generic
 
 SHELL ["/bin/bash", "-c"]
 
-RUN echo "**** Install Dependencies ****" && \
+ARG CMAKE_VERSION
+ARG CMAKE_SHA256_X86_64
+ARG CMAKE_SHA256_AARCH64
+
+RUN set -euo pipefail; \
+    echo "**** Install Dependencies ****"; \
     apt-get -y update && \
     apt-get -y upgrade && \
     apt-get -y install --no-install-recommends \
@@ -17,18 +22,32 @@ RUN echo "**** Install Dependencies ****" && \
         gpg-agent \
         wget \
         unzip && \
-    add-apt-repository -y ppa:ubuntu-toolchain-r/ppa && \
     add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
+    apt-get -y update && \
     apt-get -y upgrade && \
     apt-get -y install --no-install-recommends \
-        cmake \
         make \
-        g++ \
-        gcc \
+        g++-13 \
+        gcc-13 \
         binutils \
         patch \
         zlib1g \
-        zlib1g-dev
+        zlib1g-dev && \
+    arch="$(uname -m)"; \
+    case "$arch" in \
+      x86_64) cmake_sha256="${CMAKE_SHA256_X86_64}" ;; \
+      aarch64) cmake_sha256="${CMAKE_SHA256_AARCH64}" ;; \
+      *) echo "FATAL: unsupported CMake architecture: ${arch}" >&2; exit 1 ;; \
+    esac; \
+    cmake_archive="/tmp/cmake-${CMAKE_VERSION}-linux-${arch}.tar.gz"; \
+    wget -O "${cmake_archive}" "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${arch}.tar.gz"; \
+    echo "${cmake_sha256}  ${cmake_archive}" | sha256sum -c -; \
+    tar -xzf "${cmake_archive}" --strip-components=1 -C /usr/local; \
+    rm -f "${cmake_archive}"; \
+    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 && \
+    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 && \
+    update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 100 && \
+    update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100
 
 FROM ghcr.io/linuxserver/baseimage-alpine:3.23 AS base-plex
 
@@ -191,6 +210,28 @@ RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       LIB=$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so); \
       if nm -D --undefined-only "$LIB" | grep -E '(fcntl64|@GLIBC_)'; then \
         echo "FAIL: fcntl64 or GLIBC-versioned symbol found"; \
+        exit 1; \
+      fi; \
+    fi
+
+RUN if [ "$LIBRARY_VARIANT" = "generic" ]; then \
+      set -euo pipefail; \
+      LIB=$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so); \
+      generic_glibc_max="2.27"; \
+      needed_offenders="$(objdump -p "$LIB" | awk '$1 == "NEEDED" && $2 !~ /^(libc[.]so[.]6|libm[.]so[.]6|libpthread[.]so[.]0|libdl[.]so[.]2|librt[.]so[.]1|ld-linux.*[.]so[.][0-9]+)$/ { print }')"; \
+      if [ -n "$needed_offenders" ]; then \
+        echo "FAIL: generic library has non-glibc DT_NEEDED entries"; \
+        printf '%s\n' "$needed_offenders"; \
+        exit 1; \
+      fi; \
+      if ! test "$(objdump -p "$LIB" | awk '/GLIBC_[0-9]/{count++} END {print count+0}')" -gt 0; then \
+        echo "FAIL: generic library has no GLIBC-versioned references"; \
+        exit 1; \
+      fi; \
+      glibc_version_offenders="$(objdump -p "$LIB" | awk -v max="$generic_glibc_max" 'function gt(a,b,ap,bp,n,m,i,x,y){n=split(a,ap,".");m=split(b,bp,".");for(i=1;i<=n||i<=m;i++){x=(i<=n)?ap[i]+0:0;y=(i<=m)?bp[i]+0:0;if(x>y)return 1;if(x<y)return 0}return 0} /GLIBC_[0-9]/{for(i=1;i<=NF;i++){if(match($i,/GLIBC_[0-9][0-9.]*/)){token=substr($i,RSTART,RLENGTH);version=substr(token,7);if(version !~ /^[0-9]+[.][0-9]+([.][0-9]+)?$/){print "invalid GLIBC token: " token}else if(gt(version,max))print}}}')"; \
+      if [ -n "$glibc_version_offenders" ]; then \
+        printf 'FAIL: generic library version references exceed GLIBC_%s:\n' "$generic_glibc_max"; \
+        printf '%s\n' "$glibc_version_offenders"; \
         exit 1; \
       fi; \
     fi

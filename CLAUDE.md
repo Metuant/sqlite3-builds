@@ -26,6 +26,9 @@ Project-specific guidance:
 - Keep `LIBRARY_VARIANT=plex` limited to the Plex ICU build path.
 - Keep SQLite pins aligned across wrapper, workflow, Dockerfiles, and
   `build/Build.sh`; keep ICU pins aligned across
-  `.github/workflows/sqlite-build.yml` and `docker-library/Dockerfile`.
+  `.github/workflows/sqlite-build.yml` and `docker-library/Dockerfile`; keep
+  `BASEIMAGE_UBUNTU` = digest-pinned `ubuntu:18.04` and
+  `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
+  `docker-library/Dockerfile`, and `tests/check_pin_alignment.sh`.
 - Do not create or modify `AGENTS.md` here unless explicitly asked; the root
   convention is a symlink to this file.
