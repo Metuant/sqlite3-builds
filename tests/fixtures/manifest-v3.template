@@ -1,0 +1,17 @@
+# baked-pins schema=3
+meta|3|release_tag|2026.05.28-r1|generated_at|2026-05-28T00:00:00Z
+detect|1|plex|plex-1.43.2|@ARCH@|plex_pms:pristine|@PLEX_PMS_PATH@|@PLEX_PMS_PRISTINE_SHA@
+detect|1|plex|plex-1.43.2|@ARCH@|plex_pms:patched|@PLEX_PMS_PATH@|@PLEX_PMS_PATCHED_SHA@
+detect|1|plex|plex-1.43.2|@ARCH@|plex_scanner:pristine|@PLEX_SCANNER_PATH@|@PLEX_SCANNER_PRISTINE_SHA@
+detect|1|plex|plex-1.43.2|@ARCH@|plex_scanner:patched|@PLEX_SCANNER_PATH@|@PLEX_SCANNER_PATCHED_SHA@
+artifact|1|plex|plex-1.43.2|@ARCH@|icu69|artifacts/@ARCH@/icu69/libsqlite3.so|/usr/lib/plexmediaserver/lib/libsqlite3.so|@PLEX_ARTIFACT_SHA@
+pre|2|plex|plex-1.43.2|@ARCH@|target_sqlite|lscr.io/linuxserver/plex:1.43.2|sha256:0000000000000000000000000000000000000000000000000000000000000000|/usr/lib/plexmediaserver/lib/libsqlite3.so|@PLEX_TARGET_SHA@
+pre|2|plex|plex-1.43.2|@ARCH@|plex_icu_linked:libicuucplex.so.69|lscr.io/linuxserver/plex:1.43.2|sha256:0000000000000000000000000000000000000000000000000000000000000000|/usr/lib/plexmediaserver/lib/libicuucplex.so.69|@PLEX_ICU_UC_SHA@
+pre|2|plex|plex-1.43.2|@ARCH@|plex_icu_linked:libicui18nplex.so.69|lscr.io/linuxserver/plex:1.43.2|sha256:0000000000000000000000000000000000000000000000000000000000000000|/usr/lib/plexmediaserver/lib/libicui18nplex.so.69|@PLEX_ICU_I18N_SHA@
+pre|2|plex|plex-1.43.2|@ARCH@|plex_icu_linked:libicudataplex.so.69|lscr.io/linuxserver/plex:1.43.2|sha256:0000000000000000000000000000000000000000000000000000000000000000|/usr/lib/plexmediaserver/lib/libicudataplex.so.69|@PLEX_ICU_DATA_SHA@
+pool-site|1|plex|plex-1.43.2|@ARCH@|@PLEX_PMS_PATH@|pool-open-flags|0|0|00112233445566778899aabbccddeeff|ff112233445566778899aabbccddeeff
+pool-site|1|plex|plex-1.43.2|@ARCH@|@PLEX_SCANNER_PATH@|pool-open-flags|8|15|11112222333344445555666677778888|11112222333344ff5555666677778888
+detect|1|emby|emby-4.9.3|@ARCH@|emby_deps|@EMBY_DEPS_PATH@|@EMBY_DEPS_SHA@
+detect|1|emby|emby-4.9.3|@ARCH@|emby_dll|@EMBY_DLL_PATH@|@EMBY_DLL_SHA@
+artifact|1|emby|emby-4.9.3|@ARCH@|generic|artifacts/@ARCH@/generic/libsqlite3.so|/app/emby/lib/libsqlite3.so.3.49.2|@EMBY_ARTIFACT_SHA@
+pre|2|emby|emby-4.9.3|@ARCH@|target_sqlite|lscr.io/linuxserver/emby:version-4.9.3.0|-|/app/emby/lib/libsqlite3.so.3.49.2|@EMBY_TARGET_SHA@

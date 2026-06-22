@@ -6,20 +6,43 @@ phase_name="02-verify"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/manifest-parser.sh
+. /opt/sqlite3-lsio-mod/lib/selector.sh
 sqlite3_mod_init_logging
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
-selected_arch="$(resolve_arch)" || exit 0
-artifact="/opt/sqlite3-lsio-mod/artifacts/${selected_arch}/libsqlite3.so"
-target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
-expected="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="plex" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || log_fatal "mod=plex phase=${phase_name} event=missing-current-row arch=${selected_arch}"
+if [ ! -f "$baked_pins" ]; then log_fatal "mod=plex phase=${phase_name} event=missing-baked-pins"; fi
+selected_arch="$(resolve_arch)" || { log_warn "mod=plex phase=${phase_name} event=unsupported-arch machine=$(uname -m)"; exit 0; }
+server_id="$(select_supported_server "plex" "$selected_arch" "$baked_pins")"
+[ -n "$server_id" ] || exit 0
+if unsupported_row="$(selected_unsupported_row "plex" "$selected_arch" "$baked_pins" "$server_id")"; then
+  IFS='|' read -r unsupported_compat_group unsupported_reason <<< "$unsupported_row"
+  log_warn "mod=plex phase=${phase_name} event=unsupported-server arch=${selected_arch} server_id=${server_id} compat_group=${unsupported_compat_group} reason=${unsupported_reason}"
+  exit 0
+fi
+artifact_row="$(selected_artifact_row "plex" "$selected_arch" "$baked_pins" "$server_id")" || log_fatal "mod=plex phase=${phase_name} event=missing-artifact-row arch=${selected_arch} server_id=${server_id}"
+IFS='|' read -r compat_group artifact_relpath target_path artifact_sha256 <<< "$artifact_row"
+[ -n "$compat_group" ] || log_fatal "mod=plex phase=${phase_name} event=invalid-artifact-row arch=${selected_arch} server_id=${server_id}"
+[ -n "$artifact_relpath" ] || log_fatal "mod=plex phase=${phase_name} event=invalid-artifact-row arch=${selected_arch} server_id=${server_id}"
+[ -n "$target_path" ] || log_fatal "mod=plex phase=${phase_name} event=invalid-artifact-row arch=${selected_arch} server_id=${server_id}"
+[ -n "$artifact_sha256" ] || log_fatal "mod=plex phase=${phase_name} event=invalid-artifact-row arch=${selected_arch} server_id=${server_id}"
+[ "$target_path" = "/usr/lib/plexmediaserver/lib/libsqlite3.so" ] || log_fatal "mod=plex phase=${phase_name} event=unexpected-target-path server_id=${server_id} target_path=${target_path}"
+artifact="/opt/sqlite3-lsio-mod/${artifact_relpath}"
 [ -f "$artifact" ] || log_fatal "mod=plex phase=${phase_name} event=missing-artifact path=${artifact}"
 actual="$(sha256_of "$artifact")"
-[ "$actual" = "$expected" ] || log_fatal "mod=plex phase=${phase_name} event=baked-sha-mismatch expected=${expected} actual=${actual}"
-for so in libicuucplex.so.69 libicui18nplex.so.69 libicudataplex.so.69; do
-  runtime="/usr/lib/plexmediaserver/lib/${so}"
-  expected_icu="$(awk -F'|' -v arch="$selected_arch" -v path="$runtime" '$1=="pre" && $3=="plex" && $4==arch && $7==path { print $9; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || { log_warn "mod=plex phase=${phase_name} event=missing-icu-row path=${runtime}"; exit 0; }
+[ "$actual" = "$artifact_sha256" ] || log_fatal "mod=plex phase=${phase_name} event=baked-sha-mismatch expected=${artifact_sha256} actual=${actual}"
+for role in \
+  plex_icu_linked:libicuucplex.so.69 \
+  plex_icu_linked:libicui18nplex.so.69 \
+  plex_icu_linked:libicudataplex.so.69
+do
+  pre_row="$(selected_pre_file_sha256_row "plex" "$selected_arch" "$baked_pins" "$server_id" "$role")" || { log_warn "mod=plex phase=${phase_name} event=missing-icu-row server_id=${server_id} role=${role}"; exit 0; }
+  IFS='|' read -r runtime expected_icu <<< "$pre_row"
+  if [ -z "$runtime" ] || [ -z "$expected_icu" ]; then
+    log_warn "mod=plex phase=${phase_name} event=missing-icu-row server_id=${server_id} role=${role}"
+    exit 0
+  fi
   [ -f "$runtime" ] || { log_warn "mod=plex phase=${phase_name} event=missing-runtime-icu path=${runtime}"; exit 0; }
   actual_icu="$(sha256_of "$runtime")"
   [ "$actual_icu" = "$expected_icu" ] || { log_warn "mod=plex phase=${phase_name} event=runtime-icu-mismatch path=${runtime}"; exit 0; }
 done
-log_info "mod=plex phase=${phase_name} event=verified arch=${selected_arch}"
+log_info "mod=plex phase=${phase_name} event=verified arch=${selected_arch} server_id=${server_id} compat_group=${compat_group} target_path=${target_path}"

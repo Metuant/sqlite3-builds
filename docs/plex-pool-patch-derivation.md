@@ -34,27 +34,45 @@ label|offset|write_seek|original_hex|patched_hex
 in hex. `original_hex` and `patched_hex` are 16-byte contexts. The context must
 be unique in the target binary.
 
-## Baselines
+## Supported Surface
 
-The supported image tag is `lscr.io/linuxserver/plex:1.43.2`.
+The supported Plex pool-patch surface is keyed by `server_id` rows in
+`pins/runtime-support.tsv`.
 
-| Arch | Binary | Baseline SHA-256 |
+| Server ID | Image ref | Compat group |
 |---|---|---|
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Server` | `22861f0c26767eaa2ce0cfcf697bc14b1870d58079c1089c634a1f454b445597` |
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `8f12a65001a11953740e78f2f023aa785d5f3caf269da951b7d75b8b45c7785e` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Server` | `6f6aaac01e0a226310ee5475976d10e39721047fdfa6373249449e1a7eb0cd52` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `9ae3a009471f2411a57fb0c29bafd9e2c60592dba56d8282467a1a6c0e7b9332` |
+| `plex-1.43.1` | `lscr.io/linuxserver/plex:1.43.1` | `icu69` |
+| `plex-1.43.2` | `lscr.io/linuxserver/plex:1.43.2` | `icu69` |
+
+For each supported `server_id` and arch, pristine Plex detector SHAs live in
+`pins/runtime-baselines.tsv` and render into `detect` rows whose path roles end
+in `:pristine` (`plex_pms:pristine` and `plex_scanner:pristine`). The runtime
+pool-patch phase selects the server first, then passes the selected pristine
+Plex detector SHA to the patcher.
 
 ## Patch Sites
 
-| Arch | Binary | Tuple |
-|---|---|---|
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xb175e7|11630055|11630056|be140000004c89ff41b800000000506a|be100000004c89ff41b800000000506a` |
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x37d4b7|3658935|3658936|be140000004c89ff41b800000000506a|be100000004c89ff41b800000000506a` |
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x3997bf|3774399|3774400|be140000004889df41b80000000068d0|be100000004889df41b80000000068d0` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xa18fd4|10588116|10588116|81028052e00313aae4031f2ae7031f2a|01028052e00313aae4031f2ae7031f2a` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x33ad9c|3386780|3386780|81028052e00313aae4031f2ae7031f2a|01028052e00313aae4031f2ae7031f2a` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x3575f8|3503608|3503608|81028052e00315aae4031f2ae7031f2a|01028052e00315aae4031f2ae7031f2a` |
+Patch sites are server-scoped data rows in
+`pins/plex-pool-patch-sites.tsv`:
+
+```text
+server_id arch binary_path baseline_sha256 label offset write_seek original_hex patched_hex
+```
+
+`baseline_sha256` must match the selected pristine Plex detector SHA for the
+same `server_id`, arch, and binary path. The renderer and CI alignment tests
+enforce that binding before a `pool-site` row is emitted into `baked-pins.txt`.
+
+Human review approvals are server-scoped rows in
+`pins/plex-pool-patch-reviews.tsv`:
+
+```text
+server_id arch binary_path label offset write_seek original_hex patched_hex review_ref reviewer status
+```
+
+A review row binds the full site tuple. Any change to `server_id`, `arch`,
+`binary_path`, `label`, `offset`, `write_seek`, `original_hex`, or
+`patched_hex` creates a different tuple and requires fresh approval.
 
 ## Exclusions
 
@@ -69,12 +87,13 @@ These pool-size-2 sites are for a different database and must not be patched:
 
 ## Runtime Mechanism
 
-The runtime patcher receives the target binary path, expected baseline SHA, and
-one or more site tuples from the Phase 04 Plex pool-patch oneshot. It reads
-exactly 16 bytes at each tuple offset. A binary is patchable only when every
-site matches `original_hex` and the current binary SHA matches the `pool-pre`
-baseline row. If every site already matches `patched_hex`, the patcher logs
-`pool_patch event=already-patched` and skips the binary.
+The runtime patcher receives the target binary path, selected pristine Plex
+detector SHA (`detect ...:pristine`), and one or more site tuples from the Phase
+04 Plex pool-patch oneshot. It reads exactly 16 bytes at each tuple offset. A
+binary is patchable only when every site matches `original_hex` and the current
+binary SHA matches the selected pristine Plex detector SHA. If every site
+already matches `patched_hex`, the patcher logs `pool_patch
+event=already-patched` and skips the binary.
 
 For each original site, the patcher computes `write_index` as
 `write_seek - offset`, selects the one output byte from `patched_hex`, writes
@@ -84,3 +103,7 @@ owner and mode metadata on the temp copy, and atomically replaces the target.
 
 Unknown, mixed, mismatched, or write-failed states warn and skip without
 modifying the runtime target.
+
+## See also
+
+[Runtime Baseline Derivation](runtime-baseline-derivation.md)

@@ -28,6 +28,7 @@ docker run --detach \
   --name "$EMBY_CONTAINER" \
   -e PUID=1000 \
   -e PGID=1000 \
+  -e SQLITE3_DISABLE_STMT_TRACE=0 \
   --mount "type=bind,src=${EMBY_CONFIG_DIR},dst=/config" \
   --mount "type=bind,src=${GENERIC_ARTIFACT_DIR_ABS}/libsqlite3.so,dst=/app/emby/lib/libsqlite3.so.3.49.2,readonly" \
   --network host \

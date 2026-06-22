@@ -1,0 +1,5 @@
+mod	server_id	image_ref	compat_group	status	review_ref	notes
+plex	plex-fixture	lscr.io/linuxserver/plex:fixture	icu69	supported	fixture-review	renderer fixture plex support row
+emby	emby-fixture	lscr.io/linuxserver/emby:fixture	generic	supported	fixture-review	renderer fixture emby support row
+emby	emby-fixture-alt-target	lscr.io/linuxserver/emby:fixture-alt-target	generic	supported	fixture-review	renderer fixture emby alternate target row
+emby	emby-fixture-generic2	lscr.io/linuxserver/emby:fixture-generic2	generic2	supported	fixture-review	renderer fixture emby second compatibility group row

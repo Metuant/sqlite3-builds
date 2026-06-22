@@ -17,6 +17,7 @@ SQLITE_API int sqlite3_enable_shared_cache(int enable) {
 #include <stdatomic.h>
 
 __attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void);
+__attribute__((visibility("hidden"))) SQLITE_API int obs_stmt_trace_disabled(void);
 __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_cb(unsigned trace, void *ctx, void *p, void *x);
 __attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
@@ -106,13 +107,16 @@ static int autopragma_init(
     (void)pzErr;
 
     if (!obs_is_disabled()) {
-        unsigned trace_mask = SQLITE_TRACE_STMT;
+        unsigned trace_mask = 0;
+        if (!obs_stmt_trace_disabled()) trace_mask |= SQLITE_TRACE_STMT;
         if (!slow_query_disabled()) trace_mask |= SQLITE_TRACE_PROFILE;
-        int trace_rc = sqlite3_trace_v2(db, trace_mask, obs_trace_cb, NULL);
-        if (trace_rc != SQLITE_OK) {
-            obs_logf("sqlite3_trace_v2",
-                     "event=registration_failed db=%p rc=%d",
-                     (void*)db, trace_rc);
+        if (trace_mask != 0) {
+            int trace_rc = sqlite3_trace_v2(db, trace_mask, obs_trace_cb, NULL);
+            if (trace_rc != SQLITE_OK) {
+                obs_logf("sqlite3_trace_v2",
+                         "event=registration_failed db=%p rc=%d",
+                         (void*)db, trace_rc);
+            }
         }
     }
 

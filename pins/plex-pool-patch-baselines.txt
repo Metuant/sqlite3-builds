@@ -1,8 +1,0 @@
-# schema=1
-# target|arch|binary_path|baseline_sha256
-plex|linux-x86_64-v2|/usr/lib/plexmediaserver/Plex Media Server|22861f0c26767eaa2ce0cfcf697bc14b1870d58079c1089c634a1f454b445597
-plex|linux-x86_64-v2|/usr/lib/plexmediaserver/Plex Media Scanner|8f12a65001a11953740e78f2f023aa785d5f3caf269da951b7d75b8b45c7785e
-plex|linux-x86_64-v3|/usr/lib/plexmediaserver/Plex Media Server|22861f0c26767eaa2ce0cfcf697bc14b1870d58079c1089c634a1f454b445597
-plex|linux-x86_64-v3|/usr/lib/plexmediaserver/Plex Media Scanner|8f12a65001a11953740e78f2f023aa785d5f3caf269da951b7d75b8b45c7785e
-plex|linux-arm64|/usr/lib/plexmediaserver/Plex Media Server|6f6aaac01e0a226310ee5475976d10e39721047fdfa6373249449e1a7eb0cd52
-plex|linux-arm64|/usr/lib/plexmediaserver/Plex Media Scanner|9ae3a009471f2411a57fb0c29bafd9e2c60592dba56d8282467a1a6c0e7b9332

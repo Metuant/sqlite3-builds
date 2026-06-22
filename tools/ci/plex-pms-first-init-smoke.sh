@@ -31,6 +31,7 @@ docker run --detach \
   -e PUID=1000 \
   -e PGID=1000 \
   -e VERSION=docker \
+  -e SQLITE3_DISABLE_STMT_TRACE=0 \
   --mount "type=bind,src=${PMS_CONFIG_DIR},dst=/config" \
   --mount "type=bind,src=${ARTIFACT_DIR_ABS}/libsqlite3.so,dst=/usr/lib/plexmediaserver/lib/libsqlite3.so,readonly" \
   --network host \

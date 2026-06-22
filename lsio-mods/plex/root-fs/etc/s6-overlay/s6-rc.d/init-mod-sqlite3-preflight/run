@@ -3,48 +3,32 @@
 # shellcheck source=/dev/null
 set -u
 phase_name="01-preflight"
-# validate_baked_pins_schema reads mod_target when this script runs in-place.
-# shellcheck disable=SC2034
-mod_target="plex"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/manifest-parser.sh
+. /opt/sqlite3-lsio-mod/lib/selector.sh
 sqlite3_mod_init_logging
-target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
-validate_baked_pins_schema() {
-  version_rows=0
-  while IFS= read -r line || [ -n "$line" ]; do
-    [ -n "$line" ] || continue
-    case "$line" in \#*) continue ;; esac
-    IFS='|' read -r -a fields <<< "$line"
-    case "${fields[0]}" in
-      version)
-        if [ "${#fields[@]}" -ne 6 ] || [ "${fields[1]}" != "2" ] || [ "${fields[2]}" != "release_tag" ] || [ -z "${fields[3]}" ] || [ "${fields[4]}" != "generated_at" ] || [ -z "${fields[5]}" ]; then return 1; fi
-        version_rows=$((version_rows + 1))
-        ;;
-      current)
-        if [ "${#fields[@]}" -ne 7 ] || [ "${fields[1]}" != "1" ] || [ -z "${fields[2]}" ] || [ -z "${fields[3]}" ] || [ -z "${fields[4]}" ] || [ -z "${fields[5]}" ] || [[ ! "${fields[6]}" =~ ^[0-9A-Fa-f]{64}$ ]]; then return 1; fi
-        ;;
-      pre)
-        if [ "${#fields[@]}" -ne 9 ] || [ "${fields[1]}" != "1" ] || [ -z "${fields[2]}" ] || [ -z "${fields[3]}" ] || [ -z "${fields[4]}" ] || [ -z "${fields[5]}" ] || [ -z "${fields[6]}" ] || [ -z "${fields[7]}" ] || [[ ! "${fields[8]}" =~ ^[0-9A-Fa-f]{64}$ ]]; then return 1; fi
-        ;;
-      pool-pre)
-        if [ "${#fields[@]}" -ne 6 ] || [ "${fields[1]}" != "1" ] || [ -z "${fields[2]}" ] || [ -z "${fields[3]}" ] || [ -z "${fields[4]}" ] || [[ ! "${fields[5]}" =~ ^[0-9A-Fa-f]{64}$ ]]; then return 1; fi
-        ;;
-      unsupported)
-        if [ "${#fields[@]}" -ne 3 ] || [ -z "${fields[1]}" ] || [ -z "${fields[2]}" ]; then return 1; fi
-        ;;
-      *) return 1 ;;
-    esac
-  done < "$baked_pins"
-  [ "$version_rows" -eq 1 ]
-}
-if [ ! -f "$target_path" ]; then log_warn "mod=plex phase=${phase_name} event=missing-target target_path=${target_path}"; exit 0; fi
 if [ ! -f "$baked_pins" ]; then log_fatal "mod=plex phase=${phase_name} event=missing-baked-pins"; fi
-validate_baked_pins_schema || log_fatal "mod=plex phase=${phase_name} event=malformed-baked-pins"
 # Phase 01 command checks are a best-effort early warning; later phases re-check their mutation prerequisites.
 if ! require_all_or_warn awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname; then exit 0; fi
+validate_baked_pins_schema "$baked_pins" || log_fatal "mod=plex phase=${phase_name} event=malformed-baked-pins"
 selected_arch="$(resolve_arch)" || { log_warn "mod=plex phase=${phase_name} event=unsupported-arch machine=$(uname -m)"; exit 0; }
-release_tag="$(awk -F'|' '$1=="version" && $2=="2" { for (i=3; i<=NF; i+=2) if ($i=="release_tag") print $(i+1) }' "$baked_pins")"
-log_info "mod=plex phase=${phase_name} event=selected arch=${selected_arch} release_tag=${release_tag:-unknown} target_path=${target_path}"
+server_id="$(select_supported_server "plex" "$selected_arch" "$baked_pins")"
+[ -n "$server_id" ] || exit 0
+if unsupported_row="$(selected_unsupported_row "plex" "$selected_arch" "$baked_pins" "$server_id")"; then
+  IFS='|' read -r unsupported_compat_group unsupported_reason <<< "$unsupported_row"
+  log_warn "mod=plex phase=${phase_name} event=unsupported-server arch=${selected_arch} server_id=${server_id} compat_group=${unsupported_compat_group} reason=${unsupported_reason}"
+  exit 0
+fi
+artifact_row="$(selected_artifact_row "plex" "$selected_arch" "$baked_pins" "$server_id")" || log_fatal "mod=plex phase=${phase_name} event=missing-artifact-row arch=${selected_arch} server_id=${server_id}"
+IFS='|' read -r compat_group artifact_relpath target_path artifact_sha256 <<< "$artifact_row"
+: "$artifact_relpath" "$artifact_sha256"
+[ -n "$compat_group" ] || log_fatal "mod=plex phase=${phase_name} event=invalid-artifact-row arch=${selected_arch} server_id=${server_id}"
+[ -n "$target_path" ] || log_fatal "mod=plex phase=${phase_name} event=invalid-artifact-row arch=${selected_arch} server_id=${server_id}"
+if [ ! -f "$target_path" ]; then
+  log_warn "mod=plex phase=${phase_name} event=missing-target arch=${selected_arch} server_id=${server_id} compat_group=${compat_group} target_path=${target_path}"
+  exit 0
+fi
+log_info "mod=plex phase=${phase_name} event=selected arch=${selected_arch} server_id=${server_id} compat_group=${compat_group} target_path=${target_path}"

@@ -79,16 +79,16 @@ COPY tests/ /app/tests/
 
 RUN chmod +x /app/Build.sh
 
-ARG ICU_VERSION
-ARG ICU_SHA512
+ARG ICU_SOURCE_VERSION
+ARG ICU_SOURCE_SHA512
 RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       set -euo pipefail; \
-      icu_release_version="$(printf '%s' "${ICU_VERSION}" | tr '.' '-')"; \
-      icu_archive_version="$(printf '%s' "${ICU_VERSION}" | tr '.' '_')"; \
+      icu_release_version="$(printf '%s' "${ICU_SOURCE_VERSION}" | tr '.' '-')"; \
+      icu_archive_version="$(printf '%s' "${ICU_SOURCE_VERSION}" | tr '.' '_')"; \
       icu_archive="/tmp/icu4c-${icu_archive_version}-src.tgz"; \
       icu_url="https://github.com/unicode-org/icu/releases/download/release-${icu_release_version}/icu4c-${icu_archive_version}-src.tgz"; \
       wget -O "${icu_archive}" "${icu_url}"; \
-      echo "${ICU_SHA512}  ${icu_archive}" | sha512sum -c -; \
+      echo "${ICU_SOURCE_SHA512}  ${icu_archive}" | sha512sum -c -; \
       tar -xzf "${icu_archive}" -C /tmp; \
       cd /tmp/icu/source; \
       ./configure \

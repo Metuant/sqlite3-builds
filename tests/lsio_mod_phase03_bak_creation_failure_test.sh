@@ -11,13 +11,19 @@ trap cleanup EXIT
 
 fixture="$tmp_root/fixture"
 lib_root="$fixture/opt/sqlite3-lsio-mod/lib"
-artifact_dir="$fixture/opt/sqlite3-lsio-mod/artifacts/linux-arm64"
-runtime_lib_dir="$fixture/usr/lib/plexmediaserver/lib"
-mkdir -p "$lib_root" "$artifact_dir" "$runtime_lib_dir"
+artifact_dir="$fixture/opt/sqlite3-lsio-mod/artifacts/linux-arm64/icu69"
+runtime_root="$fixture/usr/lib/plexmediaserver"
+runtime_lib_dir="$runtime_root/lib"
+pms_path="$runtime_root/Plex Media Server"
+scanner_path="$runtime_root/Plex Media Scanner"
+detector_sha_root="$tmp_root/detector-sha"
+mkdir -p "$lib_root" "$artifact_dir" "$runtime_lib_dir" "$detector_sha_root"
 
 cp lsio-mods/shared/cont-init-fragments/logging.sh "$lib_root/logging.sh"
 cp lsio-mods/shared/cont-init-fragments/sha.sh "$lib_root/sha.sh"
 cp lsio-mods/shared/cont-init-fragments/arch.sh "$lib_root/arch.sh"
+cp lsio-mods/shared/cont-init-fragments/manifest-parser.sh "$lib_root/manifest-parser.sh"
+cp lsio-mods/shared/cont-init-fragments/selector.sh "$lib_root/selector.sh"
 cp lsio-mods/shared/cont-init-fragments/atomic-write.sh "$lib_root/atomic-write.sh"
 cp lsio-mods/shared/cont-init-fragments/swap.sh "$lib_root/swap.sh"
 
@@ -27,23 +33,45 @@ EOF_ARTIFACT
 cat > "$runtime_lib_dir/libsqlite3.so" <<'EOF_BASELINE'
 sqlite-baseline
 EOF_BASELINE
+cat > "$pms_path" <<'EOF_PMS'
+plex pms pristine
+EOF_PMS
+cat > "$scanner_path" <<'EOF_SCANNER'
+plex scanner pristine
+EOF_SCANNER
+cat > "$detector_sha_root/plex-pms-patched" <<'EOF_PMS_PATCHED'
+plex pms patched
+EOF_PMS_PATCHED
+cat > "$detector_sha_root/plex-scanner-patched" <<'EOF_SCANNER_PATCHED'
+plex scanner patched
+EOF_SCANNER_PATCHED
 for so in libicuucplex.so.69 libicui18nplex.so.69 libicudataplex.so.69; do
   printf 'icu-runtime-%s\n' "$so" > "$runtime_lib_dir/$so"
 done
 
 current_sha="$(sha256sum "$artifact_dir/libsqlite3.so" | awk '{print $1}')"
 baseline_sha="$(sha256sum "$runtime_lib_dir/libsqlite3.so" | awk '{print $1}')"
+pms_pristine_sha="$(sha256sum "$pms_path" | awk '{print $1}')"
+scanner_pristine_sha="$(sha256sum "$scanner_path" | awk '{print $1}')"
+pms_patched_sha="$(sha256sum "$detector_sha_root/plex-pms-patched" | awk '{print $1}')"
+scanner_patched_sha="$(sha256sum "$detector_sha_root/plex-scanner-patched" | awk '{print $1}')"
 icu_uc_sha="$(sha256sum "$runtime_lib_dir/libicuucplex.so.69" | awk '{print $1}')"
 icu_i18n_sha="$(sha256sum "$runtime_lib_dir/libicui18nplex.so.69" | awk '{print $1}')"
 icu_data_sha="$(sha256sum "$runtime_lib_dir/libicudataplex.so.69" | awk '{print $1}')"
 
 cat > "$fixture/opt/sqlite3-lsio-mod/baked-pins.txt" <<EOF_PINS
-version|2|release_tag|2026.05.27-r3
-current|1|plex|linux-arm64|sqlite-fixture-library-plex-linux-arm64.so|${fixture}/usr/lib/plexmediaserver/lib/libsqlite3.so|$current_sha
-pre|1|plex|linux-arm64|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libsqlite3.so|runtime|$baseline_sha
-pre|1|plex|linux-arm64|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libicuucplex.so.69|runtime|$icu_uc_sha
-pre|1|plex|linux-arm64|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libicui18nplex.so.69|runtime|$icu_i18n_sha
-pre|1|plex|linux-arm64|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libicudataplex.so.69|runtime|$icu_data_sha
+meta|3|release_tag|2026.05.28-r1|generated_at|2026-05-28T00:00:00Z
+detect|1|plex|plex-fixture|linux-arm64|plex_pms:pristine|$pms_path|$pms_pristine_sha
+detect|1|plex|plex-fixture|linux-arm64|plex_pms:patched|$pms_path|$pms_patched_sha
+detect|1|plex|plex-fixture|linux-arm64|plex_scanner:pristine|$scanner_path|$scanner_pristine_sha
+detect|1|plex|plex-fixture|linux-arm64|plex_scanner:patched|$scanner_path|$scanner_patched_sha
+artifact|1|plex|plex-fixture|linux-arm64|icu69|artifacts/linux-arm64/icu69/libsqlite3.so|${fixture}/usr/lib/plexmediaserver/lib/libsqlite3.so|$current_sha
+pre|2|plex|plex-fixture|linux-arm64|target_sqlite|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libsqlite3.so|$baseline_sha
+pre|2|plex|plex-fixture|linux-arm64|plex_icu_linked:libicuucplex.so.69|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libicuucplex.so.69|$icu_uc_sha
+pre|2|plex|plex-fixture|linux-arm64|plex_icu_linked:libicui18nplex.so.69|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libicui18nplex.so.69|$icu_i18n_sha
+pre|2|plex|plex-fixture|linux-arm64|plex_icu_linked:libicudataplex.so.69|lscr.io/linuxserver/plex:fixture|sha256:fixture|${fixture}/usr/lib/plexmediaserver/lib/libicudataplex.so.69|$icu_data_sha
+pool-site|1|plex|plex-fixture|linux-arm64|$pms_path|pool-open-flags|0|0|00112233445566778899aabbccddeeff|ffeeddccbbaa99887766554433221100
+pool-site|1|plex|plex-fixture|linux-arm64|$scanner_path|pool-open-flags|8|15|11112222333344445555666677778888|88887777666655554444333322221111
 EOF_PINS
 
 script_copy="$tmp_root/init-mod-sqlite3-swap-run"

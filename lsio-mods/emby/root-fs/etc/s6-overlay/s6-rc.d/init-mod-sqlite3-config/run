@@ -6,14 +6,24 @@ phase_name="04-config"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/manifest-parser.sh
+. /opt/sqlite3-lsio-mod/lib/selector.sh
 . /opt/sqlite3-lsio-mod/lib/atomic-write.sh
 sqlite3_mod_init_logging
 if ! require_all_or_warn awk chmod chown grep sed sha256sum mktemp mv rm stat uname; then exit 0; fi
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
-target_path="/app/emby/lib/libsqlite3.so.3.49.2"
 selected_arch="$(resolve_arch)" || { log_warn "mod=emby phase=${phase_name} event=unsupported-arch machine=$(uname -m)"; exit 0; }
-current_sha="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="emby" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || exit 0
-[ -f "$target_path" ] && [ "$(sha256_of "$target_path")" = "$current_sha" ] || { log_warn "mod=emby phase=${phase_name} event=skip-sqlite-not-current"; exit 0; }
+server_id="$(select_supported_server "emby" "$selected_arch" "$baked_pins")"
+[ -n "$server_id" ] || exit 0
+if unsupported_row="$(selected_unsupported_row "emby" "$selected_arch" "$baked_pins" "$server_id")"; then
+  IFS='|' read -r unsupported_compat_group unsupported_reason <<< "$unsupported_row"
+  log_warn "mod=emby phase=${phase_name} event=unsupported-server arch=${selected_arch} server_id=${server_id} compat_group=${unsupported_compat_group} reason=${unsupported_reason}"
+  exit 0
+fi
+if ! selected_artifact_is_current "emby" "$selected_arch" "$baked_pins" "$server_id"; then
+  log_warn "mod=emby phase=${phase_name} event=skip-sqlite-not-current"
+  exit 0
+fi
 config="/config/config/system.xml"
 [ -f "$config" ] || { log_warn "mod=emby phase=${phase_name} event=missing-config config=${config}"; exit 0; }
 

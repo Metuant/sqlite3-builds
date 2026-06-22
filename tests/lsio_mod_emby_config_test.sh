@@ -95,27 +95,51 @@ setup_case() {
   case_root="$tmp_root/$case_name"
   fixture="$case_root/fixture"
   lib_root="$fixture/opt/sqlite3-lsio-mod/lib"
+  artifact_dir="$fixture/opt/sqlite3-lsio-mod/artifacts/linux-arm64/generic"
   runtime_lib_dir="$fixture/app/emby/lib"
+  emby_root="$fixture/app/emby"
+  emby_deps_path="$emby_root/EmbyServer.deps.json"
+  emby_dll_path="$emby_root/EmbyServer.dll"
   config_dir="$fixture/config/config"
   case_tmpdir="$case_root/tmpdir"
-  mkdir -p "$lib_root" "$runtime_lib_dir" "$config_dir" "$case_tmpdir"
+  mkdir -p "$lib_root" "$artifact_dir" "$runtime_lib_dir" "$config_dir" "$case_tmpdir"
 
   cp lsio-mods/shared/cont-init-fragments/logging.sh "$lib_root/logging.sh"
   cp lsio-mods/shared/cont-init-fragments/sha.sh "$lib_root/sha.sh"
   cp lsio-mods/shared/cont-init-fragments/arch.sh "$lib_root/arch.sh"
+  cp lsio-mods/shared/cont-init-fragments/manifest-parser.sh "$lib_root/manifest-parser.sh"
+  cp lsio-mods/shared/cont-init-fragments/selector.sh "$lib_root/selector.sh"
   cp lsio-mods/shared/cont-init-fragments/atomic-write.sh "$lib_root/atomic-write.sh"
   # shellcheck source=/dev/null
   . "$lib_root/atomic-write.sh"
 
+  cat > "$artifact_dir/libsqlite3.so" <<'EOF_ARTIFACT'
+sqlite-current
+EOF_ARTIFACT
   cat > "$runtime_lib_dir/libsqlite3.so.3.49.2" <<'EOF_SQLITE'
 sqlite-current
 EOF_SQLITE
-  current_sha="$(sha_file "$runtime_lib_dir/libsqlite3.so.3.49.2")"
+  cat > "$emby_deps_path" <<'EOF_DEPS'
+{"runtimeTarget":{"name":"fixture"}}
+EOF_DEPS
+  cat > "$emby_dll_path" <<'EOF_DLL'
+fixture emby dll
+EOF_DLL
+  cat > "$case_root/sqlite-bundled-source" <<'EOF_BASELINE'
+sqlite-bundled
+EOF_BASELINE
+  artifact_sha="$(sha_file "$artifact_dir/libsqlite3.so")"
   target_path="$fixture/app/emby/lib/libsqlite3.so.3.49.2"
+  emby_deps_sha="$(sha_file "$emby_deps_path")"
+  emby_dll_sha="$(sha_file "$emby_dll_path")"
+  baseline_sha="$(sha_file "$case_root/sqlite-bundled-source")"
 
   cat > "$fixture/opt/sqlite3-lsio-mod/baked-pins.txt" <<EOF_PINS
-version|2|release_tag|2026.05.27-r3
-current|1|emby|linux-arm64|sqlite-fixture-library-linux-arm64.so|${target_path}|${current_sha}
+meta|3|release_tag|2026.05.28-r1|generated_at|2026-05-28T00:00:00Z
+detect|1|emby|emby-fixture|linux-arm64|emby_deps|${emby_deps_path}|${emby_deps_sha}
+detect|1|emby|emby-fixture|linux-arm64|emby_dll|${emby_dll_path}|${emby_dll_sha}
+artifact|1|emby|emby-fixture|linux-arm64|generic|artifacts/linux-arm64/generic/libsqlite3.so|${target_path}|${artifact_sha}
+pre|2|emby|emby-fixture|linux-arm64|target_sqlite|lscr.io/linuxserver/emby:fixture|-|${target_path}|${baseline_sha}
 EOF_PINS
 
   script_copy="$case_root/init-mod-sqlite3-config-run"
@@ -227,6 +251,7 @@ run_phase
 after_sha="$(sha_file "$config")"
 assert_eq "0" "$rc" "swap-not-current exit status"
 assert_eq "$before_sha" "$after_sha" "swap-not-current config sha"
+assert_contains 'event=current-artifact-mismatch' "$phase_log" "swap-not-current selector reason"
 assert_contains 'event=skip-sqlite-not-current' "$phase_log" "swap-not-current log"
 assert_eq "0" "$(grep_count 'event=config-updated' "$phase_log")" "swap-not-current updated count"
 assert_no_temp_leftovers

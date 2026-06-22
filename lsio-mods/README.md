@@ -15,10 +15,12 @@ Set:
 DOCKER_MODS=ghcr.io/<namespace>/linuxserver-mod-sqlite3-plex:<YYYY.MM.DD-rN>
 ```
 
-The Plex mod replaces `/usr/lib/plexmediaserver/lib/libsqlite3.so` when the
-target file's runtime SHA matches the baked baseline row. It verifies Plex ICU
-runtime files but never writes them. On amd64 and arm64, it also pool-patches
-`Plex Media Server` and `Plex Media Scanner`.
+The Plex mod detects the running server from the server-owned `Plex Media
+Server` and `Plex Media Scanner` detector files, selects the matching manifest
+rows, verifies the staged artifact and runtime baselines, then replaces
+`/usr/lib/plexmediaserver/lib/libsqlite3.so`. It verifies Plex ICU runtime files
+but never writes them. On amd64 and arm64, it also pool-patches `Plex Media
+Server` and `Plex Media Scanner`.
 
 ## Emby
 
@@ -28,8 +30,10 @@ Set:
 DOCKER_MODS=ghcr.io/<namespace>/linuxserver-mod-sqlite3-emby:<YYYY.MM.DD-rN>
 ```
 
-The Emby mod replaces `/app/emby/lib/libsqlite3.so.3.49.2` when the target
-file's runtime SHA matches the baked baseline row.
+The Emby mod detects the running server from the server-owned
+`EmbyServer.deps.json` and `EmbyServer.dll` detector files, selects the matching
+manifest rows, verifies the staged artifact and runtime baselines, then replaces
+the target path from the selected artifact row.
 
 ## Version Drift
 

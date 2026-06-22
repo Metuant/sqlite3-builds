@@ -42,9 +42,13 @@ grep -Fq 'bash tools/ci/emby-killswitch-smoke.sh' "$workflow"
 grep -Fq 'bash tools/ci/mod-bake-smoke.sh' "$workflow"
 grep -Fq 'bash tests/ci_log_assertions_test.sh' "$workflow"
 grep -Fq 'bash tests/mod_bake_assertions_test.sh' "$workflow"
+grep -Fq 'compat_group_field_for_group "$compat_group" artifact_stem' "$workflow"
+grep -Fq 'library_dir="library-${artifact_stem}"' "$workflow"
+grep -Fq 'render_args+=(--artifact "${arch}:${compat_group}:${artifact_name}:${artifact_path}:${target_path}")' "$mod_bake_script"
+grep -Fq 'stage_args+=(--artifact "${arch}:${compat_group}:${artifact_path}")' "$mod_bake_script"
 grep -Fq 'COPY root-fs /' "$mod_bake_script"
 grep -Fq 'root-fs/etc/s6-overlay/s6-rc.d' "$mod_bake_script"
-grep -Fq '${GITHUB_RUN_ID}-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}-smoke' "$mod_bake_script"
+grep -Fq '${GITHUB_RUN_ID}-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}-${server_tag}-smoke' "$mod_bake_script"
 grep -Fq 'mod-image-${{ matrix.mod }}-${{ matrix.arch_suffix }}' "$workflow"
 
 if grep -Fq ':latest' "$workflow"; then
@@ -92,6 +96,12 @@ if "docker run --rm --entrypoint sha256sum" not in mod_bake_script:
     raise SystemExit("mod-bake script missing runtime pre-SHA derivation")
 if "assert_runtime_load" not in mod_bake_script:
     raise SystemExit("mod-bake script missing app runtime-load assertion")
+if 'target_path_for_mod' in mod_bake_script:
+    raise SystemExit("mod-bake script still uses per-mod target path")
+if '${arch}:${compat_group}:${artifact_name}:${artifact_path}:${target_path}' not in mod_bake_script:
+    raise SystemExit("mod-bake script missing group-aware render artifact tuple")
+if '${arch}:${compat_group}:${artifact_path}' not in mod_bake_script:
+    raise SystemExit("mod-bake script missing group-aware stage artifact tuple")
 
 build = text.split("\n  build:", 1)[1].split("\n  mod-static-tests:", 1)[0]
 for script in [
@@ -126,6 +136,12 @@ if "docker build" in mod_publish or "docker run" in mod_publish:
 
 if "SHA256SUMS" not in release:
     raise SystemExit("release job missing SHA256SUMS")
+if "runtime_support_window<<EOF_RUNTIME_SUPPORT" not in release:
+    raise SystemExit("release job missing runtime support window output")
+if '${{ steps.release_compat.outputs.runtime_support_window }}' not in release:
+    raise SystemExit("release body missing enumerated runtime support window")
+if '$5 == "supported"' not in release:
+    raise SystemExit("release support window must enumerate supported runtime rows only")
 if "icu-${{ github.ref_name }}-" in release:
     raise SystemExit("release job still publishes ICU tarball")
 for forbidden in ["SQLITE_LIBRARY_PINS", "release-assets/update-sqlite-library.sh"]:

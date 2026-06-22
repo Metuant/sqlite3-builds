@@ -6,27 +6,51 @@ phase_name="03-swap"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/manifest-parser.sh
+. /opt/sqlite3-lsio-mod/lib/selector.sh
 . /opt/sqlite3-lsio-mod/lib/atomic-write.sh
 . /opt/sqlite3-lsio-mod/lib/swap.sh
 sqlite3_mod_init_logging
 if ! require_all_or_warn awk chmod chown cp mktemp mv rm sha256sum stat uname; then exit 0; fi
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
-target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
 selected_arch="$(resolve_arch)" || exit 0
-artifact="/opt/sqlite3-lsio-mod/artifacts/${selected_arch}/libsqlite3.so"
-current_sha="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="plex" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || exit 0
-baseline_sha="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="pre" && $3=="plex" && $4==arch && $7==target { print $9; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || exit 0
-for so in libicuucplex.so.69 libicui18nplex.so.69 libicudataplex.so.69; do
-  runtime="/usr/lib/plexmediaserver/lib/${so}"
-  expected_icu="$(awk -F'|' -v arch="$selected_arch" -v path="$runtime" '$1=="pre" && $3=="plex" && $4==arch && $7==path { print $9; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || { log_warn "mod=plex phase=${phase_name} event=missing-icu-row path=${runtime}"; exit 0; }
+server_id="$(select_supported_server "plex" "$selected_arch" "$baked_pins")"
+[ -n "$server_id" ] || exit 0
+if unsupported_row="$(selected_unsupported_row "plex" "$selected_arch" "$baked_pins" "$server_id")"; then
+  IFS='|' read -r unsupported_compat_group unsupported_reason <<< "$unsupported_row"
+  log_warn "mod=plex phase=${phase_name} event=unsupported-server arch=${selected_arch} server_id=${server_id} compat_group=${unsupported_compat_group} reason=${unsupported_reason}"
+  exit 0
+fi
+artifact_row="$(selected_artifact_row "plex" "$selected_arch" "$baked_pins" "$server_id")" || { log_warn "mod=plex phase=${phase_name} event=missing-artifact-row arch=${selected_arch} server_id=${server_id}"; exit 0; }
+IFS='|' read -r compat_group artifact_relpath target_path current_sha <<< "$artifact_row"
+if [ -z "$compat_group" ] || [ -z "$artifact_relpath" ] || [ -z "$target_path" ] || [ -z "$current_sha" ]; then
+  log_warn "mod=plex phase=${phase_name} event=invalid-artifact-row arch=${selected_arch} server_id=${server_id}"
+  exit 0
+fi
+[ "$target_path" = "/usr/lib/plexmediaserver/lib/libsqlite3.so" ] || { log_warn "mod=plex phase=${phase_name} event=unexpected-target-path server_id=${server_id} target_path=${target_path}"; exit 0; }
+baseline_sha="$(selected_pre_sha256 "plex" "$selected_arch" "$baked_pins" "$server_id" "target_sqlite")" || { log_warn "mod=plex phase=${phase_name} event=missing-pre-row server_id=${server_id} role=target_sqlite"; exit 0; }
+for role in \
+  plex_icu_linked:libicuucplex.so.69 \
+  plex_icu_linked:libicui18nplex.so.69 \
+  plex_icu_linked:libicudataplex.so.69
+do
+  pre_row="$(selected_pre_file_sha256_row "plex" "$selected_arch" "$baked_pins" "$server_id" "$role")" || { log_warn "mod=plex phase=${phase_name} event=missing-icu-row server_id=${server_id} role=${role}"; exit 0; }
+  IFS='|' read -r runtime expected_icu <<< "$pre_row"
+  if [ -z "$runtime" ] || [ -z "$expected_icu" ]; then
+    log_warn "mod=plex phase=${phase_name} event=missing-icu-row server_id=${server_id} role=${role}"
+    exit 0
+  fi
   [ -f "$runtime" ] || { log_warn "mod=plex phase=${phase_name} event=missing-runtime-icu path=${runtime}"; exit 0; }
   [ "$(sha256_of "$runtime")" = "$expected_icu" ] || { log_warn "mod=plex phase=${phase_name} event=runtime-icu-mismatch path=${runtime}"; exit 0; }
 done
 [ -f "$target_path" ] || { log_warn "mod=plex phase=${phase_name} event=missing-target target_path=${target_path}"; exit 0; }
+if selected_artifact_is_current "plex" "$selected_arch" "$baked_pins" "$server_id"; then
+  log_info "mod=plex phase=${phase_name} event=skip-already-current target_path=${target_path}"
+  exit 0
+fi
 target_sha="$(sha256_of "$target_path")"
 # Why: a verified .bundled.bak stays immutable so recovery keeps a known-good bundled binary.
 bak="${target_path}.bundled.bak"
-if [ "$target_sha" = "$current_sha" ]; then log_info "mod=plex phase=${phase_name} event=skip-already-current target_path=${target_path}"; exit 0; fi
 # Why: unknown target SHAs skip instead of restoring so we do not downgrade a legitimately updated binary.
 if [ "$target_sha" != "$baseline_sha" ]; then
   log_warn "mod=plex phase=${phase_name} event=unknown-target-sha target_path=${target_path} current_sha=${target_sha}"
@@ -34,6 +58,7 @@ if [ "$target_sha" != "$baseline_sha" ]; then
 elif [ ! -f "$bak" ]; then
   cp "$target_path" "$bak" || { log_warn "mod=plex phase=${phase_name} event=bak-write-failed target_path=${target_path}"; exit 0; }
 fi
+artifact="/opt/sqlite3-lsio-mod/${artifact_relpath}"
 if ! install_sqlite_artifact "$artifact" "$target_path" "$current_sha"; then
   if [ -f "$bak" ] && [ "$(sha256_of "$bak")" = "$baseline_sha" ]; then
     if cp -f "$bak" "$target_path"; then
@@ -42,6 +67,8 @@ if ! install_sqlite_artifact "$artifact" "$target_path" "$current_sha"; then
     else
       log_warn "mod=plex phase=${phase_name} event=restore-failed target_path=${target_path}"
     fi
+  else
+    log_warn "mod=plex phase=${phase_name} event=install-failed-target-preserved target_path=${target_path} reason=no-trusted-backup"
   fi
   exit 0
 fi

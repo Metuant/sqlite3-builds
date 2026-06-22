@@ -17,9 +17,13 @@ milestone lands.
 - SQLite pins must stay aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `.github/workflows/sqlite-build.yml`,
   `docker-cli/Dockerfile`, and `docker-library/Dockerfile`.
-- ICU pin alignment is limited to `docker-library/Dockerfile`
-  `ARG ICU_VERSION` plus workflow `ICU_VERSION` and is enforced by
-  `tests/check_pin_alignment.sh`.
+- ICU source VERSION/SHA512 fields live in the `icu69` row of
+  `pins/library-compat-groups.tsv`. The wrapper resolves them into
+  `ICU_SOURCE_VERSION` and `ICU_SOURCE_SHA512`, `docker-library/Dockerfile`
+  consumes those values as build args, and the workflow passes the same
+  `ICU_SOURCE_*` build args for the Plex library build.
+  `tests/check_pin_alignment.sh` forbids retired scalar pin keys and asserts
+  the `ICU_SOURCE_*` defaults come from the compatibility-groups TSV.
 - Mimalloc v3.3.2 Wire-2 link-time interposition applies to both library
   variants only; CLI stays on the platform allocator. Keep the full
   VERSION + URL + SHA512 pin tuple aligned across `build/Build.sh`,
@@ -44,6 +48,9 @@ milestone lands.
   under that profile (no-op).
 - `SQLITE_DEFAULT_PAGE_SIZE=16384` (16 KiB) is the compile-default
   page-size pin in `build/Build.sh`.
+- `SQLITE_DEFAULT_AUTOVACUUM=0` is the compile-default autovacuum pin in
+  `build/Build.sh:162`; `scripts/optimize_media_servers.sh` sets
+  `auto_vacuum=INCREMENTAL` explicitly during planned-downtime rebuilds.
 - `SQLITE_DEFAULT_MMAP_SIZE=34359738368` (32 GiB) is the compile-default
   mmap-size pin in `build/Build.sh`; CI compile-option assertions keep it
   aligned with the runtime auto-PRAGMA target.
@@ -67,25 +74,33 @@ milestone lands.
 
 - Plex library replacement target: exactly
   `/usr/lib/plexmediaserver/lib/libsqlite3.so`.
-- Emby library replacement target: exactly
+- Emby library replacement target comes from the selected `artifact` row
+  `target_path`; current supported Emby rows use
   `/app/emby/lib/libsqlite3.so.3.49.2`.
 - JF deployment is unsupported until a current design and validation plan land.
 - Plex ICU runtime files MUST NOT be replaced, renamed, moved, deleted, or
   overwritten. Mod code may only read and verify `libicu*plex.so.69`.
 - baked-pins.txt is the only runtime SHA source consumed by LSIO mod scripts.
-- `baked-pins.txt` includes current SQLite rows, per-arch pre rows, Plex ICU
-  runtime pre rows, and Plex PMS / Scanner baseline rows.
+- `baked-pins.txt` includes metadata, detector, artifact, runtime baseline,
+  Plex pool-site, and unsupported/offline rows.
 - `baked-pins.txt` row kinds:
-  - `version|2|release_tag|<tag>|generated_at|<iso8601-utc>` is the single
+  - `meta|3|release_tag|<tag>|generated_at|<iso8601-utc>` is the single
     metadata row.
-  - `current|1|<target>|<arch>|<artifact_name>|<target_path>|<sha256>` gives
-    each baked `libsqlite3.so` candidate and its runtime replacement path.
-  - `pre|1|<target>|<arch>|<source_image>|<image_digest>|<target_path>|runtime|<sha256>`
+  - `detect|1|<mod>|<server_id>|<arch>|<path_role>|<file_path>|<sha256>`
+    gives server-owned detector files for per-version selection.
+  - `artifact|1|<mod>|<server_id>|<arch>|<compat_group>|<artifact_relpath>|<target_path>|<artifact_sha256>`
+    gives each baked `libsqlite3.so` candidate, its group-aware artifact path,
+    and its runtime replacement path.
+  - `pre|2|<mod>|<server_id>|<arch>|<path_role>|<image_ref>|<image_digest>|<file_path>|<sha256>`
     gives bundled runtime baselines, including Plex ICU siblings.
-  - `pool-pre|1|plex|<arch>|<binary_path>|<sha256>` gives PMS and Plex Media
-    Scanner binary baselines from `pins/plex-pool-patch-baselines.txt`.
-  - `unsupported|<arch>|<reason>` keeps all-arch manifests complete when a
-    supported artifact is unavailable.
+  - `pool-site|1|plex|<server_id>|<arch>|<binary_path>|<label>|<offset>|<write_seek>|<original_hex>|<patched_hex>`
+    gives Plex pool-patch byte contexts.
+  - `unsupported|1|<mod>|<server_id>|<arch>|<compat_group>|<reason>` keeps
+    all-arch manifests complete when a local/offline render lacks an artifact.
+- `artifact_relpath` is exactly
+  `artifacts/<arch>/<compat_group>/libsqlite3.so`; published amd64 mod images
+  carry both `linux-x86_64-v2` and `linux-x86_64-v3`, while arm64 mod images
+  carry `linux-arm64`.
 - Runtime mod scripts read no custom env vars. `MOD_INFO` is log-only and
   `uname -m` is the architecture input.
 - Phase scripts run as native s6-rc oneshots under
@@ -118,9 +133,12 @@ milestone lands.
   temp copy with `dd conv=notrunc`, restores target owner/mode metadata, and
   atomically replaces the target; original and patched contexts remain
   per-binary and per-site coupled.
+- Pool-site to pristine detector baseline-SHA agreement is a render/CI gate.
+  Runtime pool-site rows bind to pristine detector rows by binary path, not by
+  an embedded pool-site baseline SHA.
 - Pool patch skips a binary when any site is mixed or unknown. It patches only
-  when all sites are original and the binary SHA matches the `pool-pre` row;
-  it skips when all sites are already patched.
+  when all sites are original and the binary SHA matches the selected pristine
+  detector SHA; it skips when all sites are already patched.
 - Plex amd64 and arm64 swap SQLite and patch PMS / Scanner pool size.
 
 ## 3. Source
@@ -169,9 +187,10 @@ milestone lands.
   `SQLITE_CONFIG_SORTERREF_SIZE` config (no `sqlite3_auto_extension` call
   -- registration is lazy per the open-wrapper helper); 103 =
   slow-query tracker `pthread_once` priming + `atexit` registration. The
-  101->102->103 order ensures env caches are populated before any
-  open-wrapper-triggered callback fires. Do NOT move slow-query
-  registration onto the PROFILE hot path.
+  101->102->103 order ensures observability env caches, including
+  `SQLITE3_DISABLE_OBSERVABILITY` and `SQLITE3_DISABLE_STMT_TRACE`, are
+  populated before any open-wrapper-triggered callback fires. Do NOT move
+  slow-query registration onto the PROFILE hot path.
 - `SLOW_QUERY_SQL_CAP=1024` (tracker key + display) and `OBS_SQL_CAP=3072`
   (observability STMT log) are intentionally separate constants. Tracker
   uses its own cap to prevent collision; `tests/check_obs_counts.sh`
@@ -185,7 +204,9 @@ milestone lands.
 - Tracker registration via `sqlite3_trace_v2` MUST stay in the
   per-connection init path (`autopragma_init` in `src/auto_extension.c`)
   that runs BEFORE the connection escapes to application code. Do not move
-  to a deferred / lazy / on-first-query path.
+  to a deferred / lazy / on-first-query path. When STMT trace and
+  slow-query PROFILE are both disabled, the trace mask is `0` and
+  `sqlite3_trace_v2` is not called.
 - Atexit safety: `g_in_atexit` acquire-load MUST be the FIRST executable
   instruction in the PROFILE-side dispatch (in `obs_trace_cb` PROFILE
   branch AND in `slow_query_trace_profile`), BEFORE any `sqlite3_*`
@@ -197,6 +218,10 @@ milestone lands.
   `slow_query_disabled()` helper (with `pthread_once`) is reserved for
   non-hot test/registration paths; constructor(103) primes `pthread_once`
   at dlopen so the cached load sees the resolved value.
+- Slow-query stats dump gating lives outside the record hot path. A
+  `slow_query_stats` line emits only when `mean_ns >= threshold_ns` and
+  `count >= 5`; `mean_ms`, `stddev_ms`, `min_ms`, and `max_ms` render with
+  `%.6f` precision.
 - Slow-query stats key identity: full-SQL `memcmp` for templates <=1024
   bytes; 64-bit FNV-1a hash equality for templates >1024 bytes (collision
   probability negligible at <=2048 templates). FNV-1a MUST NEVER be used
@@ -212,6 +237,9 @@ milestone lands.
 - `SQLITE3_DISABLE_OBSERVABILITY=1` is the master kill switch.
 - `SQLITE3_DISABLE_AUTOPRAGMA=1` disables PRAGMA emission (orthogonal to
   the observability kill switch).
+- `SQLITE3_DISABLE_STMT_TRACE=0` enables STMT trace registration. Unset or
+  any other value disables STMT trace registration; PROFILE-side slow-query
+  tracking is unaffected.
 - `SQLITE3_DISABLE_SLOW_QUERY=1` disables PROFILE-side slow-query
   tracking; subordinate to `SQLITE3_DISABLE_OBSERVABILITY=1` (master) and
   orthogonal to `SQLITE3_DISABLE_AUTOPRAGMA=1` (PRAGMA emission).
@@ -235,7 +263,8 @@ milestone lands.
 
 - Matrix `fail-fast: false` in
   `.github/workflows/sqlite-build.yml` strategy block.
-- Smoke-step positive-mode marker assertions: aggregate count guard
+- Smoke-step positive-mode marker assertions opt in with
+  `SQLITE3_DISABLE_STMT_TRACE=0`: aggregate count guard
   `sqlite3_open(_v2|16)?` AND `SQLITE_TRACE_STMT`. Do NOT assert
   `sqlite3_initialize` marker emission.
 - `release` publishes `sqlite-<tag>-*.tar.gz` and `SHA256SUMS`.
@@ -282,8 +311,10 @@ milestone lands.
 - LSIO mod tags mirror repository CalVer release tags one-to-one.
 - No LSIO mod publishes `latest`.
 - `baked-pins.txt` metadata row shape is
-  `version|2|release_tag|<tag>|generated_at|<iso8601-utc>`.
+  `meta|3|release_tag|<tag>|generated_at|<iso8601-utc>`.
 - `baked-pins.txt` contains no managed-window fields and no `post` rows.
 - Plex runtime ICU `pre` rows live in `baked-pins.txt`.
-- `tests/check_pin_alignment.sh` enforces mimalloc tuple alignment and ICU
-  workflow env vs Dockerfile ARG/URL-construction alignment.
+- `tests/check_pin_alignment.sh` enforces mimalloc VERSION + URL + SHA512
+  tuple alignment, forbids retired scalar pin keys, and asserts
+  `ICU_SOURCE_VERSION` / `ICU_SOURCE_SHA512` defaults come from
+  `pins/library-compat-groups.tsv` for `icu69`.

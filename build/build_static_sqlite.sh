@@ -3,18 +3,59 @@
 # shellcheck disable=SC2086
 set -eu
 
-script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)"
+unset CDPATH
+script_dir="$(cd -- "$(dirname -- "$0")" && pwd -P)"
 pins_file="${script_dir}/../pins/versions.env"
+compat_groups_file="${script_dir}/../pins/library-compat-groups.tsv"
 
 if [ ! -r "${pins_file}" ]; then
   printf "FATAL: version pins file not readable: %s\n" "${pins_file}" >&2
   exit 1
 fi
+if [ ! -r "${compat_groups_file}" ]; then
+  printf "FATAL: library compatibility groups file not readable: %s\n" "${compat_groups_file}" >&2
+  exit 1
+fi
 
 pin_default() {
   key="$1"
+  # shellcheck source=pins/versions.env
   . "${pins_file}"
   eval "printf '%s\n' \"\${${key}}\""
+}
+
+compat_group_pin() {
+  compat_group="$1"
+  field="$2"
+  awk -F '\t' -v want_group="$compat_group" -v want_field="$field" '
+    NR == 1 {
+      for (i = 1; i <= NF; i++) {
+        if ($i == want_field) {
+          field_index = i
+        }
+      }
+      if (field_index == 0) {
+        printf "FATAL: missing compat group field: %s\n", want_field > "/dev/stderr"
+        exit 2
+      }
+      next
+    }
+    $0 ~ /^[[:space:]]*($|#)/ { next }
+    $1 == want_group {
+      if (value != "") {
+        printf "FATAL: duplicate compat group: %s\n", want_group > "/dev/stderr"
+        exit 2
+      }
+      value = $field_index
+    }
+    END {
+      if (value == "") {
+        printf "FATAL: missing compat group: %s\n", want_group > "/dev/stderr"
+        exit 1
+      }
+      print value
+    }
+  ' "${compat_groups_file}"
 }
 
 SQLITE_AMALG_URL="${SQLITE_AMALG_URL-$(pin_default SQLITE_AMALG_URL)}"
@@ -24,8 +65,8 @@ SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256-$(pin_default SQLITE_SRC_SHA3_256)}"
 MIMALLOC_VERSION="${MIMALLOC_VERSION-$(pin_default MIMALLOC_VERSION)}"
 MIMALLOC_URL="${MIMALLOC_URL-$(pin_default MIMALLOC_URL)}"
 MIMALLOC_SHA512="${MIMALLOC_SHA512-$(pin_default MIMALLOC_SHA512)}"
-ICU_VERSION="${ICU_VERSION-$(pin_default ICU_VERSION)}"
-ICU_SHA512="${ICU_SHA512-$(pin_default ICU_SHA512)}"
+ICU_SOURCE_VERSION="${ICU_SOURCE_VERSION-$(compat_group_pin icu69 icu_source_version)}"
+ICU_SOURCE_SHA512="${ICU_SOURCE_SHA512-$(compat_group_pin icu69 icu_source_sha512)}"
 LIBRARY_VARIANT="${LIBRARY_VARIANT:-generic}"
 SQLite_compressor='upx'  # Program to use for compressing compiled sqlite
                          # Keep it empty as "" to disable compression
@@ -101,8 +142,8 @@ if [ "${LIBRARY_VARIANT}" = 'plex' ]; then
     --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}"                       \
     --build-arg MIMALLOC_URL="${MIMALLOC_URL}"                               \
     --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"                         \
-    --build-arg ICU_VERSION="${ICU_VERSION}"                                 \
-    --build-arg ICU_SHA512="${ICU_SHA512}"                                   \
+    --build-arg ICU_SOURCE_VERSION="${ICU_SOURCE_VERSION}"                   \
+    --build-arg ICU_SOURCE_SHA512="${ICU_SOURCE_SHA512}"                     \
     -f docker-library/Dockerfile .
 else
   $SUDO $DOCKER build --rm --no-cache=true -t "${DockerLibraryImage}"        \

@@ -38,8 +38,87 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Load version pins
         run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+      - name: Load library artifact stems
+        id: library_artifact_stems
+        run: |
+          set -euo pipefail
+          compat_group_field_for_group() {
+            local compat_group="$1" field="$2"
+            awk -F '\t' -v want_group="$compat_group" -v want_field="$field" '
+              NR == 1 {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == want_field) {
+                    field_index = i
+                  }
+                }
+                if (field_index == 0) {
+                  printf "FATAL: missing library compatibility field: %s\n", want_field > "/dev/stderr"
+                  exit 2
+                }
+                next
+              }
+              $0 ~ /^[[:space:]]*($|#)/ { next }
+              $1 == want_group {
+                if (value != "") {
+                  printf "FATAL: duplicate library compatibility row for compat_group: %s\n", want_group > "/dev/stderr"
+                  exit 2
+                }
+                value = $field_index
+              }
+              END {
+                if (value == "") {
+                  printf "FATAL: missing library compatibility row for compat_group: %s\n", want_group > "/dev/stderr"
+                  exit 1
+                }
+                print value
+              }
+            ' pins/library-compat-groups.tsv
+          }
+          first_compat_group_for_mod() {
+            local mod="$1"
+            awk -F '\t' -v want_mod="$mod" '
+              $0 ~ /^[[:space:]]*($|#)/ { next }
+              $1 == "compat_group" { next }
+              $2 == want_mod {
+                print $1
+                found = 1
+                exit
+              }
+              END {
+                if (!found) {
+                  printf "FATAL: missing library compatibility row for mod: %s\n", want_mod > "/dev/stderr"
+                  exit 1
+                }
+              }
+            ' pins/library-compat-groups.tsv
+          }
+          plex_compat_group="$(first_compat_group_for_mod plex)"
+          emby_compat_group="$(first_compat_group_for_mod emby)"
+          plex_stem="$(compat_group_field_for_group "$plex_compat_group" artifact_stem)"
+          emby_stem="$(compat_group_field_for_group "$emby_compat_group" artifact_stem)"
+          plex_icu_source_version="$(compat_group_field_for_group "$plex_compat_group" icu_source_version)"
+          plex_icu_source_sha512="$(compat_group_field_for_group "$plex_compat_group" icu_source_sha512)"
+          emby_icu_source_version="$(compat_group_field_for_group "$emby_compat_group" icu_source_version)"
+          emby_icu_source_sha512="$(compat_group_field_for_group "$emby_compat_group" icu_source_sha512)"
+          if [ "$plex_icu_source_version" = "-" ] || [ "$plex_icu_source_sha512" = "-" ]; then
+            echo "FATAL: Plex compatibility group is missing ICU source fields" >&2
+            exit 1
+          fi
+          if [ "$emby_icu_source_version" != "-" ] || [ "$emby_icu_source_sha512" != "-" ]; then
+            echo "FATAL: Emby compatibility group must not carry ICU source fields" >&2
+            exit 1
+          fi
+          {
+            printf 'plex=%s\n' "$plex_stem"
+            printf 'emby=%s\n' "$emby_stem"
+            printf 'plex_icu_source_version=%s\n' "$plex_icu_source_version"
+            printf 'plex_icu_source_sha512=%s\n' "$plex_icu_source_sha512"
+          } >> "$GITHUB_OUTPUT"
       - name: Pin alignment check
-        run: bash tests/check_pin_alignment.sh
+        run: |
+          set -euo pipefail
+          bash tests/check_pin_alignment.sh
+          bash tests/check_multi_version_pin_alignment.sh
       - name: Build.sh precheck paths
         run: bash tests/check_build_sh_prechecks.sh
       - name: Build sqlite CLI
@@ -65,60 +144,118 @@ jobs:
         with:
           image: ${{env.docker_library_image}}
           path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
-          destination: library
+          destination: library-${{ steps.library_artifact_stems.outputs.emby }}
       - name: Upload sqlite library artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: ${{ steps.extract_library.outputs.destination }}
-          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ matrix.arch_suffix }}
+          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ steps.library_artifact_stems.outputs.emby }}-${{ matrix.arch_suffix }}
           retention-days: 90
       - name: Build sqlite Plex library
-        run: sudo docker build --rm -t "${docker_library_plex_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" --build-arg LIBRARY_VARIANT=plex --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" --build-arg MIMALLOC_URL="${MIMALLOC_URL}" --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" --build-arg ICU_VERSION="${ICU_VERSION}" --build-arg ICU_SHA512="${ICU_SHA512}"
+        run: sudo docker build --rm -t "${docker_library_plex_image}" -f docker-library/Dockerfile . --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" --build-arg MARCH="${{ matrix.march }}" --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" --build-arg LIBRARY_VARIANT=plex --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" --build-arg MIMALLOC_URL="${MIMALLOC_URL}" --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" --build-arg ICU_SOURCE_VERSION="${{ steps.library_artifact_stems.outputs.plex_icu_source_version }}" --build-arg ICU_SOURCE_SHA512="${{ steps.library_artifact_stems.outputs.plex_icu_source_sha512 }}"
       - name: Extract Plex library from docker image
         uses: shrink/actions-docker-extract@f1ef61065b78731fe3310b4e84e511f6a927a77e # v4.0.0
         id: extract_library_plex
         with:
           image: ${{env.docker_library_plex_image}}
           path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
-          destination: library-plex
+          destination: library-${{ steps.library_artifact_stems.outputs.plex }}
       - name: Upload sqlite Plex library artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           path: ${{ steps.extract_library_plex.outputs.destination }}
-          name: sqlite-${{env.SQLITE_VERSION}}-library-plex-${{ matrix.arch_suffix }}
+          name: sqlite-${{env.SQLITE_VERSION}}-library-${{ steps.library_artifact_stems.outputs.plex }}-${{ matrix.arch_suffix }}
           retention-days: 90
-      - name: Pull Plex image (ICU smoke)
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}
-      - name: ICU smoke stage 2 (Plex variant against Plex's bundled ICU)
-        run: bash tools/ci/plex-icu-smoke.sh "lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}" "${{ matrix.arch_suffix }}" "${ICU_VERSION}" "${{ steps.extract_library_plex.outputs.destination }}"
-      - name: Pull Plex image (PMS first-init)
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}
-      - name: PMS first-init smoke (Plex)
-        run: bash tools/ci/plex-pms-first-init-smoke.sh "lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}" "${{ matrix.arch_suffix }}" "${{ github.run_id }}" "${{ steps.extract_library_plex.outputs.destination }}" "${ICU_VERSION}"
-      - name: Pull Plex image (PMS kill-switch smoke)
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}
-      - name: PMS kill-switch off-state smoke
-        run: bash tools/ci/plex-pms-killswitch-smoke.sh "lscr.io/linuxserver/plex:${PLEX_IMAGE_TAG}" "${{ matrix.arch_suffix }}" "${{ github.run_id }}" "${{ steps.extract_library_plex.outputs.destination }}"
-      - name: Pull Emby image (first-init smoke)
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/emby:${{ env.EMBY_IMAGE_TAG }}
-      - name: Emby first-init smoke
-        run: bash tools/ci/emby-first-init-smoke.sh "lscr.io/linuxserver/emby:${EMBY_IMAGE_TAG}" "${{ matrix.arch_suffix }}" "${{ github.run_id }}" "${{ steps.extract_library.outputs.destination }}" "${SQLITE_VERSION_DOTTED}"
+      - name: Plex support-window smokes
+        run: |
+          set -euo pipefail
+          compat_group_field_for_group() {
+            local compat_group="$1" field="$2"
+            awk -F '\t' -v want_group="$compat_group" -v want_field="$field" '
+              NR == 1 {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == want_field) field_index = i
+                }
+                if (field_index == 0) {
+                  printf "FATAL: missing library compatibility field: %s\n", want_field > "/dev/stderr"
+                  exit 2
+                }
+                next
+              }
+              $0 ~ /^[[:space:]]*($|#)/ { next }
+              $1 == want_group {
+                value = $field_index
+              }
+              END {
+                if (value == "") {
+                  printf "FATAL: missing library compatibility row for compat_group: %s\n", want_group > "/dev/stderr"
+                  exit 1
+                }
+                print value
+              }
+            ' pins/library-compat-groups.tsv
+          }
+          awk -F '\t' '
+            $0 ~ /^[[:space:]]*($|#)/ { next }
+            $1 == "mod" { next }
+            $1 == "plex" && $5 == "supported" { print $2 "\t" $3 "\t" $4 }
+          ' pins/runtime-support.tsv |
+          while IFS=$'\t' read -r server_id image_ref compat_group; do
+            [ -n "$server_id" ] || continue
+            artifact_stem="$(compat_group_field_for_group "$compat_group" artifact_stem)"
+            icu_source_version="$(compat_group_field_for_group "$compat_group" icu_source_version)"
+            library_dir="library-${artifact_stem}"
+            [ -d "$library_dir" ] || { echo "FATAL: missing library artifact dir for compat_group=$compat_group: $library_dir" >&2; exit 1; }
+            docker pull "$image_ref"
+            bash tools/ci/plex-icu-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "$icu_source_version" "$library_dir"
+            bash tools/ci/plex-pms-first-init-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir" "$icu_source_version"
+            bash tools/ci/plex-pms-killswitch-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir"
+          done
+      - name: Emby support-window smokes
+        run: |
+          set -euo pipefail
+          compat_group_field_for_group() {
+            local compat_group="$1" field="$2"
+            awk -F '\t' -v want_group="$compat_group" -v want_field="$field" '
+              NR == 1 {
+                for (i = 1; i <= NF; i++) {
+                  if ($i == want_field) field_index = i
+                }
+                if (field_index == 0) {
+                  printf "FATAL: missing library compatibility field: %s\n", want_field > "/dev/stderr"
+                  exit 2
+                }
+                next
+              }
+              $0 ~ /^[[:space:]]*($|#)/ { next }
+              $1 == want_group {
+                value = $field_index
+              }
+              END {
+                if (value == "") {
+                  printf "FATAL: missing library compatibility row for compat_group: %s\n", want_group > "/dev/stderr"
+                  exit 1
+                }
+                print value
+              }
+            ' pins/library-compat-groups.tsv
+          }
+          awk -F '\t' '
+            $0 ~ /^[[:space:]]*($|#)/ { next }
+            $1 == "mod" { next }
+            $1 == "emby" && $5 == "supported" { print $2 "\t" $3 "\t" $4 }
+          ' pins/runtime-support.tsv |
+          while IFS=$'\t' read -r server_id image_ref compat_group; do
+            [ -n "$server_id" ] || continue
+            artifact_stem="$(compat_group_field_for_group "$compat_group" artifact_stem)"
+            library_dir="library-${artifact_stem}"
+            [ -d "$library_dir" ] || { echo "FATAL: missing library artifact dir for compat_group=$compat_group: $library_dir" >&2; exit 1; }
+            docker pull "$image_ref"
+            bash tools/ci/emby-first-init-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir" "${SQLITE_VERSION_DOTTED}"
+            bash tools/ci/emby-killswitch-smoke.sh "$image_ref" "${{ matrix.arch_suffix }}" "${{ github.run_id }}-${server_id}" "$library_dir" "${SQLITE_VERSION_DOTTED}"
+          done
       - name: Slow-query smokes
         run: bash tools/ci/slow-query-smoke.sh "${docker_library_image}" "${{ matrix.arch_suffix }}"
-      - name: Pull Emby image (kill-switch smoke)
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/emby:${{ env.EMBY_IMAGE_TAG }}
-      - name: Emby kill-switch off-state smoke
-        run: bash tools/ci/emby-killswitch-smoke.sh "lscr.io/linuxserver/emby:${EMBY_IMAGE_TAG}" "${{ matrix.arch_suffix }}" "${{ github.run_id }}" "${{ steps.extract_library.outputs.destination }}" "${SQLITE_VERSION_DOTTED}"
       - name: Observability count check
         run: bash tests/check_obs_counts.sh
       - name: ABI obsolete config ops test
@@ -136,11 +273,15 @@ jobs:
           bash tests/plex_pool_patch_lib_test.sh
           bash tests/cont_init_fragments_test.sh
           bash tests/resolve_arch_test.sh
+          bash tests/manifest_parser_test.sh
+          bash tests/selector_test.sh
+          bash tests/selector_accessors_test.sh
           bash tests/lsio_mod_phase03_bak_creation_failure_test.sh
           bash tests/lsio_mod_emby_config_test.sh
           bash tests/render_lsio_mod_baked_pins_test.sh
           bash tests/ci_log_assertions_test.sh
           bash tests/mod_bake_assertions_test.sh
+          bash tests/skopeo_mod_image_oci_static_test.sh
           bash tests/sqlite_build_workflow_mod_only_test.sh
           bash tests/docs_mod_only_direction_c_test.sh
 
@@ -156,6 +297,47 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - name: Load version pins
         run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+      - name: Load release compatibility summary
+        id: release_compat
+        run: |
+          set -euo pipefail
+          plex_icu_source_version="$(awk -F '\t' '
+            $0 ~ /^[[:space:]]*($|#)/ { next }
+            $1 == "compat_group" { next }
+            $2 == "plex" {
+              if (value != "") {
+                print "FATAL: duplicate Plex compatibility row" > "/dev/stderr"
+                exit 2
+              }
+              value = $6
+            }
+            END {
+              if (value == "" || value == "-") {
+                print "FATAL: missing Plex ICU source version" > "/dev/stderr"
+                exit 1
+              }
+              print value
+            }
+          ' pins/library-compat-groups.tsv)"
+          {
+            printf 'plex_icu_source_version=%s\n' "$plex_icu_source_version"
+            printf 'runtime_support_window<<EOF_RUNTIME_SUPPORT\n'
+            awk -F '\t' '
+              $0 ~ /^[[:space:]]*($|#)/ { next }
+              $1 == "mod" { next }
+              $5 == "supported" {
+                printf "- mod=%s server_id=%s image_ref=%s compat_group=%s status=%s\n", $1, $2, $3, $4, $5
+                found = 1
+              }
+              END {
+                if (!found) {
+                  print "FATAL: no supported runtime-support rows" > "/dev/stderr"
+                  exit 1
+                }
+              }
+            ' pins/runtime-support.tsv
+            printf 'EOF_RUNTIME_SUPPORT\n'
+          } >> "$GITHUB_OUTPUT"
       - name: Download sqlite artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -211,11 +393,10 @@ jobs:
           body: |
             SQLite: ${{env.SQLITE_VERSION_DOTTED}} (upstream ${{env.SQLITE_VERSION}})
             mimalloc: ${{env.MIMALLOC_VERSION}}
-            ICU (Plex variant): ${{env.ICU_VERSION}}
+            ICU (Plex variant): ${{steps.release_compat.outputs.plex_icu_source_version}}
 
-            Base image baselines:
-              Plex: ${{env.PLEX_IMAGE_TAG}}
-              Emby: ${{env.EMBY_IMAGE_TAG}}
+            Runtime support window:
+            ${{ steps.release_compat.outputs.runtime_support_window }}
 
             LSIO Docker mods (this tag):
               linuxserver-mod-sqlite3-plex
@@ -271,22 +452,54 @@ jobs:
           path: sqlite-artifacts
           merge-multiple: false
           digest-mismatch: warn
-      - name: Pull Plex base image
-        if: matrix.mod == 'plex'
-        uses: ./.github/actions/retry-pull
+      - name: Record support image digests
+        run: |
+          set -euo pipefail
+          output_dir="support-image-digests-${{ matrix.mod }}-${{ matrix.arch_suffix }}"
+          mkdir -p "$output_dir"
+          output_file="${output_dir}/image-digests.tsv"
+          printf 'mod\tserver_id\tarch_suffix\timage_ref\timage_digest\n' > "$output_file"
+          awk -F '\t' -v want_mod="${{ matrix.mod }}" '
+            $0 ~ /^[[:space:]]*($|#)/ { next }
+            $1 == "mod" { next }
+            $1 == want_mod && $5 == "supported" { print $1 "\t" $2 "\t" $3 }
+          ' pins/runtime-support.tsv |
+          while IFS=$'\t' read -r row_mod server_id image_ref; do
+            [ -n "$row_mod" ] || continue
+            docker pull "$image_ref"
+            image_digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' "$image_ref")"
+            if [ -z "$image_digest" ]; then
+              echo "FATAL: docker image inspect returned no repo digest for $image_ref" >&2
+              exit 1
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\n' \
+              "$row_mod" "$server_id" "${{ matrix.arch_suffix }}" "$image_ref" "$image_digest" >> "$output_file"
+          done
+      - name: Upload support image digest artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          image: lscr.io/linuxserver/plex:${{ env.PLEX_IMAGE_TAG }}
-      - name: Pull Emby base image
-        if: matrix.mod == 'emby'
-        uses: ./.github/actions/retry-pull
-        with:
-          image: lscr.io/linuxserver/emby:${{ env.EMBY_IMAGE_TAG }}
+          path: support-image-digests-${{ matrix.mod }}-${{ matrix.arch_suffix }}
+          name: support-image-digests-${{ matrix.mod }}-${{ matrix.arch_suffix }}
+          retention-days: 90
       - name: Build, bake-smoke, and export mod image
         env:
           MATRIX_ARCH_SUFFIX: ${{ matrix.arch_suffix }}
           MATRIX_IMAGE_NAME: ${{ matrix.image_name }}
           MATRIX_MOD: ${{ matrix.mod }}
-        run: bash tools/ci/mod-bake-smoke.sh "$MATRIX_MOD" "$MATRIX_IMAGE_NAME" "$MATRIX_ARCH_SUFFIX" "$GITHUB_RUN_ID" "$OWNER_NAME" "$GITHUB_REF" "$GITHUB_REF_NAME" "$SQLITE_VERSION" "$SQLITE_VERSION_DOTTED" "$PLEX_IMAGE_TAG" "$EMBY_IMAGE_TAG" "sqlite-artifacts"
+        run: bash tools/ci/mod-bake-smoke.sh "$MATRIX_MOD" "$MATRIX_IMAGE_NAME" "$MATRIX_ARCH_SUFFIX" "$GITHUB_RUN_ID" "$OWNER_NAME" "$GITHUB_REF" "$GITHUB_REF_NAME" "$SQLITE_VERSION" "$SQLITE_VERSION_DOTTED" "sqlite-artifacts"
+      - name: Skopeo OCI static check
+        env:
+          MATRIX_ARCH_SUFFIX: ${{ matrix.arch_suffix }}
+          MATRIX_MOD: ${{ matrix.mod }}
+        run: |
+          set -euo pipefail
+          if ! command -v skopeo >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y skopeo
+          fi
+          image_dir="mod-image-${MATRIX_MOD}-${MATRIX_ARCH_SUFFIX}"
+          IFS= read -r image_ref < "${image_dir}/image-ref.txt"
+          bash tools/ci/skopeo-mod-image-oci-check.sh "$MATRIX_MOD" "$MATRIX_ARCH_SUFFIX" "${image_dir}/image.tar" "$image_ref"
       - name: Upload mod image artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:

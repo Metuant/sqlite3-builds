@@ -31,6 +31,7 @@ __attribute__((visibility("hidden"))) extern void auto_extension_register_for_op
 
 static pthread_once_t g_obs_once = PTHREAD_ONCE_INIT;
 static atomic_int g_obs_disabled;
+static atomic_int g_stmt_trace_disabled;
 static __thread int s_init_depth = 0;
 
 struct obs_name {
@@ -124,9 +125,16 @@ static const struct obs_name g_open_flag_names[] = {
 
 static void obs_init_once(void) {
     const char *v = getenv("SQLITE3_DISABLE_OBSERVABILITY");
+    const char *stmt = getenv("SQLITE3_DISABLE_STMT_TRACE");
     atomic_store_explicit(
         &g_obs_disabled,
         (v && strcmp(v, "1") == 0) ? 1 : 0,
+        memory_order_release
+    );
+    /* STMT trace is off by default; literal "0" is the explicit re-enable. */
+    atomic_store_explicit(
+        &g_stmt_trace_disabled,
+        (stmt && strcmp(stmt, "0") == 0) ? 0 : 1,
         memory_order_release
     );
 }
@@ -139,6 +147,11 @@ static void obs_init(void) {
 __attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void) {
     pthread_once(&g_obs_once, obs_init_once);
     return atomic_load_explicit(&g_obs_disabled, memory_order_acquire);
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API int obs_stmt_trace_disabled(void) {
+    pthread_once(&g_obs_once, obs_init_once);
+    return atomic_load_explicit(&g_stmt_trace_disabled, memory_order_acquire);
 }
 
 static long obs_tid(void) {

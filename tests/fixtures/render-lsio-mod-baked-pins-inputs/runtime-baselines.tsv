@@ -1,0 +1,61 @@
+kind	mod	server_id	arch	path_role	image_ref	image_digest	file_path	compat_group	icu_role	soname	sha256
+detect	plex	plex-fixture	linux-x86_64-v2	plex_pms:pristine	-	-	/usr/lib/plexmediaserver/Plex Media Server	-	-	-	1111111111111111111111111111111111111111111111111111111111111111
+detect	plex	plex-fixture	linux-x86_64-v2	plex_pms:patched	-	-	/usr/lib/plexmediaserver/Plex Media Server	-	-	-	2222222222222222222222222222222222222222222222222222222222222222
+detect	plex	plex-fixture	linux-x86_64-v2	plex_scanner:pristine	-	-	/usr/lib/plexmediaserver/Plex Media Scanner	-	-	-	3333333333333333333333333333333333333333333333333333333333333333
+detect	plex	plex-fixture	linux-x86_64-v2	plex_scanner:patched	-	-	/usr/lib/plexmediaserver/Plex Media Scanner	-	-	-	4444444444444444444444444444444444444444444444444444444444444444
+pre	plex	plex-fixture	linux-x86_64-v2	target_sqlite	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libsqlite3.so	-	-	-	5555555555555555555555555555555555555555555555555555555555555555
+pre	plex	plex-fixture	linux-x86_64-v2	plex_icu_linked:libicuucplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicuucplex.so.69	-	-	-	6666666666666666666666666666666666666666666666666666666666666666
+pre	plex	plex-fixture	linux-x86_64-v2	plex_icu_linked:libicui18nplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicui18nplex.so.69	-	-	-	7777777777777777777777777777777777777777777777777777777777777777
+pre	plex	plex-fixture	linux-x86_64-v2	plex_icu_linked:libicudataplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicudataplex.so.69	-	-	-	8888888888888888888888888888888888888888888888888888888888888888
+detect	plex	plex-fixture	linux-x86_64-v3	plex_pms:pristine	-	-	/usr/lib/plexmediaserver/Plex Media Server	-	-	-	aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+detect	plex	plex-fixture	linux-x86_64-v3	plex_pms:patched	-	-	/usr/lib/plexmediaserver/Plex Media Server	-	-	-	bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+detect	plex	plex-fixture	linux-x86_64-v3	plex_scanner:pristine	-	-	/usr/lib/plexmediaserver/Plex Media Scanner	-	-	-	cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+detect	plex	plex-fixture	linux-x86_64-v3	plex_scanner:patched	-	-	/usr/lib/plexmediaserver/Plex Media Scanner	-	-	-	dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd
+pre	plex	plex-fixture	linux-x86_64-v3	target_sqlite	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libsqlite3.so	-	-	-	eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee
+pre	plex	plex-fixture	linux-x86_64-v3	plex_icu_linked:libicuucplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicuucplex.so.69	-	-	-	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+pre	plex	plex-fixture	linux-x86_64-v3	plex_icu_linked:libicui18nplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicui18nplex.so.69	-	-	-	9999999999999999999999999999999999999999999999999999999999999999
+pre	plex	plex-fixture	linux-x86_64-v3	plex_icu_linked:libicudataplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicudataplex.so.69	-	-	-	0000000000000000000000000000000000000000000000000000000000000000
+detect	plex	plex-fixture	linux-arm64	plex_pms:pristine	-	-	/usr/lib/plexmediaserver/Plex Media Server	-	-	-	1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef
+detect	plex	plex-fixture	linux-arm64	plex_pms:patched	-	-	/usr/lib/plexmediaserver/Plex Media Server	-	-	-	2234567890abcdef2234567890abcdef2234567890abcdef2234567890abcdef
+detect	plex	plex-fixture	linux-arm64	plex_scanner:pristine	-	-	/usr/lib/plexmediaserver/Plex Media Scanner	-	-	-	3234567890abcdef3234567890abcdef3234567890abcdef3234567890abcdef
+detect	plex	plex-fixture	linux-arm64	plex_scanner:patched	-	-	/usr/lib/plexmediaserver/Plex Media Scanner	-	-	-	4234567890abcdef4234567890abcdef4234567890abcdef4234567890abcdef
+pre	plex	plex-fixture	linux-arm64	target_sqlite	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libsqlite3.so	-	-	-	5234567890abcdef5234567890abcdef5234567890abcdef5234567890abcdef
+pre	plex	plex-fixture	linux-arm64	plex_icu_linked:libicuucplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicuucplex.so.69	-	-	-	6234567890abcdef6234567890abcdef6234567890abcdef6234567890abcdef
+pre	plex	plex-fixture	linux-arm64	plex_icu_linked:libicui18nplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicui18nplex.so.69	-	-	-	7234567890abcdef7234567890abcdef7234567890abcdef7234567890abcdef
+pre	plex	plex-fixture	linux-arm64	plex_icu_linked:libicudataplex.so.69	lscr.io/linuxserver/plex:fixture	-	/usr/lib/plexmediaserver/lib/libicudataplex.so.69	-	-	-	8234567890abcdef8234567890abcdef8234567890abcdef8234567890abcdef
+icu-runtime	-	-	linux-x86_64-v2	-	-	-	-	icu69	linked	libicuucplex.so.69	6666666666666666666666666666666666666666666666666666666666666666
+icu-runtime	-	-	linux-x86_64-v2	-	-	-	-	icu69	linked	libicui18nplex.so.69	7777777777777777777777777777777777777777777777777777777777777777
+icu-runtime	-	-	linux-x86_64-v2	-	-	-	-	icu69	linked	libicudataplex.so.69	8888888888888888888888888888888888888888888888888888888888888888
+icu-runtime	-	-	linux-x86_64-v3	-	-	-	-	icu69	linked	libicuucplex.so.69	ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff
+icu-runtime	-	-	linux-x86_64-v3	-	-	-	-	icu69	linked	libicui18nplex.so.69	9999999999999999999999999999999999999999999999999999999999999999
+icu-runtime	-	-	linux-x86_64-v3	-	-	-	-	icu69	linked	libicudataplex.so.69	0000000000000000000000000000000000000000000000000000000000000000
+icu-runtime	-	-	linux-arm64	-	-	-	-	icu69	linked	libicuucplex.so.69	6234567890abcdef6234567890abcdef6234567890abcdef6234567890abcdef
+icu-runtime	-	-	linux-arm64	-	-	-	-	icu69	linked	libicui18nplex.so.69	7234567890abcdef7234567890abcdef7234567890abcdef7234567890abcdef
+icu-runtime	-	-	linux-arm64	-	-	-	-	icu69	linked	libicudataplex.so.69	8234567890abcdef8234567890abcdef8234567890abcdef8234567890abcdef
+detect	emby	emby-fixture	linux-x86_64-v2	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd
+detect	emby	emby-fixture	linux-x86_64-v2	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	bcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcda
+pre	emby	emby-fixture	linux-x86_64-v2	target_sqlite	lscr.io/linuxserver/emby:fixture	-	/app/emby/lib/libsqlite3.so.3.49.2	-	-	-	cdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdefcdef
+detect	emby	emby-fixture	linux-x86_64-v3	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	1111222233334444111122223333444411112222333344441111222233334444
+detect	emby	emby-fixture	linux-x86_64-v3	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	2222333344445555222233334444555522223333444455552222333344445555
+pre	emby	emby-fixture	linux-x86_64-v3	target_sqlite	lscr.io/linuxserver/emby:fixture	-	/app/emby/lib/libsqlite3.so.3.49.2	-	-	-	3333444455556666333344445555666633334444555566663333444455556666
+detect	emby	emby-fixture	linux-arm64	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	aaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccddddaaaabbbbccccdddd
+detect	emby	emby-fixture	linux-arm64	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	bbbbccccddddeeeebbbbccccddddeeeebbbbccccddddeeeebbbbccccddddeeee
+pre	emby	emby-fixture	linux-arm64	target_sqlite	lscr.io/linuxserver/emby:fixture	-	/app/emby/lib/libsqlite3.so.3.49.2	-	-	-	ccccddddeeeeffffccccddddeeeeffffccccddddeeeeffffccccddddeeeeffff
+detect	emby	emby-fixture-alt-target	linux-x86_64-v2	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	1010101010101010101010101010101010101010101010101010101010101010
+detect	emby	emby-fixture-alt-target	linux-x86_64-v2	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	2020202020202020202020202020202020202020202020202020202020202020
+pre	emby	emby-fixture-alt-target	linux-x86_64-v2	target_sqlite	lscr.io/linuxserver/emby:fixture-alt-target	-	/app/emby/lib/libsqlite3.so.3.50.0	-	-	-	3030303030303030303030303030303030303030303030303030303030303030
+detect	emby	emby-fixture-alt-target	linux-x86_64-v3	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	4040404040404040404040404040404040404040404040404040404040404040
+detect	emby	emby-fixture-alt-target	linux-x86_64-v3	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	5050505050505050505050505050505050505050505050505050505050505050
+pre	emby	emby-fixture-alt-target	linux-x86_64-v3	target_sqlite	lscr.io/linuxserver/emby:fixture-alt-target	-	/app/emby/lib/libsqlite3.so.3.50.0	-	-	-	6060606060606060606060606060606060606060606060606060606060606060
+detect	emby	emby-fixture-alt-target	linux-arm64	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	7070707070707070707070707070707070707070707070707070707070707070
+detect	emby	emby-fixture-alt-target	linux-arm64	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	8080808080808080808080808080808080808080808080808080808080808080
+pre	emby	emby-fixture-alt-target	linux-arm64	target_sqlite	lscr.io/linuxserver/emby:fixture-alt-target	-	/app/emby/lib/libsqlite3.so.3.50.0	-	-	-	9090909090909090909090909090909090909090909090909090909090909090
+detect	emby	emby-fixture-generic2	linux-x86_64-v2	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a0a
+detect	emby	emby-fixture-generic2	linux-x86_64-v2	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b0b
+pre	emby	emby-fixture-generic2	linux-x86_64-v2	target_sqlite	lscr.io/linuxserver/emby:fixture-generic2	-	/app/emby/lib/libsqlite3.so.3.49.2	-	-	-	0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c0c
+detect	emby	emby-fixture-generic2	linux-x86_64-v3	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d0d
+detect	emby	emby-fixture-generic2	linux-x86_64-v3	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e0e
+pre	emby	emby-fixture-generic2	linux-x86_64-v3	target_sqlite	lscr.io/linuxserver/emby:fixture-generic2	-	/app/emby/lib/libsqlite3.so.3.49.2	-	-	-	0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f
+detect	emby	emby-fixture-generic2	linux-arm64	emby_deps	-	-	/app/emby/system/EmbyServer.deps.json	-	-	-	1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a
+detect	emby	emby-fixture-generic2	linux-arm64	emby_dll	-	-	/app/emby/system/EmbyServer.dll	-	-	-	1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b
+pre	emby	emby-fixture-generic2	linux-arm64	target_sqlite	lscr.io/linuxserver/emby:fixture-generic2	-	/app/emby/lib/libsqlite3.so.3.49.2	-	-	-	1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c1c

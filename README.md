@@ -52,6 +52,10 @@ images, and smokes the staged root filesystem inside the pinned LSIO base
 images. `mod-publish` publishes stable multi-arch mod tags only for release
 tags.
 
+For cold-start runtime support changes, see `docs/extending.md`. For the
+schema v3 `baked-pins.txt` contract and validator rules, see
+`docs/baked-pins-schema.md`.
+
 ## Pre-compiled binary
 
 Pre-compiled artifacts are published on [GitHub Releases][1] for CalVer tags
@@ -62,10 +66,12 @@ Signing: TODO.
 
 ## Customization
 
-- Change SQLite source pins in `build/build_static_sqlite.sh` and keep them
-  aligned with `.github/workflows/sqlite-build.yml`:
-  `SQLITE_AMALG_URL`, `SQLITE_AMALG_SHA3_256`, `SQLITE_SRC_URL`, and
-  `SQLITE_SRC_SHA3_256`.
+- Change SQLite and mimalloc pins in `pins/versions.env`.
+- Change ICU compatibility-group source fields in
+  `pins/library-compat-groups.tsv`. Edit the canonical pin tables, not the
+  wrapper, workflow, Dockerfile, or other derived consumers.
+- Follow `docs/extending.md` when adding supported runtime versions,
+  compatibility groups, Plex pool-patch sites, or release support evidence.
 - Change CLI and library compile-time flags in `build/Build.sh`.
 - Keep `SQLite_compressor` empty in `build/build_static_sqlite.sh` to disable
   CLI compression.

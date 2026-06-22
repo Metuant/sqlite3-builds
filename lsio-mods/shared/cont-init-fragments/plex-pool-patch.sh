@@ -33,7 +33,7 @@ plex_pool_patch_populate_binary_tmp() {
   local tmp=$1
   local bin=$2
   local _expected_pre_sha=$3
-  local site label offset write_seek original_hex patched_hex write_index write_hex_index write_hex_byte observed_hex
+  local site label offset write_seek original_hex patched_hex offset_num write_seek_num write_index write_hex_index write_hex_byte observed_hex
   shift 3
 
   if ! cp -f "$bin" "$tmp"; then
@@ -46,7 +46,9 @@ plex_pool_patch_populate_binary_tmp() {
     IFS='|' read -r label offset write_seek original_hex patched_hex <<EOF_SITE
 $site
 EOF_SITE
-    write_index=$((write_seek - offset))
+    offset_num=$((10#$offset))
+    write_seek_num=$((10#$write_seek))
+    write_index=$((write_seek_num - offset_num))
     if [ "$write_index" -lt 0 ]; then
       plex_pool_patch_failure_event="invalid-site"
       plex_pool_patch_failure_site="$label"
@@ -59,12 +61,12 @@ EOF_SITE
       plex_pool_patch_failure_site="$label"
       return 1
     fi
-    if ! printf '%b' "\\x${write_hex_byte}" | dd of="$tmp" bs=1 seek="$write_seek" count=1 conv=notrunc 2>/dev/null; then
+    if ! printf '%b' "\\x${write_hex_byte}" | dd of="$tmp" bs=1 seek="$write_seek_num" count=1 conv=notrunc 2>/dev/null; then
       plex_pool_patch_failure_event="write-failed"
       plex_pool_patch_failure_site="$label"
       return 1
     fi
-    observed_hex="$(plex_pool_patch_read_hex "$tmp" "$offset")"
+    observed_hex="$(plex_pool_patch_read_hex "$tmp" "$offset_num")"
     if [ "$observed_hex" != "$patched_hex" ]; then
       plex_pool_patch_failure_event="verify-failed"
       plex_pool_patch_failure_site="$label"
@@ -77,7 +79,7 @@ EOF_SITE
 plex_pool_patch_apply_binary() {
   local bin=$1
   local expected_pre_sha=$2
-  local all_pre all_post site label offset write_seek original_hex patched_hex observed_hex bak current_sha
+  local all_pre all_post site label offset write_seek original_hex patched_hex offset_num observed_hex bak current_sha
   shift 2
 
   if [ ! -f "$bin" ]; then
@@ -95,7 +97,8 @@ plex_pool_patch_apply_binary() {
     IFS='|' read -r label offset write_seek original_hex patched_hex <<EOF_SITE
 $site
 EOF_SITE
-    observed_hex="$(plex_pool_patch_read_hex "$bin" "$offset")"
+    offset_num=$((10#$offset))
+    observed_hex="$(plex_pool_patch_read_hex "$bin" "$offset_num")"
     if [ "$observed_hex" != "$original_hex" ]; then
       all_pre=0
     fi

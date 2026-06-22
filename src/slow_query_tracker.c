@@ -18,6 +18,7 @@
 #define SLOW_QUERY_NIL UINT16_MAX
 #define SLOW_QUERY_DEFAULT_THRESHOLD_MS 500u
 #define SLOW_QUERY_DUMP_INTERVAL_NS (300ull * 1000000000ull)
+#define SLOW_QUERY_STATS_MIN_COUNT 5u
 #define SLOW_QUERY_TRUNC_TAIL "...[TRUNC]"
 #define SLOW_QUERY_FALLBACK_CAP (1u << 20)
 
@@ -391,17 +392,24 @@ static void slow_escape_unlimited(const char *src, char *dst, size_t dst_n) {
 
 static void slow_emit_stats_snapshot(const struct slow_entry_snapshot *s) {
     char sqlbuf[SLOW_QUERY_SQL_CAP + 256];
-    long double count = (long double)s->count;
-    long double mean_ns = slow_accum_to_ld(s->sum_ns) / count;
-    long double mean_sq_ns = slow_accum_to_ld(s->sum_sq_ns) / count;
-    long double variance_ns2 = mean_sq_ns - (mean_ns * mean_ns);
+    long double count;
+    long double mean_ns;
+    long double mean_sq_ns;
+    long double variance_ns2;
     long double stddev_ns;
 
+    if (s->count < SLOW_QUERY_STATS_MIN_COUNT) return;
+    count = (long double)s->count;
+    mean_ns = slow_accum_to_ld(s->sum_ns) / count;
+    if (mean_ns < (long double)g_threshold_ns) return;
+    mean_sq_ns = slow_accum_to_ld(s->sum_sq_ns) / count;
+    variance_ns2 = mean_sq_ns - (mean_ns * mean_ns);
     if (variance_ns2 < 0.0L) variance_ns2 = 0.0L;
     stddev_ns = sqrtl(variance_ns2);
     slow_escape_sql(s->sql, sqlbuf, sizeof(sqlbuf));
     obs_logf("slow_query_stats",
-             "sql=\"%s\" count=%" PRIu32 " mean_ms=%.3f stddev_ms=%.3f min_ms=%.3f max_ms=%.3f",
+             "sql=\"%s\" count=%" PRIu32
+             " mean_ms=%.6f stddev_ms=%.6f min_ms=%.6f max_ms=%.6f",
              sqlbuf, s->count,
              (double)(mean_ns / 1000000.0L),
              (double)(stddev_ns / 1000000.0L),

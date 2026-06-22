@@ -30,6 +30,15 @@ assert_file_hex() {
   assert_eq "$expected" "$actual" "$message"
 }
 
+assert_window_hex() {
+  path=$1
+  offset=$2
+  expected=$3
+  message=$4
+  actual="$(dd if="$path" bs=1 skip="$offset" count=16 2>/dev/null | od -An -tx1 -v | tr -d ' \n')"
+  assert_eq "$expected" "$actual" "$message"
+}
+
 write_hex_file() {
   path=$1
   hex=$2
@@ -115,6 +124,31 @@ no_sites="$tmp/no-sites"
 write_hex_file "$no_sites" "$orig_hex"
 run_patch "$tmp/no-sites.log" "$no_sites" "$pre_sha"
 grep -Fq 'event=no-sites' "$tmp/no-sites.log" || { echo "FATAL: no-sites log missing" >&2; exit 1; }
+
+pre_sha_mismatch="$tmp/pre-sha-mismatch"
+write_hex_file "$pre_sha_mismatch" "$orig_hex"
+run_patch "$tmp/pre-sha-mismatch.log" "$pre_sha_mismatch" "$unknown_hex" "$site"
+assert_file_hex "$pre_sha_mismatch" "$orig_hex" "pre-sha-mismatch changed target"
+grep -Fq 'event=pre-sha-mismatch' "$tmp/pre-sha-mismatch.log" || { echo "FATAL: pre-sha-mismatch log missing" >&2; exit 1; }
+
+invalid_site="$tmp/invalid-site"
+write_hex_file "$invalid_site" "$orig_hex"
+invalid_site_sha="$(sha256_file "$invalid_site")"
+invalid_site_row="bad-site|0|16|$orig_hex|$patched_hex"
+run_patch "$tmp/invalid-site.log" "$invalid_site" "$invalid_site_sha" "$invalid_site_row"
+assert_file_hex "$invalid_site" "$orig_hex" "invalid-site changed target"
+grep -Fq 'event=invalid-site' "$tmp/invalid-site.log" || { echo "FATAL: invalid-site log missing" >&2; exit 1; }
+
+leading_zero="$tmp/leading-zero"
+leading_zero_orig="00112233445566778899aabbccddeeff"
+leading_zero_patched="0011223344aa66778899aabbccddeeff"
+leading_zero_padding="000000000000000000000000000000"
+write_hex_file "$leading_zero" "${leading_zero_padding}${leading_zero_orig}"
+leading_zero_sha="$(sha256_file "$leading_zero")"
+leading_zero_site="leading-zero|015|020|$leading_zero_orig|$leading_zero_patched"
+run_patch "$tmp/leading-zero.log" "$leading_zero" "$leading_zero_sha" "$leading_zero_site"
+assert_window_hex "$leading_zero" 15 "$leading_zero_patched" "leading-zero decimal offset site was not patched"
+grep -Fq 'event=patched' "$tmp/leading-zero.log" || { echo "FATAL: leading-zero patch log missing" >&2; exit 1; }
 
 fake_bin="$tmp/fake-bin"
 mkdir -p "$fake_bin"

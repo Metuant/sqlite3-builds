@@ -5,10 +5,11 @@
 #include <stdlib.h>
 #include <string.h>
 
-/* Atexit smoke: triggers tracker recording, exits normally, expects the
- * atexit-registered dump to emit either a slow_query_stats line (successful
- * dump) or a dump_skipped reason=atexit diagnostic (mutex contention).
- * Shell-capture wrapper asserts one of the two appears. */
+/* Atexit smoke: triggers enough tracker records for stats eligibility, exits
+ * normally, expects the atexit-registered dump to emit either a
+ * slow_query_stats line (successful dump) or a dump_skipped reason=atexit
+ * diagnostic (mutex contention). Shell-capture wrapper asserts one of the two
+ * appears. */
 int slow_query_test_record_sql(const char *sql, sqlite3_int64 elapsed_ns);
 
 int obs_is_disabled(void) {
@@ -38,6 +39,9 @@ void obs_logf(const char *fn, const char *fmt, ...) {
 }
 
 int main(void) {
-    slow_query_test_record_sql("SELECT atexit_smoke", 1000000000LL);
+    int i;
+    for (i = 0; i < 5; i++) {
+        slow_query_test_record_sql("SELECT atexit_smoke", 1000000000LL);
+    }
     return 0;
 }

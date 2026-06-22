@@ -1,0 +1,13 @@
+server_id	arch	binary_path	label	offset	write_seek	original_hex	patched_hex	review_ref	reviewer	status
+plex-fixture	linux-x86_64-v2	/usr/lib/plexmediaserver/Plex Media Server	pms-small-pool	10	11	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver A	approved
+plex-fixture	linux-x86_64-v2	/usr/lib/plexmediaserver/Plex Media Server	pms-small-pool	10	11	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver B	approved
+plex-fixture	linux-x86_64-v2	/usr/lib/plexmediaserver/Plex Media Scanner	scanner-small-pool	20	21	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver A	approved
+plex-fixture	linux-x86_64-v2	/usr/lib/plexmediaserver/Plex Media Scanner	scanner-small-pool	20	21	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver B	approved
+plex-fixture	linux-x86_64-v3	/usr/lib/plexmediaserver/Plex Media Server	pms-small-pool	10	11	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver A	approved
+plex-fixture	linux-x86_64-v3	/usr/lib/plexmediaserver/Plex Media Server	pms-small-pool	10	11	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver B	approved
+plex-fixture	linux-x86_64-v3	/usr/lib/plexmediaserver/Plex Media Scanner	scanner-small-pool	20	21	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver A	approved
+plex-fixture	linux-x86_64-v3	/usr/lib/plexmediaserver/Plex Media Scanner	scanner-small-pool	20	21	be140000004c89ff41b800000000506a	be100000004c89ff41b800000000506a	fixture-review	Deriver B	approved
+plex-fixture	linux-arm64	/usr/lib/plexmediaserver/Plex Media Server	pms-small-pool	10	10	81028052e00313aae4031f2ae7031f2a	01028052e00313aae4031f2ae7031f2a	fixture-review	Deriver A	approved
+plex-fixture	linux-arm64	/usr/lib/plexmediaserver/Plex Media Server	pms-small-pool	10	10	81028052e00313aae4031f2ae7031f2a	01028052e00313aae4031f2ae7031f2a	fixture-review	Deriver B	approved
+plex-fixture	linux-arm64	/usr/lib/plexmediaserver/Plex Media Scanner	scanner-small-pool	30	30	81028052e00313aae4031f2ae7031f2a	01028052e00313aae4031f2ae7031f2a	fixture-review	Deriver A	approved
+plex-fixture	linux-arm64	/usr/lib/plexmediaserver/Plex Media Scanner	scanner-small-pool	30	30	81028052e00313aae4031f2ae7031f2a	01028052e00313aae4031f2ae7031f2a	fixture-review	Deriver B	approved

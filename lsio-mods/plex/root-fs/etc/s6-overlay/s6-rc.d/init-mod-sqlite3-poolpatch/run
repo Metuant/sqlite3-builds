@@ -6,43 +6,53 @@ phase_name="04-pool-patch"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
+. /opt/sqlite3-lsio-mod/lib/manifest-parser.sh
+. /opt/sqlite3-lsio-mod/lib/selector.sh
 . /opt/sqlite3-lsio-mod/lib/atomic-write.sh
 . /opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh
 sqlite3_mod_init_logging
 if ! require_all_or_warn awk chmod chown cp dd grep mktemp mv od printf rm sha256sum stat tr uname; then exit 0; fi
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
-target_path="/usr/lib/plexmediaserver/lib/libsqlite3.so"
 selected_arch="$(resolve_arch)" || exit 0
-current_sha="$(awk -F'|' -v arch="$selected_arch" -v target="$target_path" '$1=="current" && $3=="plex" && $4==arch && $6==target { print $7; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || exit 0
-[ -f "$target_path" ] && [ "$(sha256_of "$target_path")" = "$current_sha" ] || { log_warn "mod=plex phase=${phase_name} event=skip-sqlite-not-current"; exit 0; }
-pms="/usr/lib/plexmediaserver/Plex Media Server"
-scanner="/usr/lib/plexmediaserver/Plex Media Scanner"
-pms_sha="$(awk -F'|' -v arch="$selected_arch" -v path="$pms" '$1=="pool-pre" && $3=="plex" && $4==arch && $5==path { print $6; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms"; exit 0; }
-scanner_sha="$(awk -F'|' -v arch="$selected_arch" -v path="$scanner" '$1=="pool-pre" && $3=="plex" && $4==arch && $5==path { print $6; found=1 } END { if (!found) exit 1 }' "$baked_pins")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=scanner"; exit 0; }
-case "$selected_arch" in
-  linux-x86_64-v2|linux-x86_64-v3)
-    pms_sites=(
-      "0xb175e7|11630055|11630056|be140000004c89ff41b800000000506a|be100000004c89ff41b800000000506a"
-    )
-    scanner_sites=(
-      "0x37d4b7|3658935|3658936|be140000004c89ff41b800000000506a|be100000004c89ff41b800000000506a"
-      "0x3997bf|3774399|3774400|be140000004889df41b80000000068d0|be100000004889df41b80000000068d0"
-    )
-    ;;
-  linux-arm64)
-    pms_sites=(
-      "0xa18fd4|10588116|10588116|81028052e00313aae4031f2ae7031f2a|01028052e00313aae4031f2ae7031f2a"
-    )
-    scanner_sites=(
-      "0x33ad9c|3386780|3386780|81028052e00313aae4031f2ae7031f2a|01028052e00313aae4031f2ae7031f2a"
-      "0x3575f8|3503608|3503608|81028052e00315aae4031f2ae7031f2a|01028052e00315aae4031f2ae7031f2a"
-    )
-    ;;
-  *)
-    log_warn "mod=plex phase=${phase_name} event=skip-unsupported-pool-arch arch=${selected_arch}"
-    exit 0
-    ;;
-esac
-plex_pool_patch_apply_binary "$pms" "$pms_sha" "${pms_sites[@]}" || true
-plex_pool_patch_apply_binary "$scanner" "$scanner_sha" "${scanner_sites[@]}" || true
+server_id="$(select_supported_server "plex" "$selected_arch" "$baked_pins")"
+[ -n "$server_id" ] || exit 0
+if unsupported_row="$(selected_unsupported_row "plex" "$selected_arch" "$baked_pins" "$server_id")"; then
+  IFS='|' read -r unsupported_compat_group unsupported_reason <<< "$unsupported_row"
+  log_warn "mod=plex phase=${phase_name} event=unsupported-server arch=${selected_arch} server_id=${server_id} compat_group=${unsupported_compat_group} reason=${unsupported_reason}"
+  exit 0
+fi
+if ! selected_artifact_is_current "plex" "$selected_arch" "$baked_pins" "$server_id"; then
+  log_warn "mod=plex phase=${phase_name} event=skip-sqlite-not-current"
+  exit 0
+fi
+pms_detector_row="$(selected_pristine_detector_row "plex" "$selected_arch" "$baked_pins" "$server_id" "plex_pms")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms"; exit 0; }
+IFS='|' read -r pms_detector_path pms_sha <<< "$pms_detector_row"
+if [ -z "$pms_detector_path" ] || [ -z "$pms_sha" ]; then
+  log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms"
+  exit 0
+fi
+scanner_detector_row="$(selected_pristine_detector_row "plex" "$selected_arch" "$baked_pins" "$server_id" "plex_scanner")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=scanner"; exit 0; }
+IFS='|' read -r scanner_detector_path scanner_sha <<< "$scanner_detector_row"
+if [ -z "$scanner_detector_path" ] || [ -z "$scanner_sha" ]; then
+  log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=scanner"
+  exit 0
+fi
+pms_site_rows="$(selected_pool_site_rows "plex" "$selected_arch" "$baked_pins" "$server_id" "$pms_detector_path")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms"; exit 0; }
+scanner_site_rows="$(selected_pool_site_rows "plex" "$selected_arch" "$baked_pins" "$server_id" "$scanner_detector_path")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=scanner"; exit 0; }
+pms_sites=()
+while IFS= read -r site_row || [ -n "$site_row" ]; do
+  [ -n "$site_row" ] || continue
+  pms_sites+=("$site_row")
+done <<EOF_PMS_SITES
+$pms_site_rows
+EOF_PMS_SITES
+scanner_sites=()
+while IFS= read -r site_row || [ -n "$site_row" ]; do
+  [ -n "$site_row" ] || continue
+  scanner_sites+=("$site_row")
+done <<EOF_SCANNER_SITES
+$scanner_site_rows
+EOF_SCANNER_SITES
+plex_pool_patch_apply_binary "$pms_detector_path" "$pms_sha" "${pms_sites[@]}" || true
+plex_pool_patch_apply_binary "$scanner_detector_path" "$scanner_sha" "${scanner_sites[@]}" || true
 log_info "mod=plex phase=${phase_name} event=complete"

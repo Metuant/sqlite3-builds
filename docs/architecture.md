@@ -27,25 +27,27 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `build/build_static_sqlite.sh` | Local wrapper that builds Docker images and extracts artifacts into `release/`. |
 | `docker-cli/Dockerfile` | Alpine-based static CLI build image. |
 | `docker-library/Dockerfile` | Shared-library build image: Ubuntu/glibc for the generic variant and Alpine/musl for the Plex variant. |
+| `docs/extending.md` | Cold-start runbook for adding runtime versions, compatibility groups, pool sites, and releases. |
+| `docs/baked-pins-schema.md` | Current schema v3 `baked-pins.txt` contract, validator reject list, and runtime keying rules. |
 | `src/auto_extension.c` | Built into both library variants; registers per-connection PRAGMA tuning. |
 | `src/slow_query_tracker.c` | Hidden observability satellite for PROFILE-based slow-query logging and bounded per-template stats. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
 | `tests/slow_query_smoke.c` | Runtime smoke for the slow-query tracker threshold parser, kill switches, LRU bound, truncation, and stats dump. |
+| `tests/stmt_trace_smoke.c` | Runtime smoke for the STMT trace env contract and trace mask registration against the shared STMT/PROFILE callback. |
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
 | `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
-| `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: current rows, pre rows, Plex ICU rows, pool-patch baselines, unsupported rows, and malformed-input rejection. |
+| `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: schema v3 metadata, detector, artifact, pre, Plex pool-site, unsupported rows, and malformed-input rejection. |
 | `tests/cont_init_fragments_test.sh` | Static and unit checks for LSIO mod runtime fragments, phase-script shebangs, no custom env-var surface, and Plex ICU read-only posture. |
 | `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for minimal release assets and split `mod-build` / `mod-publish` jobs. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `build/expected-sqlite-*-count.txt`. |
-| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment and ICU workflow/Dockerfile alignment. |
+| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, and checks group-owned ICU source defaults. |
 | `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled in library images and executed only with `RUN_BENCH=1`. |
 | `build/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
 | `tools/lsio-mod/render-lsio-mod-baked-pins.sh` | Host-runnable renderer for per-mod `baked-pins.txt` runtime SHA data. |
 | `tools/lsio-mod/stage-lsio-mod.sh` | Local and CI staging helper that assembles an ephemeral LSIO mod Docker context under `mktemp -d`. |
 | `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared runtime fragments, and parent README. |
 | `lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh` | Args-only shared Plex pool-patch core staged into the Plex mod. |
-| `pins/plex-pool-patch-baselines.txt` | PMS and Plex Media Scanner baseline SHA source data rendered into Plex `baked-pins.txt`. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
 | `.dockerignore` | Tight Docker context allowlist for build, Dockerfile, source, script, and test inputs. |
@@ -66,7 +68,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 | Target | SQLite binding | Library file | Variant | State in this cycle |
 |---|---|---|---|---|
 | Plex | Native process using bundled `libsqlite3.so` | `/usr/lib/plexmediaserver/lib/libsqlite3.so` | `plex` | Active |
-| Emby | .NET P/Invoke into bundled SQLite | `/app/emby/lib/libsqlite3.so.3.49.2` | `generic` | Active |
+| Emby | .NET P/Invoke into bundled SQLite | Selected artifact-row `target_path` (current rows use `/app/emby/lib/libsqlite3.so.3.49.2`) | `generic` | Active |
 | JF | .NET SQLitePCLRaw name lookup | `/usr/lib/jellyfin/bin/libe_sqlite3.so` | `generic` | Unsupported / out of scope |
 
 See §Out of Scope.
@@ -119,8 +121,15 @@ current design and validation plan land.
 
 ## Build Inputs
 
-The source of truth for version and image pins is `pins/versions.env`; the
-local wrapper sources it and the workflow loads it into `$GITHUB_ENV`.
+The source of truth for SQLite and mimalloc build pins is `pins/versions.env`;
+the local wrapper sources it and the workflow loads it into `$GITHUB_ENV`.
+Runtime support images live in `pins/runtime-support.tsv`. Library
+compatibility groups and Plex ICU source pins live in
+`pins/library-compat-groups.tsv`.
+
+For extension procedures, use `docs/extending.md`. For the schema v3 manifest
+field contract and fail-closed validator rules, use
+`docs/baked-pins-schema.md`.
 
 | Input | Current value |
 |---|---|
@@ -131,7 +140,7 @@ local wrapper sources it and the workflow loads it into `$GITHUB_ENV`.
 | Full source URL | `https://www.sqlite.org/2026/sqlite-src-3530200.zip` |
 | Full source SHA3-256 | `490ec7af32a6bfa5f3e05dc279c04286cfe3f328def4a8b7344e3fa20be18a4c` |
 
-The Plex library image also pins ICU 69.1:
+The current Plex library compatibility group pins ICU 69.1:
 
 | Input | Current value |
 |---|---|
@@ -162,6 +171,10 @@ The mimalloc VERSION + URL + SHA512 tuple must stay aligned across
 `build/Build.sh`, `build/build_static_sqlite.sh`, `docker-library/Dockerfile`,
 and `.github/workflows/sqlite-build.yml`; `tests/check_pin_alignment.sh`
 fails on any drift in the full tuple.
+
+Plex ICU source VERSION and SHA512 fields are group-owned by
+`pins/library-compat-groups.tsv`; the workflow passes those values as Plex
+library `ICU_SOURCE_*` build args.
 
 ## Build Pipeline
 
@@ -311,14 +324,19 @@ uploaded as a workflow artifact.
 
 The build job no longer emits deploy pre-row fragments. Mod runtime SHA data is
 rendered later by `tools/lsio-mod/render-lsio-mod-baked-pins.sh` from same-run build
-artifacts, same-run runtime baseline extraction, and
-`pins/plex-pool-patch-baselines.txt`.
+artifacts, same-run runtime baseline extraction, and the Plex pool-patch pins
+(`pins/plex-pool-patch-sites.tsv` and `pins/plex-pool-patch-reviews.tsv`).
 
 The workflow keeps observability count and ABI obsolete-config checks after
 runtime smokes. Static coverage for the LSIO mod direction lives in
 `tests/render_lsio_mod_baked_pins_test.sh`,
 `tests/cont_init_fragments_test.sh`, and
 `tests/sqlite_build_workflow_mod_only_test.sh`.
+Mandatory multi-version gates include
+`tests/check_multi_version_pin_alignment.sh` in the workflow, the parser and
+selector suites (`tests/manifest_parser_test.sh` and
+`tests/selector_test.sh`), support-image digest artifacts, and the skopeo OCI
+static check in `tools/ci/skopeo-mod-image-oci-check.sh`.
 
 ### Release Job
 
@@ -372,6 +390,10 @@ up from the repository's prior 1024-page tuning and SQLite's stock 250-page
 default. At the 16 KiB compile-default page size, that yields a 128 MiB PMA cap
 per active sort worker; with `PRAGMA threads=8`, a connection may drive up to
 eight concurrent sort workers at that cap.
+
+The library profile pins `-DSQLITE_DEFAULT_AUTOVACUUM=0`.
+`scripts/optimize_media_servers.sh` sets `PRAGMA auto_vacuum=INCREMENTAL`
+explicitly during planned-downtime database rebuilds.
 
 ## Per-Connection PRAGMA Injection
 
@@ -506,6 +528,19 @@ priority-101 observability constructor, with per-wrapper `pthread_once`
 fallback. Disabled mode skips wrapper log emission and skips per-connection
 `sqlite3_trace_v2` registration.
 
+The statement-trace env knob is:
+
+```text
+SQLITE3_DISABLE_STMT_TRACE=0
+```
+
+Statement trace logging is off by default. Only literal `0` enables it; unset,
+empty, `1`, and every other value disable it. The value is cached by the same
+observability initialization path as the master kill switch. Disabled/default
+mode omits `SQLITE_TRACE_STMT` from the per-connection trace mask; PROFILE-side
+slow-query tracking is unaffected. When the resulting trace mask is `0`,
+`sqlite3_trace_v2` is not called.
+
 Log lines are written to stderr:
 
 ```text
@@ -522,25 +557,27 @@ failures where `rc != SQLITE_OK`. This absorbs helper-triggered initialization
 followed by `openDatabase`'s initialization check without false failure logs.
 
 `autopragma_init()` registers a unified trace callback before the AUTOPRAGMA
-gate, with STMT always enabled and PROFILE conditionally added when slow-query
-tracking is enabled. Observability is orthogonal to
-PRAGMA injection: target filtering, read-only skips, and the autopragma kill
-switch do not suppress observability logs. Trace registration failure logs and
-continues; it must never make `sqlite3_open*` fail.
+gate, with STMT added only when `SQLITE3_DISABLE_STMT_TRACE=0` and PROFILE
+conditionally added when slow-query tracking is enabled. Observability is
+orthogonal to PRAGMA injection: target filtering, read-only skips, and the
+autopragma kill switch do not suppress observability logs. Trace registration
+failure logs and continues; it must never make `sqlite3_open*` fail.
 
 ### Slow-Query Tracker
 
 The same per-connection trace registration uses one unified callback with
-`SQLITE_TRACE_STMT` always enabled and `SQLITE_TRACE_PROFILE` added only when
-slow-query tracking is enabled. SQLite allows one trace callback per
-connection, so the tracker shares the existing registration site that runs
-before the connection escapes to application code.
+`SQLITE_TRACE_STMT` added only when statement tracing is explicitly enabled and
+`SQLITE_TRACE_PROFILE` added only when slow-query tracking is enabled. SQLite
+allows one trace callback per connection, so the tracker shares the existing
+registration site that runs before the connection escapes to application code.
 
 The kill-switch hierarchy is:
 
 ```text
 SQLITE3_DISABLE_OBSERVABILITY=1 -> no observability or tracker work
-SQLITE3_DISABLE_SLOW_QUERY=1 -> STMT observability stays on, PROFILE tracker off
+SQLITE3_DISABLE_STMT_TRACE unset or !=0 -> STMT observability off, PROFILE tracker unaffected
+SQLITE3_DISABLE_STMT_TRACE=0 -> STMT observability on when observability is enabled
+SQLITE3_DISABLE_SLOW_QUERY=1 -> PROFILE tracker off; STMT follows SQLITE3_DISABLE_STMT_TRACE
 ```
 
 The helper unconditionally calls `sqlite3_auto_extension` regardless of the
@@ -574,7 +611,9 @@ compilers use `unsigned __int128` accumulators; fallback compilers use
 `uint64_t` with a per-template sample cap and one warning per capped template.
 The dump path heap-allocates value snapshots, copies under the tracker mutex,
 sorts by descending total elapsed time, and emits `slow_query_stats` lines
-after releasing the mutex.
+after releasing the mutex only when `mean_ns >= threshold_ns` and `count >= 5`.
+Stats fields `mean_ms`, `stddev_ms`, `min_ms`, and `max_ms` render with six
+digits after the decimal point.
 
 Dumps occur at normal process exit and at most every five minutes during
 PROFILE activity. The atexit path sets an atomic in-exit flag first, so later
@@ -591,7 +630,9 @@ export paths.
 
 Docker build compiles + runs `slow_query_smoke`, `slow_query_atexit_smoke`,
 `slow_query_concurrency_smoke`. CI re-runs positive, disabled-mode, atexit,
-and concurrency checks. Bench binaries (`slow_query_select1_bench`,
+and concurrency checks, and it compiles + runs `stmt_trace_smoke` against the
+same registration path to enforce the STMT trace env contract. Bench binaries
+(`slow_query_select1_bench`,
 `slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`, and
 `alloc_latency_bench` compile unconditionally; execute only with `RUN_BENCH=1`.
 For Bundle-2's mimalloc Wire-2 acceptance gate, `alloc_latency_bench` remains
@@ -678,15 +719,14 @@ The CI stage also verifies that the smoke binary resolves `libsqlite3.so` to
 the just-built artifact mounted at Plex's deployed library path rather than a
 system library.
 
-The CI runtime smoke derives `EXPECTED_ICU_MAJOR` from `ICU_VERSION` and pins
-the Plex image through `PLEX_IMAGE_TAG`. The stage-2 step bind-mounts the
-extracted Plex artifacts into that container, replacing
-`/usr/lib/plexmediaserver/lib/libsqlite3.so` for the smoke process and mounting
-the extracted `icu_smoke` binary read-only. The smoke is invoked through Plex's
-bundled `ld-musl-*.so.1` loader with Plex's library directory as the loader
-path, so `libsqlite3.so` and Plex-renamed ICU resolution use the same runtime
-closure as deployment. When bumping the Plex image pin, update `ICU_VERSION` if
-the bundled ICU major changes.
+The CI runtime smoke derives the expected ICU major from the Plex compatibility
+group and runs against the group's smoke server image from the support window.
+The stage-2 step bind-mounts the extracted Plex artifacts into that container,
+replacing `/usr/lib/plexmediaserver/lib/libsqlite3.so` for the smoke process and
+mounting the extracted `icu_smoke` binary read-only. The smoke is invoked
+through Plex's bundled `ld-musl-*.so.1` loader with Plex's library directory as
+the loader path, so `libsqlite3.so` and Plex-renamed ICU resolution use the same
+runtime closure as deployment.
 
 ### PMS first-init smoke
 
@@ -696,10 +736,9 @@ It proves the extracted Plex `libsqlite3.so` can replace PMS's runtime library
 at `/usr/lib/plexmediaserver/lib/libsqlite3.so` and survive PMS first
 initialization against a fresh `/config`.
 
-The smoke pins the runtime image through `PLEX_IMAGE_TAG`, matching the stage-2
-ICU smoke image pin. It starts PMS with the extracted Plex library
-bind-mounted read-only over the deployed library path and waits for readiness
-by probing TCP port 32400 for up to 90 seconds.
+The smoke runs for each supported Plex server row. It starts PMS with the
+extracted Plex library bind-mounted read-only over the deployed library path and
+waits for readiness by probing TCP port 32400 for up to 90 seconds.
 
 After readiness, the smoke copies
 `com.plexapp.plugins.library.db` from PMS's config tree and verifies the runner
@@ -708,9 +747,9 @@ fails when logs contain any of: `SQLITE_`, `database disk image is malformed`,
 `Cannot create table`, `no such function`, `no such collation`, or
 `Failed to open`.
 
-The smoke also requires observability marker lines for an open wrapper and
-`SQLITE_TRACE_STMT`. Positive-mode logs must not contain startup
-`sqlite3_config` operations returning `rc=21` (CI pattern:
+The smoke sets `SQLITE3_DISABLE_STMT_TRACE=0` and requires observability marker
+lines for an open wrapper and `SQLITE_TRACE_STMT`. Positive-mode logs must not
+contain startup `sqlite3_config` operations returning `rc=21` (CI pattern:
 `[sqlite3-builds-obs] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21`).
 A duplicate disabled-mode smoke starts PMS with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
@@ -724,9 +763,9 @@ It proves the extracted generic `libsqlite3.so` can replace Emby's bundled
 runtime library at `/app/emby/lib/libsqlite3.so.3.49.2` and survive Emby first
 initialization against a fresh `/config`.
 
-The smoke pins the runtime image through `EMBY_IMAGE_TAG`. It starts Emby with
-the extracted generic library bind-mounted read-only over the deployed library
-path and waits for readiness by polling startup logs for the prefix-agnostic
+The smoke runs for each supported Emby server row. It starts Emby with the
+extracted generic library bind-mounted read-only over the deployed library path
+and waits for readiness by polling startup logs for the prefix-agnostic
 `Sqlite version:` message for up to 90 seconds.
 
 After readiness, the smoke verifies the logged SQLite version equals the
@@ -736,9 +775,9 @@ options and verifies the
 `SORTER_PMASZ=8192`. The workflow prints full Emby logs and fails when logs
 contain the same bad-signal set as §PMS first-init smoke.
 
-The smoke also requires observability marker lines for an open wrapper and
-`SQLITE_TRACE_STMT`. Positive-mode logs must not contain startup
-`sqlite3_config` operations returning `rc=21` (CI pattern:
+The smoke sets `SQLITE3_DISABLE_STMT_TRACE=0` and requires observability marker
+lines for an open wrapper and `SQLITE_TRACE_STMT`. Positive-mode logs must not
+contain startup `sqlite3_config` operations returning `rc=21` (CI pattern:
 `[sqlite3-builds-obs] .* sqlite3_config op=SQLITE_CONFIG_[A-Z0-9_]+ rc=21`).
 A duplicate disabled-mode smoke starts Emby with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
@@ -758,10 +797,12 @@ Runtime installed files:
 
 ```text
 /opt/sqlite3-lsio-mod/baked-pins.txt
-/opt/sqlite3-lsio-mod/artifacts/<arch>/libsqlite3.so
+/opt/sqlite3-lsio-mod/artifacts/<arch>/<compat_group>/libsqlite3.so
 /opt/sqlite3-lsio-mod/lib/logging.sh
 /opt/sqlite3-lsio-mod/lib/arch.sh
 /opt/sqlite3-lsio-mod/lib/sha.sh
+/opt/sqlite3-lsio-mod/lib/manifest-parser.sh
+/opt/sqlite3-lsio-mod/lib/selector.sh
 /opt/sqlite3-lsio-mod/lib/swap.sh
 ```
 
@@ -771,14 +812,22 @@ Plex also installs:
 /opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh
 ```
 
-`baked-pins.txt` is the only runtime SHA source. It includes current SQLite
-artifact rows, per-architecture bundled target pre rows, Plex ICU runtime pre
-rows, and PMS / Plex Media Scanner pool-patch baseline rows.
+`baked-pins.txt` is the only runtime SHA source. It uses schema v3 rows:
+`meta`, `detect`, `artifact`, `pre`, `pool-site`, and `unsupported`. The
+manifest carries detector sets for per-version detector selection, group-aware
+artifact paths, target runtime baselines, Plex ICU runtime baselines, and Plex
+pool-site byte contexts.
 
-Row-kind schema and the all-arches/no-`post` manifest rule are pinned in
-`docs/invariants/sqlite3-builds.md` §2 and §8. The architecture-local point is
-that this manifest is the runtime map consumed by the staged LSIO files listed
-above.
+Row-kind schema and all-arch manifest coverage are pinned in
+`docs/invariants/sqlite3-builds.md` §2 and §8. Detailed schema v3 field rules,
+runtime keying, and validator reject conditions live in
+`docs/baked-pins-schema.md`. The architecture-local point is that this manifest
+is the runtime map consumed by the staged LSIO files listed above.
+
+Preflight validates the manifest, resolves the runtime architecture, runs
+per-version detector selection, and verifies the selected `artifact` row names a
+present target path. Later phases reuse the same selected server id and
+artifact row; they do not select by runtime `libsqlite3.so` SHA.
 
 The phase oneshots are registered with empty
 `/etc/s6-overlay/s6-rc.d/user/contents.d/init-mod-sqlite3-*` markers and are
@@ -838,33 +887,17 @@ ConnectionPool size immediate from 20 to 16. On amd64, `original_hex` starts
 `be14...` and `patched_hex` starts `be10...`; on arm64, `original_hex` starts
 `81028052...` and `patched_hex` starts `01028052...`.
 
-Current sites for `lscr.io/linuxserver/plex:1.43.2`:
-
-| Arch | Binary | Offset label | Offset decimal | Write seek |
-|---|---|---:|---:|---:|
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xb175e7` | `11630055` | `11630056` |
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x37d4b7` | `3658935` | `3658936` |
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x3997bf` | `3774399` | `3774400` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xa18fd4` | `10588116` | `10588116` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x33ad9c` | `3386780` | `3386780` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x3575f8` | `3503608` | `3503608` |
-
-Pool-size-2 sites are for a different database and must not be patched:
-
-| Arch | Binary | File offset | VA |
-|---|---|---:|---:|
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Server` | `0xaf660b` | `0xaf760b` |
-| `linux-x86_64-v2` / `linux-x86_64-v3` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x372be9` | `0x373be9` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Server` | `0x9f7868` | `0xa07868` |
-| `linux-arm64` | `/usr/lib/plexmediaserver/Plex Media Scanner` | `0x32f6d0` | `0x33f6d0` |
+Supported pool-patch sites are data rows, not runtime-derived offsets. The
+curated source rows live in `pins/plex-pool-patch-sites.tsv`; rendered runtime
+rows live as `pool-site` rows in `baked-pins.txt`.
 
 Pool-patch per-binary behavior:
 
 | Site state | Baseline SHA / backup state | Action |
 |---|---|---|
 | All sites patched | Any | Skip; already patched |
-| All sites original | Current binary SHA matches `pool-pre`; backup absent | Copy backup, patch a same-fs temp copy, restore owner/mode, then atomically replace |
-| All sites original | Current binary SHA matches `pool-pre`; verified backup present | Reuse backup, patch a same-fs temp copy, restore owner/mode, then atomically replace |
+| All sites original | Current binary SHA matches selected pristine detector SHA; backup absent | Copy backup, patch a same-fs temp copy, restore owner/mode, then atomically replace |
+| All sites original | Current binary SHA matches selected pristine detector SHA; verified backup present | Reuse backup, patch a same-fs temp copy, restore owner/mode, then atomically replace |
 | Mixed or unknown | Any | Warn and skip that binary |
 | Write, verify, or atomic replace failure | Verified backup present | Leave target unchanged, warn, and continue to the next binary |
 
@@ -912,19 +945,17 @@ operations remain operator-controlled.
 
 For each Plex instance, the script resolves the data and database paths, cleans
 selected caches, checks integrity, takes a dated backup, dumps to `dump.sql`,
-aborts on a dump rollback marker, rebuilds the database from the dump, runs the
-optional host-side page-size and incremental-autovacuum step, reruns integrity,
-runs `REINDEX`, `PRAGMA analysis_limit=0`, `PRAGMA optimize=0x10002`, optimizes
-Plex FTS4 segments, removes the dump, and runs Plex date repair SQL.
+aborts on a dump rollback marker, rebuilds the database from the dump at the
+target page size with incremental auto-vacuum, reruns integrity, runs `REINDEX`,
+`PRAGMA analysis_limit=0`, `PRAGMA optimize=0x10002`, optimizes Plex FTS4
+segments, removes the dump, and runs Plex date repair SQL.
 
-The host-side page-size step uses `HOST_SQLITE3`, defaulting to:
-
-```text
-${HOME}/bin/sqlite3
-```
-
-That step is independent from the later Plex-specific REINDEX and FTS work, so
-failure of the page-size sub-step is warning-only.
+The rebuild runs under `Plex SQLite` and sets `PRAGMA page_size` and
+`PRAGMA auto_vacuum=INCREMENTAL` before reading the dump, so the fresh database
+is created at the target page size without a separate `VACUUM`. Plex SQLite is
+required because the dumped `CREATE INDEX` statements use the `icu_root`
+collation, which only the ICU-enabled Plex binary registers. A post-rebuild
+page-size check is warning-only, so it never blocks the later REINDEX and FTS work.
 
 ### Emby Flow
 
@@ -937,9 +968,10 @@ reruns integrity, runs `REINDEX`, `PRAGMA analysis_limit=0`,
 ### Maintenance Posture
 
 Hard failures include Docker query failure, running containers, dump rollback
-markers, and integrity-check command or SQL execution failures outside optional
-sub-steps. Integrity-check result content is subject to manual operator review
-because the script does not gate on the result row.
+markers, auto_vacuum post-condition mismatch after rebuild, and
+integrity-check command or SQL execution failures outside optional sub-steps.
+Integrity-check result content is subject to manual operator review because the
+script does not gate on the result row.
 
 Warning-and-continue cases include missing optional host SQLite for Plex
 page-size migration, page-size migration failure, and page-size post-condition
@@ -1026,13 +1058,14 @@ M-series invariants:
 
 Baked pin manifest:
 
-- `baked-pins.txt` uses schema version 2: metadata row
-  `version|2|release_tag|<tag>|generated_at|<iso8601-utc>`.
-- It contains current SQLite artifact rows, per-architecture bundled target
-  pre rows, Plex ICU runtime pre rows, and PMS / Plex Media Scanner pool-patch
-  baseline rows.
-- Missing `docker image inspect` repo digest for a pinned LSIO image is a CI
-  failure.
+- `baked-pins.txt` uses schema v3 with metadata row
+  `meta|3|release_tag|<tag>|generated_at|<iso8601-utc>`.
+- It contains `detect`, `artifact`, `pre`, `pool-site`, and `unsupported` rows.
+- `artifact` rows use
+  `artifacts/<arch>/<compat_group>/libsqlite3.so`.
+- Per-version detector selection chooses the server id before target-specific
+  verification or mutation.
+- Missing image digest evidence for a supported runtime image is a CI failure.
 - Runtime SHA mismatch has no bypass environment variable.
 - LSIO mod images are the authoritative SQLite replacement artifact for a
   release tag.

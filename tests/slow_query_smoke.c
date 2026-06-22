@@ -63,6 +63,18 @@ static void assert_u64(const char *label, uint64_t got, uint64_t want) {
     }
 }
 
+static void require_contains(const char *label, const char *haystack, const char *needle) {
+    if (!strstr(haystack, needle)) {
+        failf("FATAL: %s missing \"%s\": %s", label, needle, haystack);
+    }
+}
+
+static void require_absent(const char *label, const char *haystack, const char *needle) {
+    if (strstr(haystack, needle)) {
+        failf("FATAL: %s unexpectedly found \"%s\": %s", label, needle, haystack);
+    }
+}
+
 static char *read_all_fd(int fd) {
     size_t cap = 4096;
     size_t len = 0;
@@ -135,9 +147,30 @@ static int child_kill(void) {
     return 0;
 }
 
-static int child_below_threshold(void) {
-    slow_query_test_record_sql("SELECT ?1", 50000000LL);
+static int child_fast_shape(void) {
+    int i;
+    for (i = 0; i < 5; i++) {
+        slow_query_test_record_sql("SELECT fast_shape", 50000000LL);
+    }
     slow_query_test_dump();
+    slow_query_test_disable_atexit_dump();
+    return 0;
+}
+
+static int child_slow_low_count(void) {
+    int i;
+    for (i = 0; i < 4; i++) {
+        slow_query_test_record_sql("SELECT slow_low_count", 200000000LL);
+    }
+    slow_query_test_dump();
+    slow_query_test_disable_atexit_dump();
+    return 0;
+}
+
+static int child_single_slow_event(void) {
+    slow_query_test_record_sql("SELECT single_slow_event", 200000000LL);
+    slow_query_test_dump();
+    slow_query_test_disable_atexit_dump();
     return 0;
 }
 
@@ -147,10 +180,13 @@ static int child_hierarchy(void) {
     return 0;
 }
 
-static int child_stats(void) {
+static int child_stats_frequent(void) {
     int i;
-    for (i = 0; i < 3; i++) slow_query_test_record_sql("SELECT ?1", 1000000000LL);
+    for (i = 0; i < 5; i++) {
+        slow_query_test_record_sql("SELECT stats_frequent", 1000000000LL);
+    }
     slow_query_test_dump();
+    slow_query_test_disable_atexit_dump();
     return 0;
 }
 
@@ -210,9 +246,11 @@ int main(int argc, char **argv) {
 
     if (argc == 2 && strcmp(argv[1], "child-positive") == 0) return child_positive();
     if (argc == 2 && strcmp(argv[1], "child-kill") == 0) return child_kill();
-    if (argc == 2 && strcmp(argv[1], "child-below-threshold") == 0) return child_below_threshold();
+    if (argc == 2 && strcmp(argv[1], "child-fast-shape") == 0) return child_fast_shape();
+    if (argc == 2 && strcmp(argv[1], "child-slow-low-count") == 0) return child_slow_low_count();
+    if (argc == 2 && strcmp(argv[1], "child-single-slow-event") == 0) return child_single_slow_event();
     if (argc == 2 && strcmp(argv[1], "child-hierarchy") == 0) return child_hierarchy();
-    if (argc == 2 && strcmp(argv[1], "child-stats") == 0) return child_stats();
+    if (argc == 2 && strcmp(argv[1], "child-stats-frequent") == 0) return child_stats_frequent();
     if (argc == 2 && strcmp(argv[1], "child-accumulator") == 0) return child_accumulator();
 
     test_parser_cases();
@@ -227,13 +265,20 @@ int main(int argc, char **argv) {
     printf("%s", out);
     free(out);
 
-    out = run_child_capture(argv[0], "child-below-threshold", env_threshold);
-    if (strstr(out, " slow_query ") != NULL) {
-        failf("FATAL: below-threshold sample emitted per-statement slow_query: %s", out);
-    }
-    if (!strstr(out, "slow_query_stats") || !strstr(out, "count=1")) {
-        failf("FATAL: below-threshold sample not accumulated into stats: %s", out);
-    }
+    out = run_child_capture(argv[0], "child-fast-shape", env_threshold);
+    require_absent("fast shape per-statement slow_query", out, " slow_query ");
+    require_absent("fast shape stats", out, "slow_query_stats");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-slow-low-count", env_threshold);
+    require_contains("slow low-count per-statement slow_query", out, " slow_query ");
+    require_absent("slow low-count stats", out, "slow_query_stats");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-single-slow-event", env_threshold);
+    require_contains("single slow execution per-statement slow_query", out, " slow_query ");
+    require_contains("single slow execution SQL", out, "sql=\"SELECT single_slow_event\"");
+    require_absent("single slow execution stats", out, "slow_query_stats");
     free(out);
 
     out = run_child_capture(argv[0], "child-kill", env_kill);
@@ -246,19 +291,13 @@ int main(int argc, char **argv) {
     }
     free(out);
 
-    out = run_child_capture(argv[0], "child-stats", env_positive);
-    if (!strstr(out, "slow_query_stats") || !strstr(out, "count=3")) {
-        failf("FATAL: stats dump missing count=3: %s", out);
-    }
-    if (!strstr(out, "mean_ms=")) {
-        failf("FATAL: stats dump missing mean_ms: %s", out);
-    }
-    if (!strstr(out, "min_ms=")) {
-        failf("FATAL: stats dump missing min_ms: %s", out);
-    }
-    if (!strstr(out, "max_ms=")) {
-        failf("FATAL: stats dump missing max_ms: %s", out);
-    }
+    out = run_child_capture(argv[0], "child-stats-frequent", env_threshold);
+    require_contains("frequent slow stats", out, "slow_query_stats");
+    require_contains("frequent slow stats count", out, "count=5");
+    require_contains("frequent slow stats mean precision", out, "mean_ms=1000.000000");
+    require_contains("frequent slow stats stddev precision", out, "stddev_ms=0.000000");
+    require_contains("frequent slow stats min precision", out, "min_ms=1000.000000");
+    require_contains("frequent slow stats max precision", out, "max_ms=1000.000000");
     if (strstr(out, "stddev_ms=-") || strstr(out, "nan") || strstr(out, "inf")) {
         failf("FATAL: stats dump has invalid stddev: %s", out);
     }
