@@ -161,11 +161,6 @@ emby_artifact_args=(
   --artifact "linux-x86_64-v3:generic2:sqlite-2026.05.28-r1-library-generic2-linux-x86_64-v3.so:$emby_generic2_v3:/app/emby/lib/libsqlite3.so.3.49.2"
   --artifact "linux-arm64:generic2:sqlite-2026.05.28-r1-library-generic2-linux-arm64.so:$emby_generic2_arm:/app/emby/lib/libsqlite3.so.3.49.2"
 )
-emby_arm_artifact_args=(
-  --artifact "linux-arm64:generic:sqlite-2026.05.28-r1-library-generic-linux-arm64.so:$emby_arm:/app/emby/lib/libsqlite3.so.3.49.2"
-  --artifact "linux-arm64:generic2:sqlite-2026.05.28-r1-library-generic2-linux-arm64.so:$emby_generic2_arm:/app/emby/lib/libsqlite3.so.3.49.2"
-)
-
 stage_validator_artifact linux-x86_64-v2 icu69 "$plex_v2"
 stage_validator_artifact linux-x86_64-v3 icu69 "$plex_v3"
 stage_validator_artifact linux-arm64 icu69 "$plex_arm"

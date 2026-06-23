@@ -21,7 +21,7 @@ declare -A artifact_stem_by_group support_group_seen artifact_target_by_group_ar
 
 load_compat_catalog_for_mod() {
   local mod="$1"
-  local line compat artifact_stem
+  local compat artifact_stem
   while IFS=$'\t' read -r compat artifact_stem; do
     [ -n "$compat" ] || continue
     artifact_stem_by_group[$compat]="$artifact_stem"

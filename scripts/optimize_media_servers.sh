@@ -422,6 +422,7 @@ run_fts_integrity_gate() {
     local binary="${1}"
     local db_path="${2}"
     local phase="${3}"
+    local mode="${4:-hard}"
     local field_sep=$'\t'
     local fts_rows
     local row
@@ -452,10 +453,59 @@ run_fts_integrity_gate() {
             sql="INSERT INTO ${table_ident}(${table_ident}) VALUES('integrity-check');"
         fi
         if ! "${binary}" "${db_path}" "${sql}"; then
-            echo "ERROR: ${phase} FTS integrity-check failed for ${table_name} in ${db_path}" >&2
+            if [ "${mode}" = "warn" ]; then
+                echo "WARNING: ${phase} FTS integrity-check failed for ${table_name} in ${db_path}; continuing" >&2
+                continue
+            else
+                echo "ERROR: ${phase} FTS integrity-check failed for ${table_name} in ${db_path}" >&2
+                return 1
+            fi
+        fi
+    done <<< "${fts_rows}"
+
+    return 0
+}
+
+run_fts_rebuild_hard() {
+    local binary="${1}"
+    local db_path="${2}"
+    local field_sep=$'\t'
+    local fts_rows
+    local row
+    local table_name
+    local module
+    local content_mode
+    local extra
+    local table_ident
+    local rebuild_sql
+
+    if ! fts_rows="$(discover_fts_tables "${binary}" "${db_path}")"; then
+        echo "ERROR: FTS discovery failed before rebuild for ${db_path}" >&2
+        return 1
+    fi
+
+    while IFS= read -r row
+    do
+        [ -n "${row}" ] || continue
+        IFS="${field_sep}" read -r table_name module content_mode extra <<< "${row}"
+        if [ -n "${extra}" ] || ! validate_fts_metadata "${table_name}" "${module}" "${content_mode}"; then
+            echo "ERROR: FTS metadata validation failed before rebuild for ${db_path}" >&2
+            return 1
+        fi
+
+        if [ "${module}" = "fts5" ] && [ "${content_mode}" = "contentless" ]; then
+            continue
+        fi
+
+        table_ident="$(quote_sql_ident "${table_name}")"
+        rebuild_sql="INSERT INTO ${table_ident}(${table_ident}) VALUES('rebuild');"
+        if ! "${binary}" "${db_path}" "${rebuild_sql}"; then
+            echo "ERROR: FTS rebuild failed for ${table_name} in ${db_path}" >&2
             return 1
         fi
     done <<< "${fts_rows}"
+
+    return 0
 }
 
 run_foreign_key_check_warn() {
@@ -638,8 +688,8 @@ rebuild_db_vacuum_into() {
         echo "ERROR: source DB failed integrity_check(1): ${source_integrity}; live DB has NOT been touched" >&2
         exit 1
     fi
-    if ! run_fts_integrity_gate "${binary}" "${db_path}" "source"; then
-        echo "ERROR: source FTS integrity gate failed for ${db_path}; live DB has NOT been touched" >&2
+    if ! run_fts_integrity_gate "${binary}" "${db_path}" "source" "warn"; then
+        echo "ERROR: source FTS metadata is unsafe or unclassified for ${db_path}; live DB has NOT been touched" >&2
         exit 1
     fi
     run_foreign_key_check_warn "${binary}" "${db_path}"
@@ -773,12 +823,6 @@ rebuild_db_vacuum_into() {
         cleanup_staged_db "${staged_db}"
         exit 1
     fi
-    if ! run_fts_integrity_gate "${binary}" "${staged_db}" "staged"; then
-        echo "ERROR: staged FTS integrity gate failed for ${staged_db}; live DB has NOT been touched" >&2
-        cleanup_staged_db "${staged_db}"
-        exit 1
-    fi
-
     # WHY: The exhaustive source-vs-staged row-count sweep is intentional
     # defense-in-depth before publishing the rebuilt DB.
     table_query="SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name;"
@@ -807,6 +851,17 @@ rebuild_db_vacuum_into() {
             exit 1
         fi
     done <<< "${table_list}"
+
+    if ! run_fts_rebuild_hard "${binary}" "${staged_db}"; then
+        echo "ERROR: staged FTS rebuild failed for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+    if ! run_fts_integrity_gate "${binary}" "${staged_db}" "staged"; then
+        echo "ERROR: staged FTS integrity gate failed for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
 
     if [ -n "${pre_swap_hook}" ]; then
         if ! "${pre_swap_hook}" "${binary}" "${staged_db}" "${STATS_BANDWIDTH_RETAIN_DAYS}"; then
@@ -858,10 +913,10 @@ optimize_plex_db() {
 # mkdir -p ${HOME}/plex-sql/
 # rm -vrf ${HOME}/plex-sql/lib/
 # docker cp plex:"/usr/lib/plexmediaserver/lib/" ${HOME}/plex-sql/lib/
-# WHY: If lib/ came from a modded container, restore Plex's bundled SQLite
-# library beside Plex SQLite so its source-id guard matches; the deployed
-# runtime libsqlite3.so in the container remains untouched.
-# cp "${HOME}/plex-sql/lib/libsqlite3.so.bundled.bak" "${HOME}/plex-sql/lib/libsqlite3.so"
+# # WHY: If lib/ came from a modded container, restore Plex's bundled SQLite
+# # library beside Plex SQLite so its source-id guard matches; the deployed
+# # runtime libsqlite3.so in the container remains untouched.
+# cp -vf "${HOME}/plex-sql/lib/libsqlite3.so.bundled.bak" "${HOME}/plex-sql/lib/libsqlite3.so"
 # docker cp plex:"/usr/lib/plexmediaserver/Plex SQLite" ${HOME}/plex-sql/
 # docker cp plex:"/usr/lib/plexmediaserver/Plex Media Server" ${HOME}/plex-sql/
 
@@ -883,6 +938,8 @@ fi
 
 for PLEX_INSTANCE in "${PLEX_INSTANCES[@]}"
 do
+    # docker stop ${PLEX_INSTANCE}
+
     # WHY: Capturing Docker output outside a pipeline preserves query failure
     # as a hard planned-downtime gate.
     if ! running=$(docker ps --filter "name=^${PLEX_INSTANCE}$" --filter "status=running" --format '{{.Names}}'); then
@@ -901,8 +958,6 @@ do
         echo "Skipped Missing Plex Instance: ${PLEX_INSTANCE}"
         continue
     fi
-
-    # docker stop ${PLEX_INSTANCE}
 
     echo "Cleaning Up Plex Cache: ${PLEX_PATH}"
     rm -rf "${PLEX_PATH}/Cache/PhotoTranscoder/"*
@@ -940,6 +995,8 @@ fi
 
 for EMBY_INSTANCE in "${EMBY_INSTANCES[@]}"
 do
+    # docker stop ${EMBY_INSTANCE}
+
     if ! running=$(docker ps --filter "name=^${EMBY_INSTANCE}$" --filter "status=running" --format '{{.Names}}'); then
         echo "ERROR: cannot verify ${EMBY_INSTANCE} is stopped (docker query failed)" >&2
         exit 1
@@ -954,8 +1011,6 @@ do
         echo "Skipped Missing Emby Instance: ${EMBY_INSTANCE}"
         continue
     fi
-
-    # docker stop ${EMBY_INSTANCE}
 
     echo "Optimizing Emby Database: ${EMBY_PATH}/${EMBY_DB}"
     if [ -d "${BACKUP_PATH}" ]; then

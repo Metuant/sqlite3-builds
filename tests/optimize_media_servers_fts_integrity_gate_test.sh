@@ -48,6 +48,14 @@ real_sqlite="$(command -v sqlite3 || true)"
 mkdir -p "$tmp/bin"
 cat > "$tmp/bin/sqlite3" <<'EOF_SQLITE'
 #!/usr/bin/env bash
+if [ "${FAIL_REBUILD:-0}" = "1" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      *"VALUES('rebuild')"*) exit 1 ;;
+    esac
+  done
+fi
+
 for arg in "$@"; do
   case "$arg" in
     *"VACUUM INTO "*)
@@ -126,24 +134,67 @@ set -e
 assert_eq 1 "$rc" "source FTS integrity gate rc on mismatched external content"
 assert_contains "$(cat "$tmp/source-gate.err")" "ERROR: source FTS integrity-check failed" "source FTS integrity diagnostic"
 
+set +e
+run_fts_integrity_gate sqlite3 "$corrupt_source" "source" "warn" >"$tmp/source-gate-warn.out" 2>"$tmp/source-gate-warn.err"
+rc=$?
+set -e
+assert_eq 0 "$rc" "source FTS warn gate rc on mismatched external content"
+source_warn_err="$(cat "$tmp/source-gate-warn.err")"
+assert_contains "$source_warn_err" "WARNING:" "source FTS warn diagnostic level"
+assert_contains "$source_warn_err" "continuing" "source FTS warn diagnostic continuation"
+
+rebuild_unit="$tmp/rebuild-unit.db"
+create_external_fts_db "$rebuild_unit"
+"$real_sqlite" "$rebuild_unit" "UPDATE docs SET body='rebuild-unit-mismatch' WHERE id=1;"
+set +e
+run_fts_rebuild_hard sqlite3 "$rebuild_unit" >"$tmp/rebuild-unit.out" 2>"$tmp/rebuild-unit.err"
+rc=$?
+set -e
+assert_eq 0 "$rc" "FTS rebuild hard rc on mismatched external content"
+
+rebuild_fail_unit="$tmp/rebuild-fail-unit.db"
+create_external_fts_db "$rebuild_fail_unit"
+"$real_sqlite" "$rebuild_fail_unit" "UPDATE docs SET body='rebuild-fail-mismatch' WHERE id=1;"
+export FAIL_REBUILD=1
+set +e
+run_fts_rebuild_hard sqlite3 "$rebuild_fail_unit" >"$tmp/rebuild-fail-unit.out" 2>"$tmp/rebuild-fail-unit.err"
+rc=$?
+set -e
+unset FAIL_REBUILD
+assert_eq 1 "$rc" "FTS rebuild hard rc when rebuild SQL fails"
+assert_contains "$(cat "$tmp/rebuild-fail-unit.err")" "FTS rebuild failed" "FTS rebuild hard failure diagnostic"
+
 backup_dir="$tmp/source-backup"
 mkdir -p "$backup_dir"
-run_rebuild_capture source-abort sqlite3 "$corrupt_source" "$backup_dir" 4096 NONE "" "" ""
-assert_eq 1 "$(cat "$tmp/source-abort.rc")" "source FTS pipeline abort rc"
-assert_eq "$source_hash_before" "$(sha256_file "$corrupt_source")" "source FTS abort live hash"
-[ ! -e "$corrupt_source.new" ] || fail "source FTS abort staged cleanup" "no staged file" "$corrupt_source.new exists"
-assert_contains "$(cat "$tmp/source-abort.err")" "source FTS integrity gate failed" "source FTS pipeline diagnostic"
+run_rebuild_capture source-repair sqlite3 "$corrupt_source" "$backup_dir" 4096 NONE "" "" ""
+assert_eq 0 "$(cat "$tmp/source-repair.rc")" "source FTS repair pipeline rc"
+source_backup_count="$(find "$backup_dir" -name 'corrupt-source.db-*.original' -print | wc -l | tr -d ' ')"
+assert_eq "1" "$source_backup_count" "source FTS repair backup count"
+[ ! -e "$corrupt_source.new" ] || fail "source FTS repair staged cleanup" "no staged file" "$corrupt_source.new exists"
+source_hash_after="$(sha256_file "$corrupt_source")"
+[ "$source_hash_after" != "$source_hash_before" ] || fail "source FTS repair live hash" "changed hash" "$source_hash_after"
 
 staged_source="$tmp/staged-source.db"
 create_external_fts_db "$staged_source"
 staged_hash_before="$(sha256_file "$staged_source")"
 export CORRUPT_STAGED_AFTER_VACUUM=1
 export CORRUPT_STAGED_DB="$staged_source.new"
-run_rebuild_capture staged-abort sqlite3 "$staged_source" "$tmp" 4096 NONE "" "" ""
+run_rebuild_capture staged-repair sqlite3 "$staged_source" "$tmp" 4096 NONE "" "" ""
 unset CORRUPT_STAGED_AFTER_VACUUM CORRUPT_STAGED_DB
-assert_eq 1 "$(cat "$tmp/staged-abort.rc")" "staged FTS pipeline abort rc"
-assert_eq "$staged_hash_before" "$(sha256_file "$staged_source")" "staged FTS abort live hash"
-[ ! -e "$staged_source.new" ] || fail "staged FTS abort staged cleanup" "no staged file" "$staged_source.new exists"
-assert_contains "$(cat "$tmp/staged-abort.err")" "staged FTS integrity gate failed" "staged FTS pipeline diagnostic"
+assert_eq 0 "$(cat "$tmp/staged-repair.rc")" "staged FTS repair pipeline rc"
+[ ! -e "$staged_source.new" ] || fail "staged FTS repair staged cleanup" "no staged file" "$staged_source.new exists"
+staged_hash_after="$(sha256_file "$staged_source")"
+[ "$staged_hash_after" != "$staged_hash_before" ] || fail "staged FTS repair live hash" "changed hash" "$staged_hash_after"
+
+rebuild_fail_source="$tmp/rebuild-fail-source.db"
+create_external_fts_db "$rebuild_fail_source"
+rebuild_fail_hash_before="$(sha256_file "$rebuild_fail_source")"
+export FAIL_REBUILD=1
+run_rebuild_capture staged-rebuild-fail sqlite3 "$rebuild_fail_source" "$tmp" 4096 NONE "" "" ""
+unset FAIL_REBUILD
+assert_eq 1 "$(cat "$tmp/staged-rebuild-fail.rc")" "staged FTS rebuild failure pipeline rc"
+assert_eq "$rebuild_fail_hash_before" "$(sha256_file "$rebuild_fail_source")" "staged FTS rebuild failure live hash"
+[ ! -e "$rebuild_fail_source.new" ] || fail "staged FTS rebuild failure staged cleanup" "no staged file" "$rebuild_fail_source.new exists"
+assert_contains "$(cat "$tmp/staged-rebuild-fail.err")" "staged FTS rebuild failed" "staged FTS rebuild failure diagnostic"
 
 printf 'optimize_media_servers FTS integrity gate tests passed\n'

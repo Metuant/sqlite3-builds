@@ -71,6 +71,14 @@ case "$sql_text" in
     ;;
 esac
 
+if [ "${FAIL_REBUILD:-0}" = "1" ]; then
+  for arg in "$@"; do
+    case "$arg" in
+      *"VALUES('rebuild')"*) exit 1 ;;
+    esac
+  done
+fi
+
 for arg in "$@"; do
   case "$arg" in
     *"VACUUM INTO "*)
@@ -194,10 +202,12 @@ create_external_fts_db "$source_corrupt"
 "$real_sqlite" "$source_corrupt" "UPDATE docs SET body='source-mismatch' WHERE id=1;"
 source_hash_before="$(sha256_file "$source_corrupt")"
 run_rebuild_capture source-corrupt sqlite3 "$source_corrupt" 4096 NONE "" "" ""
-assert_eq 1 "$(cat "$tmp/source-corrupt.rc")" "source FTS corruption pipeline rc"
-assert_contains "$(cat "$tmp/source-corrupt.err")" "source FTS integrity gate failed" "source FTS corruption diagnostic"
-assert_eq "$source_hash_before" "$(sha256_file "$source_corrupt")" "source FTS corruption live hash"
+assert_eq 0 "$(cat "$tmp/source-corrupt.rc")" "source FTS corruption pipeline rc"
+source_corrupt_backup_count="$(find "$backup_dir" -name 'source-corrupt.db-*.original' -print | wc -l | tr -d ' ')"
+assert_eq "1" "$source_corrupt_backup_count" "source FTS corruption backup count"
 [ ! -e "$source_corrupt.new" ] || fail "source FTS corruption staged cleanup" "no staged file" "$source_corrupt.new exists"
+source_hash_after="$(sha256_file "$source_corrupt")"
+[ "$source_hash_after" != "$source_hash_before" ] || fail "source FTS corruption live hash" "changed hash" "$source_hash_after"
 
 staged_corrupt="$tmp/staged-corrupt.db"
 create_external_fts_db "$staged_corrupt"
@@ -206,10 +216,21 @@ export CORRUPT_STAGED_AFTER_VACUUM=1
 export CORRUPT_STAGED_DB="$staged_corrupt.new"
 run_rebuild_capture staged-corrupt sqlite3 "$staged_corrupt" 4096 NONE "" "" ""
 unset CORRUPT_STAGED_AFTER_VACUUM CORRUPT_STAGED_DB
-assert_eq 1 "$(cat "$tmp/staged-corrupt.rc")" "staged FTS corruption pipeline rc"
-assert_contains "$(cat "$tmp/staged-corrupt.err")" "staged FTS integrity gate failed" "staged FTS corruption diagnostic"
-assert_eq "$staged_hash_before" "$(sha256_file "$staged_corrupt")" "staged FTS corruption live hash"
+assert_eq 0 "$(cat "$tmp/staged-corrupt.rc")" "staged FTS corruption pipeline rc"
 [ ! -e "$staged_corrupt.new" ] || fail "staged FTS corruption staged cleanup" "no staged file" "$staged_corrupt.new exists"
+staged_hash_after="$(sha256_file "$staged_corrupt")"
+[ "$staged_hash_after" != "$staged_hash_before" ] || fail "staged FTS corruption live hash" "changed hash" "$staged_hash_after"
+
+staged_rebuild_fail="$tmp/staged-rebuild-fail.db"
+create_external_fts_db "$staged_rebuild_fail"
+staged_rebuild_fail_hash_before="$(sha256_file "$staged_rebuild_fail")"
+export FAIL_REBUILD=1
+run_rebuild_capture staged-rebuild-fail sqlite3 "$staged_rebuild_fail" 4096 NONE "" "" ""
+unset FAIL_REBUILD
+assert_eq 1 "$(cat "$tmp/staged-rebuild-fail.rc")" "staged FTS rebuild failure pipeline rc"
+assert_eq "$staged_rebuild_fail_hash_before" "$(sha256_file "$staged_rebuild_fail")" "staged FTS rebuild failure live hash"
+[ ! -e "$staged_rebuild_fail.new" ] || fail "staged FTS rebuild failure staged cleanup" "no staged file" "$staged_rebuild_fail.new exists"
+assert_contains "$(cat "$tmp/staged-rebuild-fail.err")" "staged FTS rebuild failed" "staged FTS rebuild failure diagnostic"
 
 fk_db="$tmp/fk-warning.db"
 create_fk_orphan_db "$fk_db"
