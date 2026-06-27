@@ -128,6 +128,8 @@ else
   [[ -n "${amalg_dir}" ]] || fatal "sqlite amalgamation directory not found after unzip"
 
   cp "${repo_root}/src/auto_extension.c" "${tmpdir}/auto_extension.c"
+  cp "${repo_root}/src/runtime_optimize.c" "${tmpdir}/runtime_optimize.c"
+  cp "${repo_root}/src/auto_extension_internal.h" "${tmpdir}/auto_extension_internal.h"
   cp "${repo_root}/src/observability.c" "${tmpdir}/observability.c"
   (
     cd "${amalg_dir}"
@@ -164,6 +166,7 @@ else
     -DSQLITE_USE_URI=1 \
     "${amalg_dir}/sqlite3.c" \
     "${tmpdir}/auto_extension.c" \
+    "${tmpdir}/runtime_optimize.c" \
     "${tmpdir}/observability.c" \
     "${repo_root}/src/slow_query_tracker.c" \
     -lpthread -lm ${extra_ldflags} \

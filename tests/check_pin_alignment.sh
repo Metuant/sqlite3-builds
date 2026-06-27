@@ -97,6 +97,17 @@ extract_build_sh_default() {
   printf '%s\n' "$value"
 }
 
+extract_single_int() {
+  file="$1"
+  pattern="$2"
+  label="$3"
+  count="$(grep -Ec -- "$pattern" "$file" || true)"
+  [ "$count" = "1" ] || fail "$label matched $count lines in $file"
+  value="$(grep -E -- "$pattern" "$file" | sed -E "s/$pattern/\\1/")"
+  [ -n "$value" ] || fail "$label missing integer in $file"
+  printf '%s\n' "$value"
+}
+
 assert_wrapper_pin_default() {
   key="$1"
   needle="${key}=\"\${${key}-\$(pin_default ${key})}\""
@@ -179,6 +190,26 @@ top_env_pins="$(awk '
 assert_eq 'build/Build.sh MIMALLOC_VERSION' "$MIMALLOC_VERSION" "$(extract_build_sh_default MIMALLOC_VERSION)"
 assert_eq 'build/Build.sh MIMALLOC_URL' "$MIMALLOC_URL" "$(extract_build_sh_default MIMALLOC_URL)"
 assert_eq 'build/Build.sh MIMALLOC_SHA512' "$MIMALLOC_SHA512" "$(extract_build_sh_default MIMALLOC_SHA512)"
+
+build_sorterref="$(extract_single_int \
+  build/Build.sh \
+  '^[[:space:]]*-DSQLITE_DEFAULT_SORTERREF_SIZE=([0-9]+)([[:space:]]*\\)?$' \
+  'build/Build.sh SQLITE_DEFAULT_SORTERREF_SIZE')"
+build_pmasz="$(extract_single_int \
+  build/Build.sh \
+  '^[[:space:]]*-DSQLITE_SORTER_PMASZ=([0-9]+)([[:space:]]*\\)?$' \
+  'build/Build.sh SQLITE_SORTER_PMASZ')"
+rt_sorterref="$(extract_single_int \
+  src/auto_extension.c \
+  '^[[:space:]]*int[[:space:]]+cfg_rc[[:space:]]*=[[:space:]]*sqlite3_config\(SQLITE_CONFIG_SORTERREF_SIZE,[[:space:]]*([0-9]+)\);$' \
+  'src/auto_extension.c SQLITE_CONFIG_SORTERREF_SIZE')"
+rt_pmasz="$(extract_single_int \
+  src/auto_extension.c \
+  '^[[:space:]]*int[[:space:]]+pmasz_rc[[:space:]]*=[[:space:]]*sqlite3_config\(SQLITE_CONFIG_PMASZ,[[:space:]]*([0-9]+)\);$' \
+  'src/auto_extension.c SQLITE_CONFIG_PMASZ')"
+
+assert_eq 'SORTERREF compile<->runtime alignment' "$build_sorterref" "$rt_sorterref"
+assert_eq 'PMASZ compile<->runtime alignment' "$build_pmasz" "$rt_pmasz"
 
 plex_icu_source_version="$(compat_group_pin icu69 icu_source_version)"
 plex_icu_source_sha512="$(compat_group_pin icu69 icu_source_sha512)"
@@ -320,7 +351,7 @@ dbconfig_count="$(tr -d '[:space:]' < build/expected-sqlite-dbconfig-count.txt)"
 assert_eq 'build/expected-sqlite-config-count.txt' "$SQLITE_EXPECTED_CONFIG_COUNT" "$config_count"
 assert_eq 'build/expected-sqlite-dbconfig-count.txt' "$SQLITE_EXPECTED_DBCONFIG_COUNT" "$dbconfig_count"
 
-printf 'pins aligned: sqlite=%s mimalloc=%s cmake=%s icu_source=%s bases=%s,%s generic_glibc_max=%s counts=%s/%s\n' \
+printf 'pins aligned: sqlite=%s mimalloc=%s cmake=%s icu_source=%s bases=%s,%s generic_glibc_max=%s counts=%s/%s sorterref=%s pmasz=%s\n' \
   "$SQLITE_VERSION_DOTTED" \
   "$MIMALLOC_VERSION" \
   "$CMAKE_VERSION" \
@@ -329,4 +360,6 @@ printf 'pins aligned: sqlite=%s mimalloc=%s cmake=%s icu_source=%s bases=%s,%s g
   "$BASEIMAGE_ALPINE" \
   "$GENERIC_GLIBC_MAX" \
   "$SQLITE_EXPECTED_CONFIG_COUNT" \
-  "$SQLITE_EXPECTED_DBCONFIG_COUNT"
+  "$SQLITE_EXPECTED_DBCONFIG_COUNT" \
+  "$build_sorterref" \
+  "$build_pmasz"

@@ -96,6 +96,35 @@ INSERT INTO fts5_external(rowid, body) VALUES(1, 'alpha');
 EOF_SQL
 }
 
+create_plex_tag_titles_icu_db() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" <<'EOF_SQL'
+CREATE TABLE tags(id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO tags(id, tag) VALUES
+  (1, 'Music'),
+  (2, 'Movies'),
+  (3, 'imdb://tt0133093'),
+  (4, 'tmdb://603'),
+  (5, ''),
+  (6, NULL);
+CREATE VIRTUAL TABLE fts4_tag_titles_icu USING fts4(tag, content='tags');
+INSERT INTO fts4_tag_titles_icu(fts4_tag_titles_icu) VALUES('rebuild');
+EOF_SQL
+}
+
+bad_plex_tag_doc_count() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "SELECT count(*) FROM fts4_tag_titles_icu_docsize d JOIN tags t ON t.id=d.docid WHERE t.tag GLOB '*://*' OR t.tag IS NULL OR trim(t.tag)='';"
+}
+
+name_plex_tag_doc_count() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "SELECT count(*) FROM fts4_tag_titles_icu_docsize d JOIN tags t ON t.id=d.docid WHERE t.tag IN ('Music','Movies');"
+}
+
 run_rebuild_capture() {
   local name binary db backup_dir page_size auto_vacuum sanity post_sql hook
   name="$1"
@@ -185,6 +214,15 @@ assert_eq 0 "$(cat "$tmp/staged-repair.rc")" "staged FTS repair pipeline rc"
 [ ! -e "$staged_source.new" ] || fail "staged FTS repair staged cleanup" "no staged file" "$staged_source.new exists"
 staged_hash_after="$(sha256_file "$staged_source")"
 [ "$staged_hash_after" != "$staged_hash_before" ] || fail "staged FTS repair live hash" "changed hash" "$staged_hash_after"
+
+recurate_source="$tmp/recurate-source.db"
+create_plex_tag_titles_icu_db "$recurate_source"
+assert_eq "4" "$(bad_plex_tag_doc_count "$recurate_source")" "pre-pipeline Plex tag-title bad doc count"
+run_rebuild_capture recurate sqlite3 "$recurate_source" "$tmp" 4096 NONE "" "" ""
+assert_eq 0 "$(cat "$tmp/recurate.rc")" "Plex FTS re-curation pipeline rc"
+[ ! -e "$recurate_source.new" ] || fail "Plex FTS re-curation staged cleanup" "no staged file" "$recurate_source.new exists"
+assert_eq "0" "$(bad_plex_tag_doc_count "$recurate_source")" "Plex FTS re-curation bad doc count"
+assert_eq "2" "$(name_plex_tag_doc_count "$recurate_source")" "Plex FTS re-curation name doc count"
 
 rebuild_fail_source="$tmp/rebuild-fail-source.db"
 create_external_fts_db "$rebuild_fail_source"

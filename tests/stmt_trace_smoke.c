@@ -264,6 +264,12 @@ void sqlite3_log(int iErrCode, const char *zFormat, ...) {
     (void)zFormat;
 }
 
+void runtime_optimize_seed_path(sqlite3 *db, const char *raw_fn) {
+    (void)db;
+    (void)raw_fn;
+    abort();
+}
+
 int main(int argc, char **argv) {
     char *env_default[] = { NULL };
     char *env_stmt_enabled[] = { "SQLITE3_DISABLE_STMT_TRACE=0", NULL };

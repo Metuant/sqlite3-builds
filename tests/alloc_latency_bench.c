@@ -95,14 +95,8 @@ static int run_case(const char *name, int size, int touch, long long *samples) {
 }
 
 int main(void) {
-    const char *enabled = getenv("RUN_BENCH");
     long long *samples;
     int failures = 0;
-
-    if (!enabled || strcmp(enabled, "1") != 0) {
-        printf("SKIP alloc_latency_bench: set RUN_BENCH=1 to run\n");
-        return 0;
-    }
 
     if (sqlite3_initialize() != SQLITE_OK) {
         fprintf(stderr, "FAIL: sqlite3_initialize failed\n");

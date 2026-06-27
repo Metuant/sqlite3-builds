@@ -52,6 +52,28 @@ sha256_file() {
   sha256sum "$1" | awk '{print $1}'
 }
 
+count_log_occurrences() {
+  local needle file
+  needle="$1"
+  file="$2"
+  awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }' "$file"
+}
+
+mediaitems_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT Id FROM MediaItems WHERE ParentId=4600 AND Type=8;" | tr '\r\n' ' '
+}
+
+assert_eqp_uses_emby_index() {
+  local eqp phase
+  eqp="$1"
+  phase="$2"
+  assert_contains "$eqp" "SEARCH" "$phase EQP search"
+  assert_contains "$eqp" "idx_dshadow_mediaitems_parent_type" "$phase EQP index"
+  assert_not_contains "$eqp" "SCAN" "$phase EQP no scan"
+}
+
 real_sqlite="$(command -v sqlite3 || true)"
 [ -n "$real_sqlite" ] || fail "sqlite3 availability" "sqlite3 in PATH" "missing"
 
@@ -71,6 +93,29 @@ case "$sql_text" in
     ;;
 esac
 
+case "$sql_text" in
+  *"PRAGMA integrity_check;"*|*"PRAGMA integrity_check(1);"*)
+    printf '%s\n' "$sql_text" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/[[:space:]]$//' >> "$SQLITE_INTEGRITY_LOG"
+    printf '\n' >> "$SQLITE_INTEGRITY_LOG"
+    ;;
+esac
+
+case "$sql_text" in
+  *"ANALYZE;"*|*"PRAGMA optimize=0x10002;"*)
+    printf '%s\n' "$sql_text" | tr '\n' ' ' | sed 's/[[:space:]][[:space:]]*/ /g; s/[[:space:]]$//' >> "$SQLITE_MAINTENANCE_LOG"
+    printf '\n' >> "$SQLITE_MAINTENANCE_LOG"
+    ;;
+esac
+
+case "$sql_text" in
+  *"PRAGMA wal_checkpoint(TRUNCATE);"*)
+    if [ "${BUSY_WAL_CHECKPOINT:-0}" = "1" ]; then
+      printf '1|0|0\n'
+      exit 0
+    fi
+    ;;
+esac
+
 if [ "${FAIL_REBUILD:-0}" = "1" ]; then
   for arg in "$@"; do
     case "$arg" in
@@ -86,6 +131,9 @@ for arg in "$@"; do
       rc=$?
       if [ "$rc" -eq 0 ] && [ "${CORRUPT_STAGED_AFTER_VACUUM:-0}" = "1" ]; then
         "$REAL_SQLITE" "$CORRUPT_STAGED_DB" "UPDATE docs SET body='stage-mismatch' WHERE id=1;"
+      fi
+      if [ "$rc" -eq 0 ] && [ "${ALTER_STAGED_PRAGMAS_AFTER_VACUUM:-0}" = "1" ]; then
+        "$REAL_SQLITE" "$PRAGMA_MISMATCH_STAGED_DB" "PRAGMA user_version=999; PRAGMA application_id=123456;"
       fi
       exit "$rc"
       ;;
@@ -104,7 +152,11 @@ chmod +x "$tmp/bin/docker"
 PATH="$tmp/bin:$PATH"
 export PATH REAL_SQLITE="$real_sqlite"
 export SQLITE_CALL_LOG="$tmp/sqlite-calls.log"
+export SQLITE_INTEGRITY_LOG="$tmp/sqlite-integrity.log"
+export SQLITE_MAINTENANCE_LOG="$tmp/sqlite-maintenance.log"
 : > "$SQLITE_CALL_LOG"
+: > "$SQLITE_INTEGRITY_LOG"
+: > "$SQLITE_MAINTENANCE_LOG"
 
 backup_dir="$tmp/backups"
 mkdir -p "$backup_dir"
@@ -134,10 +186,37 @@ create_normal_fts_db() {
   local db
   db="$1"
   "$real_sqlite" "$db" <<'EOF_SQL'
+PRAGMA user_version=4101;
+PRAGMA application_id=123456789;
 CREATE TABLE media(id INTEGER PRIMARY KEY, title TEXT);
 INSERT INTO media(id, title) VALUES(1, 'alpha');
 CREATE VIRTUAL TABLE fts_search9 USING fts5(title);
 INSERT INTO fts_search9(rowid, title) VALUES(1, 'alpha');
+EOF_SQL
+}
+
+add_mediaitems_fixture() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" <<'EOF_SQL'
+CREATE TABLE MediaItems(
+  Id INTEGER PRIMARY KEY,
+  ParentId INTEGER NOT NULL,
+  Type INTEGER NOT NULL,
+  Name TEXT
+);
+WITH RECURSIVE seq(x) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT x + 1 FROM seq WHERE x < 5000
+)
+INSERT INTO MediaItems(Id, ParentId, Type, Name)
+SELECT
+  x,
+  CASE WHEN x <= 4500 THEN x % 25 ELSE x END,
+  CASE WHEN x % 20 = 0 THEN 8 ELSE 1 END,
+  'item-' || x
+FROM seq;
 EOF_SQL
 }
 
@@ -167,6 +246,8 @@ create_stats_db() {
   local db
   db="$1"
   "$real_sqlite" "$db" <<'EOF_SQL'
+PRAGMA user_version=4101;
+PRAGMA application_id=123456789;
 CREATE TABLE media(id INTEGER PRIMARY KEY, title TEXT);
 INSERT INTO media(id, title) VALUES(1, 'plex');
 CREATE TABLE statistics_bandwidth(
@@ -188,14 +269,50 @@ VALUES
 EOF_SQL
 }
 
+add_plex_tag_titles_icu_fixture() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" <<'EOF_SQL'
+CREATE TABLE tags(id INTEGER PRIMARY KEY, tag TEXT);
+INSERT INTO tags(id, tag) VALUES
+  (1, 'Music'),
+  (2, 'Movies'),
+  (3, 'imdb://tt0133093'),
+  (4, 'tmdb://603'),
+  (5, ''),
+  (6, NULL);
+CREATE VIRTUAL TABLE fts4_tag_titles_icu USING fts4(tag, content='tags');
+INSERT INTO fts4_tag_titles_icu(fts4_tag_titles_icu) VALUES('rebuild');
+EOF_SQL
+}
+
+bad_plex_tag_doc_count() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "SELECT count(*) FROM fts4_tag_titles_icu_docsize d JOIN tags t ON t.id=d.docid WHERE t.tag GLOB '*://*' OR t.tag IS NULL OR trim(t.tag)='';"
+}
+
+name_plex_tag_doc_count() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "SELECT count(*) FROM fts4_tag_titles_icu_docsize d JOIN tags t ON t.id=d.docid WHERE t.tag IN ('Music','Movies');"
+}
+
 healthy="$tmp/healthy.db"
 create_normal_fts_db "$healthy"
-run_rebuild_capture healthy sqlite3 "$healthy" 4096 NONE "" "REINDEX; PRAGMA analysis_limit=0; PRAGMA optimize=0x10002;" ""
+: > "$SQLITE_INTEGRITY_LOG"
+: > "$SQLITE_MAINTENANCE_LOG"
+run_rebuild_capture healthy sqlite3 "$healthy" 4096 NONE "" "PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;" ""
 assert_eq 0 "$(cat "$tmp/healthy.rc")" "healthy pipeline rc"
 assert_eq "1" "$("$real_sqlite" "$healthy" "SELECT COUNT(*) FROM media WHERE title='alpha';")" "healthy pipeline live row"
+assert_eq "4101" "$("$real_sqlite" "$healthy" "PRAGMA user_version;")" "healthy pipeline user_version"
+assert_eq "123456789" "$("$real_sqlite" "$healthy" "PRAGMA application_id;")" "healthy pipeline application_id"
 healthy_backup_count="$(find "$backup_dir" -name 'healthy.db-*.original' -print | wc -l | tr -d ' ')"
 assert_eq "1" "$healthy_backup_count" "healthy pipeline backup count"
 [ ! -e "$healthy.new" ] || fail "healthy pipeline staged cleanup" "no staged file" "$healthy.new exists"
+assert_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check;" "healthy full integrity_check"
+assert_not_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check(1);" "healthy no bounded integrity_check"
+assert_contains "$(cat "$SQLITE_MAINTENANCE_LOG")" "ANALYZE; PRAGMA optimize=0x10002;" "healthy staged ANALYZE before optimize"
 
 source_corrupt="$tmp/source-corrupt.db"
 create_external_fts_db "$source_corrupt"
@@ -239,6 +356,27 @@ assert_eq 0 "$(cat "$tmp/fk-warning.rc")" "FK warning pipeline rc"
 assert_contains "$(cat "$tmp/fk-warning.err")" "WARNING: foreign_key_check returned rows" "FK warning pipeline diagnostic"
 assert_eq "1" "$("$real_sqlite" "$fk_db" "SELECT COUNT(*) FROM child;")" "FK warning pipeline swapped row"
 
+wal_busy="$tmp/wal-busy.db"
+create_normal_fts_db "$wal_busy"
+export BUSY_WAL_CHECKPOINT=1
+run_rebuild_capture wal-busy sqlite3 "$wal_busy" 4096 NONE "" "PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;" ""
+unset BUSY_WAL_CHECKPOINT
+assert_eq 0 "$(cat "$tmp/wal-busy.rc")" "busy WAL checkpoint pipeline rc"
+assert_contains "$(cat "$tmp/wal-busy.err")" "WARNING: wal_checkpoint(TRUNCATE) reported busy=1" "busy WAL checkpoint warning"
+assert_eq "1" "$("$real_sqlite" "$wal_busy" "SELECT COUNT(*) FROM media WHERE title='alpha';")" "busy WAL checkpoint live row"
+
+pragma_mismatch="$tmp/pragma-mismatch.db"
+create_normal_fts_db "$pragma_mismatch"
+pragma_mismatch_hash_before="$(sha256_file "$pragma_mismatch")"
+export ALTER_STAGED_PRAGMAS_AFTER_VACUUM=1
+export PRAGMA_MISMATCH_STAGED_DB="$pragma_mismatch.new"
+run_rebuild_capture pragma-mismatch sqlite3 "$pragma_mismatch" 4096 NONE "" "PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;" ""
+unset ALTER_STAGED_PRAGMAS_AFTER_VACUUM PRAGMA_MISMATCH_STAGED_DB
+assert_eq 1 "$(cat "$tmp/pragma-mismatch.rc")" "PRAGMA mismatch pipeline rc"
+assert_eq "$pragma_mismatch_hash_before" "$(sha256_file "$pragma_mismatch")" "PRAGMA mismatch live hash"
+[ ! -e "$pragma_mismatch.new" ] || fail "PRAGMA mismatch staged cleanup" "no staged file" "$pragma_mismatch.new exists"
+assert_contains "$(cat "$tmp/pragma-mismatch.err")" "staged user_version mismatch" "PRAGMA mismatch diagnostic"
+
 plex_dir="$tmp/plex-dbs"
 mkdir -p "$plex_dir"
 PLEX_DATABASES_PATH="$plex_dir"
@@ -248,24 +386,48 @@ BACKUP_PATH="$tmp/no-global-backup-root"
 
 plex_main="$plex_dir/$PLEX_DB"
 create_stats_db "$plex_main"
-optimize_plex_db "$PLEX_DB" "" "try_deflate_plex_statistics_bandwidth" >"$tmp/plex-main.out" 2>"$tmp/plex-main.err"
+: > "$SQLITE_CALL_LOG"
+add_plex_tag_titles_icu_fixture "$plex_main"
+set +e
+( optimize_plex_db "$PLEX_DB" "" "try_deflate_plex_statistics_bandwidth" ) >"$tmp/plex-main.out" 2>"$tmp/plex-main.err"
+rc=$?
+set -e
+[ "$rc" = "0" ] || fail "Plex main optimize rc" "0" "rc=$rc stderr=$(cat "$tmp/plex-main.err")"
 assert_contains "$(cat "$tmp/plex-main.out")" "Deflating Plex statistics_bandwidth" "Plex main deflate log"
 assert_eq "2" "$("$real_sqlite" "$plex_main" "SELECT group_concat(id, ',') FROM (SELECT id FROM statistics_bandwidth ORDER BY id);")" "Plex main deflated ids"
+assert_eq "0" "$(bad_plex_tag_doc_count "$plex_main")" "Plex main recurate bad tag docs"
+assert_eq "2" "$(name_plex_tag_doc_count "$plex_main")" "Plex main recurate name docs"
+assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts4_tag_titles_icu"("fts4_tag_titles_icu") VALUES('\''rebuild'\'');' "$SQLITE_CALL_LOG")" "Plex main staged-only FTS rebuild count"
+assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts4_tag_titles_icu"("fts4_tag_titles_icu") VALUES('\''optimize'\'');' "$SQLITE_CALL_LOG")" "Plex main post-swap FTS optimize count"
 
 plex_blob="$plex_dir/$PLEX_BLOB_DB"
 create_stats_db "$plex_blob"
-optimize_plex_db "$PLEX_BLOB_DB" "" "" >"$tmp/plex-blob.out" 2>"$tmp/plex-blob.err"
+set +e
+( optimize_plex_db "$PLEX_BLOB_DB" "" "" ) >"$tmp/plex-blob.out" 2>"$tmp/plex-blob.err"
+rc=$?
+set -e
+[ "$rc" = "0" ] || fail "Plex blob optimize rc" "0" "rc=$rc stderr=$(cat "$tmp/plex-blob.err")"
 assert_not_contains "$(cat "$tmp/plex-blob.out")" "Deflating Plex statistics_bandwidth" "Plex blob no deflate log"
 assert_eq "1,2,3" "$("$real_sqlite" "$plex_blob" "SELECT group_concat(id, ',') FROM (SELECT id FROM statistics_bandwidth ORDER BY id);")" "Plex blob retained stats ids"
 
 emby="$tmp/emby-library.db"
 create_normal_fts_db "$emby"
+add_mediaitems_fixture "$emby"
 : > "$SQLITE_CALL_LOG"
-run_rebuild_capture emby sqlite3 "$emby" 4096 NONE "SELECT 1 FROM media LIMIT 1;" "REINDEX; PRAGMA analysis_limit=0; PRAGMA optimize=0x10002;" ""
+: > "$SQLITE_INTEGRITY_LOG"
+: > "$SQLITE_MAINTENANCE_LOG"
+run_rebuild_capture emby sqlite3 "$emby" 4096 NONE "SELECT 1 FROM media LIMIT 1;" "$(build_emby_optimize_sql)" ""
 assert_eq 0 "$(cat "$tmp/emby.rc")" "Emby fts_search9 pipeline rc"
 emby_log="$(cat "$SQLITE_CALL_LOG")"
 assert_contains "$emby_log" 'INSERT INTO "fts_search9"("fts_search9") VALUES('\''rebuild'\'');' "Emby fts_search9 rebuild"
 assert_contains "$emby_log" 'INSERT INTO "fts_search9"("fts_search9") VALUES('\''optimize'\'');' "Emby fts_search9 optimize"
+assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts_search9"("fts_search9") VALUES('\''rebuild'\'');' "$SQLITE_CALL_LOG")" "Emby staged-only FTS rebuild count"
+assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts_search9"("fts_search9") VALUES('\''optimize'\'');' "$SQLITE_CALL_LOG")" "Emby post-swap FTS optimize count"
+assert_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check;" "Emby full integrity_check"
+assert_not_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check(1);" "Emby no bounded integrity_check"
+assert_contains "$(cat "$SQLITE_MAINTENANCE_LOG")" "ANALYZE; PRAGMA optimize=0x10002;" "Emby staged ANALYZE before optimize"
+assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_mediaitems_parent_type';")" "Emby pipeline index count"
+assert_eqp_uses_emby_index "$(mediaitems_eqp "$emby")" "Emby pipeline"
 
 printf 'SKIP: Docker stopped-container gate cases require a live Docker daemon and are intentionally not run by this local helper smoke test\n'
 printf 'optimize_media_servers pipeline smoke tests passed\n'

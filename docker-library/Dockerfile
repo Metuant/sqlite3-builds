@@ -11,28 +11,46 @@ ARG CMAKE_SHA256_AARCH64
 
 RUN set -euo pipefail; \
     echo "**** Install Dependencies ****"; \
-    apt-get -y update && \
-    apt-get -y upgrade && \
-    apt-get -y install --no-install-recommends \
-        apt-transport-https \
-        ca-certificates \
-        openssl \
-        software-properties-common \
-        file \
-        gpg-agent \
-        wget \
-        unzip && \
-    add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
-    apt-get -y update && \
-    apt-get -y upgrade && \
-    apt-get -y install --no-install-recommends \
-        make \
-        g++-13 \
-        gcc-13 \
-        binutils \
-        patch \
-        zlib1g \
-        zlib1g-dev && \
+    retry() { \
+      local attempt=1 max_attempts=5 backoff=5; \
+      while true; do \
+        if "$@"; then \
+          return 0; \
+        fi; \
+        if [ "${attempt}" -ge "${max_attempts}" ]; then \
+          echo "FATAL: command failed after ${attempt} attempts: $*" >&2; \
+          return 1; \
+        fi; \
+        echo "WARN: command failed (attempt ${attempt}/${max_attempts}), retrying in ${backoff}s: $*" >&2; \
+        sleep "${backoff}"; \
+        attempt=$((attempt + 1)); \
+        backoff=$((backoff * 2)); \
+      done; \
+    }; \
+    { \
+      retry apt-get -y update && \
+      retry apt-get -y upgrade && \
+      retry apt-get -y install --no-install-recommends \
+          apt-transport-https \
+          ca-certificates \
+          openssl \
+          software-properties-common \
+          file \
+          gpg-agent \
+          wget \
+          unzip && \
+      retry add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
+      retry apt-get -y update && \
+      retry apt-get -y upgrade && \
+      retry apt-get -y install --no-install-recommends \
+          make \
+          g++-13 \
+          gcc-13 \
+          binutils \
+          patch \
+          zlib1g \
+          zlib1g-dev; \
+    } || exit 1; \
     arch="$(uname -m)"; \
     case "$arch" in \
       x86_64) cmake_sha256="${CMAKE_SHA256_X86_64}" ;; \
@@ -88,6 +106,8 @@ WORKDIR /app
 
 COPY build/Build.sh /app/Build.sh
 COPY src/auto_extension.c /app/auto_extension.c
+COPY src/runtime_optimize.c /app/runtime_optimize.c
+COPY src/auto_extension_internal.h /app/auto_extension_internal.h
 COPY src/observability.c /app/observability.c
 COPY src/slow_query_tracker.c /app/slow_query_tracker.c
 COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
@@ -165,13 +185,11 @@ ARG SQLITE_AMALG_URL
 ARG SQLITE_AMALG_SHA3_256
 ARG SQLITE_SRC_URL=""
 ARG SQLITE_SRC_SHA3_256=""
-ARG RUN_BENCH=0
 
 ENV SQLITE_AMALG_URL="${SQLITE_AMALG_URL}"
 ENV SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"
 ENV SQLITE_SRC_URL="${SQLITE_SRC_URL}"
 ENV SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}"
-ENV RUN_BENCH="${RUN_BENCH}"
 
 RUN LIBRARY_VARIANT="$LIBRARY_VARIANT" \
     MARCH="$MARCH" \
@@ -267,8 +285,16 @@ RUN set -euo pipefail; \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
     gcc -O2 -o /app/alloc_latency_bench /app/tests/alloc_latency_bench.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
-    if [ "$RUN_BENCH" = "1" ]; then \
-      LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/alloc_latency_bench; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/config_after_dlopen_concurrent_bench || \
+      printf "ADVISORY FAIL config_after_dlopen_concurrent_bench command exited nonzero\n"; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/alloc_latency_bench || \
+      printf "ADVISORY FAIL alloc_latency_bench command exited nonzero\n"; \
+    gcc -O2 -o /app/runtime_optimize_close_bench \
+        /app/tests/runtime_optimize_close_bench.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    if [ "$LIBRARY_VARIANT" = "generic" ]; then \
+      LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/runtime_optimize_close_bench || \
+        printf "ADVISORY FAIL runtime_optimize_close_bench command exited nonzero\n"; \
     fi
 
 RUN set -euo pipefail; \
@@ -280,7 +306,10 @@ RUN set -euo pipefail; \
     fi; \
     gcc -O0 -o /app/auto_extension_smoke /app/tests/auto_extension_smoke.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
-    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/auto_extension_smoke
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/auto_extension_smoke; \
+    gcc -O0 -o /app/runtime_optimize_smoke /app/tests/runtime_optimize_smoke.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/runtime_optimize_smoke
 
 RUN set -euo pipefail; \
     LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)"); \
@@ -306,4 +335,8 @@ RUN set -euo pipefail; \
     gcc -O2 -o /app/slow_query_select1_bench /app/tests/slow_query_select1_bench.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
     gcc -O2 -o /app/slow_query_metadata_bench /app/tests/slow_query_metadata_bench.c \
-        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_select1_bench || \
+      printf "ADVISORY FAIL slow_query_select1_bench command exited nonzero\n"; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_metadata_bench || \
+      printf "ADVISORY FAIL slow_query_metadata_bench command exited nonzero\n"

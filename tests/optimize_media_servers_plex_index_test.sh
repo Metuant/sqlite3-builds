@@ -1,0 +1,199 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+. ./tests/optimize_media_servers_index_test_lib.sh
+index_test_init "plex-index"
+
+PLEX_TAGGINGS_INDEX="idx_dshadow_taggings_tag_id_metadata_item_id"
+PLEX_SETTINGS_INDEX="idx_dshadow_mis_account_updated_guid_cover"
+PLEX_INDEX_NAMES=(
+  "$PLEX_TAGGINGS_INDEX"
+  "$PLEX_SETTINGS_INDEX"
+)
+
+create_plex_index_db() {
+  local db page_size
+  db="$1"
+  page_size="${2:-4096}"
+
+  "$real_sqlite" "$db" <<EOF_SQL
+PRAGMA page_size=${page_size};
+VACUUM;
+PRAGMA user_version=4101;
+PRAGMA application_id=123456789;
+CREATE TABLE versioned_metadata_items(id INTEGER PRIMARY KEY);
+INSERT INTO versioned_metadata_items(id) VALUES(1);
+CREATE TABLE taggings(
+  id INTEGER PRIMARY KEY,
+  tag_id INTEGER NOT NULL,
+  metadata_item_id INTEGER NOT NULL
+);
+CREATE INDEX index_taggings_on_tag_id ON taggings(tag_id);
+CREATE INDEX index_taggings_on_metadata_item_id ON taggings(metadata_item_id);
+WITH RECURSIVE seq(x) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT x + 1 FROM seq WHERE x < 5000
+)
+INSERT INTO taggings(id, tag_id, metadata_item_id)
+SELECT x, x % 25, x FROM seq;
+CREATE TABLE metadata_item_settings(
+  id INTEGER PRIMARY KEY,
+  account_id INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL,
+  guid TEXT NOT NULL,
+  view_offset INTEGER NOT NULL,
+  last_viewed_at INTEGER NOT NULL
+);
+CREATE INDEX index_metadata_item_settings_on_account_id ON metadata_item_settings(account_id);
+WITH RECURSIVE seq(x) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT x + 1 FROM seq WHERE x < 5000
+)
+INSERT INTO metadata_item_settings(id, account_id, updated_at, guid, view_offset, last_viewed_at)
+SELECT
+  x,
+  CASE WHEN x <= 4500 THEN 42 ELSE x END,
+  2000000 - x,
+  'plex://fixture/' || x,
+  x * 100,
+  1000000 + x
+FROM seq;
+CREATE TABLE metadata_items(
+  id INTEGER PRIMARY KEY,
+  added_at INTEGER,
+  originally_available_at INTEGER
+);
+INSERT INTO metadata_items(id, added_at, originally_available_at)
+VALUES
+  (1, 9999999999, 1000000),
+  (2, 1000000, 1),
+  (3, 1000000, 1000000);
+EOF_SQL
+}
+
+index_count() {
+  local db index_name
+  db="$1"
+  index_name="$2"
+  index_test_index_count "$db" "$index_name"
+}
+
+assert_plex_indexes_present() {
+  local db index_name
+  db="$1"
+
+  for index_name in "${PLEX_INDEX_NAMES[@]}"; do
+    assert_eq "1" "$(index_count "$db" "$index_name")" "$index_name count"
+  done
+}
+
+assert_plex_indexes_absent() {
+  local db index_name
+  db="$1"
+
+  for index_name in "${PLEX_INDEX_NAMES[@]}"; do
+    assert_eq "0" "$(index_count "$db" "$index_name")" "$index_name absent count"
+  done
+}
+
+taggings_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT metadata_item_id FROM taggings WHERE tag_id=7 AND metadata_item_id=1007;" | tr '\r\n' ' '
+}
+
+settings_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT guid, view_offset, last_viewed_at FROM metadata_item_settings WHERE account_id=42 AND view_offset > 0 AND last_viewed_at > 100000 ORDER BY updated_at DESC LIMIT 5;" | tr '\r\n' ' '
+}
+
+assert_eqp_uses_taggings_index() {
+  local eqp phase
+  eqp="$1"
+  phase="$2"
+  assert_contains "$eqp" "SEARCH" "$phase taggings EQP search"
+  assert_contains "$eqp" "$PLEX_TAGGINGS_INDEX" "$phase taggings EQP index"
+  assert_contains "$eqp" "COVERING" "$phase taggings EQP covering"
+  assert_not_contains "$eqp" "SCAN" "$phase taggings EQP no scan"
+}
+
+assert_eqp_uses_settings_index() {
+  local eqp phase
+  eqp="$1"
+  phase="$2"
+  assert_contains "$eqp" "SEARCH" "$phase settings EQP search"
+  assert_contains "$eqp" "$PLEX_SETTINGS_INDEX" "$phase settings EQP index"
+  assert_contains "$eqp" "COVERING" "$phase settings EQP covering"
+  assert_not_contains "$eqp" "USE TEMP B-TREE" "$phase settings EQP no sort"
+}
+
+plex_dir="$tmp/plex-dbs"
+mkdir -p "$plex_dir"
+published="$plex_dir/$PLEX_DB"
+create_plex_index_db "$published"
+index_test_run_plex_optimize_capture published-first "$plex_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+assert_eq 0 "$(cat "$tmp/published-first.rc")" "first Plex index pipeline rc"
+assert_plex_indexes_present "$published"
+stat1_plex_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('taggings','metadata_item_settings') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX');")"
+assert_int_gt "$stat1_plex_count" 0 "published sqlite_stat1 Plex index row count"
+stat4_exists="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_stat4';")"
+if [ "$stat4_exists" = "1" ]; then
+  stat4_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat4 WHERE tbl IN ('taggings','metadata_item_settings') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX');")"
+  printf 'sqlite_stat4 Plex index rows: %s\n' "$stat4_count"
+else
+  printf 'SKIP: sqlite_stat4 unavailable in this sqlite3 build\n'
+fi
+assert_eqp_uses_taggings_index "$(taggings_eqp "$published")" "published post-ANALYZE"
+assert_eqp_uses_settings_index "$(settings_eqp "$published")" "published post-ANALYZE"
+
+index_test_run_plex_optimize_capture published-second "$plex_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+assert_eq 0 "$(cat "$tmp/published-second.rc")" "second Plex index pipeline rc"
+assert_eq "" "$(cat "$tmp/published-second.err")" "second Plex index pipeline stderr"
+assert_plex_indexes_present "$published"
+
+warn_dir="$tmp/plex-warn"
+mkdir -p "$warn_dir"
+warn_db="$warn_dir/$PLEX_DB"
+create_plex_index_db "$warn_db" 1024
+assert_eq "1024" "$("$real_sqlite" "$warn_db" "PRAGMA page_size;")" "warn-not-abort source page_size"
+export INDEX_TEST_FAIL_SQL=1
+export INDEX_TEST_FAIL_NEEDLE="$PLEX_TAGGINGS_INDEX"
+index_test_run_plex_optimize_capture warn-not-abort "$warn_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+unset INDEX_TEST_FAIL_SQL INDEX_TEST_FAIL_NEEDLE
+assert_eq 0 "$(cat "$tmp/warn-not-abort.rc")" "warn-not-abort rc"
+assert_contains "$(cat "$tmp/warn-not-abort.err")" "WARNING: staged maintenance SQL failed" "warn-not-abort warning"
+assert_eq "16384" "$("$real_sqlite" "$warn_db" "PRAGMA page_size;")" "warn-not-abort published page_size"
+assert_plex_indexes_absent "$warn_db"
+
+gate_dir="$tmp/plex-gate"
+mkdir -p "$gate_dir"
+gate_db="$gate_dir/$PLEX_DB"
+create_plex_index_db "$gate_db"
+gate_hash_before="$(sha256_file "$gate_db")"
+export INDEX_TEST_CORRUPT_STAGED_ON_INTEGRITY=1
+export INDEX_TEST_CORRUPT_STAGED_DB="$gate_db.new"
+index_test_run_plex_optimize_capture staged-gate "$gate_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+unset INDEX_TEST_CORRUPT_STAGED_ON_INTEGRITY INDEX_TEST_CORRUPT_STAGED_DB
+assert_eq 1 "$(cat "$tmp/staged-gate.rc")" "staged integrity gate rc"
+assert_eq "$gate_hash_before" "$(sha256_file "$gate_db")" "staged integrity gate live hash"
+[ ! -e "$gate_db.new" ] || fail "staged integrity gate cleanup" "no staged file" "$gate_db.new exists"
+assert_contains "$(cat "$tmp/staged-gate.err")" "integrity check failed" "staged integrity gate diagnostic"
+
+eqp_db="$tmp/plex-eqp.db"
+create_plex_index_db "$eqp_db"
+for ddl in "${PLEX_INDEXES[@]}"; do
+  "$real_sqlite" "$eqp_db" "$ddl"
+done
+assert_eqp_uses_taggings_index "$(taggings_eqp "$eqp_db")" "pre-ANALYZE"
+assert_eqp_uses_settings_index "$(settings_eqp "$eqp_db")" "pre-ANALYZE"
+"$real_sqlite" "$eqp_db" "ANALYZE;"
+assert_eqp_uses_taggings_index "$(taggings_eqp "$eqp_db")" "post-ANALYZE"
+assert_eqp_uses_settings_index "$(settings_eqp "$eqp_db")" "post-ANALYZE"
+assert_eq "1" "$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM taggings INDEXED BY $PLEX_TAGGINGS_INDEX WHERE tag_id=7 AND metadata_item_id=1007;")" "taggings INDEXED BY usability probe"
+settings_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM metadata_item_settings INDEXED BY $PLEX_SETTINGS_INDEX WHERE account_id=42 AND view_offset > 0 AND last_viewed_at > 100000;")"
+assert_int_gt "$settings_indexed_count" 0 "settings INDEXED BY usability probe"
+
+printf 'optimize_media_servers Plex index tests passed\n'

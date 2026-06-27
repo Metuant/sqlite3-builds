@@ -32,7 +32,7 @@ case "${target}" in
     ;;
   library)
     target_cflags="-DSQLITE_ENABLE_NORMALIZE -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS -DSQLITE_ENABLE_UNLOCK_NOTIFY -DSQLITE_DEFAULT_PCACHE_INITSZ=256 -DSQLITE_DEFAULT_MEMSTATUS=0"
-    sources="sqlite3.c /app/auto_extension.c /app/observability.c /app/slow_query_tracker.c"
+    sources="sqlite3.c /app/auto_extension.c /app/runtime_optimize.c /app/observability.c /app/slow_query_tracker.c"
     target_ldflags="-fPIC -shared -Wl,-z,defs -Wl,--version-script=/app/build/libsqlite3-version-script.ld -lm -ldl -pthread"
     output="dist/libsqlite3.so"
     MIMALLOC_OBJ="${MIMALLOC_OBJ:-/opt/mimalloc/lib/mimalloc.o}"
@@ -134,7 +134,26 @@ if [ "${target}" = "library" ]; then
     exit 1
   fi
 
-  patch -p1 < /app/build/sqlite-amalgamation.patch
+  patch --fuzz=0 -p1 < /app/build/sqlite-amalgamation.patch
+  for runtime_hook_wrapper in sqlite3_step sqlite3_reset sqlite3_finalize; do
+    if ! awk -v wrapper="${runtime_hook_wrapper}" '
+      BEGIN { in_fn = 0; depth = 0; found = 0 }
+      $0 ~ "^SQLITE_API int " wrapper "\\(sqlite3_stmt \\*pStmt\\)\\{" { in_fn = 1 }
+      in_fn {
+        line = $0
+        opens = gsub(/\{/, "{", line)
+        line = $0
+        closes = gsub(/\}/, "}", line)
+        depth += opens - closes
+        if ($0 ~ /auto_extension_optimize_after_stmt/) found = 1
+        if (depth == 0 && $0 ~ /\}/) exit found ? 0 : 1
+      }
+      END { if (!in_fn || depth != 0) exit 1 }
+    ' sqlite3.c; then
+      printf "FATAL: auto_extension_optimize_after_stmt missing from patched %s wrapper\n" "${runtime_hook_wrapper}" >&2
+      exit 1
+    fi
+  done
 fi
 
 printf "\n\n===== Compiling... Please wait... ==============================================\n\n"
@@ -205,6 +224,7 @@ if ! ${CC:-gcc} \
   -DSQLITE_MAX_VARIABLE_NUMBER=250000 \
   -DSQLITE_MAX_WORKER_THREADS=8 \
   -DSQLITE_OMIT_SHARED_CACHE \
+  -DSQLITE_DEFAULT_SORTERREF_SIZE=512 \
   -DSQLITE_SORTER_PMASZ=8192 \
   -DSQLITE_STMTJRNL_SPILL=-1 \
   -DSQLITE_TEMP_STORE=3 \
@@ -241,15 +261,23 @@ if [ "${target}" = "library" ]; then
     printf "FATAL: exported sqlite3_*_real symbols in %s:\n%s\n" "${output}" "${exported_real_symbols}" >&2
     exit 1
   fi
-  exported_lazy_helper="$(readelf --dyn-syms -W "${output}" | awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" && $8 == "auto_extension_register_for_open" { print }')"
-  if [ -n "${exported_lazy_helper}" ]; then
-    printf "FATAL: exported auto_extension_register_for_open symbol in %s:\n%s\n" "${output}" "${exported_lazy_helper}" >&2
-    exit 1
-  fi
-  if readelf --dyn-syms -W "${output}" | awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" && $8 == "auto_extension_register_for_open" { found=1 } END { exit found ? 0 : 1 }'; then
-    printf "FATAL: auto_extension_register_for_open present in dynamic symbol table for %s\n" "${output}" >&2
-    exit 1
-  fi
+  for hidden_runtime_symbol in \
+    auto_extension_register_for_open \
+    auto_extension_optimize_before_close \
+    auto_extension_optimize_after_stmt \
+    auto_extension_progress_handler_push \
+    auto_extension_progress_handler_pop \
+    auto_extension_error_state_push \
+    auto_extension_error_state_pop \
+    runtime_optimize_seed_path
+  do
+    leaked_hidden_symbol="$(readelf --dyn-syms -W "${output}" | awk -v sym="${hidden_runtime_symbol}" '$8 == sym { print }')"
+    if [ -n "${leaked_hidden_symbol}" ]; then
+      printf "FATAL: %s present in dynamic symbol table for %s:\n%s\n" \
+        "${hidden_runtime_symbol}" "${output}" "${leaked_hidden_symbol}" >&2
+      exit 1
+    fi
+  done
   leaked_allocator_symbols="$(readelf --dyn-syms -W "${output}" | awk '$5 ~ /^(GLOBAL|WEAK)$/ && $7 != "UND" && ($8 ~ /^(mi_|_mi_|mimalloc)/ || $8 ~ /^(malloc|calloc|realloc|free|aligned_alloc|posix_memalign)$/) { print }')"
   if [ -n "${leaked_allocator_symbols}" ]; then
     printf "FATAL: leaked allocator symbol in %s:\n%s\n" "${output}" "${leaked_allocator_symbols}" >&2

@@ -12,7 +12,8 @@ It produces:
 - A Plex-specific `libsqlite3.so` shared library linked to Plex-style ICU 69.
 - Release archives and SHA-256 manifests for build outputs.
 - LSIO Docker mod images for Plex and Emby SQLite replacement.
-- Host scripts for planned-downtime database maintenance.
+- Host script support for planned-downtime database maintenance and optional
+  post-start Plex database optimize triggering.
 
 The repository is centered on replacing bundled SQLite libraries while keeping
 the application-owned database semantics intact. Runtime tuning lives in the
@@ -29,9 +30,12 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `docker-library/Dockerfile` | Shared-library build image: digest-pinned `ubuntu:18.04` (bionic, glibc 2.27) plus `gcc-13` for the generic variant, and LSIO Alpine/musl for the Plex variant. |
 | `docs/extending.md` | Cold-start runbook for adding runtime versions, compatibility groups, pool sites, and releases. |
 | `docs/baked-pins-schema.md` | Current schema v3 `baked-pins.txt` contract, validator reject list, and runtime keying rules. |
-| `src/auto_extension.c` | Built into both library variants; registers per-connection PRAGMA tuning. |
+| `src/auto_extension.c` | Built into both library variants; owns open-time auto-extension registration, trace-mask setup, target filtering, and the TLS seam into runtime optimize. |
+| `src/runtime_optimize.c` | Built into both library variants; owns runtime optimize state, cadence, eligibility, and hook helpers. |
+| `src/auto_extension_internal.h` | Shared internal seam header between `src/auto_extension.c` and `src/runtime_optimize.c`. |
 | `src/slow_query_tracker.c` | Hidden observability satellite for PROFILE-based slow-query logging and bounded per-template stats. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
+| `tests/runtime_optimize_smoke.c` | Runtime smoke for close and inline `PRAGMA optimize` target gating, STAT1/STAT4 tiers, kill switches, skip gates, cadence, close semantics, and shutdown/reinit. |
 | `tests/slow_query_smoke.c` | Runtime smoke for the slow-query tracker threshold parser, kill switches, LRU bound, truncation, and stats dump. |
 | `tests/stmt_trace_smoke.c` | Runtime smoke for the STMT trace env contract and trace mask registration against the shared STMT/PROFILE callback. |
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
@@ -41,14 +45,15 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/cont_init_fragments_test.sh` | Static and unit checks for LSIO mod runtime fragments, phase-script shebangs, no custom env-var surface, and Plex ICU read-only posture. |
 | `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for minimal release assets and split `mod-build` / `mod-publish` jobs. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `build/expected-sqlite-*-count.txt`. |
-| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, and checks group-owned ICU source defaults. |
-| `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled in library images and executed only with `RUN_BENCH=1`. |
+| `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, checks group-owned ICU source defaults, and checks SORTERREF/PMASZ compile defaults against constructor runtime config values. |
+| `tests/alloc_latency_bench.c` | Advisory `sqlite3_malloc` / `sqlite3_free` microbench compiled and run in library images without failing the build. |
+| `tests/runtime_optimize_close_bench.c` | Advisory runtime optimize hook microbench for close-adjacent inline exits, compiled and run for the generic library variant on every build without failing the build. |
 | `build/libsqlite3-version-script.ld` | Library-only linker version script: pinned public `sqlite3` API exports from `sqlite3.h` plus project-required extras, then `local: *;`. |
 | `tools/lsio-mod/render-lsio-mod-baked-pins.sh` | Host-runnable renderer for per-mod `baked-pins.txt` runtime SHA data. |
 | `tools/lsio-mod/stage-lsio-mod.sh` | Local and CI staging helper that assembles an ephemeral LSIO mod Docker context under `mktemp -d`. |
 | `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared runtime fragments, and parent README. |
 | `lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh` | Args-only shared Plex pool-patch core staged into the Plex mod. |
-| `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases. |
+| `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases, including container stop/start ownership and optional post-start Plex optimize API triggering. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
 | `.dockerignore` | Tight Docker context allowlist for build, Dockerfile, source, script, and test inputs. |
 
@@ -79,7 +84,7 @@ Two shared-library variants are built from the same source tree.
 
 | Variant | Build selector | Added source or linkage | Runtime purpose |
 |---|---|---|---|
-| `generic` | default `LIBRARY_VARIANT=generic` | Amalgamation plus `src/auto_extension.c` | Emby |
+| `generic` | default `LIBRARY_VARIANT=generic` | Amalgamation plus `src/auto_extension.c` and `src/runtime_optimize.c`, with seam header `src/auto_extension_internal.h` | Emby |
 | `plex` | `LIBRARY_VARIANT=plex` | Generic source plus SQLite `ext/icu/icu.c`, `SQLITE_ENABLE_ICU`, and Plex-style ICU libs | Plex |
 
 The intentional variant delta is ICU support for Plex.
@@ -87,7 +92,8 @@ The intentional variant delta is ICU support for Plex.
 Both library variants also link mimalloc v3.3.2 by link-time interposition;
 the static CLI remains on the platform allocator.
 
-Everything else is shared: the SQLite amalgamation pin, auto-extension source,
+Everything else is shared: the SQLite amalgamation pin, `src/auto_extension.c`,
+`src/runtime_optimize.c`, seam header `src/auto_extension_internal.h`,
 feature families, tuning defaults, high-capacity limits, shared-cache omission,
 and page-cache overflow stat posture.
 
@@ -159,6 +165,14 @@ The generic library build pins Kitware CMake:
 | CMake Linux aarch64 SHA-256 | `83f8fd91d2038a56556e1400390fcfe42f79602940c494f6c6f1cdae7f9e7f40` |
 | Build scope | Generic library Ubuntu base only |
 
+The build-image and generic ABI-floor pins are:
+
+| Input | Current value |
+|---|---|
+| Generic Ubuntu base | `ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98` |
+| LSIO Alpine base | `ghcr.io/linuxserver/baseimage-alpine:3.23` |
+| Generic glibc max | `2.27` |
+
 The library build also pins mimalloc v3.3.2:
 
 | Input | Current value |
@@ -226,9 +240,10 @@ architecture tuning, LTO, and shared compile flags.
 For `cli`, it builds from `shell.c sqlite3.c`, links statically, preserves
 `sqlite3_orig`, strips `sqlite3`, and optionally compresses the stripped binary.
 
-For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c`, links a
-shared object, applies library-only feature defaults, and writes
-`dist/libsqlite3.so`.
+For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c` and
+`/app/runtime_optimize.c`, with `/app/auto_extension_internal.h` as the
+internal seam header, links a shared object, applies library-only feature
+defaults, and writes `dist/libsqlite3.so`.
 
 For `library`, the link line prepends `MIMALLOC_OBJ`
 (`/opt/mimalloc/lib/mimalloc.o`) and `MIMALLOC_LIB`
@@ -255,9 +270,17 @@ renames the six wrapped SQLite API definitions to hidden `*_real` symbols:
 
 SQLite version bumps that change any target definition shape cause `patch` to
 reject hunks and fail the build with patch's native error message. The library
+patch also inserts internal runtime optimize hooks into `sqlite3_step`,
+`sqlite3_reset`, `sqlite3_finalize`, and the immediate-close path. Hook
+movement on SQLite version bumps is therefore a patch rejection. The library
 build then compiles `sqlite3.c`, `/app/auto_extension.c`,
-`/app/observability.c`, and `/app/slow_query_tracker.c`; the CLI target does
-not run this patch and does not include observability.
+`/app/runtime_optimize.c`, `/app/observability.c`, and
+`/app/slow_query_tracker.c`; `/app/auto_extension_internal.h` is the shared
+internal seam header. `/app/auto_extension.c` keeps open-time registration,
+trace-mask setup, target filtering, and the TLS seam, and reaches runtime
+optimize through `runtime_optimize_seed_path`; `/app/runtime_optimize.c` owns
+the runtime optimize logic. The CLI target does not run this patch and does
+not include observability or runtime optimize.
 
 After the library compile, `build/Build.sh` checks every
 `SQLITE_CONFIG_*` and `SQLITE_DBCONFIG_*` define in the pinned `sqlite3.h`
@@ -265,7 +288,7 @@ against the decode tables in `/app/observability.c`. Missing table entries are
 build failures.
 
 Adjacent to the preserved `sqlite3_*_real` and lazy-helper symbol gates,
-post-link checks now fail on leaked `mi_*` or malloc-family exports, require
+post-link checks fail on leaked `mi_*` or malloc-family exports and require
 local mimalloc implementation symbols to be present.
 
 For the Plex variant, it additionally requires `SQLITE_SRC_URL`, verifies the
@@ -287,10 +310,11 @@ glibc 2.27) plus `gcc-13` from `ubuntu-toolchain-r` for the generic variant
 and the LSIO Alpine/musl base for the Plex variant.
 
 It installs the shared-library build toolchain and copies `build/Build.sh`,
-`src/auto_extension.c`, `tests/`, `build/sqlite-amalgamation.patch`,
-`build/expected-sqlite-config-count.txt`, and
-`build/expected-sqlite-dbconfig-count.txt` into `/app`, with the build files
-under `/app/build/`.
+`src/auto_extension.c`, `src/runtime_optimize.c`,
+`src/auto_extension_internal.h`, `tests/`,
+`build/sqlite-amalgamation.patch`, `build/expected-sqlite-config-count.txt`,
+and `build/expected-sqlite-dbconfig-count.txt` into `/app`, with the build
+files under `/app/build/`.
 
 The generic Ubuntu base downloads pinned Kitware CMake 3.31.12 with a
 per-architecture SHA-256 check before the mimalloc CMake stage. The Plex Alpine
@@ -304,15 +328,15 @@ under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
 For the generic variant, it builds the shared library, requires at least one
 `@GLIBC_`-versioned undefined symbol, rejects any observed `@GLIBC_` reference
 above `GENERIC_GLIBC_MAX` (`2.27`), and runs the config-after-dlopen,
-shutdown/reinit, and auto-extension smokes.
+shutdown/reinit, auto-extension, and runtime optimize smokes.
 
 For the Plex variant, it also builds ICU 69.1 under `/opt/icu-69-plex`, exposes
 `PLEX_ICU_INCLUDE` and `PLEX_ICU_LIB`, checks ICU soname and symbol shape with
 `ldd` and `nm`, runs `icu_smoke`, and runs the config-after-dlopen,
-shutdown/reinit, and auto-extension smokes with the Plex ICU path available. The
-Plex branch builds under Alpine/musl so the resulting library does not carry
-glibc-versioned symbols such as `fcntl64`, which Plex's `libgcompat` shim does
-not provide.
+shutdown/reinit, auto-extension, and runtime optimize smokes with the Plex ICU
+path available. The Plex branch builds under Alpine/musl so the resulting
+library does not carry glibc-versioned symbols such as `fcntl64`, which Plex's
+`libgcompat` shim does not provide.
 
 For the Plex variant, the build stage fails if the produced `libsqlite3.so`
 carries `fcntl64` or any other glibc-versioned symbol. This zero-GLIBC gate is
@@ -345,9 +369,9 @@ auto-extension constructor. v4-capable amd64 hosts receive the v3 artifact.
 Each build output is extracted with the pinned Docker-extract action and
 uploaded as a workflow artifact.
 
-The build job no longer emits deploy pre-row fragments. Mod runtime SHA data is
-rendered later by `tools/lsio-mod/render-lsio-mod-baked-pins.sh` from same-run build
-artifacts, same-run runtime baseline extraction, and the Plex pool-patch pins
+Mod runtime SHA data is rendered by
+`tools/lsio-mod/render-lsio-mod-baked-pins.sh` from same-run build artifacts,
+same-run runtime baseline extraction, and the Plex pool-patch pins
 (`pins/plex-pool-patch-sites.tsv` and `pins/plex-pool-patch-reviews.tsv`).
 
 The workflow keeps observability count and ABI obsolete-config checks after
@@ -409,11 +433,13 @@ Plex ICU linkage.
 The CLI target adds interactive diagnostics such as database-stat and bytecode
 virtual tables. The library target keeps those out of application processes.
 
-The library profile also pins `-DSQLITE_SORTER_PMASZ=8192` in `build/Build.sh`,
-up from the repository's prior 1024-page tuning and SQLite's stock 250-page
-default. At the 16 KiB compile-default page size, that yields a 128 MiB PMA cap
-per active sort worker; with `PRAGMA threads=8`, a connection may drive up to
-eight concurrent sort workers at that cap.
+The shared compile flags pin `-DSQLITE_SORTER_PMASZ=8192` and
+`-DSQLITE_DEFAULT_SORTERREF_SIZE=512` in `build/Build.sh`, so both apply to all
+artifacts including the static CLI. At the 16 KiB compile-default page size,
+PMASZ yields a 128 MiB PMA cap per active sort worker; with `PRAGMA threads=8`, a
+connection may drive up to eight concurrent sort workers at that cap. The
+SORTERREF compile default activates the 512 B threshold even on code paths that
+do not run the runtime `sqlite3_config` re-assert.
 
 The library profile pins `-DSQLITE_DEFAULT_AUTOVACUUM=0`.
 `scripts/optimize_media_servers.sh` sets `PRAGMA auto_vacuum=NONE` explicitly
@@ -421,15 +447,23 @@ during planned-downtime database rebuilds, matching the compile default.
 
 ## Per-Connection PRAGMA Injection
 
-`src/auto_extension.c` is compiled into both library variants.
+`src/auto_extension.c` and `src/runtime_optimize.c` are compiled into both
+library variants; `src/auto_extension_internal.h` is the shared internal seam
+header. `src/auto_extension.c` owns open-time registration, trace-mask setup,
+target filtering, and the TLS seam, and reaches runtime optimize through
+`runtime_optimize_seed_path`; `src/runtime_optimize.c` owns runtime optimize
+logic.
 
 The priority-102 constructor first registers `SQLITE_CONFIG_LOG` with
-`sqlite_log_to_observability`, then calls
-`sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 16384)` before effective SQLite
-initialization so `SQLITE_ENABLE_SORTER_REFERENCES` is active. Auto-extension
-registration is lazy: the observability `sqlite3_open`, `sqlite3_open_v2`, and
-`sqlite3_open16` wrappers call `auto_extension_register_for_open()` immediately
-before the hidden real open function. That helper calls
+`sqlite_log_to_observability`. `build/Build.sh` sets
+`-DSQLITE_DEFAULT_SORTERREF_SIZE=512`, so the sorter-reference threshold is
+active for code paths that do not run this constructor. The constructor
+re-asserts `sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 512)` before
+effective SQLite initialization for visibility and drift protection.
+Auto-extension registration is lazy: the observability `sqlite3_open`,
+`sqlite3_open_v2`, and `sqlite3_open16` wrappers call
+`auto_extension_register_for_open()` immediately before the hidden real open
+function. That helper calls
 `sqlite3_auto_extension(autopragma_init)`, which performs the first effective
 `sqlite3_initialize()` when needed; `openDatabase` then reaches
 `sqlite3AutoLoadExtensions(db)` and runs the callback for the new connection.
@@ -503,16 +537,122 @@ JF deployment is unsupported; the filter remains a library behavior, not a
 current deployment promise. PMS issues its own per-connect PRAGMAs after 2-arg
 `sqlite3_open` returns with implicit `SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE`,
 so the injected settings are best-effort for Plex and sticky for Emby
-connections that do not run an app-side PRAGMA pass. Analysis and optimization
-remain in the planned-downtime maintenance lifecycle.
+connections that do not run an app-side PRAGMA pass. Open-time analysis remains
+absent; runtime incremental optimization runs later on eligible close and inline
+safe-idle paths, and planned-downtime maintenance remains the explicit full
+database rebuild lifecycle.
 
 `synchronous` is not set by the callback. The compile profile already gives WAL
 databases the desired synchronous mode, and a connection-level PRAGMA would
 also affect rollback-journal databases.
 
-`optimize` is not set by the callback. Optimization and analysis run in the
-planned-downtime maintenance script, where application-specific collations and
-tokenizers are available and the lifecycle is explicit.
+`optimize` is not set by the open callback. Runtime optimize is gated to later
+safe-idle boundaries so Plex's per-connection ICU/collation/tokenizer
+registration can already be present on the app-owned connection.
+
+## Runtime Optimize
+
+`src/runtime_optimize.c` exports hidden
+`auto_extension_optimize_before_close(sqlite3 *db)` and
+`auto_extension_optimize_after_stmt(sqlite3 *db, sqlite3_stmt *self_stmt)` for
+the library-only amalgamation patch. `src/auto_extension.c` reaches runtime
+optimize through the single hidden `runtime_optimize_seed_path(sqlite3 *db,
+const char *raw_fn)` seam declared in `src/auto_extension_internal.h`, while
+keeping open-time registration, trace-mask setup, target filtering, and the
+TLS seam on its side. The mechanism is internal, variant-agnostic C. Plex adds
+no runtime branch here; `LIBRARY_VARIANT=plex` remains limited to build-time
+ICU linkage.
+
+Runtime optimize runs on safe idle boundaries only:
+
+- Internal immediate-close path, before SQLite converts the handle to zombie.
+- Public `sqlite3_step()` when it returns `SQLITE_DONE`.
+- Public `sqlite3_reset()` when it returns `SQLITE_OK`.
+- Public `sqlite3_finalize()` when it returns `SQLITE_OK`.
+
+The helpers never change public SQLite return codes and swallow optimize
+failures after logging. NULL close, already-busy `sqlite3_close`, and busy
+`sqlite3_close_v2` zombie paths retain native SQLite behavior.
+
+Eligibility gates:
+
+- `SQLITE3_DISABLE_AUTOPRAGMA=1` disables open-time autopragmas and all runtime
+  optimize hooks.
+- `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0` enables close and inline runtime
+  optimize. Unset, literal `1`, and every other value disable runtime optimize.
+- The main database filename must pass `auto_extension_path_is_target`.
+- `sqlite3_db_readonly(db, "main") == 1` skips readonly and immutable opens.
+- `sqlite3_get_autocommit(db) == 0` skips open transactions.
+- Close requires `sqlite3_next_stmt(db, NULL) == NULL`.
+- Inline allows prepared idle cached statements but skips when another
+  statement is busy.
+
+A process-local per-path registry stores separate successful LIMITED and FULL
+cadence stamps plus inflight and failure-backoff state. LIMITED runs at most
+once per target path per `SQLITE3_RUNTIME_OPTIMIZE_LIMITED_SECONDS` successful
+cadence, default `1800`. FULL runs at most once per target path per
+`SQLITE3_RUNTIME_OPTIMIZE_FULL_SECONDS` successful cadence, default `86400`.
+A successful FULL pass also satisfies the LIMITED cadence. Failures set only a
+short backoff and never stamp either cadence, so an early missing-collation
+failure can retry later on a connection that has registered the required
+collation or tokenizer. A due no-op can still spend work at a safe idle
+boundary; SQLite's `PRAGMA optimize` remains the table-staleness gate.
+
+Each enrolled target connection also carries a clientdata next-due cache for
+its own path. Inline hot exits check that per-connection atomic value before
+filename copy, readonly/autocommit checks, and the busy-peer scan, so a due
+different target path does not force unrelated not-due target connections onto
+the slower reserve path. When an enrolled connection is plausibly due but a
+pre-reserve guard blocks it before shared path reservation, the hook pushes only
+that connection's atomic next-due value out by 30 seconds. This re-arms the
+cheap inline hot skip without touching shared per-path success cadence or
+failure backoff state and bounds repeated O(statement-cache) blocked scans and
+skip logs while the connection stays blocked; if per-connection state is
+absent, the block keeps the old behavior and does not create re-arm state.
+
+Execution tiers:
+
+```sql
+-- LIMITED
+PRAGMA main.analysis_limit=1024;
+PRAGMA main.optimize;
+
+-- FULL
+PRAGMA main.analysis_limit=0;
+PRAGMA main.optimize=0x10002;
+```
+
+Both tiers save and restore the prior `analysis_limit` and the caller-visible
+connection error state. Inline optimize also saves and restores the
+application's progress handler and uses it as a deadline guard. The close
+trigger keeps the close-only `sqlite3_busy_timeout(db, 1)` behavior. Runtime
+optimize never runs `ANALYZE` directly, never optimizes attached schemas, and
+never starts a background thread or separate connection. It uses the
+application's own connection, so Plex ICU/collation/tokenizer registrations are
+in scope when they exist.
+
+On the optimize execution path, observability emits `runtime_optimize`
+`event=optimize_start` before the `PRAGMA optimize` call, then
+`event=optimize_done` on success or `event=optimize_failed` on failure. These
+lines are gated by `SQLITE3_DISABLE_OBSERVABILITY=1` through the shared
+observability sink and include `tier`, monotonic `elapsed_ms`, `stat_rows` from
+the `sqlite3_total_changes64()` delta, and `since_last_ms` (`-1` when that tier
+has no prior success). A due pre-reserve block on an enrolled connection emits
+`event=optimize_skipped reason=readonly|open_txn|busy_peer` at the same point it
+re-arms the connection-local next-due value, so repeated inline statements log
+at most once per 30-second re-arm interval. Not-due hot skips emit no optimize
+log.
+
+Worst-case per-connection stall budget at a safe idle boundary is approximately:
+
+- LIMITED: 23 ms.
+- FULL: 4 s.
+
+Observed stable STAT4 behavior: with any nonzero `analysis_limit`, SQLite's
+`analyze.c` suppresses fresh STAT4 sampling. LIMITED therefore updates STAT1
+only. FULL temporarily sets `analysis_limit=0` and uses
+`PRAGMA main.optimize=0x10002`, so it can refresh STAT4 rows inline or at close
+without changing the planned-downtime maintenance path.
 
 ## Observability Layer
 
@@ -658,10 +798,14 @@ Docker build compiles + runs `slow_query_smoke`, `slow_query_atexit_smoke`,
 and concurrency checks, and it compiles + runs `stmt_trace_smoke` against the
 same registration path to enforce the STMT trace env contract. Bench binaries
 (`slow_query_select1_bench`,
+`slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`,
+`alloc_latency_bench`, and `runtime_optimize_close_bench`) compile
+unconditionally. The Dockerfile runs `slow_query_select1_bench`,
 `slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`, and
-`alloc_latency_bench` compile unconditionally; execute only with `RUN_BENCH=1`.
-For Bundle-2's mimalloc Wire-2 acceptance gate, `alloc_latency_bench` remains
-advisory only.
+`alloc_latency_bench` as advisory steps on every library build: nonzero exits
+print an `ADVISORY FAIL` line and continue. The generic library image also runs
+`runtime_optimize_close_bench` as advisory output; it prints p50, p95, p99, max,
+and pass/fail verdicts, then exits 0 so benchmark drift never fails CI.
 
 ## Smoke Tests
 
@@ -687,6 +831,46 @@ It proves:
 The smoke checks `busy_timeout`, `cache_size`, `mmap_size`,
 `wal_autocheckpoint`, `journal_size_limit`, `threads`, and `temp_store` where
 SQLite exposes useful runtime state.
+
+Execution points:
+
+- Generic library Docker build.
+- Plex library Docker build with Plex ICU paths in the loader environment.
+
+### `runtime_optimize_smoke`
+
+`tests/runtime_optimize_smoke.c` links against the just-built library inside the
+library Docker image.
+
+It proves:
+
+- Eligible target close and inline boundaries run bounded runtime optimize.
+- FULL writes STAT1 and STAT4 rows; LIMITED writes STAT1 only.
+- Inline optimize fires from `sqlite3_step` DONE, `sqlite3_reset` OK, and
+  `sqlite3_finalize` OK before connection close.
+- `analysis_limit` and the application progress handler are restored after
+  inline optimize success and failure.
+- Caller-visible connection error state is preserved after a swallowed inline
+  optimize failure.
+- Runtime optimize re-entrancy is blocked.
+- A busy peer cursor suppresses inline optimize for that attempt, emits one
+  throttled `event=optimize_skipped reason=busy_peer`, and re-arms the connection-local
+  hot skip so repeated blocked attempts re-scan no more than once per re-arm interval.
+- Missing ICU collation failures are swallowed, back off briefly, and do not
+  cadence-stamp success.
+- Non-target paths do not run runtime optimize.
+- `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0` enables runtime optimize.
+- Unset `SQLITE3_DISABLE_RUNTIME_OPTIMIZE`, literal `1`, and every other value
+  disable runtime optimize.
+- `SQLITE3_DISABLE_AUTOPRAGMA=1` also disables runtime optimize.
+- Readonly/immutable target opens skip runtime optimize.
+- Non-autocommit target closes skip runtime optimize.
+- `sqlite3_close` with an open statement still returns `SQLITE_BUSY` and skips
+  runtime optimize.
+- `sqlite3_close_v2` with an open statement still enters the native zombie path
+  and skips runtime optimize.
+- The per-path cadence suppresses immediate repeated successful target attempts.
+- Runtime optimize still works after `sqlite3_shutdown()` and a later reopen.
 
 Execution points:
 
@@ -959,6 +1143,37 @@ EMBY_INSTANCES=()
 
 Operators populate those arrays before a maintenance run.
 
+`scripts/optimize_media_servers.sh` owns the container lifecycle for configured
+Plex and Emby instances. Each instance with a present database directory is
+stopped before maintenance, verified stopped with
+`docker ps --filter ... status=running`, started after the maintenance section,
+and verified running with the same Docker-status idiom. Missing instance data
+is skipped before any stop. Stop, maintenance, start, and start-verification
+failures set the final process status nonzero for that instance and the script
+continues to later instances. Once `docker stop` succeeds, the script attempts
+`docker start` on every maintenance failure path before moving on.
+
+`PLEX_OPTIMIZE_API=1` enables an optional post-start Plex API trigger inside
+the per-Plex-instance loop. For each restarted Plex instance, the script
+resolves the container IP with `docker inspect`, waits up to 60 seconds for
+`GET http://<container-ip>:32400/identity` to return HTTP 200, reads
+`PlexOnlineToken` from
+`/opt/<instance>/Library/Application Support/Plex Media Server/Preferences.xml`,
+sends one `PUT http://<container-ip>:32400/library/optimize?async=1` request
+with the token only in the `X-Plex-Token` header, and waits by polling
+`/activities` for `type="general.db.optimize"`.
+
+If `/activities` already reports `type="general.db.optimize"` before submit,
+the trigger reports the instance as already running and does not send the PUT.
+After submit, completion is credited only when that activity is observed and
+then absent on consecutive successful polls. If Plex exposes a stable activity
+`uuid` or `id`, the wait tracks that activity. The PUT is never retried. Failed
+or indeterminate polls continue until the wall-clock five-minute wait cap, with
+each curl request capped to the remaining deadline. Per-instance trigger
+failures warn and continue, and the final process exits nonzero only when
+`PLEX_OPTIMIZE_API=1` was attempted and no Plex instance reached accepted,
+already-running, or completed.
+
 Maintenance defaults and optional subflows:
 
 | Control | Default | How to change | Effect |
@@ -967,70 +1182,104 @@ Maintenance defaults and optional subflows:
 | `BACKUP_PATH` | `/mnt/media-backup` | Edit the top-level script default before the run | If the path exists, backups publish under an instance-specific subdirectory there; otherwise backups stay beside the source database. |
 | `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Edit the top-level script default before the run | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside this retention window. |
 | `PLEX_PROCESS_BLOB_DB` | `0` | Set the environment value to `1` before the run | Enables the optional Plex blob database rebuild pass. |
-| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Controlled by `STATS_BANDWIDTH_RETAIN_DAYS` | Runs on the staged database before swap; DELETE or VACUUM failures warn, but a post-deflate `integrity_check(1)` failure aborts before touching the live DB. |
+| `PLEX_OPTIMIZE_API` | `0` | Set the environment value to `1` before the run | Enables the optional post-start Plex `PUT /library/optimize?async=1` trigger. |
+| `GENERIC_SQLITE_BINARY` | `${HOME}/bin/sqlite3` | Edit the top-level script default before the run | Runs Emby maintenance and the Plex main-DB STAT4 pass. |
+| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Controlled by `STATS_BANDWIDTH_RETAIN_DAYS` | Runs on the staged database before swap; DELETE or VACUUM failures warn, but a post-deflate `integrity_check` failure aborts before touching the live DB. |
 
 ### Planned-Downtime Gate
 
-For each configured Plex or Emby instance, the script queries Docker for an
-exact container name. Docker query failure or a running container exits; a
-missing host-side database directory skips that instance. Stop and start
-operations remain operator-controlled.
+For each configured Plex or Emby instance, the script checks for the expected
+instance data directory before stopping. Missing data skips without a
+stop/start cycle. For instances with data, the script runs `docker stop`,
+queries Docker for an exact container name with `status=running`, and skips
+maintenance if the stopped verification still sees the container running or the
+Docker query fails. After a successful stop, the script runs `docker start`
+after maintenance succeeds or fails, verifies the container reaches running, and
+sets final status nonzero for stop, maintenance, start, or verification
+failures.
 
 ### Plex Flow
 
 For each Plex instance, the script resolves the data and database paths, cleans
 selected caches, runs the sanity query, hard-gates source
-`PRAGMA integrity_check(1) == ok`, hard-gates source FTS integrity, warns on
+`PRAGMA integrity_check == ok`, hard-gates source FTS integrity, warns on
 foreign-key rows, switches the source to `journal_mode=DELETE`, and publishes a
 dated `.original` backup.
 
 The rebuild runs under `Plex SQLite` with `PRAGMA page_size=${PAGE_SIZE}`,
 `PRAGMA auto_vacuum=NONE`, and `VACUUM INTO` to a same-directory staged
 `<db>.new` file. The staged file must pass page-size and auto-vacuum checks,
-staged `integrity_check(1) == ok`, staged FTS integrity, and an exhaustive
+staged `integrity_check == ok`, staged FTS integrity, and an exhaustive
 source-vs-staged per-table row-count sweep before any swap is attempted. If the
 main Plex database has `statistics_bandwidth`, the pre-swap hook can deflate it
-inside the staged file and then hard-gates post-deflate integrity.
+inside the staged file with `PRAGMA temp_store=MEMORY`, `PRAGMA threads=8`, and
+`VACUUM`, then hard-gates post-deflate `integrity_check`.
 
-After validation, the script replaces the live database with `mv`, removes stale
-WAL/SHM siblings, then runs post-swap `REINDEX`, `PRAGMA analysis_limit=0`,
-`PRAGMA optimize=0x10002`, FTS maintenance, and Plex date repair SQL as
-warning-only maintenance. `PLEX_PROCESS_BLOB_DB=1` enables the same staged
-rebuild for the Plex blob database without the `statistics_bandwidth` hook.
-Plex SQLite is required because Plex data can require the ICU-enabled binary.
+After the rebuild and validation sweep, the staged Plex path runs FTS rebuild,
+the staged FTS integrity gate, FTS re-curation, staged optimize SQL, the staged
+metadata date-repair SQL, the Plex main-DB STAT4 pass, and, when that STAT4
+pass is enabled, a post-STAT4 `integrity_check` gate before the
+`user_version`/`application_id` preservation gate and atomic replacement.
+Post-swap FTS maintenance is optimize-only.
+`PLEX_PROCESS_BLOB_DB=1` enables the same staged rebuild for the Plex blob
+database without the `statistics_bandwidth` hook, metadata date repair, or
+STAT4 pass. Plex SQLite is required because Plex data can require the
+ICU-enabled binary.
+
+The Plex main-database staged optimize SQL creates the runbook-validated
+`idx_dshadow_taggings_tag_id_metadata_item_id` and
+`idx_dshadow_mis_account_updated_guid_cover` indexes before `REINDEX`,
+`ANALYZE`, and `PRAGMA optimize`. The existing Plex SQLite `ANALYZE` remains as
+the STAT1 floor for ICU-collated or skipped objects. The subsequent STAT4 pass
+uses `GENERIC_SQLITE_BINARY`, runs only after the Plex staged SQL, discovers
+safe targets from `pragma_index_list`/`pragma_index_xinfo`, skips unsupported
+collations and unsafe identifier transport, sets `analysis_limit=0`, and warns
+without aborting on preflight, discovery, per-target `ANALYZE`, or final
+`sqlite_stat4` row-count failures. `main()` derives the internal STAT4 gate
+from `GENERIC_SQLITE_BINARY` preflight for configured Plex instances, so the
+pass runs only when that binary reports `ENABLE_STAT4`.
 
 ### Emby Flow
 
 For each Emby instance, the script resolves `/opt/<instance>/data`, runs the
-sanity query, hard-gates source `integrity_check(1) == ok`, hard-gates source
+sanity query, hard-gates source `integrity_check == ok`, hard-gates source
 FTS integrity, warns on foreign-key rows, switches the source to
 `journal_mode=DELETE`, and publishes a dated `.original` backup.
 
-The rebuild runs under the configured host SQLite binary with
+The rebuild runs under `GENERIC_SQLITE_BINARY` with
 `PRAGMA page_size=${PAGE_SIZE}`, `PRAGMA auto_vacuum=NONE`, and `VACUUM INTO` to
 a staged `<db>.new` file. The staged file must pass page-size and auto-vacuum
-checks, staged `integrity_check(1) == ok`, staged FTS integrity, and an
-exhaustive source-vs-staged per-table row-count sweep before the script replaces
+checks, staged `integrity_check == ok`, staged FTS integrity, an exhaustive
+source-vs-staged per-table row-count sweep, FTS rebuild, the staged FTS
+integrity gate, FTS re-curation, staged optimize SQL, and the
+`user_version`/`application_id` preservation gate before the script replaces
 the live database with `mv` and removes stale WAL/SHM siblings.
+The Emby staged optimize SQL creates the runbook-validated
+`idx_dshadow_mediaitems_parent_type` index before `REINDEX`, `ANALYZE`, and
+`PRAGMA optimize`.
 
-Post-swap `REINDEX`, `PRAGMA analysis_limit=0`, `PRAGMA optimize=0x10002`, and
-FTS maintenance are warning-only because the database has already passed the
-source and staged validation gates.
+Post-swap FTS maintenance is optimize-only because the database has already
+passed the source and staged validation gates.
 
 ### Maintenance Posture
 
-Hard failures include Docker query failure, running containers, source
-integrity failure, source FTS integrity failure, `journal_mode=DELETE` failure,
-backup publication failure, `VACUUM INTO` failure, staged auto-vacuum mismatch
-against `NONE`, staged integrity failure, staged FTS integrity failure,
-per-table row-count mismatch, and pre-swap hook integrity failure. The source
-and staged integrity gates require the literal `ok` result from
-`PRAGMA integrity_check(1)`.
+Hard per-instance failures include Docker stop/start verification failure,
+Docker query failure, running containers after stop, source integrity failure,
+source FTS integrity failure, `journal_mode=DELETE` failure, backup publication
+failure, `VACUUM INTO` failure, staged auto-vacuum mismatch against `NONE`,
+staged integrity failure, staged FTS integrity failure, per-table row-count
+mismatch, pre-swap hook integrity failure, and post-STAT4 staged integrity
+failure. After a successful stop, these failures still fall through to the
+start gate before the script continues. The source and staged integrity gates
+require the literal `ok` result from
+`PRAGMA integrity_check`.
 
 Warning-and-continue cases include source `foreign_key_check` rows, skipped
 missing instance directories, Plex `statistics_bandwidth` table absence or
-DELETE/VACUUM failure before a clean post-deflate integrity result, and
-post-swap SQL or FTS maintenance failures.
+DELETE/VACUUM failure before a clean post-deflate integrity result, staged
+maintenance SQL failure, staged metadata date-repair failure, Plex STAT4
+preflight/worklist/per-target/final-count failures, and post-swap FTS
+maintenance failures.
 
 ## Hard Constraints
 
@@ -1102,14 +1351,16 @@ Observability:
 - The observability kill switch must remain literal
   `SQLITE3_DISABLE_OBSERVABILITY=1`.
 - CLI builds must not carry the observability wrapper layer.
+- CLI builds must not carry runtime optimize.
 
 M-series invariants:
 
 - M7: Source-level amalgamation patching via a checked-in unified-diff `.patch`
   file applied with `patch -p1` after unzip; SQLite version bumps that change
-  any of the six target signatures cause `patch` to reject hunks and fail the
-  build with patch's native error message. `build/sqlite-amalgamation.patch` is
-  the single locus of amalgamation modifications.
+  any of the six wrapped API target signatures or the internal runtime optimize
+  hook hunks cause `patch` to reject hunks and fail the build with patch's
+  native error message. `build/sqlite-amalgamation.patch` is the single locus of
+  amalgamation modifications.
 
 Baked pin manifest:
 

@@ -10,9 +10,12 @@ milestone lands.
 
 ## 1. Build / variant
 
-- Plex variant builds under the LSIO Alpine 3.23/musl base; generic variant
-  builds under digest-pinned `ubuntu:18.04` (bionic, glibc 2.27).
-  Multi-stage `docker-library/Dockerfile` selects via `LIBRARY_VARIANT`.
+- Plex variant builds under
+  `BASEIMAGE_ALPINE=ghcr.io/linuxserver/baseimage-alpine:3.23`; generic variant
+  builds under
+  `BASEIMAGE_UBUNTU=ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98`
+  (bionic, glibc 2.27). Multi-stage `docker-library/Dockerfile` selects via
+  `LIBRARY_VARIANT`.
 - `LIBRARY_VARIANT=plex` is limited to the Plex ICU build path.
 - SQLite pins must stay aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `.github/workflows/sqlite-build.yml`,
@@ -23,7 +26,9 @@ milestone lands.
   consumes those values as build args, and the workflow passes the same
   `ICU_SOURCE_*` build args for the Plex library build.
   `tests/check_pin_alignment.sh` forbids retired scalar pin keys and asserts
-  the `ICU_SOURCE_*` defaults come from the compatibility-groups TSV.
+  the `ICU_SOURCE_*` defaults come from the compatibility-groups TSV, and
+  asserts SORTERREF/PMASZ compile defaults match their constructor-102 runtime
+  config values.
 - Mimalloc v3.3.2 Wire-2 link-time interposition applies to both library
   variants only; CLI stays on the platform allocator. Keep the full
   VERSION + URL + SHA512 pin tuple aligned across `build/Build.sh`,
@@ -54,6 +59,14 @@ milestone lands.
   `build/Build.sh`; `scripts/optimize_media_servers.sh` passes
   `auto_vacuum=NONE` during planned-downtime `VACUUM INTO` rebuilds and gates
   the staged `PRAGMA auto_vacuum` result on `0`.
+- Planned-downtime Plex maintenance keeps `PLEX_BINARY` for ICU-sensitive
+  rebuild, FTS, `REINDEX`, and staged Plex SQL. `GENERIC_SQLITE_BINARY` is the
+  single host generic SQLite setting for Emby maintenance and the Plex main-DB
+  STAT4 pass. For configured Plex instances, `main()` derives internal STAT4
+  capability state from `GENERIC_SQLITE_BINARY` preflight. The Plex main-DB
+  STAT4 pass runs only when that state is `1`. Plex STAT4 preflight or
+  per-target failures warn and skip only STAT4; they do not weaken existing hard
+  integrity gates.
 - `SQLITE_DEFAULT_MMAP_SIZE=34359738368` (32 GiB) is the compile-default
   mmap-size pin in `build/Build.sh`; CI compile-option assertions keep it
   aligned with the runtime auto-PRAGMA target.
@@ -64,9 +77,16 @@ milestone lands.
   compile ceiling stays above 32 GiB; reducing it below 32 GiB silently caps the
   PRAGMA and breaks the Bundle-1 observability + performance objective. Changes
   to the build pin or the Emby compile-options assertion must update both.
+- `SQLITE_DEFAULT_SORTERREF_SIZE=512` is the `build/Build.sh` compile
+  default. SQLite's stock default is `0x7fffffff` (disabled).
+  Constructor-102 re-asserts
+  `sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 512)` in
+  `src/auto_extension.c`; `tests/check_pin_alignment.sh` asserts the compile
+  default and runtime value stay aligned.
 - `SQLITE_SORTER_PMASZ=8192` is the `build/Build.sh` compile default;
   constructor-102 re-asserts `sqlite3_config(SQLITE_CONFIG_PMASZ, 8192)` in
-  `src/auto_extension.c`. `assert_emby_compile_options` in
+  `src/auto_extension.c`. `tests/check_pin_alignment.sh` asserts the compile
+  default and runtime value stay aligned. `assert_emby_compile_options` in
   `tools/ci/lib/assertions.sh`, invoked by
   `tools/ci/emby-first-init-smoke.sh`, keeps the value pinned in CI.
 
@@ -149,6 +169,13 @@ milestone lands.
   `sqlite3_db_config`, `sqlite3_open`, `sqlite3_open_v2`,
   `sqlite3_open16`) renamed to `_real` with hidden visibility. Build
   fails on rename-drift.
+- Runtime optimize is ABI/export neutral. It does not add public SQLite API
+  exports, does not alter the version-script public allowlist, and keeps
+  `auto_extension_register_for_open`,
+  `auto_extension_optimize_before_close`,
+  `auto_extension_optimize_after_stmt`,
+  `auto_extension_progress_handler_push`, and
+  `auto_extension_progress_handler_pop` absent from `.dynsym`.
 - `sqlite3_enable_shared_cache` no-op stub at `src/auto_extension.c:6-15`
   is load-bearing for the Plex variant. **KEEP byte-for-byte intact.**
 - `build/libsqlite3-version-script.ld` is load-bearing for symbol-export
@@ -170,6 +197,21 @@ milestone lands.
   `build/expected-sqlite-dbconfig-count.txt`) are the drift detector.
 - Observability constructor priority: 101.
 - Auto-extension callback must NEVER make `sqlite3_open*` fail.
+- Runtime optimize hooks in `sqlite3_close`, `sqlite3_close_v2`,
+  `sqlite3_step`, `sqlite3_reset`, and `sqlite3_finalize` must NEVER change
+  the public return code. Optimize failures are logged/swallowed; native
+  close, zombie, busy, step, reset, and finalize semantics stay authoritative.
+- Runtime optimize execution logs use `obs_logf` only on the execution path:
+  `event=optimize_start` before `PRAGMA optimize`, `event=optimize_done` on
+  success, and `event=optimize_failed` on failure. Each line carries `tier`,
+  `elapsed_ms`, `stat_rows`, and `since_last_ms`; not-due hot skips emit no
+  optimize log.
+- Runtime optimize due-but-blocked logs use `obs_logf` only after an enrolled
+  connection has passed the not-due hot skip and a pre-reserve guard blocks
+  work. The hook atomically re-arms only that connection's `next_due_ns` and
+  emits one throttled `event=optimize_skipped reason=readonly|open_txn|busy_peer`
+  per 30-second re-arm interval. It must not acquire `g_runtime_optimize_mu` or
+  modify per-path success cadence / failure backoff state on this path.
 - Read-only opens stay quiet for PRAGMA emission; observability is
   independent of read-only state.
 - `sqlite3_initialize` log gate:
@@ -183,9 +225,11 @@ milestone lands.
 - Word-bounded `bad_signal_re` MUST stay.
 - Constructor priorities: 101 = observability cache init (`obs_init` in
   `src/observability.c`); 102 = `SQLITE_CONFIG_LOG` process-wide
-  callback registration routed into the observability sink, then
-  `SQLITE_CONFIG_SORTERREF_SIZE` config (no `sqlite3_auto_extension` call
-  -- registration is lazy per the open-wrapper helper); 103 =
+  callback registration routed into the observability sink, then the
+  `SQLITE_CONFIG_SORTERREF_SIZE` and `SQLITE_CONFIG_PMASZ` runtime
+  re-asserts of the `build/Build.sh` compile defaults (no
+  `sqlite3_auto_extension` call -- registration is lazy per the open-wrapper
+  helper); 103 =
   slow-query tracker `pthread_once` priming + `atexit` registration. The
   101->102->103 order ensures observability env caches, including
   `SQLITE3_DISABLE_OBSERVABILITY` and `SQLITE3_DISABLE_STMT_TRACE`, are
@@ -243,6 +287,31 @@ milestone lands.
 - `SQLITE3_DISABLE_SLOW_QUERY=1` disables PROFILE-side slow-query
   tracking; subordinate to `SQLITE3_DISABLE_OBSERVABILITY=1` (master) and
   orthogonal to `SQLITE3_DISABLE_AUTOPRAGMA=1` (PRAGMA emission).
+- Runtime optimize is opt-in for eligible target write connections. Literal
+  `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0` enables close and inline runtime
+  optimize; unset, literal `1`, and every other value disable runtime
+  optimize. Literal `SQLITE3_DISABLE_AUTOPRAGMA=1` disables open-time PRAGMAs
+  and runtime optimize.
+- Runtime optimize has two successful per-path cadences: LIMITED defaults to
+  1800 seconds, sets `PRAGMA main.analysis_limit=1024`, and runs
+  `PRAGMA main.optimize`; FULL defaults to 86400 seconds, sets
+  `PRAGMA main.analysis_limit=0`, and runs
+  `PRAGMA main.optimize=0x10002`. A successful FULL pass also satisfies the
+  LIMITED cadence.
+- Runtime optimize pre-reserve readonly, open-transaction, and busy-peer blocks
+  re-arm only the enrolled connection-local next-due cache for 30 seconds. They
+  do not stamp LIMITED/FULL success or set shared failure backoff.
+- Runtime optimize saves and restores the prior `analysis_limit` and the
+  application's progress handler around optimize work.
+- `scripts/optimize_media_servers.sh` owns Plex and Emby container stop/start
+  during planned-downtime maintenance. `PLEX_OPTIMIZE_API=1` enables the
+  inline post-start Plex database optimize trigger only after the per-instance
+  start gate passes. The trigger resolves reachability only from
+  `docker inspect`, waits for `GET /identity` HTTP 200, reads
+  `PlexOnlineToken` from the `/opt/<instance>/...` Preferences.xml path, sends
+  only `PUT /library/optimize?async=1` with `X-Plex-Token`, never retries the
+  PUT, and tracks completion only through debounced
+  `type="general.db.optimize"` absence in `/activities`.
 - PMS uses `sqlite3_open` (2-arg) exclusively; implicit flags
   `READWRITE|CREATE`.
 - Emby uses `sqlite3_open_v2` exclusively with
@@ -317,4 +386,5 @@ milestone lands.
 - `tests/check_pin_alignment.sh` enforces mimalloc VERSION + URL + SHA512
   tuple alignment, forbids retired scalar pin keys, and asserts
   `ICU_SOURCE_VERSION` / `ICU_SOURCE_SHA512` defaults come from
-  `pins/library-compat-groups.tsv` for `icu69`.
+  `pins/library-compat-groups.tsv` for `icu69`. It also asserts SORTERREF and
+  PMASZ compile defaults match their constructor runtime config values.

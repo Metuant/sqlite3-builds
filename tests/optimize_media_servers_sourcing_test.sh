@@ -78,6 +78,26 @@ declare -F run_post_swap_fts_maintenance >/dev/null || {
   printf 'missing-post-swap-helper\n'
   exit 13
 }
+declare -F build_emby_optimize_sql >/dev/null || {
+  printf 'missing-emby-optimize-helper\n'
+  exit 21
+}
+declare -F build_plex_optimize_sql >/dev/null || {
+  printf 'missing-plex-optimize-helper\n'
+  exit 22
+}
+declare -F plex_stat4_preflight >/dev/null || {
+  printf 'missing-plex-stat4-preflight-helper\n'
+  exit 23
+}
+declare -F discover_plex_stat4_analyze_targets >/dev/null || {
+  printf 'missing-plex-stat4-discovery-helper\n'
+  exit 24
+}
+declare -F run_plex_stat4_analyze >/dev/null || {
+  printf 'missing-plex-stat4-run-helper\n'
+  exit 25
+}
 declare -F try_deflate_plex_statistics_bandwidth >/dev/null || {
   printf 'missing-deflate-helper\n'
   exit 14
@@ -91,9 +111,22 @@ declare -F try_deflate_plex_statistics_bandwidth >/dev/null || {
   printf 'bad-retain-days:%s\n' "${STATS_BANDWIDTH_RETAIN_DAYS:-unset}"
   exit 16
 }
+[ "${PLEX_OPTIMIZE_API:-}" = "0" ] || {
+  printf 'bad-plex-optimize-api:%s\n' "${PLEX_OPTIMIZE_API:-unset}"
+  exit 28
+}
 [ "${SQLITE3_DISABLE_AUTOPRAGMA:-}" = "1" ] || {
   printf 'bad-autopragma:%s\n' "${SQLITE3_DISABLE_AUTOPRAGMA:-unset}"
   exit 17
+}
+[ "${GENERIC_SQLITE_BINARY:-}" = "${HOME}/bin/sqlite3" ] || {
+  printf 'bad-generic-sqlite-binary:%s\n' "${GENERIC_SQLITE_BINARY:-unset}"
+  exit 26
+}
+old_binary_name="EMBY""_BINARY"
+[ -z "${!old_binary_name+x}" ] || {
+  printf 'emby-binary-alias-present:%s\n' "${!old_binary_name}"
+  exit 27
 }
 
 case "$-" in

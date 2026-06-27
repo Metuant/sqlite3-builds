@@ -1,4 +1,4 @@
-#include "sqlite3.h"
+#include "auto_extension_internal.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -14,8 +14,6 @@ SQLITE_API int sqlite3_enable_shared_cache(int enable) {
     return SQLITE_OK;
 }
 
-#include <stdatomic.h>
-
 __attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void);
 __attribute__((visibility("hidden"))) SQLITE_API int obs_stmt_trace_disabled(void);
 __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_cb(unsigned trace, void *ctx, void *p, void *x);
@@ -28,6 +26,7 @@ __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
  * int writes are atomic on all supported targets, so no locking is needed. */
 static int g_sorterref_cfg_rc = SQLITE_OK;
 static int g_pmasz_cfg_rc = SQLITE_OK;
+_Thread_local int g_autopragma_depth;
 
 int auto_extension_sorterref_cfg_rc(void) {
     return g_sorterref_cfg_rc;
@@ -84,15 +83,18 @@ int auto_extension_path_is_target(const char *raw_fn) {
     if (q) *q = 0;
     const char *fn = fnbuf;
 
-    /* Targets are the current media-server main database filenames.
+    /* Filters are supported target filenames plus the legacy, unsupported
+     * JF-style main database filename.
      *
      * WHY: Suffixes match deployed absolute paths without baking container
-     * root directories into the library; new targets require explicit entries.
+     * root directories into the library; new filename matches require explicit
+     * entries, and supported JF deployment requires a binding design plus
+     * validation plan.
      */
     int is_target = 0;
     if (ends_with(fn, "com.plexapp.plugins.library.db")) is_target = 1;
-    else if (ends_with(fn, "/library.db")) is_target = 1;
-    else if (ends_with(fn, "/jellyfin.db")) is_target = 1;
+    else if (ends_with(fn, "library.db")) is_target = 1;
+    else if (ends_with(fn, "jellyfin.db")) is_target = 1;
     return is_target;
 }
 
@@ -139,6 +141,8 @@ static int autopragma_init(
     /* WHY: Read-only opens cannot accept mutating PRAGMAs and should stay quiet. */
     if (sqlite3_db_readonly(db, "main") == 1) return SQLITE_OK;
 
+    runtime_optimize_seed_path(db, raw_fn);
+
     /* Per-connection performance tuning. PRAGMAs that duplicate compile-time
      * defaults provide defense-in-depth (compile defaults apply unless
      * something interferes -- different library loaded, env tampering, etc.).
@@ -154,24 +158,29 @@ static int autopragma_init(
      *
      * PMS issues its own per-connect PRAGMAs after 2-arg sqlite3_open returns
      * with implicit SQLITE_OPEN_READWRITE|SQLITE_OPEN_CREATE, so these settings
-     * are best-effort for Plex and sticky for Emby/JF connections that do not
-     * run an app-side PRAGMA pass.
+     * are best-effort for Plex and sticky for Emby connections that do not run
+     * an app-side PRAGMA pass. The legacy JF-style filename match gets the same
+     * library behavior when reached, but JF deployment is unsupported until a
+     * binding design and validation plan land.
      *
      * PRAGMA synchronous: deliberately NOT set. Compile-time
      * DEFAULT_WAL_SYNCHRONOUS=1 already provides synchronous=NORMAL for WAL
-     * DBs (which all three media-server apps use). Setting it here would
-     * impose NORMAL on rollback-journal DBs too, a durability change the
-     * apps did not opt into. PMS itself sets it on every connect anyway.
+     * databases. Setting it here would impose NORMAL on rollback-journal DBs
+     * too, a durability change callers did not opt into. PMS itself sets it
+     * on every connect anyway.
      *
      * PRAGMA optimize: deliberately NOT set. For the Plex variant, PMS
      * registers the icu_root collation and the `collating` FTS tokenizer
      * *after* sqlite3_open returns, so this hook runs too early to analyze
      * indexes/FTS tables that depend on them -- a guaranteed open-time
-     * failure path. The maintenance script (scripts/optimize_media_servers.sh)
-     * runs `PRAGMA analysis_limit=0; PRAGMA optimize;` periodically; that is
-     * the correct lifecycle hook for ANALYZE work. */
+     * failure path. Runtime optimize is off unless
+     * SQLITE3_DISABLE_RUNTIME_OPTIMIZE is explicitly set to "0"; when enabled,
+     * it runs only on later safe-idle hooks. Planned downtime maintenance
+     * remains the explicit full ANALYZE lifecycle. */
     char *err = NULL;
-    int rc = sqlite3_exec(db,
+    int rc;
+    g_autopragma_depth++;
+    rc = sqlite3_exec(db,
         "PRAGMA cache_size=-1048576;"
         "PRAGMA mmap_size=34359738368;"
         "PRAGMA temp_store=2;"
@@ -181,6 +190,7 @@ static int autopragma_init(
         "PRAGMA busy_timeout=10000;"
         "PRAGMA analysis_limit=1024;",
         NULL, NULL, &err);
+    g_autopragma_depth--;
     if (rc != SQLITE_OK) {
         sqlite3_log(rc, "auto_extension: pragma block failed on %s: %s",
                     raw_fn, err ? err : "(no message)");
@@ -208,11 +218,14 @@ __attribute__((visibility("hidden"))) SQLITE_API void auto_extension_register_fo
  * call startup-only sqlite3_config() verbs between dlopen and first public open.
  *
  * CONFIG_LOG routes selected process-wide SQLite diagnostics into the existing
- * observability sink. SORTERREF_SIZE is what actually activates the
- * SQLITE_ENABLE_SORTER_REFERENCES compile flag. Without this runtime config,
- * the feature stays disabled (threshold = INT_MAX, effectively never trips)
- * even though it is compiled in. Both stay in this priority-102 constructor so
- * the config lands before any helper-triggered sqlite3_initialize(). */
+ * observability sink. Stock SQLite defaults SORTERREF_SIZE to INT_MAX, leaving
+ * sorter references effectively disabled. build/Build.sh sets
+ * -DSQLITE_DEFAULT_SORTERREF_SIZE=512, and this priority-102 constructor
+ * re-asserts sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 512) for
+ * visibility and drift protection, matching the PMASZ compile-default +
+ * runtime-config pair below. CONFIG_LOG and SORTERREF_SIZE stay in this
+ * priority-102 constructor so the config lands before any helper-triggered
+ * sqlite3_initialize(). */
 __attribute__((constructor(102)))
 static void register_autopragma(void) {
     int log_rc = sqlite3_config(SQLITE_CONFIG_LOG, sqlite_log_to_observability, NULL);
@@ -220,10 +233,11 @@ static void register_autopragma(void) {
         obs_logf("sqlite3_config", "op=SQLITE_CONFIG_LOG rc=%d", log_rc);
     }
 
-    /* WHY: 16384 (16 KB) replaces inline content with rowid references only
-     * for rows above 16 KB. Plex/Emby metadata rows are well under that and
-     * skip the feature; large FTS shadow rows get the memory benefit. */
-    int cfg_rc = sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 16384);
+    /* WHY: 512 B stores the sort key plus rowid references for sorter records
+     * whose estimated size exceeds 512 B, deferring the remaining columns to a
+     * post-sort rowid fetch. At this project tuning value, reference-mode engages
+     * for most metadata sorter records. */
+    int cfg_rc = sqlite3_config(SQLITE_CONFIG_SORTERREF_SIZE, 512);
     g_sorterref_cfg_rc = cfg_rc;
     if (cfg_rc != SQLITE_OK) {
         /* WHY: Config failure leaves sorter-references inert; lazy
@@ -232,15 +246,18 @@ static void register_autopragma(void) {
             "auto_extension: SORTERREF_SIZE config failed: rc=%d", cfg_rc);
     }
 
-    /* WHY: 8192 pages (= 128 MiB at 16 KiB page size) raises the sorter
-     * in-memory partial-merge-area cap. Aligns with the project's
-     * generous-resource tuning posture; media-server library / search
-     * sorts up to ~128 MiB stay in memory before partitioning to k-way
-     * merge. Multi-threaded sorter workers each hold their own PMA --
-     * up to PRAGMA threads=8 concurrent per connection. Compile-time
-     * default is also -DSQLITE_SORTER_PMASZ=8192 in build/Build.sh; this
-     * runtime config re-asserts the value at priority-102 for visibility
-     * and as protection against accidental compile-time drift. */
+    /* WHY: 8192 is the Minimum PMA Size in PAGES (SQLITE_CONFIG_PMASZ /
+     * SQLITE_SORTER_PMASZ). Per the SQLite docs the multithreaded sorter
+     * starts writing+merging PMAs once the content to sort exceeds
+     * page_size * min(PRAGMA cache_size, PMASZ). With the 16 KiB page size
+     * and the 1 GiB cache_size set above (>> 8192 pages), that threshold is
+     * 8192 * 16 KiB = 128 MiB, so media-server library / search sorts up to
+     * ~128 MiB stay in a single in-memory PMA before partitioning to k-way
+     * merge. Multi-threaded sorter workers each hold their own PMA -- up to
+     * PRAGMA threads=8 concurrent per connection. Compile-time default is
+     * also -DSQLITE_SORTER_PMASZ=8192 in build/Build.sh; this runtime config
+     * re-asserts the value at priority-102 for visibility and as protection
+     * against accidental compile-time drift. */
     int pmasz_rc = sqlite3_config(SQLITE_CONFIG_PMASZ, 8192);
     g_pmasz_cfg_rc = pmasz_rc;
     if (pmasz_rc != SQLITE_OK) {

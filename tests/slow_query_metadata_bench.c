@@ -85,10 +85,6 @@ int main(void) {
     int run;
     long long runs[RUNS];
 
-    if (!getenv("RUN_BENCH") || strcmp(getenv("RUN_BENCH"), "1")) {
-        printf("SKIP bench\n");
-        return 0;
-    }
     for (run = 0; run < RUNS; run++) {
         long long max_elapsed = 0;
         for (i = 0; i < THREADS; i++) {

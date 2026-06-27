@@ -298,11 +298,15 @@ jobs:
           bash tests/lsio_mod_preflight_artifact_root_test.sh
           bash tests/lsio_mod_unsupported_phase_test.sh
           bash tests/optimize_media_servers_deflate_test.sh
+          bash tests/optimize_media_servers_emby_index_test.sh
+          bash tests/optimize_media_servers_plex_index_test.sh
+          bash tests/optimize_media_servers_plex_stat4_test.sh
           bash tests/optimize_media_servers_foreign_key_warn_test.sh
           bash tests/optimize_media_servers_fts_discovery_test.sh
           bash tests/optimize_media_servers_fts_integrity_gate_test.sh
-          bash tests/optimize_media_servers_fts_rebuild_optimize_test.sh
+          bash tests/optimize_media_servers_fts_recurate_test.sh
           bash tests/optimize_media_servers_pipeline_smoke_test.sh
+          bash tests/optimize_media_servers_plex_api_test.sh
           bash tests/optimize_media_servers_sourcing_test.sh
           bash tests/optimize_media_servers_warn_helpers_pipefail_test.sh
           bash tests/stage_lsio_mod_baked_pins_test.sh

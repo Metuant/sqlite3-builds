@@ -121,7 +121,6 @@ static long long run_child_mode(const char *self, const char *mode) {
         dup2(pipefd[1], STDOUT_FILENO);
         dup2(pipefd[1], STDERR_FILENO);
         close(pipefd[1]);
-        setenv("RUN_BENCH", "1", 1);
         setenv("SLOW_QUERY_BENCH_MODE", mode, 1);
         if (strcmp(mode, "disabled") == 0) {
             setenv("SQLITE3_DISABLE_SLOW_QUERY", "1", 1);
@@ -154,10 +153,6 @@ int main(int argc, char **argv) {
     long long enabled_ns;
 
     (void)argc;
-    if (!getenv("RUN_BENCH") || strcmp(getenv("RUN_BENCH"), "1")) {
-        printf("SKIP bench\n");
-        return 0;
-    }
     mode = getenv("SLOW_QUERY_BENCH_MODE");
     if (mode && mode[0]) {
         if (strcmp(mode, "disabled") != 0 && strcmp(mode, "enabled") != 0) {

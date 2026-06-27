@@ -2,9 +2,10 @@
 
 export SQLITE3_DISABLE_AUTOPRAGMA=1
 
-# Maintenance assumes planned downtime. Stop each container explicitly before
-# running this script; the pre-flight gates verify that state, while container
-# start/stop stays operator-owned.
+# Maintenance assumes planned downtime. For each configured instance with a
+# present database directory, the script stops the container, verifies it is
+# stopped before database work, starts it afterward, and verifies it reaches
+# running.
 # NOTE: Jellyfin maintenance is dormant in this cycle.
 # WHY: JF maintenance stays absent until schema, page-size, FTS, and stopped-container
 # gates are re-validated.
@@ -12,6 +13,19 @@ export SQLITE3_DISABLE_AUTOPRAGMA=1
 PAGE_SIZE="16384"
 BACKUP_PATH="/mnt/media-backup"
 STATS_BANDWIDTH_RETAIN_DAYS="90"
+# Only runbook-validated indexes belong here; adding one is a future spec
+# decision and requires planner adoption, measured benefit, and landmine review.
+EMBY_INDEXES=(
+    "CREATE INDEX IF NOT EXISTS idx_dshadow_mediaitems_parent_type ON MediaItems(ParentId, Type);"
+)
+PLEX_INDEXES=(
+    "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"
+    "CREATE INDEX IF NOT EXISTS idx_dshadow_mis_account_updated_guid_cover ON metadata_item_settings (account_id, updated_at DESC, guid, view_offset, last_viewed_at);"
+)
+PLEX_STAT4_LEADER_INDEXES=(
+    "idx_dshadow_taggings_tag_id_metadata_item_id"
+    "idx_dshadow_mis_account_updated_guid_cover"
+)
 
 declare -a PLEX_INSTANCES=()
 declare -a EMBY_INSTANCES=()
@@ -20,9 +34,30 @@ PLEX_BINARY="${HOME}/plex-sql/Plex SQLite"
 PLEX_DB="com.plexapp.plugins.library.db"
 PLEX_BLOB_DB="com.plexapp.plugins.library.blobs.db"
 PLEX_PROCESS_BLOB_DB="${PLEX_PROCESS_BLOB_DB:-0}"
+PLEX_OPTIMIZE_API="${PLEX_OPTIMIZE_API:-0}"
 
-EMBY_BINARY="${HOME}/bin/sqlite3"
+GENERIC_SQLITE_BINARY="${HOME}/bin/sqlite3"
 EMBY_DB="library.db"
+
+build_emby_optimize_sql() {
+    local emby_index_sql=""
+    local ddl
+
+    for ddl in "${EMBY_INDEXES[@]}"; do
+        emby_index_sql+="${ddl} "
+    done
+    printf '%s' "PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; ${emby_index_sql}REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;"
+}
+
+build_plex_optimize_sql() {
+    local plex_index_sql=""
+    local ddl
+
+    for ddl in "${PLEX_INDEXES[@]}"; do
+        plex_index_sql+="${ddl} "
+    done
+    printf '%s' "PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; ${plex_index_sql}REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;"
+}
 
 cleanup_staged_db() {
     local staged_db="${1}"
@@ -34,6 +69,154 @@ quote_sql_ident() {
     local ident="${1}"
 
     printf '"%s"' "${ident//\"/\"\"}"
+}
+
+plex_stat4_preflight() {
+    local binary="${1}"
+    local probe_out
+    local stat4_enabled
+
+    if ! probe_out=$("${binary}" ":memory:" "SELECT 1;" 2>&1); then
+        echo "WARNING: Plex STAT4 pre-flight failed for ${binary}; skipping Plex STAT4 pass" >&2
+        echo "WARNING: pre-flight output: ${probe_out}" >&2
+        return 1
+    fi
+    if ! stat4_enabled=$("${binary}" ":memory:" "SELECT sqlite_compileoption_used('ENABLE_STAT4');" 2>&1 | tr -d '\r\n'); then
+        echo "WARNING: Plex STAT4 ENABLE_STAT4 probe failed for ${binary}; skipping Plex STAT4 pass" >&2
+        echo "WARNING: pre-flight output: ${stat4_enabled}" >&2
+        return 1
+    fi
+    if [ "${stat4_enabled}" != "1" ]; then
+        echo "WARNING: Plex STAT4 binary ${binary} does not report ENABLE_STAT4; skipping Plex STAT4 pass" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+discover_plex_stat4_analyze_targets() {
+    local binary="${1}"
+    local db_path="${2}"
+    local field_sep=$'\t'
+    local query
+
+    query="WITH RECURSIVE ctl(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM ctl WHERE n < 31), ordinary_tables AS (SELECT s.name FROM sqlite_master AS s WHERE s.type = 'table' AND s.sql IS NOT NULL AND s.name NOT GLOB 'sqlite_*' AND NOT EXISTS (SELECT 1 FROM ctl WHERE instr(s.name, char(n)) > 0) AND lower(ltrim(replace(replace(replace(s.sql, char(9), ' '), char(10), ' '), char(13), ' '))) NOT LIKE 'create virtual table%'), table_indexes AS (SELECT t.name AS table_name, il.name AS index_name, il.origin AS origin FROM ordinary_tables AS t, pragma_index_list(t.name) AS il), index_safety AS (SELECT ti.table_name, ti.index_name, ti.origin, max(CASE WHEN ix.key = 1 AND upper(coalesce(ix.coll, 'BINARY')) NOT IN ('BINARY', 'NOCASE', 'RTRIM') THEN 1 ELSE 0 END) AS has_unsafe_collation FROM table_indexes AS ti, pragma_index_xinfo(ti.index_name) AS ix GROUP BY ti.table_name, ti.index_name, ti.origin), safe_tables AS (SELECT t.name AS target_name FROM ordinary_tables AS t WHERE NOT EXISTS (SELECT 1 FROM index_safety AS s WHERE s.table_name = t.name AND s.has_unsafe_collation = 1)), safe_indexes AS (SELECT s.index_name AS target_name FROM index_safety AS s JOIN sqlite_master AS schema_idx ON schema_idx.type = 'index' AND schema_idx.name = s.index_name WHERE s.has_unsafe_collation = 0 AND s.origin = 'c' AND s.index_name NOT GLOB 'sqlite_*' AND NOT EXISTS (SELECT 1 FROM ctl WHERE instr(s.index_name, char(n)) > 0) AND EXISTS (SELECT 1 FROM index_safety AS unsafe WHERE unsafe.table_name = s.table_name AND unsafe.has_unsafe_collation = 1)) SELECT target_kind, target_name FROM (SELECT 'T' AS target_kind, target_name FROM safe_tables UNION ALL SELECT 'I' AS target_kind, target_name FROM safe_indexes) ORDER BY target_kind DESC, target_name;"
+
+    "${binary}" -batch -noheader -separator "${field_sep}" "${db_path}" "${query}"
+}
+
+run_plex_stat4_analyze() {
+    local binary="${1}"
+    local db_path="${2}"
+    local field_sep=$'\t'
+    local targets
+    local row
+    local target_kind
+    local target_name
+    local extra
+    local target_ident
+    local analyze_sql
+    local target_total=0
+    local analyzed_total=0
+    local failed_total=0
+    local stat4_exists
+    local stat4_rows
+    local leader_index
+    local leader_rows
+
+    PLEX_STAT4_LAST_ANALYZED=0
+    if ! targets="$(discover_plex_stat4_analyze_targets "${binary}" "${db_path}")"; then
+        echo "WARNING: Plex STAT4 worklist discovery failed for ${db_path}; skipping Plex STAT4 pass" >&2
+        return 0
+    fi
+
+    while IFS= read -r row
+    do
+        [ -n "${row}" ] || continue
+        target_total=$((target_total + 1))
+    done <<< "${targets}"
+
+    echo "Plex STAT4 analyze targets: ${target_total} for ${db_path}"
+    if [ "${target_total}" = "0" ]; then
+        echo "WARNING: Plex STAT4 worklist is empty for ${db_path}; skipping Plex STAT4 pass" >&2
+        return 0
+    fi
+
+    while IFS= read -r row
+    do
+        [ -n "${row}" ] || continue
+        IFS="${field_sep}" read -r target_kind target_name extra <<< "${row}"
+        if [ -n "${extra}" ] || [ -z "${target_name}" ] || has_control_chars "${target_name}"; then
+            echo "WARNING: unsafe Plex STAT4 worklist row for ${db_path}; skipping one target" >&2
+            failed_total=$((failed_total + 1))
+            continue
+        fi
+        case "${target_kind}" in
+            T|I)
+                ;;
+            *)
+                echo "WARNING: unknown Plex STAT4 worklist target kind '${target_kind}' for ${db_path}; skipping ${target_name}" >&2
+                failed_total=$((failed_total + 1))
+                continue
+                ;;
+        esac
+
+        target_ident="$(quote_sql_ident "${target_name}")"
+        analyze_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; PRAGMA analysis_limit=0; ANALYZE ${target_ident};"
+        if "${binary}" "${db_path}" "${analyze_sql}"; then
+            PLEX_STAT4_LAST_ANALYZED=1
+            analyzed_total=$((analyzed_total + 1))
+        else
+            echo "WARNING: Plex STAT4 ANALYZE failed for ${target_name} in ${db_path}; continuing" >&2
+            failed_total=$((failed_total + 1))
+        fi
+    done <<< "${targets}"
+
+    echo "Plex STAT4 analyze complete: analyzed=${analyzed_total} failed=${failed_total} for ${db_path}"
+
+    if ! stat4_exists=$("${binary}" "${db_path}" "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat4';" | tr -d '\r\n'); then
+        echo "WARNING: Plex STAT4 final sqlite_stat4 existence check failed for ${db_path}; continuing" >&2
+        return 0
+    fi
+    if [ "${stat4_exists}" != "1" ]; then
+        echo "WARNING: Plex STAT4 did not create sqlite_stat4 for ${db_path}; continuing" >&2
+        return 0
+    fi
+    if ! stat4_rows=$("${binary}" "${db_path}" "SELECT COUNT(*) FROM sqlite_stat4;" | tr -d '\r\n'); then
+        echo "WARNING: Plex STAT4 final row-count check failed for ${db_path}; continuing" >&2
+        return 0
+    fi
+    case "${stat4_rows}" in
+        ''|*[!0-9]*)
+            echo "WARNING: Plex STAT4 final row count was not numeric for ${db_path}: ${stat4_rows}; continuing" >&2
+            return 0
+            ;;
+    esac
+    if [ "${stat4_rows}" -gt 0 ]; then
+        echo "Plex STAT4 sqlite_stat4 rows: ${stat4_rows} for ${db_path}"
+    else
+        echo "WARNING: Plex STAT4 produced zero sqlite_stat4 rows for ${db_path}; continuing" >&2
+    fi
+
+    for leader_index in "${PLEX_STAT4_LEADER_INDEXES[@]}"; do
+        if ! leader_rows=$("${binary}" "${db_path}" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx = '${leader_index}';" | tr -d '\r\n'); then
+            echo "WARNING: Plex STAT4 leader index check failed for ${leader_index} in ${db_path}; continuing" >&2
+            continue
+        fi
+        case "${leader_rows}" in
+            ''|*[!0-9]*)
+                echo "WARNING: Plex STAT4 leader index row count was not numeric for ${leader_index} in ${db_path}: ${leader_rows}; continuing" >&2
+                continue
+                ;;
+        esac
+        if [ "${leader_rows}" -gt 0 ]; then
+            echo "Plex STAT4 ${leader_index} rows: ${leader_rows}"
+        else
+            echo "WARNING: Plex STAT4 produced zero rows for ${leader_index} in ${db_path}; continuing" >&2
+        fi
+    done
+
+    return 0
 }
 
 has_control_chars() {
@@ -508,6 +691,56 @@ run_fts_rebuild_hard() {
     return 0
 }
 
+run_fts_recurate() {
+    local binary="${1}"
+    local db_path="${2}"
+    local fts_table="fts4_tag_titles_icu"
+    local content_table="tags"
+    local content_id_column="id"
+    local content_indexed_column="tag"
+    local fts_ident
+    local content_ident
+    local content_id_ident
+    local content_indexed_ident
+    local docsize_ident
+    local table_count
+    local bad_count
+    local delete_sql
+    local postcondition_sql
+
+    fts_ident="$(quote_sql_ident "${fts_table}")"
+    content_ident="$(quote_sql_ident "${content_table}")"
+    content_id_ident="$(quote_sql_ident "${content_id_column}")"
+    content_indexed_ident="$(quote_sql_ident "${content_indexed_column}")"
+    docsize_ident="$(quote_sql_ident "${fts_table}_docsize")"
+
+    if ! table_count=$("${binary}" "${db_path}" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='fts4_tag_titles_icu';" | tr -d '\r\n'); then
+        echo "ERROR: FTS re-curation target check failed for ${db_path}; live DB has NOT been touched" >&2
+        return 1
+    fi
+    if [ "${table_count}" = "0" ]; then
+        return 0
+    fi
+
+    delete_sql="DELETE FROM ${fts_ident} WHERE docid IN (SELECT rowid FROM ${content_ident} WHERE ${content_indexed_ident} GLOB '*://*' OR ${content_indexed_ident} IS NULL OR trim(${content_indexed_ident})='');"
+    if ! "${binary}" "${db_path}" "${delete_sql}"; then
+        echo "ERROR: FTS re-curation DELETE failed for ${fts_table} in ${db_path}; live DB has NOT been touched" >&2
+        return 1
+    fi
+
+    postcondition_sql="SELECT count(*) FROM ${docsize_ident} d JOIN ${content_ident} t ON t.${content_id_ident}=d.docid WHERE t.${content_indexed_ident} GLOB '*://*' OR t.${content_indexed_ident} IS NULL OR trim(t.${content_indexed_ident})='';"
+    if ! bad_count=$("${binary}" "${db_path}" "${postcondition_sql}" | tr -d '\r\n'); then
+        echo "ERROR: FTS re-curation postcondition query failed for ${fts_table} in ${db_path}; live DB has NOT been touched" >&2
+        return 1
+    fi
+    if [ "${bad_count}" != "0" ]; then
+        echo "ERROR: FTS re-curation postcondition failed for ${fts_table} in ${db_path}: ${bad_count} URI/empty docs remain; live DB has NOT been touched" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 run_foreign_key_check_warn() {
     local binary="${1}"
     local db_path="${2}"
@@ -524,15 +757,63 @@ run_foreign_key_check_warn() {
     return 0
 }
 
-run_post_swap_sql() {
+run_staged_maintenance_sql() {
+    local binary="${1}"
+    local db_path="${2}"
+    local sql="${3}"
+
+    if ! "${binary}" "${db_path}" "${sql}"; then
+        echo "WARNING: staged maintenance SQL failed for ${db_path}; continuing with rebuilt staged DB" >&2
+    fi
+}
+
+run_staged_sql_warn() {
     local binary="${1}"
     local db_path="${2}"
     local step_name="${3}"
     local sql="${4}"
 
     if ! "${binary}" "${db_path}" "${sql}"; then
-        echo "WARNING: ${step_name} failed for ${db_path}; DB was already validated and swapped; continuing" >&2
+        echo "WARNING: ${step_name} failed for ${db_path}; continuing with rebuilt staged DB" >&2
     fi
+}
+
+run_plex_metadata_date_repairs_warn() {
+    local binary="${1}"
+    local db_path="${2}"
+
+    run_staged_sql_warn "${binary}" "${db_path}" "Plex originally_available_at lower-bound repair" "UPDATE metadata_items SET originally_available_at = STRFTIME('%s', 'now', '-7 days') WHERE originally_available_at < STRFTIME('%s', 'now', '-200 years');"
+    run_staged_sql_warn "${binary}" "${db_path}" "Plex originally_available_at upper-bound repair" "UPDATE metadata_items SET originally_available_at = STRFTIME('%s', 'now', '-3 days') WHERE originally_available_at > STRFTIME('%s', 'now');"
+    run_staged_sql_warn "${binary}" "${db_path}" "Plex added_at lower-bound repair" "UPDATE metadata_items SET added_at = originally_available_at WHERE added_at <> originally_available_at AND originally_available_at IS NOT NULL AND added_at < STRFTIME('%s', 'now', '-200 years');"
+    run_staged_sql_warn "${binary}" "${db_path}" "Plex added_at upper-bound repair" "UPDATE metadata_items SET added_at = originally_available_at WHERE added_at <> originally_available_at AND originally_available_at IS NOT NULL AND added_at > STRFTIME('%s', 'now');"
+}
+
+run_plex_main_post_maintenance() {
+    local stat4_binary="${1}"
+    local staged_db="${2}"
+    local post_stat4_integrity
+
+    echo "Fixing Plex metadata dates in staged DB: ${staged_db}"
+    run_plex_metadata_date_repairs_warn "${PLEX_BINARY}" "${staged_db}"
+
+    # WHY: reads main()'s dynamic-scoped local (sole entry is main "$@"); :-0 keeps STAT4 fail-safe off if ever out of scope.
+    if [ "${plex_stat4_enabled:-0}" = "1" ]; then
+        PLEX_STAT4_LAST_ANALYZED=0
+        run_plex_stat4_analyze "${stat4_binary}" "${staged_db}"
+
+        if [ "${PLEX_STAT4_LAST_ANALYZED:-0}" = "1" ]; then
+            if ! post_stat4_integrity=$("${PLEX_BINARY}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
+                echo "ERROR: post-STAT4 staged integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
+                return 1
+            fi
+            if [ "${post_stat4_integrity}" != "ok" ]; then
+                echo "ERROR: post-STAT4 staged DB failed integrity_check: ${post_stat4_integrity}; live DB has NOT been touched" >&2
+                return 1
+            fi
+        fi
+    fi
+
+    return 0
 }
 
 run_post_swap_fts_maintenance() {
@@ -546,7 +827,6 @@ run_post_swap_fts_maintenance() {
     local content_mode
     local extra
     local table_ident
-    local rebuild_sql
     local optimize_sql
 
     if ! fts_rows="$(discover_fts_tables "${binary}" "${db_path}")"; then
@@ -564,15 +844,8 @@ run_post_swap_fts_maintenance() {
         fi
 
         table_ident="$(quote_sql_ident "${table_name}")"
-        rebuild_sql="INSERT INTO ${table_ident}(${table_ident}) VALUES('rebuild');"
         optimize_sql="INSERT INTO ${table_ident}(${table_ident}) VALUES('optimize');"
 
-        if ! { [ "${module}" = "fts5" ] && [ "${content_mode}" = "contentless" ]; }; then
-            if ! "${binary}" "${db_path}" "${rebuild_sql}"; then
-                echo "WARNING: post-swap FTS rebuild failed for ${table_name} in ${db_path}; continuing" >&2
-                continue
-            fi
-        fi
         if ! "${binary}" "${db_path}" "${optimize_sql}"; then
             echo "WARNING: post-swap FTS optimize failed for ${table_name} in ${db_path}; continuing" >&2
         fi
@@ -610,15 +883,18 @@ try_deflate_plex_statistics_bandwidth() {
         echo "WARNING: statistics_bandwidth deflate DELETE failed for ${staged_db}; continuing with validated staged DB" >&2
         return 0
     fi
-    if ! "${binary}" "${staged_db}" "VACUUM;"; then
+    if ! "${binary}" "${staged_db}" \
+      "PRAGMA temp_store=MEMORY;" \
+      "PRAGMA threads=8;" \
+      "VACUUM;"; then
         echo "WARNING: post-deflate VACUUM failed for ${staged_db}; continuing to post-deflate integrity gate" >&2
     fi
-    if ! post_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check(1);" | tr -d '\r\n'); then
-        echo "ERROR: post-deflate integrity_check(1) failed to run for ${staged_db}; live DB has NOT been touched" >&2
+    if ! post_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
+        echo "ERROR: post-deflate integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
         return 1
     fi
     if [ "${post_integrity}" != "ok" ]; then
-        echo "ERROR: post-deflate DB failed integrity_check(1): ${post_integrity}; live DB has NOT been touched" >&2
+        echo "ERROR: post-deflate DB failed integrity_check: ${post_integrity}; live DB has NOT been touched" >&2
         return 1
     fi
 
@@ -634,6 +910,8 @@ rebuild_db_vacuum_into() {
     local sanity_sql="${6}"
     local optimize_sql="${7}"
     local pre_swap_hook="${8:-}"
+    local post_maintenance_hook="${9:-}"
+    local post_maintenance_binary="${10:-}"
     local db_file="${db_path##*/}"
     local backup_path
     local backup_tmp
@@ -645,7 +923,13 @@ rebuild_db_vacuum_into() {
     local needs_fixup=0
     local source_integrity
     local staged_integrity
+    local source_user_version
+    local staged_user_version
+    local source_application_id
+    local staged_application_id
     local staged_page_size
+    local wal_checkpoint_result
+    local wal_checkpoint_busy
     local table_query
     local table_list
     local table_name
@@ -677,15 +961,24 @@ rebuild_db_vacuum_into() {
         exit 1
     fi
 
+    if ! source_user_version=$("${binary}" "${db_path}" "PRAGMA user_version;" | tr -d '\r\n'); then
+        echo "ERROR: source user_version check failed for ${db_path}; live DB has NOT been touched" >&2
+        exit 1
+    fi
+    if ! source_application_id=$("${binary}" "${db_path}" "PRAGMA application_id;" | tr -d '\r\n'); then
+        echo "ERROR: source application_id check failed for ${db_path}; live DB has NOT been touched" >&2
+        exit 1
+    fi
+
     if [ -n "${sanity_sql}" ]; then
         "${binary}" "${db_path}" "${sanity_sql}"
     fi
-    if ! source_integrity=$("${binary}" "${db_path}" "PRAGMA integrity_check(1);" | tr -d '\r\n'); then
-        echo "ERROR: source integrity_check(1) failed to run for ${db_path}; live DB has NOT been touched" >&2
+    if ! source_integrity=$("${binary}" "${db_path}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
+        echo "ERROR: source integrity_check failed to run for ${db_path}; live DB has NOT been touched" >&2
         exit 1
     fi
     if [ "${source_integrity}" != "ok" ]; then
-        echo "ERROR: source DB failed integrity_check(1): ${source_integrity}; live DB has NOT been touched" >&2
+        echo "ERROR: source DB failed integrity_check: ${source_integrity}; live DB has NOT been touched" >&2
         exit 1
     fi
     if ! run_fts_integrity_gate "${binary}" "${db_path}" "source" "warn"; then
@@ -695,6 +988,16 @@ rebuild_db_vacuum_into() {
     run_foreign_key_check_warn "${binary}" "${db_path}"
 
     # Fold WAL data into the main file before the byte-for-byte filesystem backup.
+    if wal_checkpoint_result=$("${binary}" -batch -noheader -separator '|' "${db_path}" "PRAGMA wal_checkpoint(TRUNCATE);" | tr -d '\r'); then
+        IFS='|' read -r wal_checkpoint_busy _ <<< "${wal_checkpoint_result}"
+        if [ -z "${wal_checkpoint_busy}" ]; then
+            echo "WARNING: wal_checkpoint(TRUNCATE) returned no busy column for ${db_path}; continuing to journal_mode=DELETE" >&2
+        elif [ "${wal_checkpoint_busy}" != "0" ]; then
+            echo "WARNING: wal_checkpoint(TRUNCATE) reported busy=${wal_checkpoint_busy} for ${db_path}; continuing to journal_mode=DELETE" >&2
+        fi
+    else
+        echo "WARNING: wal_checkpoint(TRUNCATE) failed for ${db_path}; continuing to journal_mode=DELETE" >&2
+    fi
     if ! new_mode=$("${binary}" "${db_path}" "PRAGMA journal_mode=DELETE;" | tr -d '\r\n'); then
         echo "ERROR: could not switch ${db_path} to DELETE journal mode; aborting before backup/rebuild to avoid orphaning WAL data" >&2
         exit 1
@@ -734,6 +1037,8 @@ rebuild_db_vacuum_into() {
     cleanup_staged_db "${staged_db}"
     if [ -n "${auto_vacuum_mode}" ]; then
         if ! "${binary}" "${db_path}" \
+          "PRAGMA temp_store=MEMORY;" \
+          "PRAGMA threads=8;" \
           "PRAGMA page_size=${page_size};" \
           "PRAGMA auto_vacuum=${auto_vacuum_mode};" \
           "VACUUM INTO '${staged_db}';"; then
@@ -743,6 +1048,8 @@ rebuild_db_vacuum_into() {
         fi
     else
         if ! "${binary}" "${db_path}" \
+          "PRAGMA temp_store=MEMORY;" \
+          "PRAGMA threads=8;" \
           "PRAGMA page_size=${page_size};" \
           "VACUUM INTO '${staged_db}';"; then
             echo "ERROR: VACUUM INTO failed for ${db_path}; live DB has NOT been touched" >&2
@@ -773,6 +1080,8 @@ rebuild_db_vacuum_into() {
     if [ "${needs_fixup}" = "1" ]; then
         if [ -n "${auto_vacuum_mode}" ]; then
             if ! "${binary}" "${staged_db}" \
+              "PRAGMA temp_store=MEMORY;" \
+              "PRAGMA threads=8;" \
               "PRAGMA page_size=${page_size};" \
               "PRAGMA auto_vacuum=${auto_vacuum_mode};" \
               "VACUUM;"; then
@@ -782,6 +1091,8 @@ rebuild_db_vacuum_into() {
             fi
         else
             if ! "${binary}" "${staged_db}" \
+              "PRAGMA temp_store=MEMORY;" \
+              "PRAGMA threads=8;" \
               "PRAGMA page_size=${page_size};" \
               "VACUUM;"; then
                 echo "ERROR: staged page_size fix-up failed for ${staged_db}; live DB has NOT been touched" >&2
@@ -813,13 +1124,13 @@ rebuild_db_vacuum_into() {
         exit 1
     fi
 
-    if ! staged_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check(1);" | tr -d '\r\n'); then
+    if ! staged_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
         echo "ERROR: integrity check failed to run on staged DB; live DB has NOT been touched" >&2
         cleanup_staged_db "${staged_db}"
         exit 1
     fi
     if [ "${staged_integrity}" != "ok" ]; then
-        echo "ERROR: staged DB failed integrity_check(1): ${staged_integrity}; live DB has NOT been touched" >&2
+        echo "ERROR: staged DB failed integrity_check: ${staged_integrity}; live DB has NOT been touched" >&2
         cleanup_staged_db "${staged_db}"
         exit 1
     fi
@@ -871,11 +1182,47 @@ rebuild_db_vacuum_into() {
         fi
     fi
 
+    # Re-curate Plex's external-content fts4_tag_titles_icu before staged optimize.
+    # Spellfix stays carried forward because fts4aux cannot read external-content FTS4.
+    if ! run_fts_recurate "${binary}" "${staged_db}"; then
+        echo "ERROR: staged FTS re-curation failed for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+
+    if [ -n "${optimize_sql}" ]; then
+        run_staged_maintenance_sql "${binary}" "${staged_db}" "${optimize_sql}"
+    fi
+    if [ -n "${post_maintenance_hook}" ]; then
+        if ! "${post_maintenance_hook}" "${post_maintenance_binary}" "${staged_db}"; then
+            echo "ERROR: post-maintenance hook failed for ${staged_db}; live DB has NOT been touched" >&2
+            cleanup_staged_db "${staged_db}"
+            exit 1
+        fi
+    fi
+    if ! staged_user_version=$("${binary}" "${staged_db}" "PRAGMA user_version;" | tr -d '\r\n'); then
+        echo "ERROR: staged user_version check failed for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+    if [ "${staged_user_version}" != "${source_user_version}" ]; then
+        echo "ERROR: staged user_version mismatch for ${staged_db}: source=${source_user_version}, staged=${staged_user_version}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+    if ! staged_application_id=$("${binary}" "${staged_db}" "PRAGMA application_id;" | tr -d '\r\n'); then
+        echo "ERROR: staged application_id check failed for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+    if [ "${staged_application_id}" != "${source_application_id}" ]; then
+        echo "ERROR: staged application_id mismatch for ${staged_db}: source=${source_application_id}, staged=${staged_application_id}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+
     mv "${staged_db}" "${db_path}"
     rm -f "${db_path}-wal" "${db_path}-shm" "${staged_db}-wal" "${staged_db}-shm"
-    if [ -n "${optimize_sql}" ]; then
-        run_post_swap_sql "${binary}" "${db_path}" "post-swap maintenance SQL" "${optimize_sql}"
-    fi
     run_post_swap_fts_maintenance "${binary}" "${db_path}"
 }
 
@@ -886,6 +1233,8 @@ optimize_plex_db() {
     local db_path="${PLEX_DATABASES_PATH}/${db_file}"
     local backup_dir
     local optimize_sql
+    local post_maintenance_hook=""
+    local post_maintenance_binary=""
 
     echo "Optimizing Plex Database: ${db_path}"
     if [ -d "${BACKUP_PATH}" ]; then
@@ -896,7 +1245,12 @@ optimize_plex_db() {
     fi
 
     # NOTE: The 0x10000 bit of PRAGMA optimize=0x10002 is inert on Plex SQLite 3.39.4.
-    optimize_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; PRAGMA optimize=0x10002;"
+    optimize_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;"
+    if [ "${db_file}" = "${PLEX_DB}" ]; then
+        optimize_sql="$(build_plex_optimize_sql)"
+        post_maintenance_hook="run_plex_main_post_maintenance"
+        post_maintenance_binary="${GENERIC_SQLITE_BINARY}"
+    fi
 
     rebuild_db_vacuum_into \
       "${PLEX_BINARY}" \
@@ -906,7 +1260,625 @@ optimize_plex_db() {
       "NONE" \
       "${sanity_sql}" \
       "${optimize_sql}" \
-      "${pre_swap_hook}"
+      "${pre_swap_hook}" \
+      "${post_maintenance_hook}" \
+      "${post_maintenance_binary}"
+}
+
+plex_preferences_file() {
+    local instance="${1}"
+
+    printf '/opt/%s/Library/Application Support/Plex Media Server/Preferences.xml\n' "${instance}"
+}
+
+extract_plex_online_token() {
+    local preferences_file="${1}"
+    local token=""
+    local seen=0
+    local extracted
+
+    [ -r "${preferences_file}" ] || return 1
+
+    while IFS= read -r extracted
+    do
+        seen=$((seen + 1))
+        if [ "${seen}" -eq 1 ]; then
+            token="${extracted}"
+        fi
+    done < <(sed -n 's/.*PlexOnlineToken="\([^"]*\)".*/\1/p' "${preferences_file}")
+
+    [ "${seen}" -eq 1 ] || return 1
+    [ -n "${token}" ] || return 1
+    case "${token}" in
+        *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-]*)
+            return 1
+            ;;
+    esac
+
+    printf '%s' "${token}"
+}
+
+resolve_plex_container_ip() {
+    local instance="${1}"
+    local inspect_out
+    local ip
+
+    if ! inspect_out="$(docker inspect --format '{{range .NetworkSettings.Networks}}{{println .IPAddress}}{{end}}' "${instance}" 2>/dev/null)"; then
+        return 1
+    fi
+
+    while IFS= read -r ip
+    do
+        [ -n "${ip}" ] || continue
+        printf '%s' "${ip}"
+        return 0
+    done <<< "${inspect_out}"
+
+    return 1
+}
+
+plex_http_request() {
+    local method="${1}"
+    local url="${2}"
+    local token="${3:-}"
+    local max_time="${4:-30}"
+    local marker="__PLEX_OPTIMIZE_HTTP_STATUS__:"
+    local response
+    local status
+    local body
+    local curl_rc
+    local restore_errexit=0
+
+    case "${max_time}" in
+        ""|*[!0-9]*)
+            max_time=30
+            ;;
+    esac
+    if [ "${max_time}" -lt 1 ]; then
+        max_time=1
+    fi
+
+    case "$-" in
+        *e*)
+            restore_errexit=1
+            set +e
+            ;;
+    esac
+
+    if [ -n "${token}" ]; then
+        response="$(curl \
+            --silent \
+            --show-error \
+            --output - \
+            --write-out "${marker}%{http_code}" \
+            --config - <<EOF_CURL_CONFIG
+request = "${method}"
+url = "${url}"
+header = "X-Plex-Token: ${token}"
+connect-timeout = 5
+max-time = ${max_time}
+EOF_CURL_CONFIG
+)"
+    else
+        response="$(curl \
+            --silent \
+            --show-error \
+            --output - \
+            --write-out "${marker}%{http_code}" \
+            --config - <<EOF_CURL_CONFIG
+request = "${method}"
+url = "${url}"
+connect-timeout = 5
+max-time = ${max_time}
+EOF_CURL_CONFIG
+)"
+    fi
+    curl_rc=$?
+
+    if [ "${restore_errexit}" -eq 1 ]; then
+        set -e
+    fi
+
+    status="${response##*${marker}}"
+    if [ "${status}" = "${response}" ]; then
+        status="000"
+        body="${response}"
+    else
+        body="${response%${marker}${status}}"
+    fi
+
+    printf '%s\n%s' "${status}" "${body}"
+    return "${curl_rc}"
+}
+
+plex_http_status() {
+    local response="${1}"
+
+    printf '%s' "${response%%$'\n'*}"
+}
+
+plex_http_body() {
+    local response="${1}"
+
+    case "${response}" in
+        *$'\n'*)
+            printf '%s' "${response#*$'\n'}"
+            ;;
+        *)
+            printf ''
+            ;;
+    esac
+}
+
+plex_activities_has_optimize() {
+    local body="${1}"
+
+    case "${body}" in
+        *'type="general.db.optimize"'*)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
+plex_optimize_activity_key() {
+    local body="${1}"
+    local activity
+    local key
+
+    while IFS= read -r activity
+    do
+        case "${activity}" in
+            *'type="general.db.optimize"'*)
+                key="$(printf '%s\n' "${activity}" | sed -n 's/.*uuid="\([^"]*\)".*/uuid:\1/p')"
+                if [ -z "${key}" ]; then
+                    key="$(printf '%s\n' "${activity}" | sed -n 's/.*id="\([^"]*\)".*/id:\1/p')"
+                fi
+                [ -n "${key}" ] || return 1
+                printf '%s' "${key}"
+                return 0
+                ;;
+        esac
+    done < <(printf '%s' "${body}" | tr '>' '\n')
+
+    return 1
+}
+
+plex_optimize_now() {
+    date '+%s'
+}
+
+plex_optimize_sleep() {
+    local seconds="${1}"
+
+    sleep "${seconds}"
+}
+
+plex_deadline_remaining() {
+    local deadline="${1}"
+    local now
+
+    if ! now="$(plex_optimize_now)"; then
+        return 1
+    fi
+    case "${now}" in
+        ""|*[!0-9]*)
+            return 1
+            ;;
+    esac
+
+    printf '%s' $((deadline - now))
+}
+
+plex_http_max_time_for_remaining() {
+    local remaining="${1}"
+    local request_cap=30
+
+    if [ "${remaining}" -lt "${request_cap}" ]; then
+        printf '%s' "${remaining}"
+    else
+        printf '%s' "${request_cap}"
+    fi
+}
+
+plex_optimize_sleep_before_deadline() {
+    local deadline="${1}"
+    local poll_seconds="${2}"
+    local remaining
+    local sleep_seconds
+
+    if ! remaining="$(plex_deadline_remaining "${deadline}")"; then
+        return 1
+    fi
+    if [ "${remaining}" -le 0 ]; then
+        return 1
+    fi
+
+    sleep_seconds="${poll_seconds}"
+    if [ "${remaining}" -lt "${sleep_seconds}" ]; then
+        sleep_seconds="${remaining}"
+    fi
+    if [ "${sleep_seconds}" -le 0 ]; then
+        return 1
+    fi
+
+    plex_optimize_sleep "${sleep_seconds}"
+}
+
+plex_optimize_result() {
+    local state="${1}"
+    local warned="${2}"
+
+    printf '__PLEX_OPTIMIZE_RESULT__:%s:%s\n' "${state}" "${warned}"
+}
+
+mark_plex_optimize_skipped() {
+    local instance="${1}"
+    local reason="${2}"
+
+    echo "WARNING: Plex optimize ${reason} for ${instance}; skipped" >&2
+    plex_optimize_result "skipped" "1"
+}
+
+wait_for_plex_identity() {
+    local base_url="${1}"
+    local identity_url="${base_url}/identity"
+    local poll_seconds=2
+    local ready_timeout_seconds=60
+    local deadline
+    local now
+    local remaining
+    local max_time
+    local response
+    local status
+
+    if ! now="$(plex_optimize_now)"; then
+        return 1
+    fi
+    deadline=$((now + ready_timeout_seconds))
+
+    while :
+    do
+        if ! remaining="$(plex_deadline_remaining "${deadline}")"; then
+            return 1
+        fi
+        if [ "${remaining}" -le 0 ]; then
+            break
+        fi
+        max_time="$(plex_http_max_time_for_remaining "${remaining}")"
+
+        if response="$(plex_http_request "GET" "${identity_url}" "" "${max_time}")"; then
+            status="$(plex_http_status "${response}")"
+            [ "${status}" = "200" ] && return 0
+        fi
+
+        if ! plex_optimize_sleep_before_deadline "${deadline}" "${poll_seconds}"; then
+            break
+        fi
+    done
+
+    return 1
+}
+
+wait_for_plex_optimize_completion() {
+    local instance="${1}"
+    local base_url="${2}"
+    local token="${3}"
+    local expected_activity_key="${4:-}"
+    local activities_url="${base_url}/activities"
+    local poll_seconds=2
+    local timeout_seconds=300
+    local startup_polls=3
+    local completion_absent_polls_required=2
+    local deadline
+    local now
+    local remaining
+    local max_time
+    local response
+    local status
+    local body
+    local seen=0
+    local startup_absent_polls=0
+    local completion_absent_polls=0
+    local activity_key=""
+
+    if ! now="$(plex_optimize_now)"; then
+        echo "WARNING: Plex optimize accepted but did not start for ${instance}" >&2
+        echo "Plex optimize accepted but did not start: ${instance}"
+        plex_optimize_result "accepted-but-never-started" "1"
+        return 0
+    fi
+    deadline=$((now + timeout_seconds))
+
+    while :
+    do
+        if ! plex_optimize_sleep_before_deadline "${deadline}" "${poll_seconds}"; then
+            break
+        fi
+        if ! remaining="$(plex_deadline_remaining "${deadline}")"; then
+            break
+        fi
+        if [ "${remaining}" -le 0 ]; then
+            break
+        fi
+        max_time="$(plex_http_max_time_for_remaining "${remaining}")"
+
+        if ! response="$(plex_http_request "GET" "${activities_url}" "${token}" "${max_time}")"; then
+            continue
+        fi
+        status="$(plex_http_status "${response}")"
+        [ "${status}" = "200" ] || continue
+        body="$(plex_http_body "${response}")"
+
+        if plex_activities_has_optimize "${body}"; then
+            activity_key=""
+            if plex_optimize_activity_key "${body}" >/dev/null; then
+                activity_key="$(plex_optimize_activity_key "${body}")"
+            fi
+            if [ -n "${expected_activity_key}" ]; then
+                if [ "${activity_key}" = "${expected_activity_key}" ]; then
+                    seen=1
+                    startup_absent_polls=0
+                    completion_absent_polls=0
+                fi
+                continue
+            else
+                seen=1
+                startup_absent_polls=0
+                completion_absent_polls=0
+                continue
+            fi
+        fi
+
+        if [ "${seen}" -eq 1 ]; then
+            completion_absent_polls=$((completion_absent_polls + 1))
+            if [ "${completion_absent_polls}" -ge "${completion_absent_polls_required}" ]; then
+                echo "Plex optimize completed: ${instance}"
+                plex_optimize_result "completed" "0"
+                return 0
+            fi
+            continue
+        fi
+
+        startup_absent_polls=$((startup_absent_polls + 1))
+        if [ "${startup_absent_polls}" -ge "${startup_polls}" ]; then
+            echo "WARNING: Plex optimize accepted but did not start for ${instance}" >&2
+            echo "Plex optimize accepted but did not start: ${instance}"
+            plex_optimize_result "accepted-but-never-started" "1"
+            return 0
+        fi
+    done
+
+    if [ "${seen}" -eq 1 ]; then
+        echo "WARNING: Plex optimize completion unconfirmed for ${instance}" >&2
+        echo "Plex optimize started but completion unconfirmed: ${instance}"
+        plex_optimize_result "started-but-completion-unconfirmed" "1"
+        return 0
+    fi
+
+    echo "WARNING: Plex optimize accepted but did not start for ${instance}" >&2
+    echo "Plex optimize accepted but did not start: ${instance}"
+    plex_optimize_result "accepted-but-never-started" "1"
+    return 0
+}
+
+trigger_plex_optimize_instance_impl() {
+    local instance="${1}"
+    local preferences_file
+    local token
+    local container_ip
+    local base_url
+    local optimize_port=32400
+    local activities_url
+    local optimize_url
+    local response
+    local status
+    local body
+    local expected_activity_key=""
+
+    if ! container_ip="$(resolve_plex_container_ip "${instance}")"; then
+        mark_plex_optimize_skipped "${instance}" "container IP unavailable"
+        return 0
+    fi
+
+    base_url="http://${container_ip}:${optimize_port}"
+    if ! wait_for_plex_identity "${base_url}"; then
+        mark_plex_optimize_skipped "${instance}" "identity not ready"
+        return 0
+    fi
+
+    preferences_file="$(plex_preferences_file "${instance}")"
+    if ! token="$(extract_plex_online_token "${preferences_file}")"; then
+        mark_plex_optimize_skipped "${instance}" "token missing"
+        return 0
+    fi
+
+    activities_url="${base_url}/activities"
+    optimize_url="${base_url}/library/optimize?async=1"
+
+    if ! response="$(plex_http_request "GET" "${activities_url}" "${token}")"; then
+        mark_plex_optimize_skipped "${instance}" "activities preflight unreachable"
+        return 0
+    fi
+    status="$(plex_http_status "${response}")"
+    body="$(plex_http_body "${response}")"
+    if [ "${status}" != "200" ]; then
+        mark_plex_optimize_skipped "${instance}" "activities preflight HTTP ${status}"
+        return 0
+    fi
+
+    if plex_activities_has_optimize "${body}"; then
+        echo "Plex optimize already running: ${instance}"
+        plex_optimize_result "already-running" "0"
+        return 0
+    fi
+
+    if ! response="$(plex_http_request "PUT" "${optimize_url}" "${token}")"; then
+        mark_plex_optimize_skipped "${instance}" "trigger request failed"
+        return 0
+    fi
+    status="$(plex_http_status "${response}")"
+    body="$(plex_http_body "${response}")"
+    if [ "${status}" != "200" ]; then
+        mark_plex_optimize_skipped "${instance}" "trigger HTTP ${status}"
+        return 0
+    fi
+    if plex_optimize_activity_key "${body}" >/dev/null; then
+        expected_activity_key="$(plex_optimize_activity_key "${body}")"
+    fi
+
+    echo "Plex optimize accepted: ${instance}"
+    wait_for_plex_optimize_completion "${instance}" "${base_url}" "${token}" "${expected_activity_key}"
+}
+
+trigger_plex_optimize_instance() {
+    local restore_xtrace=0
+    local rc
+
+    case "$-" in
+        *x*)
+            restore_xtrace=1
+            set +x
+            ;;
+    esac
+
+    trigger_plex_optimize_instance_impl "$@"
+    rc=$?
+
+    if [ "${restore_xtrace}" -eq 1 ]; then
+        set -x
+    fi
+
+    return "${rc}"
+}
+
+stop_container_for_maintenance() {
+    local kind="${1}"
+    local instance="${2}"
+    local running
+
+    if ! docker stop "${instance}"; then
+        echo "WARNING: docker stop failed for ${kind} ${instance}; skipped" >&2
+        return 2
+    fi
+
+    # WHY: Capturing Docker output outside a pipeline preserves query failure
+    # as a planned-downtime gate while still allowing restart after a stop.
+    if ! running=$(docker ps --filter "name=^${instance}$" --filter "status=running" --format '{{.Names}}'); then
+        echo "ERROR: cannot verify ${instance} is stopped (docker query failed)" >&2
+        return 3
+    fi
+    if [[ -n "${running}" ]]; then
+        echo "ERROR: ${instance} appears to be running -- planned-downtime gate failed" >&2
+        return 4
+    fi
+
+    return 0
+}
+
+start_container_after_maintenance() {
+    local kind="${1}"
+    local instance="${2}"
+    local running
+
+    if ! docker start "${instance}"; then
+        echo "ERROR: docker start failed for ${kind} ${instance}" >&2
+        return 1
+    fi
+    if ! running=$(docker ps --filter "name=^${instance}$" --filter "status=running" --format '{{.Names}}'); then
+        echo "ERROR: cannot verify ${instance} is running after start (docker query failed)" >&2
+        return 1
+    fi
+    if [[ -z "${running}" ]]; then
+        echo "ERROR: ${instance} failed to reach running after start" >&2
+        return 1
+    fi
+
+    return 0
+}
+
+run_plex_maintenance_safely() {
+    local rc
+    local restore_errexit=0
+
+    case "$-" in
+        *e*)
+            restore_errexit=1
+            set +e
+            ;;
+    esac
+
+    (
+        set -e
+
+        echo "Cleaning Up Plex Cache: ${PLEX_PATH}"
+        rm -rf "${PLEX_PATH}/Cache/PhotoTranscoder/"*
+        rm -rf "${PLEX_PATH}/Crash Reports/"*
+        rm -rf "${PLEX_PATH}/Codecs/"*
+        rm -rf "${PLEX_PATH}/Plug-in Support/Caches/"*
+
+        optimize_plex_db \
+          "${PLEX_DB}" \
+          "SELECT 1 FROM versioned_metadata_items LIMIT 1;" \
+          "try_deflate_plex_statistics_bandwidth"
+
+        if [ "${PLEX_PROCESS_BLOB_DB}" = "1" ]; then
+            optimize_plex_db "${PLEX_BLOB_DB}" "" ""
+        fi
+    )
+    rc=$?
+
+    if [ "${restore_errexit}" -eq 1 ]; then
+        set -e
+    fi
+
+    return "${rc}"
+}
+
+run_emby_maintenance_safely() {
+    local emby_backup_dir
+    local optimize_sql
+    local rc
+    local restore_errexit=0
+
+    case "$-" in
+        *e*)
+            restore_errexit=1
+            set +e
+            ;;
+    esac
+
+    (
+        set -e
+
+        echo "Optimizing Emby Database: ${EMBY_PATH}/${EMBY_DB}"
+        if [ -d "${BACKUP_PATH}" ]; then
+          mkdir -p "${BACKUP_PATH}/${EMBY_INSTANCE}/Databases"
+          emby_backup_dir="${BACKUP_PATH}/${EMBY_INSTANCE}/Databases"
+        else
+          emby_backup_dir="${EMBY_PATH}"
+        fi
+
+        optimize_sql="$(build_emby_optimize_sql)"
+
+        rebuild_db_vacuum_into \
+          "${GENERIC_SQLITE_BINARY}" \
+          "${EMBY_PATH}/${EMBY_DB}" \
+          "${emby_backup_dir}" \
+          "${PAGE_SIZE}" \
+          "NONE" \
+          "SELECT 1 FROM SyncJobs2 LIMIT 1;" \
+          "${optimize_sql}" \
+          ""
+    )
+    rc=$?
+
+    if [ "${restore_errexit}" -eq 1 ]; then
+        set -e
+    fi
+
+    return "${rc}"
 }
 
 
@@ -922,6 +1894,24 @@ optimize_plex_db() {
 
 
 main() {
+    local final_rc=0
+    local plex_optimize_attempted=0
+    local plex_optimize_successful=0
+    local plex_optimize_accepted=0
+    local plex_optimize_already_running=0
+    local plex_optimize_completed=0
+    local plex_optimize_skipped=0
+    local plex_optimize_warned=0
+    local plex_stat4_enabled=0
+    local stop_rc
+    local maintenance_rc
+    local trigger_output
+    local trigger_rc
+    local trigger_result
+    local trigger_state
+    local trigger_warned
+    local trigger_line
+
     set -ex
     set -o pipefail
 
@@ -933,24 +1923,15 @@ if [ "${#PLEX_INSTANCES[@]}" -gt 0 ]; then
         echo "WARNING: if so, copy ${HOME}/plex-sql/lib/libsqlite3.so.bundled.bak to ${HOME}/plex-sql/lib/libsqlite3.so in the staging copy and retry; the deployed container runtime lib is unchanged" >&2
         echo "WARNING: the per-instance stopped-container gate was NOT evaluated for Plex this run" >&2
         PLEX_INSTANCES=()
+    elif plex_stat4_preflight "${GENERIC_SQLITE_BINARY}"; then
+        plex_stat4_enabled=1
+    else
+        plex_stat4_enabled=0
     fi
 fi
 
 for PLEX_INSTANCE in "${PLEX_INSTANCES[@]}"
 do
-    # docker stop ${PLEX_INSTANCE}
-
-    # WHY: Capturing Docker output outside a pipeline preserves query failure
-    # as a hard planned-downtime gate.
-    if ! running=$(docker ps --filter "name=^${PLEX_INSTANCE}$" --filter "status=running" --format '{{.Names}}'); then
-        echo "ERROR: cannot verify ${PLEX_INSTANCE} is stopped (docker query failed)" >&2
-        exit 1
-    fi
-    if [[ -n "${running}" ]]; then
-        echo "ERROR: ${PLEX_INSTANCE} appears to be running -- planned-downtime gate failed" >&2
-        exit 1
-    fi
-
     PLEX_PATH="/opt/${PLEX_INSTANCE}/Library/Application Support/Plex Media Server"
     PLEX_DATABASES_PATH="${PLEX_PATH}/Plug-in Support/Databases"
 
@@ -959,34 +1940,125 @@ do
         continue
     fi
 
-    echo "Cleaning Up Plex Cache: ${PLEX_PATH}"
-    rm -rf "${PLEX_PATH}/Cache/PhotoTranscoder/"*
-    rm -rf "${PLEX_PATH}/Crash Reports/"*
-    rm -rf "${PLEX_PATH}/Codecs/"*
-    rm -rf "${PLEX_PATH}/Plug-in Support/Caches/"*
+    set +e
+    stop_container_for_maintenance "Plex" "${PLEX_INSTANCE}"
+    stop_rc=$?
+    set -e
+    case "${stop_rc}" in
+        0)
+            ;;
+        3)
+            final_rc=1
+            if ! start_container_after_maintenance "Plex" "${PLEX_INSTANCE}"; then
+                final_rc=1
+            fi
+            continue
+            ;;
+        *)
+            final_rc=1
+            continue
+            ;;
+    esac
 
-    optimize_plex_db \
-      "${PLEX_DB}" \
-      "SELECT 1 FROM versioned_metadata_items LIMIT 1;" \
-      "try_deflate_plex_statistics_bandwidth"
-
-    echo "Fixing Recently Added"
-    run_post_swap_sql "${PLEX_BINARY}" "${PLEX_DATABASES_PATH}/${PLEX_DB}" "Plex originally_available_at lower-bound repair" "UPDATE metadata_items SET originally_available_at = STRFTIME('%s', 'now', '-7 days') WHERE originally_available_at < STRFTIME('%s', 'now', '-200 years');"
-    run_post_swap_sql "${PLEX_BINARY}" "${PLEX_DATABASES_PATH}/${PLEX_DB}" "Plex originally_available_at upper-bound repair" "UPDATE metadata_items SET originally_available_at = STRFTIME('%s', 'now', '-3 days') WHERE originally_available_at > STRFTIME('%s', 'now');"
-    run_post_swap_sql "${PLEX_BINARY}" "${PLEX_DATABASES_PATH}/${PLEX_DB}" "Plex added_at lower-bound repair" "UPDATE metadata_items SET added_at = originally_available_at WHERE added_at <> originally_available_at AND originally_available_at IS NOT NULL AND added_at < STRFTIME('%s', 'now', '-200 years');"
-    run_post_swap_sql "${PLEX_BINARY}" "${PLEX_DATABASES_PATH}/${PLEX_DB}" "Plex added_at upper-bound repair" "UPDATE metadata_items SET added_at = originally_available_at WHERE added_at <> originally_available_at AND originally_available_at IS NOT NULL AND added_at > STRFTIME('%s', 'now');"
-
-    if [ "${PLEX_PROCESS_BLOB_DB}" = "1" ]; then
-        optimize_plex_db "${PLEX_BLOB_DB}" "" ""
+    set +e
+    run_plex_maintenance_safely
+    maintenance_rc=$?
+    set -e
+    if [ "${maintenance_rc}" -ne 0 ]; then
+        echo "WARNING: Plex maintenance failed for ${PLEX_INSTANCE}; restarting container and continuing" >&2
+        final_rc=1
     fi
 
-    # docker start ${PLEX_INSTANCE}
+    if ! start_container_after_maintenance "Plex" "${PLEX_INSTANCE}"; then
+        final_rc=1
+        continue
+    fi
+
+    if [ "${maintenance_rc}" -ne 0 ]; then
+        continue
+    fi
+
+    if [ "${PLEX_OPTIMIZE_API}" = "1" ]; then
+        plex_optimize_attempted=$((plex_optimize_attempted + 1))
+        set +e
+        trigger_output="$(trigger_plex_optimize_instance "${PLEX_INSTANCE}")"
+        trigger_rc=$?
+        set -e
+        trigger_result=""
+        if [ -n "${trigger_output}" ]; then
+            while IFS= read -r trigger_line
+            do
+                case "${trigger_line}" in
+                    __PLEX_OPTIMIZE_RESULT__:*)
+                        trigger_result="${trigger_line#__PLEX_OPTIMIZE_RESULT__:}"
+                        ;;
+                    *)
+                        printf '%s\n' "${trigger_line}"
+                        ;;
+                esac
+            done <<< "${trigger_output}"
+        fi
+        if [ "${trigger_rc}" -ne 0 ]; then
+            trigger_state="skipped"
+            trigger_warned=1
+            echo "WARNING: Plex optimize internal failure for ${PLEX_INSTANCE}; skipped" >&2
+        elif [ -n "${trigger_result}" ]; then
+            trigger_state="${trigger_result%%:*}"
+            trigger_warned="${trigger_result#*:}"
+            case "${trigger_warned}" in
+                0|1)
+                    ;;
+                *)
+                    trigger_state="skipped"
+                    trigger_warned=1
+                    echo "WARNING: Plex optimize malformed terminal state for ${PLEX_INSTANCE}; skipped" >&2
+                    ;;
+            esac
+        else
+            trigger_state="skipped"
+            trigger_warned=1
+            echo "WARNING: Plex optimize missing terminal state for ${PLEX_INSTANCE}; skipped" >&2
+        fi
+
+        if [ "${trigger_warned}" -eq 1 ]; then
+            plex_optimize_warned=$((plex_optimize_warned + 1))
+        fi
+        case "${trigger_state}" in
+            completed)
+                plex_optimize_completed=$((plex_optimize_completed + 1))
+                plex_optimize_successful=$((plex_optimize_successful + 1))
+                ;;
+            already-running)
+                plex_optimize_already_running=$((plex_optimize_already_running + 1))
+                plex_optimize_successful=$((plex_optimize_successful + 1))
+                ;;
+            accepted-but-never-started|started-but-completion-unconfirmed)
+                plex_optimize_accepted=$((plex_optimize_accepted + 1))
+                plex_optimize_successful=$((plex_optimize_successful + 1))
+                ;;
+            skipped|"")
+                plex_optimize_skipped=$((plex_optimize_skipped + 1))
+                ;;
+            *)
+                plex_optimize_skipped=$((plex_optimize_skipped + 1))
+                plex_optimize_warned=$((plex_optimize_warned + 1))
+                echo "WARNING: Plex optimize unknown terminal state for ${PLEX_INSTANCE}; skipped" >&2
+                ;;
+        esac
+    fi
 done
+
+if [ "${PLEX_OPTIMIZE_API}" = "1" ] && [ "${plex_optimize_attempted}" -gt 0 ]; then
+    echo "Plex optimize summary: accepted=${plex_optimize_accepted} already-running=${plex_optimize_already_running} completed=${plex_optimize_completed} skipped=${plex_optimize_skipped} warned=${plex_optimize_warned}"
+    if [ "${plex_optimize_successful}" -eq 0 ]; then
+        final_rc=1
+    fi
+fi
 
 
 if [ "${#EMBY_INSTANCES[@]}" -gt 0 ]; then
-    if ! emby_preflight_out=$("${EMBY_BINARY}" ":memory:" "SELECT 1;" 2>&1); then
-        echo "WARNING: ${EMBY_BINARY} pre-flight failed; skipping all Emby maintenance" >&2
+    if ! emby_preflight_out=$("${GENERIC_SQLITE_BINARY}" ":memory:" "SELECT 1;" 2>&1); then
+        echo "WARNING: ${GENERIC_SQLITE_BINARY} pre-flight failed; skipping all Emby maintenance" >&2
         echo "WARNING: pre-flight output: ${emby_preflight_out}" >&2
         echo "WARNING: the per-instance stopped-container gate was NOT evaluated for Emby this run" >&2
         EMBY_INSTANCES=()
@@ -995,45 +2067,50 @@ fi
 
 for EMBY_INSTANCE in "${EMBY_INSTANCES[@]}"
 do
-    # docker stop ${EMBY_INSTANCE}
-
-    if ! running=$(docker ps --filter "name=^${EMBY_INSTANCE}$" --filter "status=running" --format '{{.Names}}'); then
-        echo "ERROR: cannot verify ${EMBY_INSTANCE} is stopped (docker query failed)" >&2
-        exit 1
-    fi
-    if [[ -n "${running}" ]]; then
-        echo "ERROR: ${EMBY_INSTANCE} appears to be running -- planned-downtime gate failed" >&2
-        exit 1
-    fi
-
     EMBY_PATH="/opt/${EMBY_INSTANCE}/data"
     if [ ! -d "${EMBY_PATH}" ]; then
         echo "Skipped Missing Emby Instance: ${EMBY_INSTANCE}"
         continue
     fi
 
-    echo "Optimizing Emby Database: ${EMBY_PATH}/${EMBY_DB}"
-    if [ -d "${BACKUP_PATH}" ]; then
-      mkdir -p "${BACKUP_PATH}/${EMBY_INSTANCE}/Databases"
-      emby_backup_dir="${BACKUP_PATH}/${EMBY_INSTANCE}/Databases"
-    else
-      emby_backup_dir="${EMBY_PATH}"
-    fi
-    rebuild_db_vacuum_into \
-      "${EMBY_BINARY}" \
-      "${EMBY_PATH}/${EMBY_DB}" \
-      "${emby_backup_dir}" \
-      "${PAGE_SIZE}" \
-      "NONE" \
-      "SELECT 1 FROM SyncJobs2 LIMIT 1;" \
-      "REINDEX; PRAGMA analysis_limit=0; PRAGMA optimize=0x10002;" \
-      ""
+    set +e
+    stop_container_for_maintenance "Emby" "${EMBY_INSTANCE}"
+    stop_rc=$?
+    set -e
+    case "${stop_rc}" in
+        0)
+            ;;
+        3)
+            final_rc=1
+            if ! start_container_after_maintenance "Emby" "${EMBY_INSTANCE}"; then
+                final_rc=1
+            fi
+            continue
+            ;;
+        *)
+            final_rc=1
+            continue
+            ;;
+    esac
 
-    # docker start ${EMBY_INSTANCE}
+    set +e
+    run_emby_maintenance_safely
+    maintenance_rc=$?
+    set -e
+    if [ "${maintenance_rc}" -ne 0 ]; then
+        echo "WARNING: Emby maintenance failed for ${EMBY_INSTANCE}; restarting container and continuing" >&2
+        final_rc=1
+    fi
+
+    if ! start_container_after_maintenance "Emby" "${EMBY_INSTANCE}"; then
+        final_rc=1
+        continue
+    fi
 done
 
 
 set +ex
+return "${final_rc}"
 }
 
 if [ "${BASH_SOURCE[0]}" = "${0}" ]; then

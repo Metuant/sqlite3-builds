@@ -74,7 +74,7 @@ fi
 
 if [ -n "${BAD_INTEGRITY_MARKER:-}" ] && [ -e "$BAD_INTEGRITY_MARKER" ]; then
   case "$sql_text" in
-    *"PRAGMA integrity_check(1);"*)
+    *"PRAGMA integrity_check;"*)
       printf 'not ok\n'
       exit 0
       ;;
@@ -153,7 +153,7 @@ assert_eq "2,5,6" "$("$real_sqlite" "$positive" "$remaining_sql")" "remaining st
 assert_eq "index_statistics_bandwidth_on_account_id_and_timespan_and_at
 index_statistics_bandwidth_on_at" "$("$real_sqlite" "$positive" "$index_sql")" "statistics_bandwidth indexes"
 assert_eq "$schema_before" "$("$real_sqlite" "$positive" "$schema_sql")" "statistics_bandwidth schema after deflate"
-assert_eq "ok" "$("$real_sqlite" "$positive" "PRAGMA integrity_check(1);")" "post-deflate integrity"
+assert_eq "ok" "$("$real_sqlite" "$positive" "PRAGMA integrity_check;")" "post-deflate integrity"
 
 run_invalid_retention_case invalid-retention-empty ""
 run_invalid_retention_case invalid-retention-alpha "abc"
@@ -172,7 +172,7 @@ try_deflate_plex_statistics_bandwidth sqlite3 "$delete_fail" 90 >"$tmp/delete-fa
 unset FAIL_DELETE
 assert_contains "$(cat "$tmp/delete-fail.err")" "WARNING: statistics_bandwidth deflate DELETE failed" "DELETE failure warning"
 assert_eq "$delete_hash_before" "$(sha256_file "$delete_fail")" "DELETE failure DB hash"
-assert_eq "ok" "$("$real_sqlite" "$delete_fail" "PRAGMA integrity_check(1);")" "DELETE failure DB integrity"
+assert_eq "ok" "$("$real_sqlite" "$delete_fail" "PRAGMA integrity_check;")" "DELETE failure DB integrity"
 
 vacuum_fail="$tmp/vacuum-fail.db"
 create_stats_fixture "$vacuum_fail"
@@ -181,7 +181,7 @@ try_deflate_plex_statistics_bandwidth sqlite3 "$vacuum_fail" 90 >"$tmp/vacuum-fa
 unset FAIL_VACUUM
 assert_contains "$(cat "$tmp/vacuum-fail.err")" "WARNING: post-deflate VACUUM failed" "VACUUM failure warning"
 assert_eq "2,5,6" "$("$real_sqlite" "$vacuum_fail" "$remaining_sql")" "VACUUM failure retained deflated rows"
-assert_eq "ok" "$("$real_sqlite" "$vacuum_fail" "PRAGMA integrity_check(1);")" "VACUUM failure DB integrity"
+assert_eq "ok" "$("$real_sqlite" "$vacuum_fail" "PRAGMA integrity_check;")" "VACUUM failure DB integrity"
 
 integrity_live="$tmp/integrity-live.db"
 create_stats_fixture "$integrity_live"

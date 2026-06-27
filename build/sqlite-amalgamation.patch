@@ -1,6 +1,75 @@
 --- a/sqlite3.c
 +++ b/sqlite3.c
-@@ -187294,7 +187294,7 @@
+@@ -93653,15 +93653,20 @@
+ ** This routine sets the error code and string returned by
+ ** sqlite3_errcode(), sqlite3_errmsg() and sqlite3_errmsg16().
+ */
++__attribute__((visibility("hidden"))) extern void
++auto_extension_optimize_after_stmt(sqlite3 *db, sqlite3_stmt *self_stmt);
++
+ SQLITE_API int sqlite3_finalize(sqlite3_stmt *pStmt){
+   int rc;
++  sqlite3 *db = 0;
++  int runOptimize = 0;
+   if( pStmt==0 ){
+     /* IMPLEMENTATION-OF: R-57228-12904 Invoking sqlite3_finalize() on a NULL
+     ** pointer is a harmless no-op. */
+     rc = SQLITE_OK;
+   }else{
+     Vdbe *v = (Vdbe*)pStmt;
+-    sqlite3 *db = v->db;
++    db = v->db;
+     if( vdbeSafety(v) ) return SQLITE_MISUSE_BKPT;
+     sqlite3_mutex_enter(db->mutex);
+     checkProfileCallback(db, v);
+@@ -93669,8 +93674,12 @@
+     rc = sqlite3VdbeReset(v);
+     sqlite3VdbeDelete(v);
+     rc = sqlite3ApiExit(db, rc);
++    runOptimize = rc==SQLITE_OK && db && db->init.busy==0 && db->eOpenState!=SQLITE_STATE_ZOMBIE;
+     sqlite3LeaveMutexAndCloseZombie(db);
+   }
++  if( runOptimize ){
++    auto_extension_optimize_after_stmt(db, NULL);
++  }
+   return rc;
+ }
+ 
+@@ -93684,11 +93693,12 @@
+ */
+ SQLITE_API int sqlite3_reset(sqlite3_stmt *pStmt){
+   int rc;
++  sqlite3 *db = 0;
+   if( pStmt==0 ){
+     rc = SQLITE_OK;
+   }else{
+     Vdbe *v = (Vdbe*)pStmt;
+-    sqlite3 *db = v->db;
++    db = v->db;
+     sqlite3_mutex_enter(db->mutex);
+     checkProfileCallback(db, v);
+     rc = sqlite3VdbeReset(v);
+@@ -93697,6 +93707,9 @@
+     rc = sqlite3ApiExit(db, rc);
+     sqlite3_mutex_leave(db->mutex);
+   }
++  if( rc==SQLITE_OK && db && db->init.busy==0 && db->eOpenState!=SQLITE_STATE_ZOMBIE ){
++    auto_extension_optimize_after_stmt(db, pStmt);
++  }
+   return rc;
+ }
+ 
+@@ -94513,6 +94526,9 @@
+     assert( v->expired==0 );
+   }
+   sqlite3_mutex_leave(db->mutex);
++  if( rc==SQLITE_DONE && db && db->init.busy==0 && db->eOpenState!=SQLITE_STATE_ZOMBIE ){
++    auto_extension_optimize_after_stmt(db, pStmt);
++  }
+   return rc;
+ }
+ 
+@@ -187385,7 +187401,7 @@
  **    *  Recursive calls to this routine from thread X return immediately
  **       without blocking.
  */
@@ -9,7 +78,7 @@
    MUTEX_LOGIC( sqlite3_mutex *pMainMtx; )      /* The main static mutex */
    int rc;                                      /* Result code */
  #ifdef SQLITE_EXTRA_INIT
-@@ -187530,7 +187530,7 @@
+@@ -187621,7 +187637,7 @@
  ** threadsafe.  Failure to heed these warnings can lead to unpredictable
  ** behavior.
  */
@@ -18,7 +87,7 @@
    va_list ap;
    int rc = SQLITE_OK;
  
-@@ -188054,7 +188054,7 @@
+@@ -188145,7 +188161,7 @@
  /*
  ** Configuration settings for an individual database connection
  */
@@ -27,7 +96,94 @@
    va_list ap;
    int rc;
  
-@@ -190790,14 +190790,14 @@
+@@ -188430,6 +188446,76 @@
+   UNUSED_PARAMETER(db);
+ #endif
+ }
++__attribute__((visibility("hidden"))) extern void auto_extension_optimize_before_close(sqlite3 *db);
++
++typedef struct auto_extension_progress_snapshot {
++  unsigned nProgressOps;
++  int (*xProgress)(void*);
++  void *pProgressArg;
++} auto_extension_progress_snapshot;
++
++typedef struct auto_extension_error_snapshot {
++  int errCode;
++  int errByteOffset;
++  sqlite3_value *pErr;
++} auto_extension_error_snapshot;
++
++__attribute__((visibility("hidden"))) void
++auto_extension_progress_handler_push(sqlite3 *db, int nOps,
++                                     int (*xProgress)(void*), void *pArg,
++                                     auto_extension_progress_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  snapshot->nProgressOps = db->nProgressOps;
++  snapshot->xProgress = db->xProgress;
++  snapshot->pProgressArg = db->pProgressArg;
++  db->xProgress = xProgress;
++  db->nProgressOps = (unsigned)nOps;
++  db->pProgressArg = pArg;
++  sqlite3_mutex_leave(db->mutex);
++}
++
++__attribute__((visibility("hidden"))) void
++auto_extension_progress_handler_pop(sqlite3 *db,
++                                    const auto_extension_progress_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  db->nProgressOps = snapshot->nProgressOps;
++  db->xProgress = snapshot->xProgress;
++  db->pProgressArg = snapshot->pProgressArg;
++  sqlite3_mutex_leave(db->mutex);
++}
++
++__attribute__((visibility("hidden"))) int
++auto_extension_error_state_push(sqlite3 *db,
++                                auto_extension_error_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  snapshot->errCode = db->errCode;
++  snapshot->errByteOffset = db->errByteOffset;
++  snapshot->pErr = sqlite3_value_dup(db->pErr);
++  if( db->pErr && !snapshot->pErr ){
++    sqlite3_mutex_leave(db->mutex);
++    return SQLITE_NOMEM;
++  }
++  sqlite3_mutex_leave(db->mutex);
++  return SQLITE_OK;
++}
++
++__attribute__((visibility("hidden"))) void
++auto_extension_error_state_pop(sqlite3 *db,
++                               auto_extension_error_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  db->errCode = snapshot->errCode;
++  db->errByteOffset = snapshot->errByteOffset;
++  if( snapshot->pErr ){
++    if( db->pErr || (db->pErr = sqlite3ValueNew(db))!=0 ){
++      (void)sqlite3VdbeMemCopy((Mem*)db->pErr, (Mem*)snapshot->pErr);
++    }
++    sqlite3_value_free(snapshot->pErr);
++    snapshot->pErr = 0;
++  }else if( db->pErr ){
++    sqlite3ValueSetNull(db->pErr);
++  }
++  sqlite3_mutex_leave(db->mutex);
++}
+ 
+ /*
+ ** Return TRUE if database connection db has unfinalized prepared
+@@ -188484,6 +188570,9 @@
+     sqlite3_mutex_leave(db->mutex);
+     return SQLITE_BUSY;
+   }
++  if( !connectionIsBusy(db) ){
++    auto_extension_optimize_before_close(db);
++  }
+ 
+ #ifdef SQLITE_ENABLE_SQLLOG
+   if( sqlite3GlobalConfig.xSqllog ){
+@@ -190881,14 +190970,14 @@
  /*
  ** Open a new database handle.
  */
@@ -44,7 +200,7 @@
    const char *filename,   /* Database filename (UTF-8) */
    sqlite3 **ppDb,         /* OUT: SQLite db handle */
    int flags,              /* Flags */
-@@ -190810,7 +190810,7 @@
+@@ -190901,7 +190990,7 @@
  /*
  ** Open a new database handle.
  */

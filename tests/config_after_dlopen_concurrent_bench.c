@@ -191,13 +191,7 @@ static int run_mode(const char *mode, int disabled) {
 }
 
 int main(void) {
-    const char *run_bench = getenv("RUN_BENCH");
     int failures = 0;
-
-    if (!run_bench || strcmp(run_bench, "1") != 0) {
-        printf("SKIP bench\n");
-        return 0;
-    }
 
     failures += run_mode("positive", 0);
     sqlite3_shutdown();
