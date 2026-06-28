@@ -100,7 +100,7 @@ case "$stat4_available" in
   *) fail "test sqlite3 ENABLE_STAT4 capability" "0 or 1" "$stat4_available" ;;
 esac
 
-[ "${GENERIC_SQLITE_BINARY:-}" = "${HOME}/bin/sqlite3" ] || fail "GENERIC_SQLITE_BINARY default" "${HOME}/bin/sqlite3" "${GENERIC_SQLITE_BINARY:-unset}"
+[ -z "${GENERIC_SQLITE_BINARY+x}" ] || fail "GENERIC_SQLITE_BINARY source-only state" "unset" "$GENERIC_SQLITE_BINARY"
 old_binary_name="EMBY""_BINARY"
 [ -z "${!old_binary_name+x}" ] || fail "$old_binary_name hard rename" "unset" "${!old_binary_name}"
 
@@ -273,7 +273,7 @@ con.close()
 PY
 
   local ddl
-  for ddl in "${PLEX_INDEXES[@]}"; do
+  for ddl in "${_PLEX_INDEXES[@]}"; do
     "$real_sqlite" "$db" "$ddl"
   done
 }
@@ -430,13 +430,13 @@ run_plex_optimize_with_stat4_capture() {
   (
     cd "$repo_root"
     . ./scripts/optimize_media_servers.sh
+    local plex_databases_path="$db_dir"
+    local plex_instance="plex-stat4-fixture"
     PLEX_BINARY="$tmp/bin/plex-sqlite"
     GENERIC_SQLITE_BINARY="$tmp/bin/stat4-sqlite"
     plex_stat4_enabled=1
-    PLEX_DATABASES_PATH="$db_dir"
-    PLEX_INSTANCE="plex-stat4-fixture"
     BACKUP_PATH="$tmp/backups"
-    optimize_plex_db "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+    optimize_plex_db "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
   ) >"$tmp/${name}.out" 2>"$tmp/${name}.err"
   rc=$?
   set -e
@@ -445,7 +445,7 @@ run_plex_optimize_with_stat4_capture() {
 
 integration_dir="$tmp/integration"
 mkdir -p "$integration_dir"
-integration_db="$integration_dir/$PLEX_DB"
+integration_db="$integration_dir/$_PLEX_DB"
 create_plex_stat4_fixture "$integration_db" 0 0 1
 export ORDER_LOG="$tmp/order.log"
 export STAT4_MARKER="$tmp/stat4-marker"
@@ -481,7 +481,7 @@ fi
 
 corrupt_dir="$tmp/corrupt"
 mkdir -p "$corrupt_dir"
-corrupt_db="$corrupt_dir/$PLEX_DB"
+corrupt_db="$corrupt_dir/$_PLEX_DB"
 create_plex_stat4_fixture "$corrupt_db" 0 0
 corrupt_hash_before="$(sha256_file "$corrupt_db")"
 : > "$ORDER_LOG"

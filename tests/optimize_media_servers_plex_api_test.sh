@@ -56,6 +56,14 @@ count_log_occurrences() {
   awk -v needle="$needle" 'index($0, needle) { count++ } END { print count + 0 }' "$file"
 }
 
+safe_instance_name() {
+  local prefix name safe
+  prefix="$1"
+  name="$2"
+  safe="$(printf '%s' "$name" | tr -c 'A-Za-z0-9_-' '-')"
+  printf '%s-%s\n' "$prefix" "$safe"
+}
+
 first_line_of() {
   local file needle
   file="$1"
@@ -102,6 +110,33 @@ assert_case_artifacts_redacted() {
   done < <(find "$case_dir" -type f)
 }
 
+map_test_opt_path() {
+  local path prefix
+  path="$1"
+  if [ -n "${OPTIMIZE_API_INSTANCE_ROOT:-}" ] && [ -n "${OPTIMIZE_API_INSTANCE:-}" ]; then
+    prefix="/opt/${OPTIMIZE_API_INSTANCE}"
+    case "$path" in
+      "$prefix"|"$prefix"/*)
+        printf '%s%s\n' "$OPTIMIZE_API_INSTANCE_ROOT" "${path#"$prefix"}"
+        return 0
+        ;;
+    esac
+  fi
+  printf '%s\n' "$path"
+}
+
+[() {
+  if builtin [ "$#" -eq 3 ] && builtin [ "$1" = "-d" ] && builtin [ "$3" = "]" ]; then
+    builtin [ -d "$(map_test_opt_path "$2")" ]
+    return
+  fi
+  if builtin [ "$#" -eq 4 ] && builtin [ "$1" = "!" ] && builtin [ "$2" = "-d" ] && builtin [ "$4" = "]" ]; then
+    builtin [ ! -d "$(map_test_opt_path "$3")" ]
+    return
+  fi
+  builtin [ "$@"
+}
+
 mkdir -p "$tmp/bin"
 
 cat > "$tmp/bin/sqlite-ok" <<'EOF_SQLITE'
@@ -115,6 +150,29 @@ cat > "$tmp/bin/docker" <<'EOF_DOCKER'
 cmd="${1:-}"
 shift || true
 printf '%s %s\n' "$cmd" "$*" >> "$OPTIMIZE_API_DOCKER_ARGV_LOG"
+
+emit_running_instance() {
+  local arg filter_next name_regex
+  filter_next=0
+  name_regex=""
+
+  for arg in "$@"; do
+    if [ "$filter_next" = "1" ]; then
+      case "$arg" in
+        name=*) name_regex="${arg#name=}" ;;
+      esac
+      filter_next=0
+      continue
+    fi
+    if [ "$arg" = "--filter" ]; then
+      filter_next=1
+    fi
+  done
+
+  if [ -z "$name_regex" ] || [[ "$OPTIMIZE_API_INSTANCE" =~ $name_regex ]]; then
+    printf '%s\n' "$OPTIMIZE_API_INSTANCE"
+  fi
+}
 
 case "$cmd" in
   stop)
@@ -156,7 +214,7 @@ case "$cmd" in
 
     case "$OPTIMIZE_API_DOCKER_SCENARIO:$count" in
       fail-to-stop:1)
-        printf '%s\n' "$OPTIMIZE_API_INSTANCE"
+        emit_running_instance "$@"
         ;;
       fail-to-start:1)
         :
@@ -168,7 +226,7 @@ case "$cmd" in
         :
         ;;
       *)
-        printf '%s\n' "$OPTIMIZE_API_INSTANCE"
+        emit_running_instance "$@"
         ;;
     esac
     exit 0
@@ -318,11 +376,12 @@ EOF_CURL
 chmod +x "$tmp/bin/curl"
 
 prepare_plex_instance() {
-  local case_dir instance_path plex_root copy_prefs layout
+  local case_dir instance_name instance_path plex_root copy_prefs layout
   case_dir="$1"
-  copy_prefs="$2"
-  layout="${3:-normal}"
-  instance_path="$case_dir/plex"
+  instance_name="$2"
+  copy_prefs="$3"
+  layout="${4:-normal}"
+  instance_path="$case_dir/opt/$instance_name"
   plex_root="$instance_path/Library/Application Support/Plex Media Server"
   if [ "$layout" != "missing-databases" ]; then
     mkdir -p "$plex_root/Plug-in Support/Databases"
@@ -333,24 +392,23 @@ prepare_plex_instance() {
   if [ "$copy_prefs" = "1" ]; then
     cp "$fixture_prefs" "$plex_root/Preferences.xml"
   fi
-  printf '../%s\n' "${instance_path#/}"
 }
 
 prepare_emby_instance() {
-  local case_dir instance_path layout
+  local case_dir instance_name instance_path layout
   case_dir="$1"
-  layout="${2:-normal}"
-  instance_path="$case_dir/emby"
+  instance_name="$2"
+  layout="${3:-normal}"
+  instance_path="$case_dir/opt/$instance_name"
   if [ "$layout" != "missing-data" ]; then
     mkdir -p "$instance_path/data"
   else
     mkdir -p "$instance_path"
   fi
-  printf '../%s\n' "${instance_path#/}"
 }
 
 run_plex_case() {
-  local name http_scenario docker_scenario flag prefs expected_rc layout maintenance_scenario case_dir instance rc out err
+  local name http_scenario docker_scenario flag prefs expected_rc layout maintenance_scenario case_dir instance instance_root rc out err
   name="$1"
   http_scenario="$2"
   docker_scenario="$3"
@@ -369,7 +427,9 @@ run_plex_case() {
   : > "$case_dir/lifecycle.log"
   : > "$case_dir/maintenance.log"
   printf '0\n' > "$case_dir/fake-time"
-  instance="$(prepare_plex_instance "$case_dir" "$prefs" "$layout")"
+  instance="$(safe_instance_name plex "$name")"
+  instance_root="$case_dir/opt/$instance"
+  prepare_plex_instance "$case_dir" "$instance" "$prefs" "$layout"
 
   set +e
   (
@@ -385,6 +445,7 @@ run_plex_case() {
     export OPTIMIZE_API_HTTP_SCENARIO="$http_scenario"
     export OPTIMIZE_API_PREFS_FIXTURE="$fixture_prefs"
     export OPTIMIZE_API_INSTANCE="$instance"
+    export OPTIMIZE_API_INSTANCE_ROOT="$instance_root"
     export OPTIMIZE_API_FAKE_TIME_FILE="$case_dir/fake-time"
     export OPTIMIZE_API_MAINTENANCE_SCENARIO="$maintenance_scenario"
 
@@ -396,6 +457,18 @@ run_plex_case() {
         exit 42
       fi
     }
+    plex_preferences_file() {
+      map_test_opt_path "/opt/$1/Library/Application Support/Plex Media Server/Preferences.xml"
+    }
+    run_plex_maintenance_safely() {
+      (
+        set -e
+        optimize_plex_db "${_PLEX_DB}" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" "try_deflate_plex_statistics_bandwidth"
+        if [ "${PLEX_PROCESS_BLOB_DB:-0}" = "1" ]; then
+          optimize_plex_db "${_PLEX_BLOB_DB}" "" ""
+        fi
+      )
+    }
     plex_optimize_now() { cat "$OPTIMIZE_API_FAKE_TIME_FILE"; }
     plex_optimize_sleep() {
       local seconds now
@@ -404,14 +477,29 @@ run_plex_case() {
       printf '%s\n' $((now + seconds)) > "$OPTIMIZE_API_FAKE_TIME_FILE"
     }
 
-    PLEX_BINARY="$tmp/bin/sqlite-ok"
-    GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
-    BACKUP_PATH="$case_dir/backups"
-    PLEX_OPTIMIZE_API="$flag"
-    PLEX_INSTANCES=("$instance")
-    EMBY_INSTANCES=()
+    cat > "$case_dir/optimize.conf" <<EOF_CONF
+PLEX_INSTANCES=("$instance")
+EMBY_INSTANCES=()
+PLEX_BINARY="$tmp/bin/sqlite-ok"
+GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
+BACKUP_PATH="$case_dir/backups"
+PLEX_OPTIMIZE_API=$flag
+PLEX_PROCESS_BLOB_DB=0
+STATS_BANDWIDTH_RETAIN_DAYS=90
+EOF_CONF
+    export OPTIMIZE_MEDIA_SERVERS_CONF="$case_dir/optimize.conf"
 
     main
+    main_rc=$?
+    assert_eq "$tmp/bin/sqlite-ok" "$PLEX_BINARY" "$name config PLEX_BINARY"
+    assert_eq "$tmp/bin/sqlite-ok" "$GENERIC_SQLITE_BINARY" "$name config GENERIC_SQLITE_BINARY"
+    assert_eq "$case_dir/backups" "$BACKUP_PATH" "$name config BACKUP_PATH"
+    assert_eq "$flag" "$PLEX_OPTIMIZE_API" "$name config PLEX_OPTIMIZE_API"
+    assert_eq "0" "$PLEX_PROCESS_BLOB_DB" "$name config PLEX_PROCESS_BLOB_DB"
+    assert_eq "90" "$STATS_BANDWIDTH_RETAIN_DAYS" "$name config STATS_BANDWIDTH_RETAIN_DAYS"
+    assert_eq "$instance" "${PLEX_INSTANCES[*]}" "$name config PLEX_INSTANCES"
+    assert_eq "" "${EMBY_INSTANCES[*]}" "$name config EMBY_INSTANCES"
+    exit "$main_rc"
   ) >"$case_dir/out" 2>"$case_dir/err"
   rc=$?
   set -e
@@ -432,7 +520,7 @@ run_plex_case() {
 }
 
 run_emby_case() {
-  local name docker_scenario expected_rc layout maintenance_scenario case_dir instance rc
+  local name docker_scenario expected_rc layout maintenance_scenario case_dir instance instance_root rc
   name="$1"
   docker_scenario="$2"
   expected_rc="$3"
@@ -446,7 +534,9 @@ run_emby_case() {
   : > "$case_dir/requests.log"
   : > "$case_dir/lifecycle.log"
   : > "$case_dir/maintenance.log"
-  instance="$(prepare_emby_instance "$case_dir" "$layout")"
+  instance="$(safe_instance_name emby "$name")"
+  instance_root="$case_dir/opt/$instance"
+  prepare_emby_instance "$case_dir" "$instance" "$layout"
 
   set +e
   (
@@ -461,6 +551,7 @@ run_emby_case() {
     export OPTIMIZE_API_HTTP_SCENARIO="completed"
     export OPTIMIZE_API_PREFS_FIXTURE="$fixture_prefs"
     export OPTIMIZE_API_INSTANCE="$instance"
+    export OPTIMIZE_API_INSTANCE_ROOT="$instance_root"
     export OPTIMIZE_API_MAINTENANCE_SCENARIO="$maintenance_scenario"
 
     . ./scripts/optimize_media_servers.sh
@@ -470,15 +561,36 @@ run_emby_case() {
         exit 42
       fi
     }
+    run_emby_maintenance_safely() {
+      (
+        set -e
+        rebuild_db_vacuum_into
+      )
+    }
 
-    PLEX_BINARY="$tmp/bin/sqlite-ok"
-    GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
-    BACKUP_PATH="$case_dir/backups"
-    PLEX_OPTIMIZE_API=1
-    PLEX_INSTANCES=()
-    EMBY_INSTANCES=("$instance")
+    cat > "$case_dir/optimize.conf" <<EOF_CONF
+PLEX_INSTANCES=()
+EMBY_INSTANCES=("$instance")
+PLEX_BINARY="$tmp/bin/sqlite-ok"
+GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
+BACKUP_PATH="$case_dir/backups"
+PLEX_OPTIMIZE_API=1
+PLEX_PROCESS_BLOB_DB=0
+STATS_BANDWIDTH_RETAIN_DAYS=90
+EOF_CONF
+    export OPTIMIZE_MEDIA_SERVERS_CONF="$case_dir/optimize.conf"
 
     main
+    main_rc=$?
+    assert_eq "$tmp/bin/sqlite-ok" "$PLEX_BINARY" "$name config PLEX_BINARY"
+    assert_eq "$tmp/bin/sqlite-ok" "$GENERIC_SQLITE_BINARY" "$name config GENERIC_SQLITE_BINARY"
+    assert_eq "$case_dir/backups" "$BACKUP_PATH" "$name config BACKUP_PATH"
+    assert_eq "1" "$PLEX_OPTIMIZE_API" "$name config PLEX_OPTIMIZE_API"
+    assert_eq "0" "$PLEX_PROCESS_BLOB_DB" "$name config PLEX_PROCESS_BLOB_DB"
+    assert_eq "90" "$STATS_BANDWIDTH_RETAIN_DAYS" "$name config STATS_BANDWIDTH_RETAIN_DAYS"
+    assert_eq "" "${PLEX_INSTANCES[*]}" "$name config PLEX_INSTANCES"
+    assert_eq "$instance" "${EMBY_INSTANCES[*]}" "$name config EMBY_INSTANCES"
+    exit "$main_rc"
   ) >"$case_dir/out" 2>"$case_dir/err"
   rc=$?
   set -e
@@ -490,8 +602,8 @@ run_emby_case() {
 run_plex_case flag-off completed ok 0 1 0
 assert_eq 0 "$(count_log_occurrences 'identity' "$tmp/flag-off/requests.log")" "flag off skips identity wait"
 assert_eq 0 "$(count_log_occurrences 'library/optimize?async=1' "$tmp/flag-off/requests.log")" "flag off skips optimize PUT"
-assert_contains "$(cat "$tmp/flag-off/lifecycle.log")" "stop ../" "flag off stops Plex"
-assert_contains "$(cat "$tmp/flag-off/lifecycle.log")" "start ../" "flag off starts Plex"
+assert_contains "$(cat "$tmp/flag-off/lifecycle.log")" "stop plex-flag-off" "flag off stops Plex"
+assert_contains "$(cat "$tmp/flag-off/lifecycle.log")" "start plex-flag-off" "flag off starts Plex"
 
 run_plex_case completed-readiness readiness-wait ok 1 1 0
 assert_contains "$(cat "$tmp/completed-readiness/out")" "Plex optimize completed:" "completed terminal state"
@@ -567,7 +679,7 @@ run_plex_case start-command-fails completed start-command-fails 0 1 1
 assert_contains "$(cat "$tmp/start-command-fails/err")" "ERROR: docker start failed for Plex" "start command failure labeled"
 
 run_plex_case maintenance-exits completed ok 0 1 1 normal exit-fail
-assert_contains "$(cat "$tmp/maintenance-exits/lifecycle.log")" "start ../" "maintenance exit still restarts Plex"
+assert_contains "$(cat "$tmp/maintenance-exits/lifecycle.log")" "start plex-maintenance-exits" "maintenance exit still restarts Plex"
 assert_contains "$(cat "$tmp/maintenance-exits/err")" "WARNING: Plex maintenance failed" "maintenance exit warning"
 
 run_plex_case fail-to-stop completed fail-to-stop 0 1 1
@@ -576,11 +688,11 @@ assert_not_contains "$(cat "$tmp/fail-to-stop/lifecycle.log")" "start " "fail-to
 
 run_plex_case fail-to-start completed fail-to-start 0 1 1
 assert_contains "$(cat "$tmp/fail-to-start/err")" "failed to reach running after start" "fail-to-start error"
-assert_contains "$(cat "$tmp/fail-to-start/lifecycle.log")" "start ../" "fail-to-start attempted start"
+assert_contains "$(cat "$tmp/fail-to-start/lifecycle.log")" "start plex-fail-to-start" "fail-to-start attempted start"
 
 run_emby_case emby-lifecycle ok 0
-assert_contains "$(cat "$tmp/emby-lifecycle/lifecycle.log")" "stop ../" "Emby stops"
-assert_contains "$(cat "$tmp/emby-lifecycle/lifecycle.log")" "start ../" "Emby starts"
+assert_contains "$(cat "$tmp/emby-lifecycle/lifecycle.log")" "stop emby-emby-lifecycle" "Emby stops"
+assert_contains "$(cat "$tmp/emby-lifecycle/lifecycle.log")" "start emby-emby-lifecycle" "Emby starts"
 assert_eq "" "$(cat "$tmp/emby-lifecycle/requests.log")" "Emby makes no HTTP requests"
 
 run_emby_case emby-missing-data ok 0 missing-data
@@ -589,7 +701,7 @@ assert_not_contains "$(cat "$tmp/emby-missing-data/lifecycle.log")" "stop " "mis
 assert_not_contains "$(cat "$tmp/emby-missing-data/lifecycle.log")" "start " "missing Emby data does not start"
 
 run_emby_case emby-maintenance-exits ok 1 normal exit-fail
-assert_contains "$(cat "$tmp/emby-maintenance-exits/lifecycle.log")" "start ../" "maintenance exit still restarts Emby"
+assert_contains "$(cat "$tmp/emby-maintenance-exits/lifecycle.log")" "start emby-emby-maintenance-exits" "maintenance exit still restarts Emby"
 assert_contains "$(cat "$tmp/emby-maintenance-exits/err")" "WARNING: Emby maintenance failed" "Emby maintenance exit warning"
 
 run_emby_case emby-start-command-fails start-command-fails 1

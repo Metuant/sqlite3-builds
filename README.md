@@ -84,15 +84,67 @@ Signing: TODO.
 
 ## Planned-Downtime Maintenance
 
-`scripts/optimize_media_servers.sh` operates only on instances added to its
-`PLEX_INSTANCES` and `EMBY_INSTANCES` arrays. Current operator controls:
+`scripts/optimize_media_servers.sh` is a host-side helper for stopped Plex and
+Emby containers. It consumes a generic SQLite CLI at `${HOME}/bin/sqlite3` and
+Plex runtime files under `${HOME}/plex-sql/`.
+
+Stage the generic CLI directly from the local build output:
+
+```bash
+mkdir -p "${HOME}/bin"
+install -m 0755 release/cli/sqlite3 "${HOME}/bin/sqlite3"
+```
+
+The Plex maintenance prerequisites are copied from a Plex container, not from
+the built `release/library-plex/libsqlite3.so` output. That built library is a
+separate library-replacement artifact for the Plex LSIO mod path.
+
+```bash
+mkdir -p "${HOME}/plex-sql"
+rm -rf "${HOME}/plex-sql/lib"
+docker cp plex:"/usr/lib/plexmediaserver/lib/" "${HOME}/plex-sql/lib/"
+
+# If lib/ came from a modded container, restore Plex's bundled SQLite in the
+# staging copy so Plex SQLite's source-id guard matches.
+cp -f "${HOME}/plex-sql/lib/libsqlite3.so.bundled.bak" \
+  "${HOME}/plex-sql/lib/libsqlite3.so"
+
+docker cp plex:"/usr/lib/plexmediaserver/Plex SQLite" "${HOME}/plex-sql/"
+docker cp plex:"/usr/lib/plexmediaserver/Plex Media Server" "${HOME}/plex-sql/"
+```
+
+Copying the `Plex Media Server` sibling is recommended staging for Plex's
+source-id guard. The script executes only `PLEX_BINARY` (`Plex SQLite`); the
+sibling binary is not a code-proven runtime dependency of the helper.
+
+Operator config is a sourced Bash file. Copy
+`scripts/optimize_media_servers.conf.example` to
+`scripts/optimize_media_servers.conf`, or set
+`OPTIMIZE_MEDIA_SERVERS_CONF=/path/to/optimize_media_servers.conf`. An absent
+resolved config file is an error before any database or container work. Run
+`scripts/optimize_media_servers.sh --help` for usage; help does not require a
+config file. Keep the copied or host-local config out of version control; do
+not commit it.
+
+Each `PLEX_INSTANCES` or `EMBY_INSTANCES` entry is both the Docker container
+name and the `/opt/<instance>` path stem:
+
+```bash
+PLEX_INSTANCES=("plex" "plex-4k")
+EMBY_INSTANCES=("emby")
+```
+
+Current operator controls:
 
 | Control | Default | Change path | Effect |
 |---|---|---|---|
-| `PAGE_SIZE` | `16384` | Edit the script default before the run | Target page size for staged Plex and Emby rebuilds. |
-| `BACKUP_PATH` | `/mnt/media-backup` | Edit the script default before the run | Existing path receives instance-scoped `.original` backups; otherwise backups stay beside the database. |
-| `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Edit the script default before the run | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside the retention window. |
-| `PLEX_PROCESS_BLOB_DB` | `0` | Set to `1` in the environment before the run | Opts into the Plex blob database rebuild pass. |
+| `_PAGE_SIZE` | `16384` | Edit the in-script `_PAGE_SIZE` constant in `scripts/optimize_media_servers.sh` | Target page size for staged Plex and Emby rebuilds. |
+| `BACKUP_PATH` | `/mnt/media-backup` | Set in the config file | Existing path receives instance-scoped `.original` backups; otherwise backups stay beside the database. |
+| `GENERIC_SQLITE_BINARY` | `${HOME}/bin/sqlite3` | Set in the config file | Runs Emby maintenance and the Plex main-DB STAT4 pass. |
+| `PLEX_BINARY` | `${HOME}/plex-sql/Plex SQLite` | Set in the config file | Runs Plex maintenance with Plex's ICU-enabled SQLite binary. |
+| `PLEX_OPTIMIZE_API` | `0` | Set in the config file | Literal `1` enables the optional post-start Plex `PUT /library/optimize?async=1` trigger. |
+| `PLEX_PROCESS_BLOB_DB` | `0` | Set in the config file | Literal `1` opts into the Plex blob database rebuild pass. |
+| `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Set in the config file | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside the retention window. |
 | Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Uses `STATS_BANDWIDTH_RETAIN_DAYS` | Deletes anonymous or older bandwidth rows on the staged database, runs `VACUUM`, and aborts before swap if post-deflate integrity is not `ok`. |
 
 ## Motivation

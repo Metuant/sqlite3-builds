@@ -90,6 +90,21 @@ assert_eq() {
   [ "$actual" = "$expected" ] || fail "$label drift: observed=$actual expected=$expected"
 }
 
+extract_sqlite_url_version_suffix() {
+  label="$1"
+  url="$2"
+  basename="${url##*/}"
+  suffix="${basename%.zip}"
+  suffix="${suffix##*-}"
+  case "$suffix" in
+    ''|*[!0-9]*) fail "$label version suffix is not numeric: observed=$suffix expected=$SQLITE_VERSION" ;;
+  esac
+  printf '%s\n' "$suffix"
+}
+
+assert_eq 'SQLITE_AMALG_URL version suffix' "$SQLITE_VERSION" "$(extract_sqlite_url_version_suffix SQLITE_AMALG_URL "$SQLITE_AMALG_URL")"
+assert_eq 'SQLITE_SRC_URL version suffix' "$SQLITE_VERSION" "$(extract_sqlite_url_version_suffix SQLITE_SRC_URL "$SQLITE_SRC_URL")"
+
 extract_build_sh_default() {
   key="$1"
   value="$(sed -n "s/^${key}=\"\${${key}:-\\([^\}]*\\)}\"$/\\1/p" build/Build.sh)"
@@ -122,6 +137,13 @@ assert_wrapper_compat_default() {
   needle="${key}=\"\${${key}-\$(compat_group_pin ${compat_group} ${field})}\""
   grep -Fq "$needle" build/build_static_sqlite.sh || \
     fail "build/build_static_sqlite.sh does not default $key from pins/library-compat-groups.tsv"
+}
+
+assert_wrapper_build_arg() {
+  key="$1"
+  needle="--build-arg ${key}=\"\${${key}}\""
+  grep -Fq -- "$needle" build/build_static_sqlite.sh || \
+    fail "build/build_static_sqlite.sh does not forward $key as a docker build arg"
 }
 
 compat_group_pin() {
@@ -168,6 +190,15 @@ for key in \
   MIMALLOC_SHA512
 do
   assert_wrapper_pin_default "$key"
+done
+
+for key in \
+  CMAKE_VERSION \
+  CMAKE_SHA256_X86_64 \
+  CMAKE_SHA256_AARCH64
+do
+  assert_wrapper_pin_default "$key"
+  assert_wrapper_build_arg "$key"
 done
 
 assert_wrapper_compat_default ICU_SOURCE_VERSION icu69 icu_source_version

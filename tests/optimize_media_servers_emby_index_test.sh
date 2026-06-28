@@ -121,7 +121,7 @@ assert_contains "$(cat "$tmp/staged-gate.err")" "integrity check failed" "staged
 
 eqp_db="$tmp/eqp.db"
 create_mediaitems_db "$eqp_db"
-for ddl in "${EMBY_INDEXES[@]}"; do
+for ddl in "${_EMBY_INDEXES[@]}"; do
   "$real_sqlite" "$eqp_db" "$ddl"
 done
 assert_eqp_uses_emby_index "$(mediaitems_eqp "$eqp_db")" "pre-ANALYZE"

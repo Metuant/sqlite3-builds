@@ -144,9 +144,9 @@ index_test_run_plex_optimize_capture() {
   (
     cd "$repo_root"
     . ./scripts/optimize_media_servers.sh
+    local plex_databases_path="$db_dir"
+    local plex_instance="plex-index-fixture"
     PLEX_BINARY="sqlite3"
-    PLEX_DATABASES_PATH="$db_dir"
-    PLEX_INSTANCE="plex-index-fixture"
     BACKUP_PATH="$backup_dir"
     optimize_plex_db "$db_file" "$sanity" "$pre_swap_hook"
   ) >"$tmp/${name}.out" 2>"$tmp/${name}.err"

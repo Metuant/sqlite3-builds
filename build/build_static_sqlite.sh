@@ -65,6 +65,9 @@ SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256-$(pin_default SQLITE_SRC_SHA3_256)}"
 MIMALLOC_VERSION="${MIMALLOC_VERSION-$(pin_default MIMALLOC_VERSION)}"
 MIMALLOC_URL="${MIMALLOC_URL-$(pin_default MIMALLOC_URL)}"
 MIMALLOC_SHA512="${MIMALLOC_SHA512-$(pin_default MIMALLOC_SHA512)}"
+CMAKE_VERSION="${CMAKE_VERSION-$(pin_default CMAKE_VERSION)}"
+CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64-$(pin_default CMAKE_SHA256_X86_64)}"
+CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64-$(pin_default CMAKE_SHA256_AARCH64)}"
 ICU_SOURCE_VERSION="${ICU_SOURCE_VERSION-$(compat_group_pin icu69 icu_source_version)}"
 ICU_SOURCE_SHA512="${ICU_SOURCE_SHA512-$(compat_group_pin icu69 icu_source_sha512)}"
 LIBRARY_VARIANT="${LIBRARY_VARIANT:-generic}"
@@ -154,6 +157,9 @@ else
     --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}"                       \
     --build-arg MIMALLOC_URL="${MIMALLOC_URL}"                               \
     --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"                         \
+    --build-arg CMAKE_VERSION="${CMAKE_VERSION}"                             \
+    --build-arg CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64}"                 \
+    --build-arg CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64}"               \
     -f docker-library/Dockerfile .
 fi
 

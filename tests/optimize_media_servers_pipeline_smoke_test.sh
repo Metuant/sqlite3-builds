@@ -379,19 +379,31 @@ assert_contains "$(cat "$tmp/pragma-mismatch.err")" "staged user_version mismatc
 
 plex_dir="$tmp/plex-dbs"
 mkdir -p "$plex_dir"
-PLEX_DATABASES_PATH="$plex_dir"
-PLEX_INSTANCE="plex-fixture"
 PLEX_BINARY="sqlite3"
 BACKUP_PATH="$tmp/no-global-backup-root"
+STATS_BANDWIDTH_RETAIN_DAYS=90
 
-plex_main="$plex_dir/$PLEX_DB"
+run_pipeline_plex_optimize_capture() {
+  local name db_file pre_swap_hook rc
+  local plex_databases_path="$plex_dir"
+  local plex_instance="plex-fixture"
+  name="$1"
+  db_file="$2"
+  pre_swap_hook="${3:-}"
+
+  set +e
+  ( optimize_plex_db "$db_file" "" "$pre_swap_hook" ) >"$tmp/${name}.out" 2>"$tmp/${name}.err"
+  rc=$?
+  set -e
+  printf '%s' "$rc" > "$tmp/${name}.rc"
+}
+
+plex_main="$plex_dir/$_PLEX_DB"
 create_stats_db "$plex_main"
 : > "$SQLITE_CALL_LOG"
 add_plex_tag_titles_icu_fixture "$plex_main"
-set +e
-( optimize_plex_db "$PLEX_DB" "" "try_deflate_plex_statistics_bandwidth" ) >"$tmp/plex-main.out" 2>"$tmp/plex-main.err"
-rc=$?
-set -e
+run_pipeline_plex_optimize_capture plex-main "$_PLEX_DB" "try_deflate_plex_statistics_bandwidth"
+rc="$(cat "$tmp/plex-main.rc")"
 [ "$rc" = "0" ] || fail "Plex main optimize rc" "0" "rc=$rc stderr=$(cat "$tmp/plex-main.err")"
 assert_contains "$(cat "$tmp/plex-main.out")" "Deflating Plex statistics_bandwidth" "Plex main deflate log"
 assert_eq "2" "$("$real_sqlite" "$plex_main" "SELECT group_concat(id, ',') FROM (SELECT id FROM statistics_bandwidth ORDER BY id);")" "Plex main deflated ids"
@@ -400,12 +412,10 @@ assert_eq "2" "$(name_plex_tag_doc_count "$plex_main")" "Plex main recurate name
 assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts4_tag_titles_icu"("fts4_tag_titles_icu") VALUES('\''rebuild'\'');' "$SQLITE_CALL_LOG")" "Plex main staged-only FTS rebuild count"
 assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts4_tag_titles_icu"("fts4_tag_titles_icu") VALUES('\''optimize'\'');' "$SQLITE_CALL_LOG")" "Plex main post-swap FTS optimize count"
 
-plex_blob="$plex_dir/$PLEX_BLOB_DB"
+plex_blob="$plex_dir/$_PLEX_BLOB_DB"
 create_stats_db "$plex_blob"
-set +e
-( optimize_plex_db "$PLEX_BLOB_DB" "" "" ) >"$tmp/plex-blob.out" 2>"$tmp/plex-blob.err"
-rc=$?
-set -e
+run_pipeline_plex_optimize_capture plex-blob "$_PLEX_BLOB_DB" ""
+rc="$(cat "$tmp/plex-blob.rc")"
 [ "$rc" = "0" ] || fail "Plex blob optimize rc" "0" "rc=$rc stderr=$(cat "$tmp/plex-blob.err")"
 assert_not_contains "$(cat "$tmp/plex-blob.out")" "Deflating Plex statistics_bandwidth" "Plex blob no deflate log"
 assert_eq "1,2,3" "$("$real_sqlite" "$plex_blob" "SELECT group_concat(id, ',') FROM (SELECT id FROM statistics_bandwidth ORDER BY id);")" "Plex blob retained stats ids"

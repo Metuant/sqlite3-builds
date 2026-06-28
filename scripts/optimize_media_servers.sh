@@ -10,40 +10,43 @@ export SQLITE3_DISABLE_AUTOPRAGMA=1
 # WHY: JF maintenance stays absent until schema, page-size, FTS, and stopped-container
 # gates are re-validated.
 # This script intentionally covers only Plex and Emby.
-PAGE_SIZE="16384"
-BACKUP_PATH="/mnt/media-backup"
-STATS_BANDWIDTH_RETAIN_DAYS="90"
+[ -n "${_PAGE_SIZE+x}" ] || _PAGE_SIZE="16384"
+readonly _PAGE_SIZE
 # Only runbook-validated indexes belong here; adding one is a future spec
 # decision and requires planner adoption, measured benefit, and landmine review.
-EMBY_INDEXES=(
-    "CREATE INDEX IF NOT EXISTS idx_dshadow_mediaitems_parent_type ON MediaItems(ParentId, Type);"
-)
-PLEX_INDEXES=(
-    "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"
-    "CREATE INDEX IF NOT EXISTS idx_dshadow_mis_account_updated_guid_cover ON metadata_item_settings (account_id, updated_at DESC, guid, view_offset, last_viewed_at);"
-)
-PLEX_STAT4_LEADER_INDEXES=(
-    "idx_dshadow_taggings_tag_id_metadata_item_id"
-    "idx_dshadow_mis_account_updated_guid_cover"
-)
+if [ -z "${_EMBY_INDEXES+x}" ]; then
+    _EMBY_INDEXES=(
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_mediaitems_parent_type ON MediaItems(ParentId, Type);"
+    )
+fi
+readonly -a _EMBY_INDEXES
+if [ -z "${_PLEX_INDEXES+x}" ]; then
+    _PLEX_INDEXES=(
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_mis_account_updated_guid_cover ON metadata_item_settings (account_id, updated_at DESC, guid, view_offset, last_viewed_at);"
+    )
+fi
+readonly -a _PLEX_INDEXES
+if [ -z "${_PLEX_STAT4_LEADER_INDEXES+x}" ]; then
+    _PLEX_STAT4_LEADER_INDEXES=(
+        "idx_dshadow_taggings_tag_id_metadata_item_id"
+        "idx_dshadow_mis_account_updated_guid_cover"
+    )
+fi
+readonly -a _PLEX_STAT4_LEADER_INDEXES
 
-declare -a PLEX_INSTANCES=()
-declare -a EMBY_INSTANCES=()
-
-PLEX_BINARY="${HOME}/plex-sql/Plex SQLite"
-PLEX_DB="com.plexapp.plugins.library.db"
-PLEX_BLOB_DB="com.plexapp.plugins.library.blobs.db"
-PLEX_PROCESS_BLOB_DB="${PLEX_PROCESS_BLOB_DB:-0}"
-PLEX_OPTIMIZE_API="${PLEX_OPTIMIZE_API:-0}"
-
-GENERIC_SQLITE_BINARY="${HOME}/bin/sqlite3"
-EMBY_DB="library.db"
+[ -n "${_PLEX_DB+x}" ] || _PLEX_DB="com.plexapp.plugins.library.db"
+readonly _PLEX_DB
+[ -n "${_PLEX_BLOB_DB+x}" ] || _PLEX_BLOB_DB="com.plexapp.plugins.library.blobs.db"
+readonly _PLEX_BLOB_DB
+[ -n "${_EMBY_DB+x}" ] || _EMBY_DB="library.db"
+readonly _EMBY_DB
 
 build_emby_optimize_sql() {
     local emby_index_sql=""
     local ddl
 
-    for ddl in "${EMBY_INDEXES[@]}"; do
+    for ddl in "${_EMBY_INDEXES[@]}"; do
         emby_index_sql+="${ddl} "
     done
     printf '%s' "PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; ${emby_index_sql}REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;"
@@ -53,7 +56,7 @@ build_plex_optimize_sql() {
     local plex_index_sql=""
     local ddl
 
-    for ddl in "${PLEX_INDEXES[@]}"; do
+    for ddl in "${_PLEX_INDEXES[@]}"; do
         plex_index_sql+="${ddl} "
     done
     printf '%s' "PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; ${plex_index_sql}REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;"
@@ -124,7 +127,7 @@ run_plex_stat4_analyze() {
     local leader_index
     local leader_rows
 
-    PLEX_STAT4_LAST_ANALYZED=0
+    _PLEX_STAT4_LAST_ANALYZED=0
     if ! targets="$(discover_plex_stat4_analyze_targets "${binary}" "${db_path}")"; then
         echo "WARNING: Plex STAT4 worklist discovery failed for ${db_path}; skipping Plex STAT4 pass" >&2
         return 0
@@ -164,7 +167,7 @@ run_plex_stat4_analyze() {
         target_ident="$(quote_sql_ident "${target_name}")"
         analyze_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; PRAGMA analysis_limit=0; ANALYZE ${target_ident};"
         if "${binary}" "${db_path}" "${analyze_sql}"; then
-            PLEX_STAT4_LAST_ANALYZED=1
+            _PLEX_STAT4_LAST_ANALYZED=1
             analyzed_total=$((analyzed_total + 1))
         else
             echo "WARNING: Plex STAT4 ANALYZE failed for ${target_name} in ${db_path}; continuing" >&2
@@ -198,7 +201,7 @@ run_plex_stat4_analyze() {
         echo "WARNING: Plex STAT4 produced zero sqlite_stat4 rows for ${db_path}; continuing" >&2
     fi
 
-    for leader_index in "${PLEX_STAT4_LEADER_INDEXES[@]}"; do
+    for leader_index in "${_PLEX_STAT4_LEADER_INDEXES[@]}"; do
         if ! leader_rows=$("${binary}" "${db_path}" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx = '${leader_index}';" | tr -d '\r\n'); then
             echo "WARNING: Plex STAT4 leader index check failed for ${leader_index} in ${db_path}; continuing" >&2
             continue
@@ -798,10 +801,10 @@ run_plex_main_post_maintenance() {
 
     # WHY: reads main()'s dynamic-scoped local (sole entry is main "$@"); :-0 keeps STAT4 fail-safe off if ever out of scope.
     if [ "${plex_stat4_enabled:-0}" = "1" ]; then
-        PLEX_STAT4_LAST_ANALYZED=0
+        _PLEX_STAT4_LAST_ANALYZED=0
         run_plex_stat4_analyze "${stat4_binary}" "${staged_db}"
 
-        if [ "${PLEX_STAT4_LAST_ANALYZED:-0}" = "1" ]; then
+        if [ "${_PLEX_STAT4_LAST_ANALYZED:-0}" = "1" ]; then
             if ! post_stat4_integrity=$("${PLEX_BINARY}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
                 echo "ERROR: post-STAT4 staged integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
                 return 1
@@ -1230,7 +1233,7 @@ optimize_plex_db() {
     local db_file="${1}"
     local sanity_sql="${2}"
     local pre_swap_hook="${3:-}"
-    local db_path="${PLEX_DATABASES_PATH}/${db_file}"
+    local db_path="${plex_databases_path}/${db_file}"
     local backup_dir
     local optimize_sql
     local post_maintenance_hook=""
@@ -1238,25 +1241,25 @@ optimize_plex_db() {
 
     echo "Optimizing Plex Database: ${db_path}"
     if [ -d "${BACKUP_PATH}" ]; then
-      mkdir -p "${BACKUP_PATH}/${PLEX_INSTANCE}"
-      backup_dir="${BACKUP_PATH}/${PLEX_INSTANCE}"
+      mkdir -p "${BACKUP_PATH}/${plex_instance}"
+      backup_dir="${BACKUP_PATH}/${plex_instance}"
     else
-      backup_dir="${PLEX_DATABASES_PATH}"
+      backup_dir="${plex_databases_path}"
     fi
 
     # NOTE: The 0x10000 bit of PRAGMA optimize=0x10002 is inert on Plex SQLite 3.39.4.
     optimize_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;"
-    if [ "${db_file}" = "${PLEX_DB}" ]; then
+    if [ "${db_file}" = "${_PLEX_DB}" ]; then
         optimize_sql="$(build_plex_optimize_sql)"
         post_maintenance_hook="run_plex_main_post_maintenance"
-        post_maintenance_binary="${GENERIC_SQLITE_BINARY}"
+        post_maintenance_binary="${GENERIC_SQLITE_BINARY:-}"
     fi
 
     rebuild_db_vacuum_into \
       "${PLEX_BINARY}" \
       "${db_path}" \
       "${backup_dir}" \
-      "${PAGE_SIZE}" \
+      "${_PAGE_SIZE}" \
       "NONE" \
       "${sanity_sql}" \
       "${optimize_sql}" \
@@ -1812,19 +1815,19 @@ run_plex_maintenance_safely() {
     (
         set -e
 
-        echo "Cleaning Up Plex Cache: ${PLEX_PATH}"
-        rm -rf "${PLEX_PATH}/Cache/PhotoTranscoder/"*
-        rm -rf "${PLEX_PATH}/Crash Reports/"*
-        rm -rf "${PLEX_PATH}/Codecs/"*
-        rm -rf "${PLEX_PATH}/Plug-in Support/Caches/"*
+        echo "Cleaning Up Plex Cache: ${plex_path}"
+        rm -rf "${plex_path}/Cache/PhotoTranscoder/"*
+        rm -rf "${plex_path}/Crash Reports/"*
+        rm -rf "${plex_path}/Codecs/"*
+        rm -rf "${plex_path}/Plug-in Support/Caches/"*
 
         optimize_plex_db \
-          "${PLEX_DB}" \
+          "${_PLEX_DB}" \
           "SELECT 1 FROM versioned_metadata_items LIMIT 1;" \
           "try_deflate_plex_statistics_bandwidth"
 
-        if [ "${PLEX_PROCESS_BLOB_DB}" = "1" ]; then
-            optimize_plex_db "${PLEX_BLOB_DB}" "" ""
+        if [ "${PLEX_PROCESS_BLOB_DB:-0}" = "1" ]; then
+            optimize_plex_db "${_PLEX_BLOB_DB}" "" ""
         fi
     )
     rc=$?
@@ -1852,21 +1855,21 @@ run_emby_maintenance_safely() {
     (
         set -e
 
-        echo "Optimizing Emby Database: ${EMBY_PATH}/${EMBY_DB}"
+        echo "Optimizing Emby Database: ${emby_path}/${_EMBY_DB}"
         if [ -d "${BACKUP_PATH}" ]; then
-          mkdir -p "${BACKUP_PATH}/${EMBY_INSTANCE}/Databases"
-          emby_backup_dir="${BACKUP_PATH}/${EMBY_INSTANCE}/Databases"
+          mkdir -p "${BACKUP_PATH}/${emby_instance}/Databases"
+          emby_backup_dir="${BACKUP_PATH}/${emby_instance}/Databases"
         else
-          emby_backup_dir="${EMBY_PATH}"
+          emby_backup_dir="${emby_path}"
         fi
 
         optimize_sql="$(build_emby_optimize_sql)"
 
         rebuild_db_vacuum_into \
           "${GENERIC_SQLITE_BINARY}" \
-          "${EMBY_PATH}/${EMBY_DB}" \
+          "${emby_path}/${_EMBY_DB}" \
           "${emby_backup_dir}" \
-          "${PAGE_SIZE}" \
+          "${_PAGE_SIZE}" \
           "NONE" \
           "SELECT 1 FROM SyncJobs2 LIMIT 1;" \
           "${optimize_sql}" \
@@ -1882,15 +1885,120 @@ run_emby_maintenance_safely() {
 }
 
 
-# mkdir -p ${HOME}/plex-sql/
-# rm -vrf ${HOME}/plex-sql/lib/
-# docker cp plex:"/usr/lib/plexmediaserver/lib/" ${HOME}/plex-sql/lib/
-# # WHY: If lib/ came from a modded container, restore Plex's bundled SQLite
-# # library beside Plex SQLite so its source-id guard matches; the deployed
-# # runtime libsqlite3.so in the container remains untouched.
-# cp -vf "${HOME}/plex-sql/lib/libsqlite3.so.bundled.bak" "${HOME}/plex-sql/lib/libsqlite3.so"
-# docker cp plex:"/usr/lib/plexmediaserver/Plex SQLite" ${HOME}/plex-sql/
-# docker cp plex:"/usr/lib/plexmediaserver/Plex Media Server" ${HOME}/plex-sql/
+print_usage() {
+    cat <<'USAGE'
+Usage: ./scripts/optimize_media_servers.sh [--help]
+
+Run with no arguments to maintain the Plex and Emby instances configured in:
+  scripts/optimize_media_servers.conf
+
+Override the config path with:
+  OPTIMIZE_MEDIA_SERVERS_CONF=/path/to/optimize_media_servers.conf
+
+Create the config by copying:
+  scripts/optimize_media_servers.conf.example
+
+The config is sourced as Bash and owns:
+  PLEX_INSTANCES
+  EMBY_INSTANCES
+  PLEX_BINARY
+  GENERIC_SQLITE_BINARY
+  BACKUP_PATH
+  PLEX_OPTIMIZE_API
+  PLEX_PROCESS_BLOB_DB
+  STATS_BANDWIDTH_RETAIN_DAYS
+
+Each PLEX_INSTANCES or EMBY_INSTANCES entry is both the Docker container name
+and the /opt/<instance> filesystem stem. Only literal PLEX_OPTIMIZE_API=1
+triggers the post-start Plex optimize API. Only literal PLEX_PROCESS_BLOB_DB=1
+enables the Plex blob database rebuild pass.
+
+Stage consumed binaries before running:
+  release/cli/sqlite3 -> ${HOME}/bin/sqlite3
+  Plex SQLite plus Plex's lib/ runtime copy -> ${HOME}/plex-sql/
+
+If ${HOME}/plex-sql/lib came from a modded container, restore
+libsqlite3.so.bundled.bak over libsqlite3.so in that staging copy before use.
+Copying Plex Media Server beside Plex SQLite is recommended for source-id
+staging checks, but this script executes only PLEX_BINARY.
+USAGE
+}
+
+load_optimize_config() {
+    local conf_file="${1}"
+    local rc=0
+    local failure_kind=""
+    local restore_errexit=0
+    local restore_xtrace=0
+    local restore_functrace=0
+    local previous_debug_trap=""
+    local config_command_rc=0
+    local first_config_failure_rc=0
+
+    case "$-" in
+        *e*) restore_errexit=1 ;;
+    esac
+    case "$-" in
+        *x*) restore_xtrace=1 ;;
+    esac
+    case "$-" in
+        *T*) restore_functrace=1 ;;
+    esac
+    previous_debug_trap="$(trap -p DEBUG)"
+
+    set +ex
+    if [ ! -f "${conf_file}" ]; then
+        rc=1
+        failure_kind="absent"
+    else
+        set -T
+        trap 'config_command_rc=$?; case "${config_command_rc}:${first_config_failure_rc:-0}" in 0:*) ;; *:0) first_config_failure_rc="${config_command_rc}" ;; esac' DEBUG
+        . "${conf_file}"
+        rc=$?
+        trap - DEBUG
+        if [ "${restore_functrace}" -eq 1 ]; then
+            set -T
+        else
+            set +T
+        fi
+        case "${previous_debug_trap}" in
+            "")
+                ;;
+            *)
+                eval "${previous_debug_trap}"
+                ;;
+        esac
+        if [ "${first_config_failure_rc}" -ne 0 ]; then
+            rc="${first_config_failure_rc}"
+            failure_kind="source"
+        elif [ "${rc}" -ne 0 ]; then
+            failure_kind="source"
+        fi
+    fi
+    set +ex
+
+    if [ "${restore_errexit}" -eq 1 ]; then
+        set -e
+    fi
+    if [ "${restore_xtrace}" -eq 1 ]; then
+        set -x
+    fi
+
+    case "${failure_kind}" in
+        absent)
+            echo "ERROR: required config file not found: ${conf_file}" >&2
+            echo "ERROR: copy scripts/optimize_media_servers.conf.example to that path, or set OPTIMIZE_MEDIA_SERVERS_CONF; see --help" >&2
+            return "${rc}"
+            ;;
+        source)
+            echo "ERROR: failed to source config file: ${conf_file}" >&2
+            echo "ERROR: copy scripts/optimize_media_servers.conf.example to that path, or set OPTIMIZE_MEDIA_SERVERS_CONF; see --help" >&2
+            return "${rc}"
+            ;;
+    esac
+
+    return 0
+}
 
 
 main() {
@@ -1911,6 +2019,49 @@ main() {
     local trigger_state
     local trigger_warned
     local trigger_line
+    local script_dir
+    local conf_file
+    local config_rc
+    local plex_preflight_out
+    local emby_preflight_out
+    local plex_instance
+    local plex_path
+    local plex_databases_path
+    local emby_instance
+    local emby_path
+    local arg
+
+    if [ "$#" -gt 0 ]; then
+        for arg in "$@"; do
+            case "${arg}" in
+            -h|--help)
+                ;;
+            *)
+                echo "ERROR: unknown argument: ${arg}" >&2
+                print_usage >&2
+                return 2
+                ;;
+            esac
+        done
+        print_usage
+        return 0
+    fi
+
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    conf_file="${OPTIMIZE_MEDIA_SERVERS_CONF:-${script_dir}/optimize_media_servers.conf}"
+    if load_optimize_config "${conf_file}"; then
+        config_rc=0
+    else
+        config_rc=$?
+    fi
+    if [ "${config_rc}" -ne 0 ]; then
+        return "${config_rc}"
+    fi
+
+    if [ "${#PLEX_INSTANCES[@]}" -eq 0 ] && [ "${#EMBY_INSTANCES[@]}" -eq 0 ]; then
+        echo "WARNING: no Plex or Emby instances configured; nothing to do" >&2
+        return 0
+    fi
 
     set -ex
     set -o pipefail
@@ -1930,18 +2081,18 @@ if [ "${#PLEX_INSTANCES[@]}" -gt 0 ]; then
     fi
 fi
 
-for PLEX_INSTANCE in "${PLEX_INSTANCES[@]}"
+for plex_instance in "${PLEX_INSTANCES[@]}"
 do
-    PLEX_PATH="/opt/${PLEX_INSTANCE}/Library/Application Support/Plex Media Server"
-    PLEX_DATABASES_PATH="${PLEX_PATH}/Plug-in Support/Databases"
+    plex_path="/opt/${plex_instance}/Library/Application Support/Plex Media Server"
+    plex_databases_path="${plex_path}/Plug-in Support/Databases"
 
-    if [ ! -d "${PLEX_DATABASES_PATH}" ]; then
-        echo "Skipped Missing Plex Instance: ${PLEX_INSTANCE}"
+    if [ ! -d "${plex_databases_path}" ]; then
+        echo "Skipped Missing Plex Instance: ${plex_instance}"
         continue
     fi
 
     set +e
-    stop_container_for_maintenance "Plex" "${PLEX_INSTANCE}"
+    stop_container_for_maintenance "Plex" "${plex_instance}"
     stop_rc=$?
     set -e
     case "${stop_rc}" in
@@ -1949,7 +2100,7 @@ do
             ;;
         3)
             final_rc=1
-            if ! start_container_after_maintenance "Plex" "${PLEX_INSTANCE}"; then
+            if ! start_container_after_maintenance "Plex" "${plex_instance}"; then
                 final_rc=1
             fi
             continue
@@ -1965,11 +2116,11 @@ do
     maintenance_rc=$?
     set -e
     if [ "${maintenance_rc}" -ne 0 ]; then
-        echo "WARNING: Plex maintenance failed for ${PLEX_INSTANCE}; restarting container and continuing" >&2
+        echo "WARNING: Plex maintenance failed for ${plex_instance}; restarting container and continuing" >&2
         final_rc=1
     fi
 
-    if ! start_container_after_maintenance "Plex" "${PLEX_INSTANCE}"; then
+    if ! start_container_after_maintenance "Plex" "${plex_instance}"; then
         final_rc=1
         continue
     fi
@@ -1978,10 +2129,10 @@ do
         continue
     fi
 
-    if [ "${PLEX_OPTIMIZE_API}" = "1" ]; then
+    if [ "${PLEX_OPTIMIZE_API:-0}" = "1" ]; then
         plex_optimize_attempted=$((plex_optimize_attempted + 1))
         set +e
-        trigger_output="$(trigger_plex_optimize_instance "${PLEX_INSTANCE}")"
+        trigger_output="$(trigger_plex_optimize_instance "${plex_instance}")"
         trigger_rc=$?
         set -e
         trigger_result=""
@@ -2001,7 +2152,7 @@ do
         if [ "${trigger_rc}" -ne 0 ]; then
             trigger_state="skipped"
             trigger_warned=1
-            echo "WARNING: Plex optimize internal failure for ${PLEX_INSTANCE}; skipped" >&2
+            echo "WARNING: Plex optimize internal failure for ${plex_instance}; skipped" >&2
         elif [ -n "${trigger_result}" ]; then
             trigger_state="${trigger_result%%:*}"
             trigger_warned="${trigger_result#*:}"
@@ -2011,13 +2162,13 @@ do
                 *)
                     trigger_state="skipped"
                     trigger_warned=1
-                    echo "WARNING: Plex optimize malformed terminal state for ${PLEX_INSTANCE}; skipped" >&2
+                    echo "WARNING: Plex optimize malformed terminal state for ${plex_instance}; skipped" >&2
                     ;;
             esac
         else
             trigger_state="skipped"
             trigger_warned=1
-            echo "WARNING: Plex optimize missing terminal state for ${PLEX_INSTANCE}; skipped" >&2
+            echo "WARNING: Plex optimize missing terminal state for ${plex_instance}; skipped" >&2
         fi
 
         if [ "${trigger_warned}" -eq 1 ]; then
@@ -2042,13 +2193,13 @@ do
             *)
                 plex_optimize_skipped=$((plex_optimize_skipped + 1))
                 plex_optimize_warned=$((plex_optimize_warned + 1))
-                echo "WARNING: Plex optimize unknown terminal state for ${PLEX_INSTANCE}; skipped" >&2
+                echo "WARNING: Plex optimize unknown terminal state for ${plex_instance}; skipped" >&2
                 ;;
         esac
     fi
 done
 
-if [ "${PLEX_OPTIMIZE_API}" = "1" ] && [ "${plex_optimize_attempted}" -gt 0 ]; then
+if [ "${PLEX_OPTIMIZE_API:-0}" = "1" ] && [ "${plex_optimize_attempted}" -gt 0 ]; then
     echo "Plex optimize summary: accepted=${plex_optimize_accepted} already-running=${plex_optimize_already_running} completed=${plex_optimize_completed} skipped=${plex_optimize_skipped} warned=${plex_optimize_warned}"
     if [ "${plex_optimize_successful}" -eq 0 ]; then
         final_rc=1
@@ -2065,16 +2216,16 @@ if [ "${#EMBY_INSTANCES[@]}" -gt 0 ]; then
     fi
 fi
 
-for EMBY_INSTANCE in "${EMBY_INSTANCES[@]}"
+for emby_instance in "${EMBY_INSTANCES[@]}"
 do
-    EMBY_PATH="/opt/${EMBY_INSTANCE}/data"
-    if [ ! -d "${EMBY_PATH}" ]; then
-        echo "Skipped Missing Emby Instance: ${EMBY_INSTANCE}"
+    emby_path="/opt/${emby_instance}/data"
+    if [ ! -d "${emby_path}" ]; then
+        echo "Skipped Missing Emby Instance: ${emby_instance}"
         continue
     fi
 
     set +e
-    stop_container_for_maintenance "Emby" "${EMBY_INSTANCE}"
+    stop_container_for_maintenance "Emby" "${emby_instance}"
     stop_rc=$?
     set -e
     case "${stop_rc}" in
@@ -2082,7 +2233,7 @@ do
             ;;
         3)
             final_rc=1
-            if ! start_container_after_maintenance "Emby" "${EMBY_INSTANCE}"; then
+            if ! start_container_after_maintenance "Emby" "${emby_instance}"; then
                 final_rc=1
             fi
             continue
@@ -2098,11 +2249,11 @@ do
     maintenance_rc=$?
     set -e
     if [ "${maintenance_rc}" -ne 0 ]; then
-        echo "WARNING: Emby maintenance failed for ${EMBY_INSTANCE}; restarting container and continuing" >&2
+        echo "WARNING: Emby maintenance failed for ${emby_instance}; restarting container and continuing" >&2
         final_rc=1
     fi
 
-    if ! start_container_after_maintenance "Emby" "${EMBY_INSTANCE}"; then
+    if ! start_container_after_maintenance "Emby" "${emby_instance}"; then
         final_rc=1
         continue
     fi

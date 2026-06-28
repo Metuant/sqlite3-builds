@@ -140,12 +140,12 @@ field contract and fail-closed validator rules, use
 
 | Input | Current value |
 |---|---|
-| SQLite version | `3530200` |
+| SQLite version | `3530300` |
 | SQLite release year | `2026` |
-| Amalgamation URL | `https://www.sqlite.org/2026/sqlite-amalgamation-3530200.zip` |
-| Amalgamation SHA3-256 | `81142986038e18f96c4a54e1a72562ae17e502a916f2a7701eff43388cbf1a40` |
-| Full source URL | `https://www.sqlite.org/2026/sqlite-src-3530200.zip` |
-| Full source SHA3-256 | `490ec7af32a6bfa5f3e05dc279c04286cfe3f328def4a8b7344e3fa20be18a4c` |
+| Amalgamation URL | `https://www.sqlite.org/2026/sqlite-amalgamation-3530300.zip` |
+| Amalgamation SHA3-256 | `d45c688a8cb23f68611a894a756a12d7eb6ab6e9e2468ca70adbeab3808b5ab9` |
+| Full source URL | `https://www.sqlite.org/2026/sqlite-src-3530300.zip` |
+| Full source SHA3-256 | `2daecfa16e3b19e058dc2e2cb717b80ade361e0315aa5376c3619f66aa81e181` |
 
 The current Plex library compatibility group pins ICU 69.1:
 
@@ -1123,7 +1123,7 @@ package managers, or network access.
 ## Maintenance Architecture
 
 `scripts/optimize_media_servers.sh` is a host-side planned-downtime maintenance
-script.
+script for Plex and Emby containers.
 
 It starts with:
 
@@ -1134,14 +1134,62 @@ SQLITE3_DISABLE_AUTOPRAGMA=1
 That keeps maintenance connections from receiving the library's automatic
 PRAGMA block.
 
-The instance arrays are empty in the repository:
+### Invocation and Config
+
+Run with no arguments to maintain configured instances. `-h` and `--help`
+print usage and exit 0 before any config load. Any other argument is rejected
+with a short error and `--help` pointer before config load.
+
+The script resolves its sourced Bash config as
+`${OPTIMIZE_MEDIA_SERVERS_CONF:-<script-dir>/optimize_media_servers.conf}`.
+The default path is `scripts/optimize_media_servers.conf` beside the script;
+`scripts/optimize_media_servers.conf.example` is the committed template.
+The resolved config must exist and source successfully before any binary
+preflight, Docker operation, curl request, or database work.
+
+Config load happens inside `main()` only. Sourcing the script for tests or
+helper reuse does not load the config and does not fail on a missing config.
+
+The side-car config is the sole source of these operator variables:
 
 ```text
-PLEX_INSTANCES=()
-EMBY_INSTANCES=()
+PLEX_INSTANCES
+EMBY_INSTANCES
+PLEX_BINARY
+GENERIC_SQLITE_BINARY
+BACKUP_PATH
+PLEX_OPTIMIZE_API
+PLEX_PROCESS_BLOB_DB
+STATS_BANDWIDTH_RETAIN_DAYS
 ```
 
-Operators populate those arrays before a maintenance run.
+`OPTIMIZE_MEDIA_SERVERS_CONF` is only the external path selector and is not
+stored in the config file.
+
+Each instance array entry is both the Docker container name and the
+`/opt/<instance>` path stem:
+
+```text
+PLEX_INSTANCES=("plex" "plex-4k")
+EMBY_INSTANCES=("emby")
+```
+
+For Plex, the database path resolves under
+`/opt/<instance>/Library/Application Support/Plex Media Server/...`. For Emby,
+the database path resolves under `/opt/<instance>/data/...`.
+
+The generic CLI consumed by `GENERIC_SQLITE_BINARY` is staged from the build
+output `release/cli/sqlite3` to `${HOME}/bin/sqlite3`. Plex maintenance uses
+container-copied runtime files: `PLEX_BINARY` points at
+`${HOME}/plex-sql/Plex SQLite`, and `${HOME}/plex-sql/lib/` holds the Plex
+container's `/usr/lib/plexmediaserver/lib/` copy. If that copied `lib/` came
+from a modded container, restore `libsqlite3.so.bundled.bak` over
+`${HOME}/plex-sql/lib/libsqlite3.so` in the staging copy before running
+maintenance. Copying the `Plex Media Server` sibling into `${HOME}/plex-sql/`
+is recommended staging for Plex's source-id guard, but the script only
+executes `PLEX_BINARY` (`Plex SQLite`); the sibling is not a code-proven
+runtime dependency of the helper. The built `release/library-plex/libsqlite3.so`
+is a separate Plex library-replacement output, not a maintenance input.
 
 `scripts/optimize_media_servers.sh` owns the container lifecycle for configured
 Plex and Emby instances. Each instance with a present database directory is
@@ -1153,6 +1201,7 @@ failures set the final process status nonzero for that instance and the script
 continues to later instances. Once `docker stop` succeeds, the script attempts
 `docker start` on every maintenance failure path before moving on.
 
+`PLEX_OPTIMIZE_API` defaults to `0` in the config template. Literal
 `PLEX_OPTIMIZE_API=1` enables an optional post-start Plex API trigger inside
 the per-Plex-instance loop. For each restarted Plex instance, the script
 resolves the container IP with `docker inspect`, waits up to 60 seconds for
@@ -1174,16 +1223,19 @@ failures warn and continue, and the final process exits nonzero only when
 `PLEX_OPTIMIZE_API=1` was attempted and no Plex instance reached accepted,
 already-running, or completed.
 
-Maintenance defaults and optional subflows:
+Maintenance controls:
 
-| Control | Default | How to change | Effect |
+| Control | Default/example | How to change | Effect |
 |---|---|---|---|
-| `PAGE_SIZE` | `16384` | Edit the top-level script default before the run | Rebuilt Plex and Emby databases target 16 KiB pages. |
-| `BACKUP_PATH` | `/mnt/media-backup` | Edit the top-level script default before the run | If the path exists, backups publish under an instance-specific subdirectory there; otherwise backups stay beside the source database. |
-| `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Edit the top-level script default before the run | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside this retention window. |
-| `PLEX_PROCESS_BLOB_DB` | `0` | Set the environment value to `1` before the run | Enables the optional Plex blob database rebuild pass. |
-| `PLEX_OPTIMIZE_API` | `0` | Set the environment value to `1` before the run | Enables the optional post-start Plex `PUT /library/optimize?async=1` trigger. |
-| `GENERIC_SQLITE_BINARY` | `${HOME}/bin/sqlite3` | Edit the top-level script default before the run | Runs Emby maintenance and the Plex main-DB STAT4 pass. |
+| `PLEX_INSTANCES` | `("plex" "plex-4k")` | Set in the config file | Plex Docker container names and `/opt/<instance>` stems. |
+| `EMBY_INSTANCES` | `("emby")` | Set in the config file | Emby Docker container names and `/opt/<instance>` stems. |
+| `PLEX_BINARY` | `${HOME}/plex-sql/Plex SQLite` | Set in the config file | Runs Plex maintenance with Plex's ICU-enabled SQLite binary. |
+| `GENERIC_SQLITE_BINARY` | `${HOME}/bin/sqlite3` | Set in the config file | Runs Emby maintenance and the Plex main-DB STAT4 pass. |
+| `BACKUP_PATH` | `/mnt/media-backup` | Set in the config file | If the path exists, backups publish under an instance-specific subdirectory there; otherwise backups stay beside the source database. |
+| `PLEX_OPTIMIZE_API` | `0` | Set in the config file | Literal `1` enables the optional post-start Plex `PUT /library/optimize?async=1` trigger. |
+| `PLEX_PROCESS_BLOB_DB` | `0` | Set in the config file | Literal `1` enables the optional Plex blob database rebuild pass. |
+| `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Set in the config file | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside this retention window. |
+| `_PAGE_SIZE` | `16384` | Edit the in-script `_PAGE_SIZE` constant | Rebuilt Plex and Emby databases target 16 KiB pages. |
 | Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Controlled by `STATS_BANDWIDTH_RETAIN_DAYS` | Runs on the staged database before swap; DELETE or VACUUM failures warn, but a post-deflate `integrity_check` failure aborts before touching the live DB. |
 
 ### Planned-Downtime Gate
@@ -1206,14 +1258,15 @@ selected caches, runs the sanity query, hard-gates source
 foreign-key rows, switches the source to `journal_mode=DELETE`, and publishes a
 dated `.original` backup.
 
-The rebuild runs under `Plex SQLite` with `PRAGMA page_size=${PAGE_SIZE}`,
-`PRAGMA auto_vacuum=NONE`, and `VACUUM INTO` to a same-directory staged
-`<db>.new` file. The staged file must pass page-size and auto-vacuum checks,
-staged `integrity_check == ok`, staged FTS integrity, and an exhaustive
-source-vs-staged per-table row-count sweep before any swap is attempted. If the
-main Plex database has `statistics_bandwidth`, the pre-swap hook can deflate it
-inside the staged file with `PRAGMA temp_store=MEMORY`, `PRAGMA threads=8`, and
-`VACUUM`, then hard-gates post-deflate `integrity_check`.
+The rebuild runs under `PLEX_BINARY` (`Plex SQLite`) with
+`PRAGMA page_size=${_PAGE_SIZE}`, `PRAGMA auto_vacuum=NONE`, and `VACUUM INTO`
+to a same-directory staged `<db>.new` file. The staged file must pass page-size
+and auto-vacuum checks, staged `integrity_check == ok`, staged FTS integrity,
+and an exhaustive source-vs-staged per-table row-count sweep before any swap is
+attempted. If the main Plex database has `statistics_bandwidth`, the pre-swap
+hook can deflate it inside the staged file with `PRAGMA temp_store=MEMORY`,
+`PRAGMA threads=8`, and `VACUUM`, then hard-gates post-deflate
+`integrity_check`.
 
 After the rebuild and validation sweep, the staged Plex path runs FTS rebuild,
 the staged FTS integrity gate, FTS re-curation, staged optimize SQL, the staged
@@ -1247,13 +1300,13 @@ FTS integrity, warns on foreign-key rows, switches the source to
 `journal_mode=DELETE`, and publishes a dated `.original` backup.
 
 The rebuild runs under `GENERIC_SQLITE_BINARY` with
-`PRAGMA page_size=${PAGE_SIZE}`, `PRAGMA auto_vacuum=NONE`, and `VACUUM INTO` to
-a staged `<db>.new` file. The staged file must pass page-size and auto-vacuum
-checks, staged `integrity_check == ok`, staged FTS integrity, an exhaustive
-source-vs-staged per-table row-count sweep, FTS rebuild, the staged FTS
-integrity gate, FTS re-curation, staged optimize SQL, and the
-`user_version`/`application_id` preservation gate before the script replaces
-the live database with `mv` and removes stale WAL/SHM siblings.
+`PRAGMA page_size=${_PAGE_SIZE}`, `PRAGMA auto_vacuum=NONE`, and
+`VACUUM INTO` to a staged `<db>.new` file. The staged file must pass page-size
+and auto-vacuum checks, staged `integrity_check == ok`, staged FTS integrity,
+an exhaustive source-vs-staged per-table row-count sweep, FTS rebuild, the
+staged FTS integrity gate, FTS re-curation, staged optimize SQL, and the
+`user_version`/`application_id` preservation gate before the script replaces the
+live database with `mv` and removes stale WAL/SHM siblings.
 The Emby staged optimize SQL creates the runbook-validated
 `idx_dshadow_mediaitems_parent_type` index before `REINDEX`, `ANALYZE`, and
 `PRAGMA optimize`.
@@ -1263,15 +1316,17 @@ passed the source and staged validation gates.
 
 ### Maintenance Posture
 
-Hard per-instance failures include Docker stop/start verification failure,
-Docker query failure, running containers after stop, source integrity failure,
-source FTS integrity failure, `journal_mode=DELETE` failure, backup publication
-failure, `VACUUM INTO` failure, staged auto-vacuum mismatch against `NONE`,
-staged integrity failure, staged FTS integrity failure, per-table row-count
-mismatch, pre-swap hook integrity failure, and post-STAT4 staged integrity
-failure. After a successful stop, these failures still fall through to the
-start gate before the script continues. The source and staged integrity gates
-require the literal `ok` result from
+Before per-instance work, hard failures include unsupported arguments, absent
+resolved config, and config source failure. Hard per-instance failures include
+Docker stop/start verification failure, Docker query failure, running
+containers after stop, source integrity failure, source FTS integrity failure,
+`journal_mode=DELETE` failure, backup publication failure, `VACUUM INTO`
+failure, staged auto-vacuum mismatch against `NONE`, staged integrity failure,
+staged FTS integrity failure, per-table row-count mismatch, pre-swap hook
+integrity failure, and post-STAT4 staged integrity failure. After a successful
+stop, these failures still fall through to the start gate before the script
+continues. The source and staged integrity gates require the literal `ok`
+result from
 `PRAGMA integrity_check`.
 
 Warning-and-continue cases include source `foreign_key_check` rows, skipped

@@ -132,9 +132,9 @@ assert_eqp_uses_settings_index() {
 
 plex_dir="$tmp/plex-dbs"
 mkdir -p "$plex_dir"
-published="$plex_dir/$PLEX_DB"
+published="$plex_dir/$_PLEX_DB"
 create_plex_index_db "$published"
-index_test_run_plex_optimize_capture published-first "$plex_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+index_test_run_plex_optimize_capture published-first "$plex_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 assert_eq 0 "$(cat "$tmp/published-first.rc")" "first Plex index pipeline rc"
 assert_plex_indexes_present "$published"
 stat1_plex_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('taggings','metadata_item_settings') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX');")"
@@ -149,19 +149,19 @@ fi
 assert_eqp_uses_taggings_index "$(taggings_eqp "$published")" "published post-ANALYZE"
 assert_eqp_uses_settings_index "$(settings_eqp "$published")" "published post-ANALYZE"
 
-index_test_run_plex_optimize_capture published-second "$plex_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+index_test_run_plex_optimize_capture published-second "$plex_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 assert_eq 0 "$(cat "$tmp/published-second.rc")" "second Plex index pipeline rc"
 assert_eq "" "$(cat "$tmp/published-second.err")" "second Plex index pipeline stderr"
 assert_plex_indexes_present "$published"
 
 warn_dir="$tmp/plex-warn"
 mkdir -p "$warn_dir"
-warn_db="$warn_dir/$PLEX_DB"
+warn_db="$warn_dir/$_PLEX_DB"
 create_plex_index_db "$warn_db" 1024
 assert_eq "1024" "$("$real_sqlite" "$warn_db" "PRAGMA page_size;")" "warn-not-abort source page_size"
 export INDEX_TEST_FAIL_SQL=1
 export INDEX_TEST_FAIL_NEEDLE="$PLEX_TAGGINGS_INDEX"
-index_test_run_plex_optimize_capture warn-not-abort "$warn_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+index_test_run_plex_optimize_capture warn-not-abort "$warn_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 unset INDEX_TEST_FAIL_SQL INDEX_TEST_FAIL_NEEDLE
 assert_eq 0 "$(cat "$tmp/warn-not-abort.rc")" "warn-not-abort rc"
 assert_contains "$(cat "$tmp/warn-not-abort.err")" "WARNING: staged maintenance SQL failed" "warn-not-abort warning"
@@ -170,12 +170,12 @@ assert_plex_indexes_absent "$warn_db"
 
 gate_dir="$tmp/plex-gate"
 mkdir -p "$gate_dir"
-gate_db="$gate_dir/$PLEX_DB"
+gate_db="$gate_dir/$_PLEX_DB"
 create_plex_index_db "$gate_db"
 gate_hash_before="$(sha256_file "$gate_db")"
 export INDEX_TEST_CORRUPT_STAGED_ON_INTEGRITY=1
 export INDEX_TEST_CORRUPT_STAGED_DB="$gate_db.new"
-index_test_run_plex_optimize_capture staged-gate "$gate_dir" "$PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
+index_test_run_plex_optimize_capture staged-gate "$gate_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 unset INDEX_TEST_CORRUPT_STAGED_ON_INTEGRITY INDEX_TEST_CORRUPT_STAGED_DB
 assert_eq 1 "$(cat "$tmp/staged-gate.rc")" "staged integrity gate rc"
 assert_eq "$gate_hash_before" "$(sha256_file "$gate_db")" "staged integrity gate live hash"
@@ -184,7 +184,7 @@ assert_contains "$(cat "$tmp/staged-gate.err")" "integrity check failed" "staged
 
 eqp_db="$tmp/plex-eqp.db"
 create_plex_index_db "$eqp_db"
-for ddl in "${PLEX_INDEXES[@]}"; do
+for ddl in "${_PLEX_INDEXES[@]}"; do
   "$real_sqlite" "$eqp_db" "$ddl"
 done
 assert_eqp_uses_taggings_index "$(taggings_eqp "$eqp_db")" "pre-ANALYZE"

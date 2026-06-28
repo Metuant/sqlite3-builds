@@ -1,0 +1,34 @@
+# optimize_media_servers.conf -- operator config for optimize_media_servers.sh
+#
+# Sourced as Bash. Copy this file to the default path beside the script:
+#   cp scripts/optimize_media_servers.conf.example scripts/optimize_media_servers.conf
+#
+# Or point the script at another path:
+#   export OPTIMIZE_MEDIA_SERVERS_CONF=/path/to/optimize_media_servers.conf
+#
+# Keep real host-local configs out of version control; do not commit them.
+
+# Plex Docker container names. Each entry is also the /opt/<name> path stem.
+PLEX_INSTANCES=("plex")
+
+# Emby Docker container names. Each entry is also the /opt/<name> path stem.
+EMBY_INSTANCES=("emby")
+
+# ICU-enabled Plex SQLite binary. The path contains a space; keep it quoted.
+PLEX_BINARY="${HOME}/plex-sql/Plex SQLite"
+
+# Tuned generic sqlite3 CLI for Emby maintenance and the Plex STAT4 pass.
+GENERIC_SQLITE_BINARY="${HOME}/bin/sqlite3"
+
+# Backup root. If this directory exists, dated .original backups publish under
+# an instance subdirectory; otherwise backups stay beside the source database.
+BACKUP_PATH="/mnt/media-backup"
+
+# Literal 1 enables the optional post-start Plex optimize API trigger.
+PLEX_OPTIMIZE_API=0
+
+# Literal 1 enables the optional Plex blob-database rebuild pass.
+PLEX_PROCESS_BLOB_DB=0
+
+# Plex statistics_bandwidth deflate retention window, in days.
+STATS_BANDWIDTH_RETAIN_DAYS=90

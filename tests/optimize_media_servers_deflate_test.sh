@@ -188,6 +188,7 @@ create_stats_fixture "$integrity_live"
 live_hash_before="$(sha256_file "$integrity_live")"
 mkdir -p "$tmp/backups"
 export BAD_INTEGRITY_MARKER="$tmp/bad-integrity-marker"
+STATS_BANDWIDTH_RETAIN_DAYS=90
 set +e
 (
   cd "$repo_root"
