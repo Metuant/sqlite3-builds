@@ -240,6 +240,20 @@ const char *sqlite3_sql(sqlite3_stmt *pStmt) {
     return fake ? fake->sql : NULL;
 }
 
+char *sqlite3_expanded_sql(sqlite3_stmt *pStmt) {
+    struct fake_stmt *fake = (struct fake_stmt *)pStmt;
+    const char *sql = fake ? fake->sql : NULL;
+    char *copy;
+    size_t n;
+
+    if (!sql) return NULL;
+    n = strlen(sql) + 1;
+    copy = malloc(n);
+    if (!copy) return NULL;
+    memcpy(copy, sql, n);
+    return copy;
+}
+
 int sqlite3_exec(
     sqlite3 *db,
     const char *sql,

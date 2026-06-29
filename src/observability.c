@@ -13,7 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define OBS_SQL_CAP 3072
+#define OBS_SQL_CAP 4096
 #define OBS_TRUNC_TAIL "...[TRUNC]"
 
 typedef void (*obs_log_func)(void*, int, const char*);
@@ -579,6 +579,9 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned 
     (void)ctx;
     if (trace != SQLITE_TRACE_STMT || obs_is_disabled()) return 0;
 
+    /* STMT trace stays template-only: sensitive expanded SQL capture is
+     * restricted to the gated PROFILE slow path because STMT has no elapsed
+     * threshold and can fire for every statement. */
     stmt = (sqlite3_stmt*)p;
     db = stmt ? sqlite3_db_handle(stmt) : NULL;
     sql = x ? (const char*)x : (stmt ? sqlite3_sql(stmt) : NULL);

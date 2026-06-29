@@ -12,11 +12,13 @@
 #include <string.h>
 #include <time.h>
 
-#define SLOW_QUERY_MAX_ENTRIES 2048u
-#define SLOW_QUERY_SQL_CAP 1024u
-#define SLOW_QUERY_BUCKETS 4096u
+#define SLOW_QUERY_MAX_ENTRIES 4096u
+#define SLOW_QUERY_SQL_CAP 2048u
+#define SLOW_QUERY_EXPANDED_SQL_CAP 65536u
+#define SLOW_QUERY_BUCKETS 8192u
 #define SLOW_QUERY_NIL UINT16_MAX
 #define SLOW_QUERY_DEFAULT_THRESHOLD_MS 500u
+#define SLOW_QUERY_DEFAULT_EXPANDED_SQL_THRESHOLD_MS 2500u
 #define SLOW_QUERY_DUMP_INTERVAL_NS (300ull * 1000000000ull)
 #define SLOW_QUERY_STATS_MIN_COUNT 5u
 #define SLOW_QUERY_TRUNC_TAIL "...[TRUNC]"
@@ -35,6 +37,7 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_is_disabled_cached(void);
+int auto_extension_path_is_target(const char *raw_fn);
 
 /* Decode tables stay in src/observability.c. */
 
@@ -75,10 +78,20 @@ static struct slow_table g_slow = {
 };
 static pthread_once_t g_slow_once = PTHREAD_ONCE_INIT;
 static atomic_int g_slow_disabled;
+static atomic_int g_expanded_sql_enabled;
 static uint64_t g_threshold_ns = SLOW_QUERY_DEFAULT_THRESHOLD_MS * 1000000ull;
+static uint64_t g_expanded_threshold_ns =
+    SLOW_QUERY_DEFAULT_EXPANDED_SQL_THRESHOLD_MS * 1000000ull;
 static _Atomic uint64_t g_negative_diag_mono_ns;
 static _Atomic int g_in_atexit = 0;
 static uint8_t g_fallback_cap_warned[SLOW_QUERY_MAX_ENTRIES];
+
+#ifdef SLOW_QUERY_TRACKER_TEST_API
+static char *(*g_test_expanded_sql_provider)(sqlite3_stmt *);
+static atomic_uint g_test_expanded_sql_calls;
+static atomic_uint g_test_expanded_sql_frees;
+static atomic_int g_test_force_detail_alloc_failure;
+#endif
 
 static uint64_t slow_mono_ns(void) {
     struct timespec ts;
@@ -100,14 +113,21 @@ static int slow_parse_ms(const char *s, uint64_t *out_ms) {
     return 1;
 }
 
+static int slow_disable_env_is_disabled(const char *s) {
+    return s && strcmp(s, "1") == 0;
+}
+
 static void slow_init_once(void) {
     const char *disable = getenv("SQLITE3_DISABLE_SLOW_QUERY");
     const char *threshold = getenv("SQLITE3_SLOW_QUERY_THRESHOLD_MS");
+    const char *expanded_disable = getenv("SQLITE3_DISABLE_SLOW_QUERY_EXPANDED_SQL");
+    const char *expanded_threshold = getenv("SQLITE3_SLOW_QUERY_EXPANDED_SQL_THRESHOLD_MS");
     uint64_t ms = SLOW_QUERY_DEFAULT_THRESHOLD_MS;
+    uint64_t expanded_ms = SLOW_QUERY_DEFAULT_EXPANDED_SQL_THRESHOLD_MS;
 
     atomic_store_explicit(
         &g_slow_disabled,
-        (disable && strcmp(disable, "1") == 0) ? 1 : 0,
+        slow_disable_env_is_disabled(disable) ? 1 : 0,
         memory_order_release
     );
     if (slow_parse_ms(threshold, &ms)) {
@@ -115,6 +135,18 @@ static void slow_init_once(void) {
     } else {
         g_threshold_ns = SLOW_QUERY_DEFAULT_THRESHOLD_MS * 1000000ull;
     }
+    if (slow_parse_ms(expanded_threshold, &expanded_ms)) {
+        if (expanded_ms < ms) expanded_ms = ms;
+        g_expanded_threshold_ns = expanded_ms * 1000000ull;
+    } else {
+        if (expanded_ms < ms) expanded_ms = ms;
+        g_expanded_threshold_ns = expanded_ms * 1000000ull;
+    }
+    atomic_store_explicit(
+        &g_expanded_sql_enabled,
+        slow_disable_env_is_disabled(expanded_disable) ? 0 : 1,
+        memory_order_release
+    );
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void) {
@@ -141,6 +173,23 @@ static uint64_t slow_fnv1a(const char *sql, uint32_t *full_len) {
         if (n < UINT32_MAX) n++;
     }
     *full_len = (uint32_t)n;
+    return h;
+}
+
+static uint64_t slow_fnv1a_prefix(
+    const char *sql, size_t cap, uint32_t *prefix_len, int *truncated
+) {
+    const unsigned char *p = (const unsigned char *)(sql ? sql : "");
+    uint64_t h = 1469598103934665603ull;
+    uint32_t n = 0;
+
+    while (*p && (size_t)n < cap) {
+        h ^= (uint64_t)*p++;
+        h *= 1099511628211ull;
+        n++;
+    }
+    *prefix_len = n;
+    *truncated = *p ? 1 : 0;
     return h;
 }
 
@@ -390,6 +439,124 @@ static void slow_escape_unlimited(const char *src, char *dst, size_t dst_n) {
     slow_escape_string(src, dst, dst_n, SIZE_MAX, &truncated);
 }
 
+static int slow_utf8_cont(unsigned char c) {
+    return c >= 0x80 && c <= 0xbf;
+}
+
+static size_t slow_valid_utf8_len(const unsigned char *s, size_t n) {
+    unsigned char c;
+    uint32_t cp;
+
+    if (n == 0) return 0;
+    c = s[0];
+    if (c < 0x80) return 1;
+    if (c >= 0xc2 && c <= 0xdf) {
+        if (n < 2 || !slow_utf8_cont(s[1])) return 0;
+        return 2;
+    }
+    if (c >= 0xe0 && c <= 0xef) {
+        if (n < 3 || !slow_utf8_cont(s[1]) || !slow_utf8_cont(s[2])) return 0;
+        if (c == 0xe0 && s[1] < 0xa0) return 0;
+        if (c == 0xed && s[1] >= 0xa0) return 0;
+        return 3;
+    }
+    if (c >= 0xf0 && c <= 0xf4) {
+        if (n < 4 || !slow_utf8_cont(s[1]) || !slow_utf8_cont(s[2]) ||
+            !slow_utf8_cont(s[3])) {
+            return 0;
+        }
+        if (c == 0xf0 && s[1] < 0x90) return 0;
+        if (c == 0xf4 && s[1] > 0x8f) return 0;
+        cp = ((uint32_t)(c & 0x07u) << 18) |
+             ((uint32_t)(s[1] & 0x3fu) << 12) |
+             ((uint32_t)(s[2] & 0x3fu) << 6) |
+             (uint32_t)(s[3] & 0x3fu);
+        return cp <= 0x10ffffu ? 4 : 0;
+    }
+    return 0;
+}
+
+static void slow_detail_put_hex(char *dst, size_t *o, unsigned char c) {
+    static const char hex[] = "0123456789ABCDEF";
+    dst[(*o)++] = '\\';
+    dst[(*o)++] = 'x';
+    dst[(*o)++] = hex[c >> 4];
+    dst[(*o)++] = hex[c & 0x0f];
+}
+
+static size_t slow_escape_detail_prefix(
+    const char *src, size_t src_len, char *dst, size_t dst_n
+) {
+    const unsigned char *p = (const unsigned char *)(src ? src : "");
+    size_t i = 0;
+    size_t o = 0;
+
+    if (dst_n == 0) return 0;
+    while (i < src_len && o + 5 < dst_n) {
+        unsigned char c = p[i];
+        size_t utf8_len;
+
+        switch (c) {
+            case '\\': dst[o++] = '\\'; dst[o++] = '\\'; i++; continue;
+            case '"': dst[o++] = '\\'; dst[o++] = '"'; i++; continue;
+            case '\n': dst[o++] = '\\'; dst[o++] = 'n'; i++; continue;
+            case '\r': dst[o++] = '\\'; dst[o++] = 'r'; i++; continue;
+            case '\t': dst[o++] = '\\'; dst[o++] = 't'; i++; continue;
+            default:
+                break;
+        }
+
+        utf8_len = slow_valid_utf8_len(p + i, src_len - i);
+        if (utf8_len > 1) {
+            if (o + utf8_len >= dst_n) break;
+            memcpy(dst + o, p + i, utf8_len);
+            o += utf8_len;
+            i += utf8_len;
+            continue;
+        }
+
+        if (c < 0x20 || c == 0x7f || (c >= 0x80 && c <= 0x9f)) {
+            slow_detail_put_hex(dst, &o, c);
+        } else {
+            dst[o++] = (char)c;
+        }
+        i++;
+    }
+    dst[o] = 0;
+    return o;
+}
+
+static void *slow_detail_malloc(size_t n) {
+#ifdef SLOW_QUERY_TRACKER_TEST_API
+    if (atomic_load_explicit(&g_test_force_detail_alloc_failure, memory_order_acquire)) {
+        return NULL;
+    }
+#endif
+    return malloc(n);
+}
+
+static char *slow_expanded_sql(sqlite3_stmt *stmt) {
+#ifdef SLOW_QUERY_TRACKER_TEST_API
+    if (g_test_expanded_sql_provider) {
+        atomic_fetch_add_explicit(&g_test_expanded_sql_calls, 1u, memory_order_acq_rel);
+        return g_test_expanded_sql_provider(stmt);
+    }
+#endif
+    return sqlite3_expanded_sql(stmt);
+}
+
+static void slow_expanded_sql_free(char *sql) {
+    if (!sql) return;
+#ifdef SLOW_QUERY_TRACKER_TEST_API
+    if (g_test_expanded_sql_provider) {
+        atomic_fetch_add_explicit(&g_test_expanded_sql_frees, 1u, memory_order_acq_rel);
+        free(sql);
+        return;
+    }
+#endif
+    sqlite3_free(sql);
+}
+
 static void slow_emit_stats_snapshot(const struct slow_entry_snapshot *s) {
     char sqlbuf[SLOW_QUERY_SQL_CAP + 256];
     long double count;
@@ -419,7 +586,7 @@ static void slow_emit_stats_snapshot(const struct slow_entry_snapshot *s) {
 
 /* Heap-snapshot WHY: snapshot is heap-allocated to keep qsort + emit work
  * OUTSIDE the mutex (held only for per-entry value copy). Stack allocation is
- * forbidden: 2048 entries x ~1.1 KiB per entry would blow the default stack. */
+ * forbidden: 4096 entries x ~2.1 KiB per entry would blow the default stack. */
 static void slow_query_dump(int try_lock, const char *reason) {
     struct slow_entry_snapshot *snap = NULL;
     uint32_t n = 0;
@@ -493,8 +660,98 @@ static void slow_negative_elapsed_diag(void) {
     }
 }
 
-static int slow_query_record_sql(
-    sqlite3 *db, sqlite3_stmt *stmt, const char *sql, sqlite3_int64 elapsed_ns
+static int slow_expanded_detail_is_eligible(uint64_t elapsed, const char *file_name) {
+    if (!atomic_load_explicit(&g_expanded_sql_enabled, memory_order_acquire)) return 0;
+    if (elapsed < g_expanded_threshold_ns) return 0;
+    if (!file_name || file_name[0] == 0) return 0;
+    return auto_extension_path_is_target(file_name);
+}
+
+static void slow_emit_expanded_alloc_failed(const char *file_name, uint64_t elapsed) {
+    char file[4096];
+    slow_escape_unlimited(file_name, file, sizeof(file));
+    obs_logf("slow_query_expanded",
+             "db=\"%s\" elapsed_ms=%.3f "
+             "sql_expanded_source=alloc_failed sql_expanded_len=0 "
+             "sql_expanded_hash=%016" PRIx64 " sql_expanded_truncated=0",
+             file, (double)((long double)elapsed / 1000000.0L), (uint64_t)0);
+}
+
+static void slow_emit_expanded_detail(
+    sqlite3_stmt *stmt,
+    const char *template_sql,
+    uint64_t template_hash,
+    uint32_t template_full_len,
+    uint64_t elapsed,
+    const char *file_name
+) {
+    const char *source = "template";
+    const char *detail_sql = template_sql ? template_sql : "(null)";
+    char *expanded = NULL;
+    char *escaped = NULL;
+    char file[4096];
+    size_t escaped_n;
+    size_t escaped_len;
+    uint32_t detail_len = 0;
+    uint64_t detail_hash;
+    int truncated = 0;
+
+    if (stmt) {
+        expanded = slow_expanded_sql(stmt);
+        if (expanded) {
+            source = "expanded";
+            detail_sql = expanded;
+        }
+    }
+
+    if (strcmp(source, "template") == 0 &&
+        template_full_len <= SLOW_QUERY_EXPANDED_SQL_CAP) {
+        detail_len = template_full_len;
+        detail_hash = template_hash;
+        truncated = 0;
+    } else {
+        detail_hash = slow_fnv1a_prefix(
+            detail_sql, SLOW_QUERY_EXPANDED_SQL_CAP, &detail_len, &truncated
+        );
+    }
+
+    escaped_n = ((size_t)detail_len * 4u) + strlen(SLOW_QUERY_TRUNC_TAIL) + 1u;
+    escaped = (char *)slow_detail_malloc(escaped_n);
+    if (!escaped) {
+        slow_emit_expanded_alloc_failed(file_name, elapsed);
+        slow_expanded_sql_free(expanded);
+        return;
+    }
+
+    escaped_len = slow_escape_detail_prefix(detail_sql, (size_t)detail_len, escaped, escaped_n);
+    if (truncated && escaped_len + strlen(SLOW_QUERY_TRUNC_TAIL) + 1u <= escaped_n) {
+        memcpy(escaped + escaped_len, SLOW_QUERY_TRUNC_TAIL, strlen(SLOW_QUERY_TRUNC_TAIL) + 1u);
+    }
+
+    slow_escape_unlimited(file_name, file, sizeof(file));
+    obs_logf("slow_query_expanded",
+             "db=\"%s\" elapsed_ms=%.3f "
+             "sql_expanded_source=%s sql_expanded_len=%" PRIu32
+             " sql_expanded_hash=%016" PRIx64
+             " sql_expanded_truncated=%d sql_expanded=\"%s\"",
+             file,
+             (double)((long double)elapsed / 1000000.0L),
+             source,
+             detail_len,
+             detail_hash,
+             truncated,
+             escaped);
+
+    free(escaped);
+    slow_expanded_sql_free(expanded);
+}
+
+static int slow_query_record_sql_with_file(
+    sqlite3 *db,
+    sqlite3_stmt *stmt,
+    const char *sql,
+    sqlite3_int64 elapsed_ns,
+    const char *file_name_override
 ) {
     uint64_t elapsed;
     uint64_t hash;
@@ -539,15 +796,25 @@ static int slow_query_record_sql(
     if (elapsed >= threshold_ns) {
         char file[4096];
         char sqlbuf[SLOW_QUERY_SQL_CAP + 256];
-        const char *file_name = db ? sqlite3_db_filename(db, "main") : NULL;
+        const char *file_name = file_name_override ? file_name_override :
+            (db ? sqlite3_db_filename(db, "main") : NULL);
         slow_escape_unlimited(file_name, file, sizeof(file));
         slow_escape_sql(sql, sqlbuf, sizeof(sqlbuf));
         obs_logf("slow_query", "db=\"%s\" elapsed_ms=%.3f sql=\"%s\"",
                  file, (double)((long double)elapsed / 1000000.0L), sqlbuf);
+        if (slow_expanded_detail_is_eligible(elapsed, file_name)) {
+            slow_emit_expanded_detail(stmt, sql, hash, full_len, elapsed, file_name);
+        }
     }
     slow_maybe_periodic_dump();
     (void)stmt;
     return 0;
+}
+
+static int slow_query_record_sql(
+    sqlite3 *db, sqlite3_stmt *stmt, const char *sql, sqlite3_int64 elapsed_ns
+) {
+    return slow_query_record_sql_with_file(db, stmt, sql, elapsed_ns, NULL);
 }
 
 /* B-F5/OD2 invariant: g_in_atexit acquire-load MUST remain the FIRST
@@ -594,6 +861,13 @@ int slow_query_test_record_sql(const char *sql, sqlite3_int64 elapsed_ns) {
     return slow_query_record_sql(NULL, NULL, sql, elapsed_ns);
 }
 
+int slow_query_test_record_sql_for_db(
+    const char *db_filename, const char *sql, sqlite3_int64 elapsed_ns, int with_stmt
+) {
+    sqlite3_stmt *stmt = with_stmt ? (sqlite3_stmt *)(uintptr_t)1u : NULL;
+    return slow_query_record_sql_with_file(NULL, stmt, sql, elapsed_ns, db_filename);
+}
+
 void slow_query_test_dump(void) {
     slow_query_dump(0, "test");
 }
@@ -608,6 +882,14 @@ uint32_t slow_query_test_entries_used(void) {
 
 uint32_t slow_query_test_max_entries(void) {
     return SLOW_QUERY_MAX_ENTRIES;
+}
+
+uint32_t slow_query_test_sql_cap(void) {
+    return SLOW_QUERY_SQL_CAP;
+}
+
+uint32_t slow_query_test_expanded_sql_cap(void) {
+    return SLOW_QUERY_EXPANDED_SQL_CAP;
 }
 
 uint32_t slow_query_test_count_for_sql(const char *sql) {
@@ -635,6 +917,53 @@ uint32_t slow_query_test_tombstones(void) {
 uint64_t slow_query_test_parse_threshold_ns(const char *value) {
     uint64_t ms = SLOW_QUERY_DEFAULT_THRESHOLD_MS;
     return slow_parse_ms(value, &ms) ? ms * 1000000ull : SLOW_QUERY_DEFAULT_THRESHOLD_MS * 1000000ull;
+}
+
+uint64_t slow_query_test_parse_expanded_threshold_ns(
+    const char *slow_value, const char *expanded_value
+) {
+    uint64_t slow_ms = SLOW_QUERY_DEFAULT_THRESHOLD_MS;
+    uint64_t expanded_ms = SLOW_QUERY_DEFAULT_EXPANDED_SQL_THRESHOLD_MS;
+    uint64_t parsed_slow_ms = slow_ms;
+
+    if (slow_parse_ms(slow_value, &parsed_slow_ms)) slow_ms = parsed_slow_ms;
+    if (!slow_parse_ms(expanded_value, &expanded_ms)) {
+        expanded_ms = SLOW_QUERY_DEFAULT_EXPANDED_SQL_THRESHOLD_MS;
+    }
+    if (expanded_ms < slow_ms) expanded_ms = slow_ms;
+    return expanded_ms * 1000000ull;
+}
+
+int slow_query_test_expanded_sql_enabled_value(const char *value) {
+    return slow_disable_env_is_disabled(value) ? 0 : 1;
+}
+
+int slow_query_test_path_is_target(const char *path) {
+    return auto_extension_path_is_target(path);
+}
+
+void slow_query_test_set_expanded_sql_provider(char *(*provider)(sqlite3_stmt *)) {
+    g_test_expanded_sql_provider = provider;
+    atomic_store_explicit(&g_test_expanded_sql_calls, 0u, memory_order_release);
+    atomic_store_explicit(&g_test_expanded_sql_frees, 0u, memory_order_release);
+}
+
+void slow_query_test_reset_expanded_sql_provider(void) {
+    g_test_expanded_sql_provider = NULL;
+    atomic_store_explicit(&g_test_expanded_sql_calls, 0u, memory_order_release);
+    atomic_store_explicit(&g_test_expanded_sql_frees, 0u, memory_order_release);
+}
+
+uint32_t slow_query_test_expanded_sql_free_count(void) {
+    return atomic_load_explicit(&g_test_expanded_sql_frees, memory_order_acquire);
+}
+
+uint32_t slow_query_test_expanded_sql_call_count(void) {
+    return atomic_load_explicit(&g_test_expanded_sql_calls, memory_order_acquire);
+}
+
+void slow_query_test_force_detail_alloc_failure(int enabled) {
+    atomic_store_explicit(&g_test_force_detail_alloc_failure, enabled ? 1 : 0, memory_order_release);
 }
 
 void slow_query_test_disable_atexit_dump(void) {
