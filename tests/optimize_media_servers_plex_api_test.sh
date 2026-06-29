@@ -125,7 +125,7 @@ map_test_opt_path() {
   printf '%s\n' "$path"
 }
 
-[() {
+function [ {
   if builtin [ "$#" -eq 3 ] && builtin [ "$1" = "-d" ] && builtin [ "$3" = "]" ]; then
     builtin [ -d "$(map_test_opt_path "$2")" ]
     return

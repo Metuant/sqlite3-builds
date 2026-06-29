@@ -65,11 +65,10 @@ SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256-$(pin_default SQLITE_SRC_SHA3_256)}"
 MIMALLOC_VERSION="${MIMALLOC_VERSION-$(pin_default MIMALLOC_VERSION)}"
 MIMALLOC_URL="${MIMALLOC_URL-$(pin_default MIMALLOC_URL)}"
 MIMALLOC_SHA512="${MIMALLOC_SHA512-$(pin_default MIMALLOC_SHA512)}"
-CMAKE_VERSION="${CMAKE_VERSION-$(pin_default CMAKE_VERSION)}"
-CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64-$(pin_default CMAKE_SHA256_X86_64)}"
-CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64-$(pin_default CMAKE_SHA256_AARCH64)}"
 ICU_SOURCE_VERSION="${ICU_SOURCE_VERSION-$(compat_group_pin icu69 icu_source_version)}"
 ICU_SOURCE_SHA512="${ICU_SOURCE_SHA512-$(compat_group_pin icu69 icu_source_sha512)}"
+BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE-$(pin_default BASEIMAGE_ALPINE)}"
+BASE_IMAGE="${BASE_IMAGE-}"
 LIBRARY_VARIANT="${LIBRARY_VARIANT:-generic}"
 SQLite_compressor='upx'  # Program to use for compressing compiled sqlite
                          # Keep it empty as "" to disable compression
@@ -126,6 +125,22 @@ if ! $SUDO $DOCKER version  >/dev/null 2>&1; then
 fi
 
 
+if [ -z "${BASE_IMAGE}" ]; then
+  base_ref_output="$(bash build/base_image_ref.sh)"
+  printf '%s\n' "${base_ref_output}"
+  BASE_IMAGE="$(printf '%s\n' "${base_ref_output}" | awk -F= '$1=="BASE_REF"{print $2; exit}')"
+  if [ -z "${BASE_IMAGE}" ]; then
+    onErr "build/base_image_ref.sh did not emit BASE_REF" 4
+  fi
+  $SUDO $DOCKER buildx build --load --provenance=false -t "${BASE_IMAGE}"    \
+    --build-arg BASEIMAGE_UBUNTU="$(pin_default BASEIMAGE_UBUNTU)"           \
+    --build-arg CMAKE_VERSION="$(pin_default CMAKE_VERSION)"                 \
+    --build-arg CMAKE_SHA256_X86_64="$(pin_default CMAKE_SHA256_X86_64)"     \
+    --build-arg CMAKE_SHA256_AARCH64="$(pin_default CMAKE_SHA256_AARCH64)"   \
+    --build-arg UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT="$(pin_default UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT)" \
+    -f docker-build-base/Dockerfile docker-build-base/
+fi
+
 
 $SUDO $DOCKER build --rm --no-cache=true -t "${DockerCliImage}"              \
   --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}"                         \
@@ -139,6 +154,8 @@ if [ "${LIBRARY_VARIANT}" = 'plex' ]; then
     --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}"                       \
     --build-arg MARCH="${MARCH:-x86-64-v3}"                                  \
     --build-arg LIBRARY_VARIANT="${LIBRARY_VARIANT}"                         \
+    --build-arg BASE_IMAGE="${BASE_IMAGE}"                                    \
+    --build-arg BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE}"                       \
     --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"             \
     --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}"                           \
     --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}"                 \
@@ -153,13 +170,12 @@ else
     --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}"                       \
     --build-arg MARCH="${MARCH:-x86-64-v3}"                                  \
     --build-arg LIBRARY_VARIANT="${LIBRARY_VARIANT}"                         \
+    --build-arg BASE_IMAGE="${BASE_IMAGE}"                                    \
+    --build-arg BASEIMAGE_ALPINE="${BASEIMAGE_ALPINE}"                       \
     --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}"             \
     --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}"                       \
     --build-arg MIMALLOC_URL="${MIMALLOC_URL}"                               \
     --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}"                         \
-    --build-arg CMAKE_VERSION="${CMAKE_VERSION}"                             \
-    --build-arg CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64}"                 \
-    --build-arg CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64}"               \
     -f docker-library/Dockerfile .
 fi
 

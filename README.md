@@ -66,9 +66,12 @@ Signing: TODO.
 
 ## Customization
 
-- Change SQLite source pins, the mimalloc tuple, generic CMake `CMAKE_*` pins,
-  base-image pins, `GENERIC_GLIBC_MAX`, and SQLite config-count pins in
-  `pins/versions.env`.
+- Change SQLite source pins, the mimalloc tuple, `CMAKE_*` inputs for the
+  content-addressed GHCR generic base, base-image source pins,
+  `GENERIC_GLIBC_MAX`, and SQLite config-count pins in `pins/versions.env`.
+  The generic library build consumes `BASE_IMAGE` dynamically from CI or the
+  local wrapper; do not add a static generic base digest pin to
+  `docker-library/Dockerfile`.
 - Keep `SQLITE_EXPECTED_CONFIG_COUNT` and `SQLITE_EXPECTED_DBCONFIG_COUNT`
   aligned with `build/expected-sqlite-config-count.txt`,
   `build/expected-sqlite-dbconfig-count.txt`, and `tests/check_pin_alignment.sh`

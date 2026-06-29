@@ -26,8 +26,11 @@ host application loads SQLite by handle rather than by symbol interposition.
 |---|---|
 | `build/Build.sh` | Container-internal build driver for CLI and library targets. |
 | `build/build_static_sqlite.sh` | Local wrapper that builds Docker images and extracts artifacts into `release/`. |
+| `build/base_image_ref.sh` | Computes the content-hash GHCR reference for the generic Ubuntu build base. |
 | `docker-cli/Dockerfile` | Alpine-based static CLI build image. |
-| `docker-library/Dockerfile` | Shared-library build image: digest-pinned `ubuntu:18.04` (bionic, glibc 2.27) plus `gcc-13` for the generic variant, and LSIO Alpine/musl for the Plex variant. |
+| `docker-build-base/Dockerfile` | Generic Ubuntu 18.04 build-base image with gcc-13, g++-13, and pinned Kitware CMake. |
+| `docker-build-base/ubuntu-toolchain-r-test.asc` | Vendored `ubuntu-toolchain-r/test` signing key used by the generic build-base image. |
+| `docker-library/Dockerfile` | Shared-library build image: dynamic `BASE_IMAGE` for the generic variant and LSIO Alpine/musl for the Plex variant. |
 | `docs/extending.md` | Cold-start runbook for adding runtime versions, compatibility groups, pool sites, and releases. |
 | `docs/baked-pins-schema.md` | Current schema v3 `baked-pins.txt` contract, validator reject list, and runtime keying rules. |
 | `src/auto_extension.c` | Built into both library variants; owns open-time auto-extension registration, trace-mask setup, target filtering, and the TLS seam into runtime optimize. |
@@ -54,6 +57,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared runtime fragments, and parent README. |
 | `lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh` | Args-only shared Plex pool-patch core staged into the Plex mod. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases, including container stop/start ownership and optional post-start Plex optimize API triggering. |
+| `.github/workflows/base.yml` | Reusable workflow that resolves, builds, smokes, and publishes the generic build-base image by content hash. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
 | `.dockerignore` | Tight Docker context allowlist for build, Dockerfile, source, script, and test inputs. |
 
@@ -156,22 +160,28 @@ The current Plex library compatibility group pins ICU 69.1:
 | ICU build prefix | `/opt/icu-69-plex` |
 | ICU configure suffix | `--with-library-suffix=plex` |
 
-The generic library build pins Kitware CMake:
+The generic build-base image pins Kitware CMake:
 
 | Input | Current value |
 |---|---|
 | CMake version | `3.31.12` |
 | CMake Linux x86_64 SHA-256 | `0dc2e9a6860f06bf10bd8fadc03e35d9eeb4df46e33763a7e480e987758f385c` |
 | CMake Linux aarch64 SHA-256 | `83f8fd91d2038a56556e1400390fcfe42f79602940c494f6c6f1cdae7f9e7f40` |
-| Build scope | Generic library Ubuntu base only |
+| Build scope | Content-addressed generic Ubuntu build base only |
 
-The build-image and generic ABI-floor pins are:
+The build-image, toolchain key, and generic ABI-floor pins are:
 
 | Input | Current value |
 |---|---|
 | Generic Ubuntu base | `ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98` |
+| Ubuntu toolchain PPA key fingerprint | `60C317803A41BA51845E371A1E9377A2BA9EF27F` |
 | LSIO Alpine base | `ghcr.io/linuxserver/baseimage-alpine:3.23` |
 | Generic glibc max | `2.27` |
+
+`BASEIMAGE_UBUNTU` and `CMAKE_*` build the content-addressed GHCR base image.
+They are not per-run generic library build-stage inputs. The generic library
+build consumes `BASE_IMAGE`, resolved to a GHCR digest by CI or to a local tag by
+the wrapper fallback.
 
 The library build also pins mimalloc v3.3.2:
 
@@ -196,9 +206,10 @@ The mimalloc VERSION + URL + SHA512 tuple must stay aligned across
 and `.github/workflows/sqlite-build.yml`; `tests/check_pin_alignment.sh`
 fails on any drift in the full tuple.
 
-`CMAKE_VERSION` and `CMAKE_SHA256_*` fields must stay aligned across
-`pins/versions.env`, the generic library workflow build args,
-`docker-library/Dockerfile`, and `tests/check_pin_alignment.sh`.
+`CMAKE_VERSION`, `CMAKE_SHA256_*`, `BASEIMAGE_UBUNTU`, and the vendored
+toolchain key inputs must stay aligned across `pins/versions.env`,
+`docker-build-base/Dockerfile`, `.github/workflows/base.yml`,
+`build/base_image_ref.sh`, and `tests/check_pin_alignment.sh`.
 
 Plex ICU source VERSION and SHA512 fields are group-owned by
 `pins/library-compat-groups.tsv`; the workflow passes those values as Plex
@@ -221,6 +232,12 @@ the temporary images.
 
 For library builds, it also forwards the mimalloc VERSION + URL + SHA512 pins
 into `docker-library/Dockerfile`.
+
+For generic library builds, it resolves the content-hash base reference through
+`build/base_image_ref.sh`. When `BASE_IMAGE` is not provided by the caller, the
+wrapper builds `docker-build-base/` locally with Buildx `--load`, tags that local
+image with the computed reference, and passes it to `docker-library/Dockerfile`
+as `BASE_IMAGE`.
 
 ### Build Driver
 
@@ -305,20 +322,24 @@ and SHA pin. The CLI image is only responsible for the static CLI artifact.
 
 ### Library Docker Image
 
-`docker-library/Dockerfile` uses digest-pinned `ubuntu:18.04` (bionic,
-glibc 2.27) plus `gcc-13` from `ubuntu-toolchain-r` for the generic variant
-and the LSIO Alpine/musl base for the Plex variant.
+`docker-library/Dockerfile` selects `base-generic` from dynamic `BASE_IMAGE` for
+the generic variant and `base-plex` from the LSIO Alpine/musl base for the Plex
+variant. In CI, `BASE_IMAGE` is a resolved
+`ghcr.io/darthshadow/sqlite3-build-base@sha256:<digest>` reference. In fork pull
+request or local fallback paths, `BASE_IMAGE` can be the local image tag loaded
+by Buildx.
 
-It installs the shared-library build toolchain and copies `build/Build.sh`,
+It copies `build/Build.sh`,
 `src/auto_extension.c`, `src/runtime_optimize.c`,
 `src/auto_extension_internal.h`, `tests/`,
 `build/sqlite-amalgamation.patch`, `build/expected-sqlite-config-count.txt`,
 and `build/expected-sqlite-dbconfig-count.txt` into `/app`, with the build
 files under `/app/build/`.
 
-The generic Ubuntu base downloads pinned Kitware CMake 3.31.12 with a
-per-architecture SHA-256 check before the mimalloc CMake stage. The Plex Alpine
-base uses its package CMake.
+The generic branch starts from `BASE_IMAGE`, then builds mimalloc and SQLite for
+the current run. The per-run generic branch performs no `apt` work, no PPA
+registration, and no CMake installation. Those steps belong to the generic
+build-base image.
 
 The same Dockerfile builds mimalloc v3.3.2 in a dedicated stage, installs it
 under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
@@ -342,13 +363,51 @@ For the Plex variant, the build stage fails if the produced `libsqlite3.so`
 carries `fcntl64` or any other glibc-versioned symbol. This zero-GLIBC gate is
 distinct from the generic variant's bounded glibc floor gate.
 
+### Generic Base Image Workflow
+
+`.github/workflows/base.yml` is a reusable workflow that resolves the generic
+build base for callers. It loads pins, calls `build/base_image_ref.sh`, and uses
+the script's content-hash tag:
+
+```text
+ghcr.io/darthshadow/sqlite3-build-base:src-<hash>
+```
+
+The hash covers `docker-build-base/Dockerfile`,
+`docker-build-base/ubuntu-toolchain-r-test.asc`, `BASEIMAGE_UBUNTU`,
+`CMAKE_VERSION`, `CMAKE_SHA256_X86_64`, and `CMAKE_SHA256_AARCH64`. Changing any
+of those inputs changes the tag and triggers a build-if-missing path on the next
+trusted CI run.
+
+The workflow first inspects the content-hash tag with `docker buildx imagetools`.
+If the manifest already exists, it emits the resolved
+`ghcr.io/darthshadow/sqlite3-build-base@sha256:<digest>` reference. If the tag
+is missing on a trusted push, native `ubuntu-24.04` amd64 and
+`ubuntu-24.04-arm` arm64 lanes build the base without QEMU, push each
+architecture image by digest to GHCR, smoke the built image, and use
+`imagetools create` to publish the multi-arch manifest. The manifest is then
+inspected and emitted as the resolved digest output.
+
+Base-image smoke checks cover gcc, g++, cc, c++ major version 13, the pinned
+CMake version, glibc 2.27, the direct `ubuntu-toolchain-r/test` bionic source,
+OpenSSL SHA3 support, image labels, and the expected linux/amd64 plus
+linux/arm64 manifest platforms.
+
+Fork pull requests and other events without package write authority do not push
+to GHCR. When the content-hash base is missing, the caller builds
+`docker-build-base/` locally with `docker buildx build --load`, uses the computed
+local reference as `BASE_IMAGE`, and continues in the same matrix job.
+
 ### Workflow Matrix
 
 `.github/workflows/sqlite-build.yml` builds on pushes to `main`,
 digit-prefixed tag pushes matching `[0-9]*`, pull requests to `main`, and
-manual dispatch. The workflow jobs are `build`, `mod-static-tests`, `release`,
-`mod-build`, and `mod-publish`. The release job validates `YYYY.MM.DD-rN`
-before archive assembly and release asset publication; `mod-build` and
+manual dispatch. The workflow jobs are `base`, `build`, `mod-static-tests`,
+`release`, `mod-build`, and `mod-publish`. The `base` job calls the reusable
+base workflow and supplies the resolved generic `BASE_IMAGE` digest to the
+build matrix when GHCR already has it or a trusted run can publish it. The
+release job validates `YYYY.MM.DD-rN` before archive assembly and release asset
+publication; `mod-build` and
 `mod-publish` handle LSIO mod images.
 
 The build job uses an architecture matrix:
@@ -360,7 +419,11 @@ The build job uses an architecture matrix:
 | `ubuntu-24.04-arm` | `armv8-a` | `linux-arm64` |
 
 Each matrix row builds three Docker images: CLI, generic library, and Plex
-library.
+library. Per-run builds use Buildx with `--load`, import `type=gha` layer cache
+by image family, `MARCH`, and runner architecture, and export
+`type=gha,mode=max` cache only on trusted cache-writer events. The CLI
+Dockerfile's `RUN --mount=type=cache,target=/ccache` mount remains local to that
+build and is not exported through the GitHub Actions cache backend.
 
 x86-64-v4 is intentionally absent. GitHub `ubuntu-24.04` runners commonly use
 AMD Zen 3 hosts without AVX-512, and a v4 library SIGILLs in the

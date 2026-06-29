@@ -17,6 +17,14 @@ require_line() {
   grep -Fxq -- "$line" "$file" || fail "$file missing exact line: $line"
 }
 
+reject_line() {
+  file="$1"
+  line="$2"
+  if grep -Fxq -- "$line" "$file"; then
+    fail "$file contains rejected exact line: $line"
+  fi
+}
+
 reject_pattern() {
   file="$1"
   pattern="$2"
@@ -41,7 +49,7 @@ legacy_scalar_keys() {
 
 reject_legacy_scalar_keys() {
   key_list="$(legacy_scalar_keys)"
-  set -- pins .github/workflows build docker-library tools scripts
+  set -- pins .github/workflows build docker-library docker-build-base tools scripts
   for key in $key_list; do
     matches="$(grep -R -n -- "$key" "$@" 2>/dev/null || true)"
     if [ -n "$matches" ]; then
@@ -70,6 +78,7 @@ MIMALLOC_SHA512
 CMAKE_VERSION
 CMAKE_SHA256_X86_64
 CMAKE_SHA256_AARCH64
+UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT
 SQLITE_EXPECTED_CONFIG_COUNT
 SQLITE_EXPECTED_DBCONFIG_COUNT
 BASEIMAGE_UBUNTU
@@ -81,6 +90,9 @@ for key in $required_pins; do
   eval "value=\${${key}-}"
   [ -n "$value" ] || fail "$pin_file missing non-empty $key"
 done
+
+printf '%s\n' "$UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT" | grep -Eq '^[0-9A-F]{40}$' || \
+  fail "$pin_file UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT must be 40 uppercase hex characters"
 
 assert_eq() {
   label="$1"
@@ -146,6 +158,57 @@ assert_wrapper_build_arg() {
     fail "build/build_static_sqlite.sh does not forward $key as a docker build arg"
 }
 
+assert_wrapper_library_build_arg_absent() {
+  key="$1"
+  if ! awk -v key="$key" '
+    index($0, "DockerLibraryImage") && index($0, "build --rm --no-cache=true") {
+      in_library_build = 1
+    }
+    in_library_build && index($0, "--build-arg " key "=") {
+      print
+      found = 1
+    }
+    in_library_build && index($0, "-f docker-library/Dockerfile .") {
+      in_library_build = 0
+    }
+    END {
+      exit found ? 1 : 0
+    }
+  ' build/build_static_sqlite.sh; then
+    fail "build/build_static_sqlite.sh forwards $key to docker-library/Dockerfile"
+  fi
+}
+
+require_workflow_step_no_pattern() {
+  file="$1"
+  step="$2"
+  pattern="$3"
+  label="$4"
+  step_body="$(awk -v step="$step" '
+    /^[[:space:]]+- name: / {
+      if (in_step) {
+        in_step = 0
+      }
+      if (index($0, "- name: " step) > 0) {
+        in_step = 1
+        found = 1
+        next
+      }
+    }
+    in_step {
+      print
+    }
+    END {
+      if (!found) {
+        exit 2
+      }
+    }
+  ' "$file")" || fail "$file missing workflow step: $step"
+  if printf '%s\n' "$step_body" | grep -Eq -- "$pattern"; then
+    fail "$label contains rejected pattern: $pattern"
+  fi
+}
+
 compat_group_pin() {
   compat_group="$1"
   field="$2"
@@ -192,13 +255,11 @@ do
   assert_wrapper_pin_default "$key"
 done
 
-for key in \
-  CMAKE_VERSION \
-  CMAKE_SHA256_X86_64 \
-  CMAKE_SHA256_AARCH64
-do
-  assert_wrapper_pin_default "$key"
-  assert_wrapper_build_arg "$key"
+reject_line build/build_static_sqlite.sh 'CMAKE_VERSION="${CMAKE_VERSION-$(pin_default CMAKE_VERSION)}"'
+reject_line build/build_static_sqlite.sh 'CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64-$(pin_default CMAKE_SHA256_X86_64)}"'
+reject_line build/build_static_sqlite.sh 'CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64-$(pin_default CMAKE_SHA256_AARCH64)}"'
+for key in CMAKE_VERSION CMAKE_SHA256_X86_64 CMAKE_SHA256_AARCH64; do
+  assert_wrapper_library_build_arg_absent "$key"
 done
 
 assert_wrapper_compat_default ICU_SOURCE_VERSION icu69 icu_source_version
@@ -251,12 +312,61 @@ generic_icu_source_sha512="$(compat_group_pin generic icu_source_sha512)"
 [ "$generic_icu_source_version" = "-" ] || fail "generic compat group must not carry ICU source version"
 [ "$generic_icu_source_sha512" = "-" ] || fail "generic compat group must not carry ICU source SHA512"
 
-for key in ICU_SOURCE_VERSION ICU_SOURCE_SHA512 MIMALLOC_VERSION MIMALLOC_URL MIMALLOC_SHA512 CMAKE_VERSION CMAKE_SHA256_X86_64 CMAKE_SHA256_AARCH64; do
+for key in ICU_SOURCE_VERSION ICU_SOURCE_SHA512 MIMALLOC_VERSION MIMALLOC_URL MIMALLOC_SHA512; do
   require_line docker-library/Dockerfile "ARG $key"
   reject_pattern docker-library/Dockerfile "^ARG ${key}="
 done
 reject_pattern .github/workflows/sqlite-build.yml '--build-arg ICU_(VERSION|SHA512)='
-require_pattern .github/workflows/sqlite-build.yml 'docker_library_image.*--build-arg CMAKE_VERSION="\$\{CMAKE_VERSION\}"' 'generic library CMake build arg'
+for key in CMAKE_VERSION CMAKE_SHA256_X86_64 CMAKE_SHA256_AARCH64; do
+  require_line docker-build-base/Dockerfile "ARG $key"
+  reject_pattern docker-build-base/Dockerfile "^ARG ${key}="
+  reject_pattern docker-library/Dockerfile "^ARG ${key}$"
+  reject_pattern docker-library/Dockerfile "$key"
+done
+require_line docker-build-base/Dockerfile 'ARG BASEIMAGE_UBUNTU'
+require_line docker-build-base/Dockerfile 'FROM ${BASEIMAGE_UBUNTU}'
+require_line docker-build-base/Dockerfile 'ARG UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT'
+require_pattern docker-build-base/Dockerfile 'COPY ubuntu-toolchain-r-test[.]asc' 'vendored toolchain key copy'
+require_pattern docker-build-base/Dockerfile 'https://ppa[.]launchpadcontent[.]net/ubuntu-toolchain-r/test/ubuntu' 'direct toolchain PPA URL'
+require_pattern docker-build-base/Dockerfile 'bionic' 'bionic PPA codename'
+require_pattern docker-build-base/Dockerfile 'openssl' 'OpenSSL package/smoke'
+require_pattern docker-build-base/Dockerfile '345bd227155241c08ab64f6a3e34ec2b1b590f4b9c98087dfef0d7e70dbe578b' 'OpenSSL SHA3 smoke hash'
+reject_pattern docker-build-base/Dockerfile 'add-apt-repository|apt-key|keyserver|launchpad[.]net/api|software-properties-common|apt-transport-https'
+
+for key in BASEIMAGE_UBUNTU CMAKE_VERSION CMAKE_SHA256_X86_64 CMAKE_SHA256_AARCH64; do
+  require_pattern .github/workflows/base.yml "\\$\\{${key}\\}" ".github/workflows/base.yml $key reference"
+  require_line build/base_image_ref.sh ": \"\${${key}:?missing pin ${key}}\""
+  require_line build/base_image_ref.sh "  printf '%s' \"\${${key}}\""
+done
+require_line build/base_image_ref.sh '  cat "${repo_root}/docker-build-base/Dockerfile"'
+require_line build/base_image_ref.sh '  cat "${repo_root}/docker-build-base/ubuntu-toolchain-r-test.asc"'
+
+require_line .github/workflows/base.yml '        run: grep -E '\''^[A-Za-z_][A-Za-z0-9_]*='\'' pins/versions.env >> "$GITHUB_ENV"'
+require_pattern .github/workflows/base.yml 'build/base_image_ref[.]sh' 'base ref script call'
+require_pattern .github/workflows/base.yml 'docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5' 'pinned setup-buildx action'
+require_pattern .github/workflows/base.yml 'docker buildx imagetools inspect "\$\{base_ref\}"|docker buildx imagetools inspect "\$\{BASE_REF\}"' 'base image inspect'
+require_pattern .github/workflows/base.yml 'provenance=false' 'base build provenance disable'
+require_pattern .github/workflows/base.yml 'docker buildx imagetools create' 'base manifest publish'
+require_pattern .github/workflows/base.yml 'ghcr[.]io/darthshadow/sqlite3-build-base@sha256:<digest>|ghcr[.]io/darthshadow/sqlite3-build-base@%s|ghcr\[.\]io/darthshadow/sqlite3-build-base@sha256:' 'resolved base digest output'
+require_line .github/workflows/base.yml '            --build-arg CMAKE_VERSION="${CMAKE_VERSION}" \'
+require_line .github/workflows/base.yml '            --build-arg CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64}" \'
+require_line .github/workflows/base.yml '            --build-arg CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64}" \'
+require_line .github/workflows/base.yml '            --build-arg UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT="${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" \'
+
+require_pattern .github/workflows/sqlite-build.yml 'docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5' 'main workflow setup-buildx action'
+require_pattern .github/workflows/sqlite-build.yml 'docker buildx build --load' 'main workflow buildx local load'
+require_pattern .github/workflows/sqlite-build.yml '--cache-from type=gha' 'main workflow GHA cache import'
+require_pattern .github/workflows/sqlite-build.yml '--cache-to type=gha,mode=max' 'main workflow GHA cache export'
+require_pattern .github/workflows/sqlite-build.yml '--build-arg BASE_IMAGE="\$\{BASE_IMAGE\}"' 'library BASE_IMAGE build arg'
+require_pattern .github/workflows/sqlite-build.yml '--build-arg BASEIMAGE_ALPINE="\$\{BASEIMAGE_ALPINE\}"' 'library BASEIMAGE_ALPINE build arg'
+reject_pattern .github/workflows/sqlite-build.yml 'sudo docker build|--platform'
+for step in 'Build sqlite library' 'Build sqlite Plex library'; do
+  require_workflow_step_no_pattern \
+    .github/workflows/sqlite-build.yml \
+    "$step" \
+    '--build-arg CMAKE_(VERSION|SHA256_X86_64|SHA256_AARCH64)=' \
+    "$step"
+done
 reject_pattern .github/workflows/sqlite-build.yml 'env\.(PLEX|EMBY)_.*TAG'
 reject_pattern .github/workflows/sqlite-build.yml '\$(PLEX|EMBY)_.*TAG'
 reject_pattern tools/ci/mod-bake-smoke.sh '(PLEX|EMBY)_.*TAG'
@@ -365,8 +475,10 @@ awk -F '\t' '
 require_line docker-cli/Dockerfile "FROM ${BASEIMAGE_ALPINE}"
 require_line docker-cli/Dockerfile 'ENTRYPOINT []'
 require_line docker-cli/Dockerfile 'CMD ["/bin/sh"]'
-require_line docker-library/Dockerfile "FROM ${BASEIMAGE_UBUNTU} AS base-generic"
-require_line docker-library/Dockerfile "FROM ${BASEIMAGE_ALPINE} AS base-plex"
+require_line docker-library/Dockerfile 'ARG BASE_IMAGE'
+require_line docker-library/Dockerfile 'FROM ${BASE_IMAGE} AS base-generic'
+require_line docker-library/Dockerfile 'ARG BASEIMAGE_ALPINE'
+require_line docker-library/Dockerfile 'FROM ${BASEIMAGE_ALPINE} AS base-plex'
 require_line docker-library/Dockerfile "      generic_glibc_max=\"${GENERIC_GLIBC_MAX}\"; \\"
 require_line docker-library/Dockerfile 'ENTRYPOINT []'
 require_line docker-library/Dockerfile 'CMD ["/bin/sh"]'
@@ -376,16 +488,24 @@ require_line docker-library/Dockerfile 'ARG SQLITE_SRC_URL=""'
 require_line docker-library/Dockerfile 'ARG SQLITE_SRC_SHA3_256=""'
 require_line docker-cli/Dockerfile 'ARG SQLITE_AMALG_URL'
 require_line docker-cli/Dockerfile 'ARG SQLITE_AMALG_SHA3_256'
+reject_pattern docker-library/Dockerfile 'add-apt-repository|ppa:ubuntu-toolchain-r/test|^FROM ubuntu:18[.]04|wget[[:space:]]+-O'
+
+require_pattern build/build_static_sqlite.sh 'build/base_image_ref[.]sh' 'local wrapper base ref script call'
+require_pattern build/build_static_sqlite.sh 'buildx build --load' 'local wrapper base buildx local load'
+require_pattern build/build_static_sqlite.sh '--build-arg BASE_IMAGE="\$\{BASE_IMAGE\}"' 'local wrapper BASE_IMAGE build arg'
+require_pattern build/build_static_sqlite.sh '--build-arg BASEIMAGE_ALPINE="\$\{BASEIMAGE_ALPINE\}"' 'local wrapper BASEIMAGE_ALPINE build arg'
 
 config_count="$(tr -d '[:space:]' < build/expected-sqlite-config-count.txt)"
 dbconfig_count="$(tr -d '[:space:]' < build/expected-sqlite-dbconfig-count.txt)"
 assert_eq 'build/expected-sqlite-config-count.txt' "$SQLITE_EXPECTED_CONFIG_COUNT" "$config_count"
 assert_eq 'build/expected-sqlite-dbconfig-count.txt' "$SQLITE_EXPECTED_DBCONFIG_COUNT" "$dbconfig_count"
 
-printf 'pins aligned: sqlite=%s mimalloc=%s cmake=%s icu_source=%s bases=%s,%s generic_glibc_max=%s counts=%s/%s sorterref=%s pmasz=%s\n' \
+printf 'pins aligned: sqlite=%s mimalloc=%s base_cmake=%s base_ref_script=%s toolchain_key=%s icu_source=%s bases=%s,%s generic_glibc_max=%s counts=%s/%s sorterref=%s pmasz=%s\n' \
   "$SQLITE_VERSION_DOTTED" \
   "$MIMALLOC_VERSION" \
   "$CMAKE_VERSION" \
+  "build/base_image_ref.sh" \
+  "$UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT" \
   "$plex_icu_source_version" \
   "$BASEIMAGE_UBUNTU" \
   "$BASEIMAGE_ALPINE" \

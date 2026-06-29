@@ -1,0 +1,394 @@
+name: Build sqlite base
+
+on:
+  workflow_call:
+    outputs:
+      image:
+        description: Resolved generic build base image
+        value: ${{ jobs.resolve.outputs.image }}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  inspect:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      base_ref: ${{ steps.inspect.outputs.base_ref }}
+      image: ${{ steps.inspect.outputs.image }}
+      missing: ${{ steps.inspect.outputs.missing }}
+      can_publish: ${{ steps.inspect.outputs.can_publish }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Load version pins
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to GHCR
+        if: github.event_name == 'push' && github.repository == 'darthshadow/sqlite3-builds'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Inspect content-hash base
+        id: inspect
+        run: |
+          set -euo pipefail
+
+          base_ref_line="$(bash build/base_image_ref.sh)"
+          if [[ ! "${base_ref_line}" =~ ^BASE_REF=ghcr[.]io/darthshadow/sqlite3-build-base:src-[0-9a-f]+$ ]]; then
+            echo "FATAL: unexpected base ref output: ${base_ref_line}" >&2
+            exit 1
+          fi
+          base_ref="${base_ref_line#BASE_REF=}"
+          can_publish=false
+          repository_lc="${GITHUB_REPOSITORY,,}"
+          if [ "${GITHUB_EVENT_NAME}" = "push" ] && [ "${repository_lc}" = "darthshadow/sqlite3-builds" ]; then
+            can_publish=true
+          fi
+
+          {
+            printf 'base_ref=%s\n' "${base_ref}"
+            printf 'can_publish=%s\n' "${can_publish}"
+          } >> "$GITHUB_OUTPUT"
+
+          if docker buildx imagetools inspect "${base_ref}" > base-image-inspect.txt 2> base-image-inspect.err; then
+            digest="$(awk '$1=="Digest:" { print $2; exit }' base-image-inspect.txt)"
+            if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "FATAL: unexpected base manifest digest: ${digest}" >&2
+              cat base-image-inspect.txt >&2
+              exit 1
+            fi
+            {
+              printf 'missing=false\n'
+              printf 'image=ghcr.io/darthshadow/sqlite3-build-base@%s\n' "${digest}"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! grep -Eiq '(not found|no such|manifest unknown|name unknown|repository does not exist)' base-image-inspect.err; then
+            cat base-image-inspect.err >&2
+            exit 1
+          fi
+
+          if [ "${can_publish}" != "true" ]; then
+            cat base-image-inspect.err >&2
+          fi
+          {
+            printf 'missing=true\n'
+            printf 'image=\n'
+          } >> "$GITHUB_OUTPUT"
+
+  build-amd64:
+    if: needs.inspect.outputs.missing == 'true' && needs.inspect.outputs.can_publish == 'true'
+    needs: inspect
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      digest_ref: ${{ steps.build.outputs.digest_ref }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Load version pins
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to GHCR
+        if: github.event_name == 'push' && github.repository == 'darthshadow/sqlite3-builds'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and smoke base image
+        id: build
+        env:
+          BASE_REF: ${{ needs.inspect.outputs.base_ref }}
+          EXPECTED_PLATFORM: linux/amd64
+          ARCH: amd64
+        run: |
+          set -euo pipefail
+          : "${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT:?missing pin UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}"
+
+          image_name="${BASE_REF%:src-*}"
+          metadata_file="base-${ARCH}.metadata.json"
+          docker buildx build \
+            --file docker-build-base/Dockerfile \
+            --provenance=false \
+            --metadata-file "${metadata_file}" \
+            --output "type=image,name=${image_name},push=true,push-by-digest=true" \
+            --build-arg BASEIMAGE_UBUNTU="${BASEIMAGE_UBUNTU}" \
+            --build-arg CMAKE_VERSION="${CMAKE_VERSION}" \
+            --build-arg CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64}" \
+            --build-arg CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64}" \
+            --build-arg UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT="${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" \
+            docker-build-base
+
+          digest="$(jq -r '."containerimage.digest"' "${metadata_file}")"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "FATAL: unexpected image digest: ${digest}" >&2
+            exit 1
+          fi
+          digest_ref="${image_name}@${digest}"
+
+          docker run --rm \
+            -e CMAKE_VERSION="${CMAKE_VERSION}" \
+            "${digest_ref}" \
+            bash -c '
+              set -euo pipefail
+              for compiler in gcc g++ cc c++; do
+                major="$("${compiler}" -dumpversion | awk -F. "{print \$1}")"
+                if [ "${major}" != "13" ]; then
+                  echo "FATAL: ${compiler} major version is ${major}, expected 13" >&2
+                  exit 1
+                fi
+              done
+              if [ "$(cmake --version | sed -n "1p")" != "cmake version ${CMAKE_VERSION}" ]; then
+                cmake --version >&2
+                exit 1
+              fi
+              if [ "$(ldd --version | awk "NR==1{print \$NF}")" != "2.27" ]; then
+                ldd --version >&2
+                exit 1
+              fi
+              grep -F "https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu bionic main" /etc/apt/sources.list.d/ubuntu-toolchain-r-test.list
+              sha3="$(printf "sqlite3-builds\n" | openssl dgst -sha3-256 | awk "{print \$NF}")"
+              if [ "${sha3}" != "345bd227155241c08ab64f6a3e34ec2b1b590f4b9c98087dfef0d7e70dbe578b" ]; then
+                echo "FATAL: OpenSSL SHA3 smoke mismatch: ${sha3}" >&2
+                exit 1
+              fi
+            '
+
+          actual_platform="$(docker image inspect "${digest_ref}" --format '{{.Os}}/{{.Architecture}}')"
+          if [ "${actual_platform}" != "${EXPECTED_PLATFORM}" ]; then
+            echo "FATAL: platform is ${actual_platform}, expected ${EXPECTED_PLATFORM}" >&2
+            exit 1
+          fi
+          base_label="$(docker image inspect "${digest_ref}" --format '{{ index .Config.Labels "org.sqlite3-builds.base.ubuntu" }}')"
+          cmake_label="$(docker image inspect "${digest_ref}" --format '{{ index .Config.Labels "org.sqlite3-builds.cmake.version" }}')"
+          key_label="$(docker image inspect "${digest_ref}" --format '{{ index .Config.Labels "org.sqlite3-builds.ubuntu-toolchain-r-test.key-fingerprint" }}')"
+          if [ "${base_label}" != "${BASEIMAGE_UBUNTU}" ]; then
+            echo "FATAL: base label is ${base_label}, expected ${BASEIMAGE_UBUNTU}" >&2
+            exit 1
+          fi
+          if [ "${cmake_label}" != "${CMAKE_VERSION}" ]; then
+            echo "FATAL: CMake label is ${cmake_label}, expected ${CMAKE_VERSION}" >&2
+            exit 1
+          fi
+          if [ "${key_label}" != "${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" ]; then
+            echo "FATAL: toolchain key label is ${key_label}, expected ${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" >&2
+            exit 1
+          fi
+          printf 'digest_ref=%s\n' "${digest_ref}" >> "$GITHUB_OUTPUT"
+
+  build-arm64:
+    if: needs.inspect.outputs.missing == 'true' && needs.inspect.outputs.can_publish == 'true'
+    needs: inspect
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    outputs:
+      digest_ref: ${{ steps.build.outputs.digest_ref }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Load version pins
+        run: grep -E '^[A-Za-z_][A-Za-z0-9_]*=' pins/versions.env >> "$GITHUB_ENV"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to GHCR
+        if: github.event_name == 'push' && github.repository == 'darthshadow/sqlite3-builds'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and smoke base image
+        id: build
+        env:
+          BASE_REF: ${{ needs.inspect.outputs.base_ref }}
+          EXPECTED_PLATFORM: linux/arm64
+          ARCH: arm64
+        run: |
+          set -euo pipefail
+          : "${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT:?missing pin UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}"
+
+          image_name="${BASE_REF%:src-*}"
+          metadata_file="base-${ARCH}.metadata.json"
+          docker buildx build \
+            --file docker-build-base/Dockerfile \
+            --provenance=false \
+            --metadata-file "${metadata_file}" \
+            --output "type=image,name=${image_name},push=true,push-by-digest=true" \
+            --build-arg BASEIMAGE_UBUNTU="${BASEIMAGE_UBUNTU}" \
+            --build-arg CMAKE_VERSION="${CMAKE_VERSION}" \
+            --build-arg CMAKE_SHA256_X86_64="${CMAKE_SHA256_X86_64}" \
+            --build-arg CMAKE_SHA256_AARCH64="${CMAKE_SHA256_AARCH64}" \
+            --build-arg UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT="${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" \
+            docker-build-base
+
+          digest="$(jq -r '."containerimage.digest"' "${metadata_file}")"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "FATAL: unexpected image digest: ${digest}" >&2
+            exit 1
+          fi
+          digest_ref="${image_name}@${digest}"
+
+          docker run --rm \
+            -e CMAKE_VERSION="${CMAKE_VERSION}" \
+            "${digest_ref}" \
+            bash -c '
+              set -euo pipefail
+              for compiler in gcc g++ cc c++; do
+                major="$("${compiler}" -dumpversion | awk -F. "{print \$1}")"
+                if [ "${major}" != "13" ]; then
+                  echo "FATAL: ${compiler} major version is ${major}, expected 13" >&2
+                  exit 1
+                fi
+              done
+              if [ "$(cmake --version | sed -n "1p")" != "cmake version ${CMAKE_VERSION}" ]; then
+                cmake --version >&2
+                exit 1
+              fi
+              if [ "$(ldd --version | awk "NR==1{print \$NF}")" != "2.27" ]; then
+                ldd --version >&2
+                exit 1
+              fi
+              grep -F "https://ppa.launchpadcontent.net/ubuntu-toolchain-r/test/ubuntu bionic main" /etc/apt/sources.list.d/ubuntu-toolchain-r-test.list
+              sha3="$(printf "sqlite3-builds\n" | openssl dgst -sha3-256 | awk "{print \$NF}")"
+              if [ "${sha3}" != "345bd227155241c08ab64f6a3e34ec2b1b590f4b9c98087dfef0d7e70dbe578b" ]; then
+                echo "FATAL: OpenSSL SHA3 smoke mismatch: ${sha3}" >&2
+                exit 1
+              fi
+            '
+
+          actual_platform="$(docker image inspect "${digest_ref}" --format '{{.Os}}/{{.Architecture}}')"
+          if [ "${actual_platform}" != "${EXPECTED_PLATFORM}" ]; then
+            echo "FATAL: platform is ${actual_platform}, expected ${EXPECTED_PLATFORM}" >&2
+            exit 1
+          fi
+          base_label="$(docker image inspect "${digest_ref}" --format '{{ index .Config.Labels "org.sqlite3-builds.base.ubuntu" }}')"
+          cmake_label="$(docker image inspect "${digest_ref}" --format '{{ index .Config.Labels "org.sqlite3-builds.cmake.version" }}')"
+          key_label="$(docker image inspect "${digest_ref}" --format '{{ index .Config.Labels "org.sqlite3-builds.ubuntu-toolchain-r-test.key-fingerprint" }}')"
+          if [ "${base_label}" != "${BASEIMAGE_UBUNTU}" ]; then
+            echo "FATAL: base label is ${base_label}, expected ${BASEIMAGE_UBUNTU}" >&2
+            exit 1
+          fi
+          if [ "${cmake_label}" != "${CMAKE_VERSION}" ]; then
+            echo "FATAL: CMake label is ${cmake_label}, expected ${CMAKE_VERSION}" >&2
+            exit 1
+          fi
+          if [ "${key_label}" != "${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" ]; then
+            echo "FATAL: toolchain key label is ${key_label}, expected ${UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT}" >&2
+            exit 1
+          fi
+          printf 'digest_ref=%s\n' "${digest_ref}" >> "$GITHUB_OUTPUT"
+
+  publish:
+    if: needs.inspect.outputs.missing == 'true' && needs.inspect.outputs.can_publish == 'true'
+    needs:
+      - inspect
+      - build-amd64
+      - build-arm64
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image: ${{ steps.publish.outputs.image }}
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5 # v4.1.0
+
+      - name: Login to GHCR
+        if: github.event_name == 'push' && github.repository == 'darthshadow/sqlite3-builds'
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Publish manifest
+        id: publish
+        env:
+          BASE_REF: ${{ needs.inspect.outputs.base_ref }}
+          AMD64_DIGEST_REF: ${{ needs.build-amd64.outputs.digest_ref }}
+          ARM64_DIGEST_REF: ${{ needs.build-arm64.outputs.digest_ref }}
+        run: |
+          set -euo pipefail
+          for digest_ref in "${AMD64_DIGEST_REF}" "${ARM64_DIGEST_REF}"; do
+            if [[ ! "${digest_ref}" =~ ^ghcr[.]io/darthshadow/sqlite3-build-base@sha256:[0-9a-f]{64}$ ]]; then
+              echo "FATAL: unexpected digest ref: ${digest_ref}" >&2
+              exit 1
+            fi
+          done
+
+          docker buildx imagetools create \
+            --tag "${BASE_REF}" \
+            "${AMD64_DIGEST_REF}" \
+            "${ARM64_DIGEST_REF}"
+          docker buildx imagetools inspect "${BASE_REF}" > base-manifest.txt
+          awk '$1=="Platform:" { print $2 }' base-manifest.txt | sort > base-platforms.txt
+          printf 'linux/amd64\nlinux/arm64\n' > expected-platforms.txt
+          diff -u expected-platforms.txt base-platforms.txt
+          digest="$(awk '$1=="Digest:" { print $2; exit }' base-manifest.txt)"
+          if [[ ! "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "FATAL: unexpected manifest digest: ${digest}" >&2
+            cat base-manifest.txt >&2
+            exit 1
+          fi
+          printf 'image=ghcr.io/darthshadow/sqlite3-build-base@%s\n' "${digest}" >> "$GITHUB_OUTPUT"
+
+  resolve:
+    if: always()
+    needs:
+      - inspect
+      - publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    outputs:
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - name: Resolve workflow output
+        id: resolve
+        env:
+          INSPECT_RESULT: ${{ needs.inspect.result }}
+          PUBLISH_RESULT: ${{ needs.publish.result }}
+          INSPECT_IMAGE: ${{ needs.inspect.outputs.image }}
+          PUBLISH_IMAGE: ${{ needs.publish.outputs.image }}
+          MISSING: ${{ needs.inspect.outputs.missing }}
+          CAN_PUBLISH: ${{ needs.inspect.outputs.can_publish }}
+        run: |
+          set -euo pipefail
+          if [ "${INSPECT_RESULT}" != "success" ]; then
+            echo "FATAL: base inspect job result was ${INSPECT_RESULT}" >&2
+            exit 1
+          fi
+
+          image="${INSPECT_IMAGE}"
+          if [ -z "${image}" ] && [ "${MISSING}" = "true" ] && [ "${CAN_PUBLISH}" = "true" ]; then
+            if [ "${PUBLISH_RESULT}" != "success" ]; then
+              echo "FATAL: base publish job result was ${PUBLISH_RESULT}" >&2
+              exit 1
+            fi
+            image="${PUBLISH_IMAGE}"
+          fi
+
+          if [ -n "${image}" ] && [[ ! "${image}" =~ ^ghcr[.]io/darthshadow/sqlite3-build-base@sha256:[0-9a-f]{64}$ ]]; then
+            echo "FATAL: unexpected resolved image: ${image}" >&2
+            exit 1
+          fi
+          printf 'image=%s\n' "${image}" >> "$GITHUB_OUTPUT"

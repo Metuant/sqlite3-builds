@@ -4,6 +4,8 @@ set -euo pipefail
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=tools/ci/lib/assertions.sh
 . "${script_dir}/lib/assertions.sh"
+# shellcheck source=tools/ci/retry.sh
+. "${script_dir}/retry.sh"
 
 MATRIX_MOD=$1
 MATRIX_IMAGE_NAME=$2
@@ -140,7 +142,7 @@ emit_pre_row() {
 while IFS=$'\t' read -r server_id lsio_image compat_group; do
   [ -n "$server_id" ] || continue
   remember_support_group "$compat_group"
-  docker pull "$lsio_image"
+  retry docker pull "$lsio_image"
   image_digest="$(docker image inspect --format '{{if .RepoDigests}}{{index .RepoDigests 0}}{{end}}' "$lsio_image")"
   if [ -z "$image_digest" ]; then
     echo "FATAL: docker image inspect returned no repo digest for $lsio_image" >&2

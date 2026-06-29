@@ -1,73 +1,11 @@
 # syntax=docker/dockerfile:1.5
 ARG LIBRARY_VARIANT=generic
+ARG BASE_IMAGE
+ARG BASEIMAGE_ALPINE
 
-FROM ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98 AS base-generic
+FROM ${BASE_IMAGE} AS base-generic
 
-SHELL ["/bin/bash", "-c"]
-
-ARG CMAKE_VERSION
-ARG CMAKE_SHA256_X86_64
-ARG CMAKE_SHA256_AARCH64
-
-RUN set -euo pipefail; \
-    echo "**** Install Dependencies ****"; \
-    retry() { \
-      local attempt=1 max_attempts=5 backoff=5; \
-      while true; do \
-        if "$@"; then \
-          return 0; \
-        fi; \
-        if [ "${attempt}" -ge "${max_attempts}" ]; then \
-          echo "FATAL: command failed after ${attempt} attempts: $*" >&2; \
-          return 1; \
-        fi; \
-        echo "WARN: command failed (attempt ${attempt}/${max_attempts}), retrying in ${backoff}s: $*" >&2; \
-        sleep "${backoff}"; \
-        attempt=$((attempt + 1)); \
-        backoff=$((backoff * 2)); \
-      done; \
-    }; \
-    { \
-      retry apt-get -y update && \
-      retry apt-get -y upgrade && \
-      retry apt-get -y install --no-install-recommends \
-          apt-transport-https \
-          ca-certificates \
-          openssl \
-          software-properties-common \
-          file \
-          gpg-agent \
-          wget \
-          unzip && \
-      retry add-apt-repository -y ppa:ubuntu-toolchain-r/test && \
-      retry apt-get -y update && \
-      retry apt-get -y upgrade && \
-      retry apt-get -y install --no-install-recommends \
-          make \
-          g++-13 \
-          gcc-13 \
-          binutils \
-          patch \
-          zlib1g \
-          zlib1g-dev; \
-    } || exit 1; \
-    arch="$(uname -m)"; \
-    case "$arch" in \
-      x86_64) cmake_sha256="${CMAKE_SHA256_X86_64}" ;; \
-      aarch64) cmake_sha256="${CMAKE_SHA256_AARCH64}" ;; \
-      *) echo "FATAL: unsupported CMake architecture: ${arch}" >&2; exit 1 ;; \
-    esac; \
-    cmake_archive="/tmp/cmake-${CMAKE_VERSION}-linux-${arch}.tar.gz"; \
-    wget -O "${cmake_archive}" "https://github.com/Kitware/CMake/releases/download/v${CMAKE_VERSION}/cmake-${CMAKE_VERSION}-linux-${arch}.tar.gz"; \
-    echo "${cmake_sha256}  ${cmake_archive}" | sha256sum -c -; \
-    tar -xzf "${cmake_archive}" --strip-components=1 -C /usr/local; \
-    rm -f "${cmake_archive}"; \
-    update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-13 100 && \
-    update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-13 100 && \
-    update-alternatives --install /usr/bin/cc cc /usr/bin/gcc-13 100 && \
-    update-alternatives --install /usr/bin/c++ c++ /usr/bin/g++-13 100
-
-FROM ghcr.io/linuxserver/baseimage-alpine:3.23 AS base-plex
+FROM ${BASEIMAGE_ALPINE} AS base-plex
 
 RUN echo "**** Install Dependencies ****" && \
     apk add --no-cache \
@@ -126,7 +64,7 @@ RUN if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       icu_archive_version="$(printf '%s' "${ICU_SOURCE_VERSION}" | tr '.' '_')"; \
       icu_archive="/tmp/icu4c-${icu_archive_version}-src.tgz"; \
       icu_url="https://github.com/unicode-org/icu/releases/download/release-${icu_release_version}/icu4c-${icu_archive_version}-src.tgz"; \
-      wget -O "${icu_archive}" "${icu_url}"; \
+      wget --tries=3 --timeout=30 --waitretry=5 --retry-connrefused -O "${icu_archive}" "${icu_url}"; \
       echo "${ICU_SOURCE_SHA512}  ${icu_archive}" | sha512sum -c -; \
       tar -xzf "${icu_archive}" -C /tmp; \
       cd /tmp/icu/source; \
@@ -154,7 +92,7 @@ RUN set -euo pipefail; \
     if [ "$LIBRARY_VARIANT" = "plex" ]; then \
       mimalloc_extra_cmake_flags="-DMI_LIBC_MUSL=ON"; \
     fi; \
-    wget -O "${mimalloc_archive}" "${MIMALLOC_URL}"; \
+    wget --tries=3 --timeout=30 --waitretry=5 --retry-connrefused -O "${mimalloc_archive}" "${MIMALLOC_URL}"; \
     echo "${MIMALLOC_SHA512}  ${mimalloc_archive}" | sha512sum -c -; \
     tar -xzf "${mimalloc_archive}" -C /tmp; \
     cmake -S "${mimalloc_src_dir}" -B "${mimalloc_build_dir}" \

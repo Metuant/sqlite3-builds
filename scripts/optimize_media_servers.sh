@@ -1953,6 +1953,7 @@ load_optimize_config() {
     else
         set -T
         trap 'config_command_rc=$?; case "${config_command_rc}:${first_config_failure_rc:-0}" in 0:*) ;; *:0) first_config_failure_rc="${config_command_rc}" ;; esac' DEBUG
+        # shellcheck source=/dev/null
         . "${conf_file}"
         rc=$?
         trap - DEBUG

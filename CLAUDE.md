@@ -30,12 +30,14 @@ Project-specific guidance:
   `build/Build.sh`) aligned with their runtime `sqlite3_config` values in
   `src/auto_extension.c`, enforced by `tests/check_pin_alignment.sh`; keep ICU
   pins aligned across `.github/workflows/sqlite-build.yml` and
-  `docker-library/Dockerfile`; keep
-  `CMAKE_*` pins aligned across `pins/versions.env`,
-  `.github/workflows/sqlite-build.yml`, `docker-library/Dockerfile`, and
-  `tests/check_pin_alignment.sh`; keep `BASEIMAGE_UBUNTU` =
-  `ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98`,
-  `BASEIMAGE_ALPINE` = `ghcr.io/linuxserver/baseimage-alpine:3.23`, and
+  `docker-library/Dockerfile`; keep `BASEIMAGE_UBUNTU`, `CMAKE_*`, and
+  `UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT` aligned across
+  `pins/versions.env`, `docker-build-base/Dockerfile`,
+  `.github/workflows/base.yml`, `build/base_image_ref.sh`, and
+  `tests/check_pin_alignment.sh`; keep `docker-library/Dockerfile`,
+  `.github/workflows/sqlite-build.yml`, and `build/build_static_sqlite.sh`
+  consuming `BASE_IMAGE` dynamically with no static generic base digest pin;
+  keep `BASEIMAGE_ALPINE` = `ghcr.io/linuxserver/baseimage-alpine:3.23` and
   `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`, and
   `tests/check_pin_alignment.sh`.

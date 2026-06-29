@@ -11,10 +11,10 @@ milestone lands.
 ## 1. Build / variant
 
 - Plex variant builds under
-  `BASEIMAGE_ALPINE=ghcr.io/linuxserver/baseimage-alpine:3.23`; generic variant
-  builds under
-  `BASEIMAGE_UBUNTU=ubuntu:18.04@sha256:152dc042452c496007f07ca9127571cb9c29697f42acbfad72324b2bb2e43c98`
-  (bionic, glibc 2.27). Multi-stage `docker-library/Dockerfile` selects via
+  `BASEIMAGE_ALPINE=ghcr.io/linuxserver/baseimage-alpine:3.23`. Generic variant
+  is two-step: `BASEIMAGE_UBUNTU` builds the content-addressed GHCR generic
+  base, and `docker-library/Dockerfile` consumes dynamic `BASE_IMAGE` for the
+  per-run library build. Multi-stage `docker-library/Dockerfile` selects via
   `LIBRARY_VARIANT`.
 - `LIBRARY_VARIANT=plex` is limited to the Plex ICU build path.
 - SQLite pins must stay aligned across `build/Build.sh`,
