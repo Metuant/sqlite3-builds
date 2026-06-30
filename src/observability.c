@@ -28,6 +28,7 @@ extern int sqlite3_open_v2_real(
 );
 extern int sqlite3_open16_real(const void *filename, sqlite3 **ppDb);
 __attribute__((visibility("hidden"))) extern void auto_extension_register_for_open(void);
+__attribute__((visibility("hidden"))) extern int runtime_optimize_in_progress(void);
 
 static pthread_once_t g_obs_once = PTHREAD_ONCE_INIT;
 static atomic_int g_obs_disabled;
@@ -576,6 +577,7 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned 
     char file[4096];
     char sqlbuf[OBS_SQL_CAP + 256];
 
+    if (runtime_optimize_in_progress()) return 0;
     (void)ctx;
     if (trace != SQLITE_TRACE_STMT || obs_is_disabled()) return 0;
 

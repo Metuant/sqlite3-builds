@@ -1,4 +1,4 @@
-#include "sqlite3.h"
+#include "auto_extension_internal.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -37,7 +37,6 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_is_disabled_cached(void);
-int auto_extension_path_is_target(const char *raw_fn);
 
 /* Decode tables stay in src/observability.c. */
 
@@ -160,6 +159,11 @@ __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void) {
  * the cached load sees the resolved value. */
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_is_disabled_cached(void) {
     return atomic_load_explicit(&g_slow_disabled, memory_order_acquire);
+}
+
+__attribute__((visibility("hidden"))) uint64_t slow_query_threshold_ns(void) {
+    pthread_once(&g_slow_once, slow_init_once);
+    return g_threshold_ns;
 }
 
 static uint64_t slow_fnv1a(const char *sql, uint32_t *full_len) {
@@ -825,7 +829,9 @@ __attribute__((visibility("hidden"))) SQLITE_API int slow_query_trace_profile(
     sqlite3_stmt *stmt, sqlite3_int64 elapsed_ns
 ) {
     if (atomic_load_explicit(&g_in_atexit, memory_order_acquire)) return 0;
+    if (runtime_optimize_in_progress()) return 0;
     sqlite3 *db = stmt ? sqlite3_db_handle(stmt) : NULL;
+    runtime_optimize_note_stmt_elapsed(db, stmt, elapsed_ns);
     const char *sql = stmt ? sqlite3_sql(stmt) : NULL;
     return slow_query_record_sql(db, stmt, sql, elapsed_ns);
 }
@@ -836,6 +842,7 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_cb(
     if (trace == SQLITE_TRACE_STMT) return obs_trace_stmt_cb(trace, ctx, p, x);
     if (trace == SQLITE_TRACE_PROFILE) {
         if (atomic_load_explicit(&g_in_atexit, memory_order_acquire)) return 0;
+        if (runtime_optimize_in_progress()) return 0;
         sqlite3_int64 elapsed_ns = x ? *(sqlite3_int64 *)x : 0;
         return slow_query_trace_profile((sqlite3_stmt *)p, elapsed_ns);
     }

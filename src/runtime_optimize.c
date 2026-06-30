@@ -1,5 +1,6 @@
 #include "auto_extension_internal.h"
 
+#include <ctype.h>
 #include <limits.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -31,6 +32,9 @@ __attribute__((visibility("hidden"))) void
 auto_extension_progress_handler_pop(sqlite3 *db,
                                     const auto_extension_progress_snapshot *snapshot);
 
+__attribute__((visibility("hidden"))) void
+auto_extension_progress_handler_clear(sqlite3 *db);
+
 __attribute__((visibility("hidden"))) int
 auto_extension_error_state_push(sqlite3 *db,
                                 auto_extension_error_snapshot *snapshot);
@@ -39,6 +43,24 @@ __attribute__((visibility("hidden"))) void
 auto_extension_error_state_pop(sqlite3 *db,
                                auto_extension_error_snapshot *snapshot);
 
+__attribute__((visibility("hidden"))) void
+auto_extension_busy_handler_push(sqlite3 *db, int ms,
+                                 auto_extension_busy_handler_snapshot *snapshot);
+
+__attribute__((visibility("hidden"))) void
+auto_extension_busy_handler_pop(sqlite3 *db,
+                                const auto_extension_busy_handler_snapshot *snapshot);
+
+__attribute__((visibility("hidden"))) void
+auto_extension_change_counter_push(sqlite3 *db,
+                                   auto_extension_change_counter_snapshot *snapshot);
+
+__attribute__((visibility("hidden"))) void
+auto_extension_change_counter_pop(
+    sqlite3 *db,
+    const auto_extension_change_counter_snapshot *snapshot
+);
+
 #define RUNTIME_OPTIMIZE_PATH_MAX 2048
 #define RUNTIME_OPTIMIZE_REGISTRY_CAP 16
 #define RUNTIME_OPTIMIZE_NS_PER_SECOND 1000000000LL
@@ -46,8 +68,8 @@ auto_extension_error_state_pop(sqlite3 *db,
 #define RUNTIME_OPTIMIZE_DEFAULT_FULL_SECONDS 86400LL
 #define RUNTIME_OPTIMIZE_BACKOFF_MAX_SECONDS 60LL
 #define RUNTIME_OPTIMIZE_PROGRESS_OPS 1000
-#define RUNTIME_OPTIMIZE_LIMITED_DEADLINE_NS 23000000LL
-#define RUNTIME_OPTIMIZE_FULL_DEADLINE_NS 4000000000LL
+#define RUNTIME_OPTIMIZE_LIMITED_DEADLINE_NS 3000000000LL
+#define RUNTIME_OPTIMIZE_FULL_DEADLINE_NS 15000000000LL
 #define RUNTIME_OPTIMIZE_CLIENTDATA_KEY "sqlite3-builds-runtime-optimize"
 /* WHY: Bound repeated O(statement-cache) blocked scans and skip logs. */
 #define RUNTIME_OPTIMIZE_BLOCKED_REARM_NS (30LL * RUNTIME_OPTIMIZE_NS_PER_SECOND)
@@ -84,11 +106,17 @@ typedef struct {
     int has_path;
     char path[RUNTIME_OPTIMIZE_PATH_MAX];
     atomic_llong next_due_ns;
+    _Atomic(uintptr_t) last_stmt_ptr;
+    atomic_llong last_stmt_elapsed_ns;
 } runtime_optimize_connection_state;
 
 static pthread_mutex_t g_runtime_optimize_mu = PTHREAD_MUTEX_INITIALIZER;
 static runtime_optimize_slot g_runtime_optimize_slots[RUNTIME_OPTIMIZE_REGISTRY_CAP];
 static _Thread_local int g_runtime_optimize_depth;
+
+__attribute__((visibility("hidden"))) int runtime_optimize_in_progress(void) {
+    return g_runtime_optimize_depth != 0;
+}
 
 static int env_is_literal_1(const char *name) {
     const char *value = getenv(name);
@@ -315,6 +343,8 @@ static runtime_optimize_connection_state *runtime_optimize_connection_state_get(
     if (!state) return NULL;
     memset(state, 0, sizeof(*state));
     atomic_init(&state->next_due_ns, 0LL);
+    atomic_init(&state->last_stmt_ptr, (uintptr_t)0);
+    atomic_init(&state->last_stmt_elapsed_ns, -1LL);
 
     rc = sqlite3_set_clientdata(
         db,
@@ -327,6 +357,49 @@ static runtime_optimize_connection_state *runtime_optimize_connection_state_get(
         return NULL;
     }
     return state;
+}
+
+static void runtime_optimize_clear_stmt_elapsed(
+    runtime_optimize_connection_state *state
+) {
+    if (!state) return;
+    atomic_store_explicit(&state->last_stmt_ptr, (uintptr_t)0, memory_order_relaxed);
+    atomic_store_explicit(&state->last_stmt_elapsed_ns, -1LL, memory_order_relaxed);
+}
+
+static void runtime_optimize_clear_stmt_elapsed_for_db(
+    sqlite3 *db,
+    runtime_optimize_connection_state *state
+) {
+    if (!state && db) state = runtime_optimize_connection_state_get(db, 0);
+    runtime_optimize_clear_stmt_elapsed(state);
+}
+
+__attribute__((visibility("hidden"))) void runtime_optimize_note_stmt_elapsed(
+    sqlite3 *db,
+    sqlite3_stmt *stmt,
+    sqlite3_int64 elapsed_ns
+) {
+    runtime_optimize_connection_state *state;
+
+    if (!db) return;
+    if (runtime_optimize_in_progress()) return;
+    state = runtime_optimize_connection_state_get(db, 0);
+    if (!state) return;
+    if (!stmt || elapsed_ns < 0) {
+        runtime_optimize_clear_stmt_elapsed(state);
+        return;
+    }
+    atomic_store_explicit(
+        &state->last_stmt_elapsed_ns,
+        (long long)elapsed_ns,
+        memory_order_release
+    );
+    atomic_store_explicit(
+        &state->last_stmt_ptr,
+        (uintptr_t)stmt,
+        memory_order_release
+    );
 }
 
 static void runtime_optimize_connection_state_set(
@@ -363,7 +436,10 @@ static int runtime_optimize_connection_hot_skip(
         &state->next_due_ns,
         memory_order_relaxed
     );
-    if (next_due_ns != 0 && now_ns < next_due_ns) return 1;
+    if (next_due_ns != 0 && now_ns < next_due_ns) {
+        runtime_optimize_clear_stmt_elapsed(state);
+        return 1;
+    }
 
     *state_out = state;
     *now_out = now_ns;
@@ -527,6 +603,97 @@ static int runtime_optimize_no_busy_peer(sqlite3 *db, sqlite3_stmt *self_stmt) {
     return 1;
 }
 
+static const char *runtime_optimize_sql_prefix_start(const char *sql) {
+    const unsigned char *p = (const unsigned char*)sql;
+
+    if (!p) return NULL;
+    for (;;) {
+        while (*p && isspace(*p)) p++;
+        if (p[0] == '-' && p[1] == '-') {
+            p += 2;
+            while (*p && *p != '\n' && *p != '\r') p++;
+            continue;
+        }
+        if (p[0] == '/' && p[1] == '*') {
+            p += 2;
+            while (p[0] && !(p[0] == '*' && p[1] == '/')) p++;
+            if (!p[0]) return NULL;
+            p += 2;
+            continue;
+        }
+        return (const char*)p;
+    }
+}
+
+static int runtime_optimize_sql_identifier_char(unsigned char c) {
+    return isalnum(c) || c == '_';
+}
+
+static int runtime_optimize_sql_starts_with_keyword(
+    const char *sql,
+    const char *keyword
+) {
+    const char *p = runtime_optimize_sql_prefix_start(sql);
+    size_t n = strlen(keyword);
+
+    if (!p || !p[0]) return 0;
+    if (sqlite3_strnicmp(p, keyword, (int)n) != 0) return 0;
+    return !runtime_optimize_sql_identifier_char((unsigned char)p[n]);
+}
+
+static int runtime_optimize_sql_is_control_or_schema_change(const char *sql) {
+    return runtime_optimize_sql_starts_with_keyword(sql, "BEGIN") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "COMMIT") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "END") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "ROLLBACK") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "SAVEPOINT") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "RELEASE") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "ATTACH") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "DETACH") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "VACUUM") ||
+           runtime_optimize_sql_starts_with_keyword(sql, "PRAGMA");
+}
+
+static int runtime_optimize_consume_stmt_elapsed(
+    runtime_optimize_connection_state *state,
+    sqlite3_stmt *self_stmt,
+    sqlite3_int64 *elapsed_ns
+) {
+    uintptr_t stmt_ptr;
+    sqlite3_int64 elapsed;
+
+    if (!state) return 0;
+    stmt_ptr = atomic_exchange_explicit(
+        &state->last_stmt_ptr,
+        (uintptr_t)0,
+        memory_order_acquire
+    );
+    elapsed = (sqlite3_int64)atomic_exchange_explicit(
+        &state->last_stmt_elapsed_ns,
+        -1LL,
+        memory_order_acquire
+    );
+    if (!self_stmt || stmt_ptr != (uintptr_t)self_stmt || elapsed < 0) return 0;
+    *elapsed_ns = elapsed;
+    return 1;
+}
+
+static int runtime_optimize_inline_gate_allows(
+    runtime_optimize_connection_state *state,
+    sqlite3_stmt *self_stmt
+) {
+    sqlite3_int64 elapsed_ns = -1;
+    const char *sql;
+
+    if (!runtime_optimize_consume_stmt_elapsed(state, self_stmt, &elapsed_ns)) return 0;
+    if (!self_stmt) return 0;
+    if (!sqlite3_stmt_readonly(self_stmt)) return 0;
+    sql = sqlite3_sql(self_stmt);
+    if (!sql || runtime_optimize_sql_is_control_or_schema_change(sql)) return 0;
+    if (elapsed_ns < 0) return 0;
+    return (uint64_t)elapsed_ns < slow_query_threshold_ns();
+}
+
 static int runtime_optimize_read_analysis_limit(sqlite3 *db, int *out) {
     sqlite3_stmt *stmt = NULL;
     int rc = sqlite3_prepare_v2(db, "PRAGMA main.analysis_limit;", -1, &stmt, NULL);
@@ -567,8 +734,8 @@ static sqlite3_int64 runtime_optimize_tier_deadline_ns(runtime_optimize_tier tie
 
 static const char *runtime_optimize_tier_sql(runtime_optimize_tier tier) {
     return tier == RUNTIME_OPTIMIZE_TIER_FULL ?
-           "PRAGMA main.optimize=0x10002;" :
-           "PRAGMA main.optimize;";
+           "ANALYZE main;" :
+           "PRAGMA main.optimize=0x10002;";
 }
 
 static const char *runtime_optimize_tier_name(runtime_optimize_tier tier) {
@@ -586,6 +753,8 @@ static int runtime_optimize_run(
     int rc = SQLITE_OK;
     int saved_limit = 0;
     int analysis_limit_changed = 0;
+    int change_counter_pushed = 0;
+    int busy_handler_pushed = 0;
     int error_pushed = 0;
     int progress_pushed = 0;
     char *err = NULL;
@@ -597,11 +766,14 @@ static int runtime_optimize_run(
     long long since_last_ms = runtime_optimize_since_last_ms(since_last_ns);
     auto_extension_error_snapshot error_snapshot;
     auto_extension_progress_snapshot progress_snapshot;
+    auto_extension_busy_handler_snapshot busy_snapshot;
+    auto_extension_change_counter_snapshot change_snapshot;
     runtime_optimize_progress_ctx progress_ctx;
 
-    (void)trigger;
     memset(&error_snapshot, 0, sizeof(error_snapshot));
     memset(&progress_snapshot, 0, sizeof(progress_snapshot));
+    memset(&busy_snapshot, 0, sizeof(busy_snapshot));
+    memset(&change_snapshot, 0, sizeof(change_snapshot));
     g_runtime_optimize_depth++;
     rc = auto_extension_error_state_push(db, &error_snapshot);
     if (rc != SQLITE_OK) {
@@ -614,6 +786,14 @@ static int runtime_optimize_run(
         goto cleanup;
     }
     error_pushed = 1;
+
+    auto_extension_change_counter_push(db, &change_snapshot);
+    change_counter_pushed = 1;
+
+    if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+        auto_extension_busy_handler_push(db, 1, &busy_snapshot);
+        busy_handler_pushed = 1;
+    }
 
     progress_ctx.deadline_ns = runtime_optimize_safe_add_ns(
         runtime_optimize_now_ns(),
@@ -639,13 +819,7 @@ static int runtime_optimize_run(
         goto cleanup;
     }
 
-    rc = runtime_optimize_exec_runtime_sql(
-        db,
-        tier == RUNTIME_OPTIMIZE_TIER_FULL ?
-            "PRAGMA main.analysis_limit=0;" :
-            "PRAGMA main.analysis_limit=1024;",
-        &err
-    );
+    rc = runtime_optimize_exec_runtime_sql(db, "PRAGMA main.analysis_limit=0;", &err);
     if (rc != SQLITE_OK) {
         sqlite3_log(rc,
                     "auto_extension: runtime optimize set analysis_limit failed on %s: %s",
@@ -686,6 +860,9 @@ static int runtime_optimize_run(
     success = 1;
 
 cleanup:
+    if (progress_pushed) {
+        auto_extension_progress_handler_clear(db);
+    }
     if (analysis_limit_changed) {
         int restore_rc;
         sqlite3_free(err);
@@ -708,11 +885,17 @@ cleanup:
                      residual_rc == SQLITE_OK ? residual_limit : -1, residual_rc);
         }
     }
-    if (progress_pushed) {
-        auto_extension_progress_handler_pop(db, &progress_snapshot);
+    if (change_counter_pushed) {
+        auto_extension_change_counter_pop(db, &change_snapshot);
+    }
+    if (busy_handler_pushed) {
+        auto_extension_busy_handler_pop(db, &busy_snapshot);
     }
     if (error_pushed) {
         auto_extension_error_state_pop(db, &error_snapshot);
+    }
+    if (progress_pushed) {
+        auto_extension_progress_handler_pop(db, &progress_snapshot);
     }
     sqlite3_free(err);
     g_runtime_optimize_depth--;
@@ -739,30 +922,67 @@ static void runtime_optimize_maybe_run(
     int rc;
 
     if (!db) return;
-    if (g_autopragma_depth != 0) return;
+    if (g_autopragma_depth != 0) {
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
+        return;
+    }
     if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE &&
         runtime_optimize_connection_hot_skip(db, &conn_state, &now_ns)) {
         return;
     }
-    if (env_is_literal_1("SQLITE3_DISABLE_AUTOPRAGMA")) return;
-    if (!runtime_optimize_is_enabled()) return;
-    if (g_runtime_optimize_depth != 0) return;
+    if (env_is_literal_1("SQLITE3_DISABLE_AUTOPRAGMA")) {
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
+        return;
+    }
+    if (!runtime_optimize_is_enabled()) {
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
+        return;
+    }
+    if (g_runtime_optimize_depth != 0) {
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
+        return;
+    }
 
     raw_fn = sqlite3_db_filename(db, "main");
-    if (!auto_extension_path_is_target(raw_fn)) return;
-    if (!runtime_optimize_copy_path_key(raw_fn, path, sizeof(path))) return;
+    if (!auto_extension_path_is_target(raw_fn)) {
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
+        return;
+    }
+    if (!runtime_optimize_copy_path_key(raw_fn, path, sizeof(path))) {
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
+        return;
+    }
     if (sqlite3_db_readonly(db, "main") == 1) {
         runtime_optimize_rearm_due_blocked(db, conn_state, path, now_ns, "readonly");
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
         return;
     }
     if (sqlite3_get_autocommit(db) != 1) {
         runtime_optimize_rearm_due_blocked(db, conn_state, path, now_ns, "open_txn");
+        if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE) {
+            runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
+        }
         return;
     }
     if (trigger == RUNTIME_OPTIMIZE_TRIGGER_CLOSE) {
         if (sqlite3_next_stmt(db, NULL) != NULL) return;
     } else if (!runtime_optimize_no_busy_peer(db, self_stmt)) {
         runtime_optimize_rearm_due_blocked(db, conn_state, path, now_ns, "busy_peer");
+        runtime_optimize_clear_stmt_elapsed_for_db(db, conn_state);
         return;
     }
     if (!conn_state) conn_state = runtime_optimize_connection_state_get(db, 1);
@@ -772,7 +992,16 @@ static void runtime_optimize_maybe_run(
         &conn_state->next_due_ns,
         memory_order_relaxed
     ) : 0;
-    if (next_due_ns != 0 && now_ns < next_due_ns) return;
+    if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE &&
+        next_due_ns != 0 && now_ns < next_due_ns) {
+        runtime_optimize_clear_stmt_elapsed(conn_state);
+        return;
+    }
+    if (trigger == RUNTIME_OPTIMIZE_TRIGGER_INLINE &&
+        !runtime_optimize_inline_gate_allows(conn_state, self_stmt)) {
+        runtime_optimize_rearm_due_blocked(db, conn_state, path, now_ns, "not_idle_read");
+        return;
+    }
 
     limited_cadence_ns = runtime_optimize_limited_cadence_ns();
     full_cadence_ns = runtime_optimize_full_cadence_ns();

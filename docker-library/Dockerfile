@@ -258,16 +258,22 @@ RUN set -euo pipefail; \
     fi; \
     gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -o /app/slow_query_smoke \
         /app/tests/slow_query_smoke.c /app/slow_query_tracker.c \
+        /app/tests/slow_query_tracker_stubs.c \
+        /app/tests/runtime_optimize_stubs.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_smoke; \
     gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -o /app/slow_query_atexit_smoke \
         /app/tests/slow_query_atexit_smoke.c /app/slow_query_tracker.c \
+        /app/tests/slow_query_tracker_stubs.c \
+        /app/tests/runtime_optimize_stubs.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
     atexit_output="$(LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_atexit_smoke 2>&1)"; \
     printf "%s\n" "$atexit_output"; \
     printf "%s\n" "$atexit_output" | grep -E 'slow_query_stats|dump_skipped'; \
     gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -o /app/slow_query_concurrency_smoke \
         /app/tests/slow_query_concurrency_smoke.c /app/slow_query_tracker.c \
+        /app/tests/slow_query_tracker_stubs.c \
+        /app/tests/runtime_optimize_stubs.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_concurrency_smoke; \
     gcc -O2 -o /app/slow_query_select1_bench /app/tests/slow_query_select1_bench.c \

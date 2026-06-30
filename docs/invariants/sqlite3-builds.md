@@ -202,16 +202,20 @@ milestone lands.
   the public return code. Optimize failures are logged/swallowed; native
   close, zombie, busy, step, reset, and finalize semantics stay authoritative.
 - Runtime optimize execution logs use `obs_logf` only on the execution path:
-  `event=optimize_start` before `PRAGMA optimize`, `event=optimize_done` on
-  success, and `event=optimize_failed` on failure. Each line carries `tier`,
+  `event=optimize_start` before the tier SQL statement, `event=optimize_done`
+  on success, and `event=optimize_failed` on failure. Each line carries `tier`,
   `elapsed_ms`, `stat_rows`, and `since_last_ms`; not-due hot skips emit no
   optimize log.
 - Runtime optimize due-but-blocked logs use `obs_logf` only after an enrolled
   connection has passed the not-due hot skip and a pre-reserve guard blocks
   work. The hook atomically re-arms only that connection's `next_due_ns` and
-  emits one throttled `event=optimize_skipped reason=readonly|open_txn|busy_peer`
+  emits one throttled
+  `event=optimize_skipped reason=readonly|open_txn|busy_peer|not_idle_read`
   per 30-second re-arm interval. It must not acquire `g_runtime_optimize_mu` or
   modify per-path success cadence / failure backoff state on this path.
+- Runtime optimize internal statements MUST NOT emit `trace_stmt`,
+  `slow_query`, or `slow_query_expanded` lines. `runtime_optimize` start, done,
+  failed, and skipped logs remain the public optimize telemetry.
 - Read-only opens stay quiet for PRAGMA emission; observability is
   independent of read-only state.
 - `sqlite3_initialize` log gate:
@@ -293,16 +297,28 @@ milestone lands.
   optimize. Literal `SQLITE3_DISABLE_AUTOPRAGMA=1` disables open-time PRAGMAs
   and runtime optimize.
 - Runtime optimize has two successful per-path cadences: LIMITED defaults to
-  1800 seconds, sets `PRAGMA main.analysis_limit=1024`, and runs
-  `PRAGMA main.optimize`; FULL defaults to 86400 seconds, sets
-  `PRAGMA main.analysis_limit=0`, and runs
-  `PRAGMA main.optimize=0x10002`. A successful FULL pass also satisfies the
-  LIMITED cadence.
-- Runtime optimize pre-reserve readonly, open-transaction, and busy-peer blocks
-  re-arm only the enrolled connection-local next-due cache for 30 seconds. They
-  do not stamp LIMITED/FULL success or set shared failure backoff.
-- Runtime optimize saves and restores the prior `analysis_limit` and the
-  application's progress handler around optimize work.
+  1800 seconds, sets `PRAGMA main.analysis_limit=0`, and runs
+  `PRAGMA main.optimize=0x10002` with a 3-second deadline; FULL defaults to
+  86400 seconds, sets `PRAGMA main.analysis_limit=0`, and runs
+  `ANALYZE main;` with a 15-second deadline and no trailing optimize. A
+  successful FULL pass also satisfies the LIMITED cadence.
+- Inline runtime optimize runs only after a provably fast plain read statement:
+  `sqlite3_stmt_readonly(self_stmt)` is true, the SQL is not transaction or
+  connection control, and the fresh PROFILE elapsed time is below
+  `SQLITE3_SLOW_QUERY_THRESHOLD_MS`. Missing statement identity, telemetry-off,
+  write, transaction-control, slow, and unobserved inline triggers defer without
+  stamping success; close remains the unconditional due-work backstop.
+- Runtime optimize pre-reserve `readonly`, `open_txn`, `busy_peer`, and
+  `not_idle_read` blocks re-arm only the enrolled connection-local next-due
+  cache for 30 seconds. They do not stamp LIMITED/FULL success or set shared
+  failure backoff.
+- Runtime optimize saves and restores the prior `analysis_limit`,
+  caller-visible error state, caller-visible `sqlite3_changes()` /
+  `sqlite3_total_changes64()` counters, and the application's progress handler
+  around optimize work. Inline optimize also saves and restores `busy_timeout`.
+  The close path sets `sqlite3_busy_timeout(db, 1)` and does not restore it
+  because the connection is closing. The progress deadline is suspended before
+  restoring connection state after an interrupted tier statement.
 - `scripts/optimize_media_servers.sh` owns Plex and Emby container stop/start
   during planned-downtime maintenance. `PLEX_OPTIMIZE_API=1` enables the
   inline post-start Plex database optimize trigger only after the per-instance

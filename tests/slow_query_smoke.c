@@ -35,11 +35,6 @@ void slow_query_test_disable_atexit_dump(void);
 
 void obs_logf(const char *fn, const char *fmt, ...);
 
-int obs_is_disabled(void) {
-    const char *v = getenv("SQLITE3_DISABLE_OBSERVABILITY");
-    return v && strcmp(v, "1") == 0;
-}
-
 int obs_trace_stmt_cb(unsigned trace, void *ctx, void *p, void *x) {
     (void)ctx;
     (void)p;
@@ -48,19 +43,6 @@ int obs_trace_stmt_cb(unsigned trace, void *ctx, void *p, void *x) {
         obs_logf("trace_stmt", "event=SQLITE_TRACE_STMT sql=\"SELECT ?1\"");
     }
     return 0;
-}
-
-void obs_logf(const char *fn, const char *fmt, ...) {
-    va_list ap;
-    if (obs_is_disabled()) return;
-    fprintf(stderr, "[sqlite3-builds-obs] test 0 0 %s", fn);
-    if (fmt && fmt[0]) {
-        fputc(' ', stderr);
-        va_start(ap, fmt);
-        vfprintf(stderr, fmt, ap);
-        va_end(ap);
-    }
-    fputc('\n', stderr);
 }
 
 static void failf(const char *fmt, ...) {

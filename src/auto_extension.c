@@ -176,7 +176,8 @@ static int autopragma_init(
      * failure path. Runtime optimize is off unless
      * SQLITE3_DISABLE_RUNTIME_OPTIMIZE is explicitly set to "0"; when enabled,
      * it runs only on later safe-idle hooks. Planned downtime maintenance
-     * remains the explicit full ANALYZE lifecycle. */
+     * remains the explicit full ANALYZE lifecycle. analysis_limit=0 stays
+     * explicit so app-side ANALYZE on this connection remains accurate. */
     char *err = NULL;
     int rc;
     g_autopragma_depth++;
@@ -188,7 +189,7 @@ static int autopragma_init(
         "PRAGMA wal_autocheckpoint=16000;"
         "PRAGMA journal_size_limit=67108864;"
         "PRAGMA busy_timeout=10000;"
-        "PRAGMA analysis_limit=1024;",
+        "PRAGMA analysis_limit=0;",
         NULL, NULL, &err);
     g_autopragma_depth--;
     if (rc != SQLITE_OK) {

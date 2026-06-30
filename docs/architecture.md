@@ -38,7 +38,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `src/auto_extension_internal.h` | Shared internal seam header between `src/auto_extension.c` and `src/runtime_optimize.c`. |
 | `src/slow_query_tracker.c` | Hidden observability satellite for PROFILE-based slow-query logging and bounded per-template stats. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
-| `tests/runtime_optimize_smoke.c` | Runtime smoke for close and inline `PRAGMA optimize` target gating, STAT1/STAT4 tiers, kill switches, skip gates, cadence, close semantics, and shutdown/reinit. |
+| `tests/runtime_optimize_smoke.c` | Runtime smoke for close and inline runtime optimize target gating, STAT1/STAT4 refresh, kill switches, skip gates, cadence, close semantics, and shutdown/reinit. |
 | `tests/slow_query_smoke.c` | Runtime smoke for the slow-query tracker threshold parser, kill switches, LRU bound, truncation, and stats dump. |
 | `tests/stmt_trace_smoke.c` | Runtime smoke for the STMT trace env contract and trace mask registration against the shared STMT/PROFILE callback. |
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
@@ -587,13 +587,15 @@ PRAGMA threads=8;
 PRAGMA wal_autocheckpoint=16000;
 PRAGMA journal_size_limit=67108864;
 PRAGMA busy_timeout=10000;
-PRAGMA analysis_limit=1024;
+PRAGMA analysis_limit=0;
 ```
 
-Per-connection injection sets `analysis_limit=1024`.
+Per-connection injection sets `analysis_limit=0`.
 `scripts/optimize_media_servers.sh` exports `SQLITE3_DISABLE_AUTOPRAGMA=1` and
 re-sets `analysis_limit=0` during planned-downtime runs so maintenance
 `optimize()` calls execute without the per-connection ceiling.
+PMS app-side `ANALYZE` inherits this accurate-stats setting on enrolled
+connections.
 
 The same callback recognizes Plex, Emby, and the legacy JF-style filename.
 JF deployment is unsupported; the filter remains a library behavior, not a
@@ -629,9 +631,12 @@ ICU linkage.
 Runtime optimize runs on safe idle boundaries only:
 
 - Internal immediate-close path, before SQLite converts the handle to zombie.
-- Public `sqlite3_step()` when it returns `SQLITE_DONE`.
-- Public `sqlite3_reset()` when it returns `SQLITE_OK`.
-- Public `sqlite3_finalize()` when it returns `SQLITE_OK`.
+- Public `sqlite3_step()` when it returns `SQLITE_DONE`, after a provably fast
+  plain read statement.
+- Public `sqlite3_reset()` when it returns `SQLITE_OK`, after a provably fast
+  plain read statement.
+- Public `sqlite3_finalize()` hook exists, but it passes NULL statement
+  identity; directly finalized statements are close-backstop only.
 
 The helpers never change public SQLite return codes and swallow optimize
 failures after logging. NULL close, already-busy `sqlite3_close`, and busy
@@ -649,6 +654,14 @@ Eligibility gates:
 - Close requires `sqlite3_next_stmt(db, NULL) == NULL`.
 - Inline allows prepared idle cached statements but skips when another
   statement is busy.
+- Inline runs only when the triggering statement is an ordinary read-only query
+  and its fresh PROFILE elapsed time is below
+  `SQLITE3_SLOW_QUERY_THRESHOLD_MS` (default 500 ms). Transaction-control,
+  connection-control, read-only `PRAGMA`, write, missing-statement,
+  telemetry-off, and unobserved inline triggers defer to a later inline attempt
+  or the close backstop.
+- Operator note: `SQLITE3_SLOW_QUERY_THRESHOLD_MS=0` disables inline optimize;
+  every observed elapsed time is `>= 0`, so due work runs only at close.
 
 A process-local per-path registry stores separate successful LIMITED and FULL
 cadence stamps plus inflight and failure-backoff state. LIMITED runs at most
@@ -658,8 +671,13 @@ cadence, default `1800`. FULL runs at most once per target path per
 A successful FULL pass also satisfies the LIMITED cadence. Failures set only a
 short backoff and never stamp either cadence, so an early missing-collation
 failure can retry later on a connection that has registered the required
-collation or tokenizer. A due no-op can still spend work at a safe idle
-boundary; SQLite's `PRAGMA optimize` remains the table-staleness gate.
+collation or tokenizer. A due LIMITED no-op can still spend work at a safe idle
+boundary; SQLite's `PRAGMA optimize` remains the LIMITED table-staleness gate.
+With runtime optimize enabled, the first qualifying fast read after a path's
+FULL cadence is due can synchronously pay the FULL `ANALYZE main;` cost on the
+caller connection up to `RUNTIME_OPTIMIZE_FULL_DEADLINE_NS` (15 s), bounded by
+the progress-deadline interrupt. This is opt-in and defaults to about once per
+target path per day.
 
 Each enrolled target connection also carries a clientdata next-due cache for
 its own path. Inline hot exits check that per-connection atomic value before
@@ -677,45 +695,63 @@ Execution tiers:
 
 ```sql
 -- LIMITED
-PRAGMA main.analysis_limit=1024;
-PRAGMA main.optimize;
+PRAGMA main.analysis_limit=0;
+PRAGMA main.optimize=0x10002;
 
 -- FULL
 PRAGMA main.analysis_limit=0;
-PRAGMA main.optimize=0x10002;
+ANALYZE main;
 ```
 
 Both tiers save and restore the prior `analysis_limit` and the caller-visible
 connection error state. Inline optimize also saves and restores the
-application's progress handler and uses it as a deadline guard. The close
-trigger keeps the close-only `sqlite3_busy_timeout(db, 1)` behavior. Runtime
-optimize never runs `ANALYZE` directly, never optimizes attached schemas, and
-never starts a background thread or separate connection. It uses the
+application's progress handler and uses it as a deadline guard, then suspends
+that guard before restoring connection state. Inline optimize snapshots the full
+busy-handler state, installs a 1 ms built-in busy timeout while the tier
+statement runs, and restores the exact prior handler and timeout afterward. The
+close trigger keeps the close-only 1 ms busy-timeout behavior. LIMITED runs
+conditional `PRAGMA main.optimize=0x10002`; FULL runs unconditional
+`ANALYZE main;` with no trailing optimize. Neither tier optimizes attached
+schemas or starts a background thread or separate connection. It uses the
 application's own connection, so Plex ICU/collation/tokenizer registrations are
 in scope when they exist.
+Runtime optimize snapshots and restores the caller-visible
+`sqlite3_changes()` and `sqlite3_total_changes64()` counters across its
+internal statements after computing telemetry.
 
 On the optimize execution path, observability emits `runtime_optimize`
-`event=optimize_start` before the `PRAGMA optimize` call, then
+`event=optimize_start` before the tier statement, then
 `event=optimize_done` on success or `event=optimize_failed` on failure. These
 lines are gated by `SQLITE3_DISABLE_OBSERVABILITY=1` through the shared
 observability sink and include `tier`, monotonic `elapsed_ms`, `stat_rows` from
 the `sqlite3_total_changes64()` delta, and `since_last_ms` (`-1` when that tier
 has no prior success). A due pre-reserve block on an enrolled connection emits
-`event=optimize_skipped reason=readonly|open_txn|busy_peer` at the same point it
-re-arms the connection-local next-due value, so repeated inline statements log
-at most once per 30-second re-arm interval. Not-due hot skips emit no optimize
-log.
+`event=optimize_skipped reason=readonly|open_txn|busy_peer|not_idle_read` at
+the same point it re-arms the connection-local next-due value, so repeated
+inline statements log at most once per 30-second re-arm interval. Not-due hot
+skips emit no optimize log.
+
+Runtime optimize's own `PRAGMA main.analysis_limit=0`,
+`PRAGMA main.optimize=0x10002`, and `ANALYZE main` statements are suppressed
+from `trace_stmt`, `slow_query`, and `slow_query_expanded` output. The
+`runtime_optimize` start/done/failed lines remain visible through the
+observability sink.
 
 Worst-case per-connection stall budget at a safe idle boundary is approximately:
 
-- LIMITED: 23 ms.
-- FULL: 4 s.
+- LIMITED: 3 s.
+- FULL: 15 s.
 
-Observed stable STAT4 behavior: with any nonzero `analysis_limit`, SQLite's
-`analyze.c` suppresses fresh STAT4 sampling. LIMITED therefore updates STAT1
-only. FULL temporarily sets `analysis_limit=0` and uses
-`PRAGMA main.optimize=0x10002`, so it can refresh STAT4 rows inline or at close
-without changing the planned-downtime maintenance path.
+Both tiers refresh STAT1 and STAT4 at `analysis_limit=0` when their tier
+statement analyzes a table. LIMITED lets SQLite's optimize staleness gate choose
+the tables. FULL recomputes whole-main-schema stats every cycle, including
+present-but-wrong `sqlite_stat1` rows that optimize leaves unchanged.
+
+RCA: sampled `sqlite_stat1` created by `analysis_limit=1024` can record a
+limit+1 fan-out artifact such as `1025` and mis-drive the Plex user prefix
+tag-search into a tight `fts4_tag_titles_icu_segdir` per-row loop. The spin was
+observed on SQLite 3.53.2; the current 3.53.3 pin does not fix it. Accurate
+`analysis_limit=0` stats flip the plan to the FTS-driver shape.
 
 ## Observability Layer
 
@@ -908,11 +944,14 @@ library Docker image.
 It proves:
 
 - Eligible target close and inline boundaries run bounded runtime optimize.
-- FULL writes STAT1 and STAT4 rows; LIMITED writes STAT1 only.
-- Inline optimize fires from `sqlite3_step` DONE, `sqlite3_reset` OK, and
-  `sqlite3_finalize` OK before connection close.
-- `analysis_limit` and the application progress handler are restored after
-  inline optimize success and failure.
+- FULL writes STAT1 and STAT4 rows; LIMITED writes STAT1 and STAT4 rows when
+  optimize analyzes stale or missing tables.
+- Inline optimize fires from `sqlite3_step` DONE and `sqlite3_reset` OK before
+  connection close when the trigger is a fast plain read; directly finalized
+  statements pass NULL identity and are close-backstop only.
+- `analysis_limit`, `busy_timeout`, the application progress handler, and the
+  caller-visible error state are restored after inline optimize success and
+  failure.
 - Caller-visible connection error state is preserved after a swallowed inline
   optimize failure.
 - Runtime optimize re-entrancy is blocked.
@@ -932,6 +971,11 @@ It proves:
   runtime optimize.
 - `sqlite3_close_v2` with an open statement still enters the native zombie path
   and skips runtime optimize.
+- Inline runtime optimize defers to close when the triggering statement is not a
+  provably fast plain read, including telemetry-off, write, transaction-control,
+  and unclassifiable finalized-statement paths.
+- Runtime optimize's own statements are suppressed from STMT trace and
+  slow-query logs.
 - The per-path cadence suppresses immediate repeated successful target attempts.
 - Runtime optimize still works after `sqlite3_shutdown()` and a later reopen.
 

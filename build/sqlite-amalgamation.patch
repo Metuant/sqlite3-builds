@@ -96,7 +96,7 @@
    va_list ap;
    int rc;
  
-@@ -188430,6 +188446,76 @@
+@@ -188430,6 +188446,189 @@
    UNUSED_PARAMETER(db);
  #endif
  }
@@ -113,6 +113,47 @@
 +  int errByteOffset;
 +  sqlite3_value *pErr;
 +} auto_extension_error_snapshot;
++
++typedef struct auto_extension_busy_handler_snapshot {
++  int (*xBusyHandler)(void*, int);
++  void *pBusyArg;
++  int nBusy;
++  int busyTimeout;
++  int setlkTimeout;
++} auto_extension_busy_handler_snapshot;
++
++typedef struct auto_extension_change_counter_snapshot {
++  sqlite3_int64 nChange;
++  sqlite3_int64 nTotalChange;
++} auto_extension_change_counter_snapshot;
++
++/* Fixed-layout hidden ABI mirrored with src/auto_extension_internal.h. */
++_Static_assert(sizeof(((auto_extension_busy_handler_snapshot*)0)->xBusyHandler) == sizeof(void*),
++               "auto_extension_busy_handler_snapshot pointer size drift");
++_Static_assert(offsetof(auto_extension_busy_handler_snapshot, xBusyHandler) == 0,
++               "auto_extension_busy_handler_snapshot xBusyHandler offset drift");
++_Static_assert(offsetof(auto_extension_busy_handler_snapshot, pBusyArg) ==
++                   sizeof(((auto_extension_busy_handler_snapshot*)0)->xBusyHandler),
++               "auto_extension_busy_handler_snapshot pBusyArg offset drift");
++_Static_assert(offsetof(auto_extension_busy_handler_snapshot, nBusy) ==
++                   sizeof(((auto_extension_busy_handler_snapshot*)0)->xBusyHandler) + sizeof(void*),
++               "auto_extension_busy_handler_snapshot nBusy offset drift");
++_Static_assert(offsetof(auto_extension_busy_handler_snapshot, busyTimeout) ==
++                   sizeof(((auto_extension_busy_handler_snapshot*)0)->xBusyHandler) +
++                       sizeof(void*) + sizeof(int),
++               "auto_extension_busy_handler_snapshot busyTimeout offset drift");
++_Static_assert(offsetof(auto_extension_busy_handler_snapshot, setlkTimeout) ==
++                   sizeof(((auto_extension_busy_handler_snapshot*)0)->xBusyHandler) +
++                       sizeof(void*) + (2 * sizeof(int)),
++               "auto_extension_busy_handler_snapshot setlkTimeout offset drift");
++_Static_assert(offsetof(auto_extension_change_counter_snapshot, nChange) == 0,
++               "auto_extension_change_counter_snapshot nChange offset drift");
++_Static_assert(offsetof(auto_extension_change_counter_snapshot, nTotalChange) == sizeof(sqlite3_int64),
++               "auto_extension_change_counter_snapshot nTotalChange offset drift");
++_Static_assert(sizeof(auto_extension_change_counter_snapshot) == 2 * sizeof(sqlite3_int64),
++               "auto_extension_change_counter_snapshot size drift");
++
++static int sqliteDefaultBusyCallback(void*, int);
 +
 +__attribute__((visibility("hidden"))) void
 +auto_extension_progress_handler_push(sqlite3 *db, int nOps,
@@ -135,6 +176,78 @@
 +  db->nProgressOps = snapshot->nProgressOps;
 +  db->xProgress = snapshot->xProgress;
 +  db->pProgressArg = snapshot->pProgressArg;
++  sqlite3_mutex_leave(db->mutex);
++}
++
++__attribute__((visibility("hidden"))) void
++auto_extension_progress_handler_clear(sqlite3 *db){
++  sqlite3_mutex_enter(db->mutex);
++  db->nProgressOps = 0;
++  db->xProgress = 0;
++  db->pProgressArg = 0;
++  sqlite3_mutex_leave(db->mutex);
++}
++
++__attribute__((visibility("hidden"))) void
++auto_extension_busy_handler_push(sqlite3 *db, int ms,
++                                 auto_extension_busy_handler_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  snapshot->xBusyHandler = db->busyHandler.xBusyHandler;
++  snapshot->pBusyArg = db->busyHandler.pBusyArg;
++  snapshot->nBusy = db->busyHandler.nBusy;
++  snapshot->busyTimeout = db->busyTimeout;
++#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
++  snapshot->setlkTimeout = db->setlkTimeout;
++#endif
++  if( ms>0 ){
++    db->busyHandler.xBusyHandler = (int(*)(void*,int))sqliteDefaultBusyCallback;
++    db->busyHandler.pBusyArg = (void*)db;
++    db->busyHandler.nBusy = 0;
++    db->busyTimeout = ms;
++#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
++    db->setlkTimeout = ms;
++#endif
++  }else{
++    db->busyHandler.xBusyHandler = 0;
++    db->busyHandler.pBusyArg = 0;
++    db->busyHandler.nBusy = 0;
++    db->busyTimeout = 0;
++#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
++    db->setlkTimeout = 0;
++#endif
++  }
++  sqlite3_mutex_leave(db->mutex);
++}
++
++__attribute__((visibility("hidden"))) void
++auto_extension_busy_handler_pop(sqlite3 *db,
++                                const auto_extension_busy_handler_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  db->busyHandler.xBusyHandler = snapshot->xBusyHandler;
++  db->busyHandler.pBusyArg = snapshot->pBusyArg;
++  db->busyHandler.nBusy = snapshot->nBusy;
++  db->busyTimeout = snapshot->busyTimeout;
++#ifdef SQLITE_ENABLE_SETLK_TIMEOUT
++  db->setlkTimeout = snapshot->setlkTimeout;
++#endif
++  sqlite3_mutex_leave(db->mutex);
++}
++
++__attribute__((visibility("hidden"))) void
++auto_extension_change_counter_push(sqlite3 *db,
++                                   auto_extension_change_counter_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  snapshot->nChange = db->nChange;
++  snapshot->nTotalChange = db->nTotalChange;
++  sqlite3_mutex_leave(db->mutex);
++}
++
++__attribute__((visibility("hidden"))) void
++auto_extension_change_counter_pop(sqlite3 *db,
++                                  const auto_extension_change_counter_snapshot *snapshot){
++  sqlite3_mutex_enter(db->mutex);
++  db->nChange = snapshot->nChange;
++  db->nTotalChange = snapshot->nTotalChange;
 +  sqlite3_mutex_leave(db->mutex);
 +}
 +

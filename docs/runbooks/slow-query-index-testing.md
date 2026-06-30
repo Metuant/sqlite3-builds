@@ -53,7 +53,7 @@ reasserts startup-only sorter settings for deployed shared libraries.
 
 The auto-extension PRAGMA block also sets `temp_store=2`,
 `wal_autocheckpoint=16000`, `journal_size_limit=67108864`,
-`busy_timeout=10000`, and `analysis_limit=1024`. The compile-time
+`busy_timeout=10000`, and `analysis_limit=0`. The compile-time
 `SQLITE_TEMP_STORE=3` profile is stronger than the `temp_store=2` PRAGMA and
 keeps temp storage in memory.
 
@@ -68,15 +68,15 @@ PRAGMA page_size;
 Record the output. Existing databases keep their header page size; rebuilt or
 new databases should reflect the 16 KiB default.
 
-Production `sqlite_stat4` can be empty. Treat empty stats as the current
-production baseline unless the copied database proves otherwise. An empty-stat
-planner relies on heuristics and can resist otherwise-good indexes or adopt
-harmful ones. Run the full A/B test twice:
+Production `sqlite_stat1` can be sampled or stale. Treat the copied database's
+stats as the current production baseline unless the copy proves otherwise. A
+sampled stat1 fan-out can resist otherwise-good indexes or adopt harmful ones.
+Run the full A/B test twice:
 
-1. `stat_state=empty`: current production state, with candidate indexes prepared
-   but no fresh `ANALYZE`.
-2. `stat_state=analyzed`: after running `PRAGMA analysis_limit=0; ANALYZE;` on
-   both copies.
+1. `stat_state=current`: current copied stat state, with candidate indexes
+   prepared but no fresh `ANALYZE main`.
+2. `stat_state=analyzed`: after running `PRAGMA analysis_limit=0; ANALYZE main;`
+   on both copies.
 
 If an index helps only in the analyzed state, the recommendation is not "deploy
 the index" alone. It is "deploy the index plus an ANALYZE maintenance path",
@@ -166,11 +166,11 @@ run_sql "$baseline_db" "$setup_sql" "$run_dir/setup-literals.tsv" "setup literal
 # Convert setup output into realistic literal values, then write the full vendor SELECT to $query_sql.
 [ -s "$query_sql" ] || die "missing materialized query SQL: $query_sql"
 prewarm(){ cat "$1" "$1-wal" "$1-shm" 2>/dev/null >/dev/null || true; }
-analyze(){ printf 'PRAGMA analysis_limit=0;\nANALYZE;\n' > "$run_dir/analyze.sql"; run_sql "$baseline_db" "$run_dir/analyze.sql" "$run_dir/analyze-baseline.out" "baseline analyze"; run_sql "$indexed_db" "$run_dir/analyze.sql" "$run_dir/analyze-indexed.out" "indexed analyze"; }
+analyze(){ printf 'PRAGMA analysis_limit=0;\nANALYZE main;\n' > "$run_dir/analyze.sql"; run_sql "$baseline_db" "$run_dir/analyze.sql" "$run_dir/analyze-baseline.out" "baseline analyze"; run_sql "$indexed_db" "$run_dir/analyze.sql" "$run_dir/analyze-indexed.out" "indexed analyze"; }
 write_eqp(){ { printf 'EXPLAIN QUERY PLAN\n'; cat "$query_sql"; } > "$1"; }
 write_run(){ { printf '.timer on\n.print TAG stat_state=%s query=%s copy=%s adoption=%s phase=%s iter=%s\n' "$2" "$3" "$4" "$5" "$6" "$7"; cat "$query_sql"; printf '\n.timer off\n'; } > "$1"; }
 timing_tsv="$run_dir/timings.tsv"; : > "$timing_tsv"
-for stat_state in empty analyzed; do
+for stat_state in current analyzed; do
   [ "$stat_state" = analyzed ] && analyze
   prewarm "$baseline_db"; prewarm "$indexed_db"
   for copy in baseline indexed; do db=$(db_for "$copy"); eqp_sql="$run_dir/$stat_state-$copy-eqp.sql"; eqp_raw="$run_dir/$stat_state-$copy-eqp.raw"; write_eqp "$eqp_sql"; run_sql "$db" "$eqp_sql" "$eqp_raw" "$copy $stat_state eqp"; adoption=not-adopted; grep -F "$candidate_index" "$eqp_raw" >/dev/null && adoption=adopted; sed "s/^/EQP stat_state=$stat_state query=$query_name copy=$copy adoption=$adoption /" "$eqp_raw" >> "$run_dir/eqp-tagged.log"; write_run "$run_dir/$stat_state-$copy-warm.sql" "$stat_state" "$query_name" "$copy" "$adoption" warm 0; run_sql "$db" "$run_dir/$stat_state-$copy-warm.sql" "$run_dir/$stat_state-$copy-warm.out" "$copy $stat_state warm"; done
@@ -245,10 +245,10 @@ Run the complete sequence in this order:
 
 1. Prepare baseline and indexed copies; prove `sqlite_master` state.
 2. Run setup SQL on the baseline copy and materialize literal values.
-3. `stat_state=empty`: pre-warm both copies, print EQP for both copies, run one
+3. `stat_state=current`: pre-warm both copies, print EQP for both copies, run one
    warm-up per copy, run timed iterations in counterbalanced order, compute
    medians.
-4. Run `PRAGMA analysis_limit=0; ANALYZE;` on both copies.
+4. Run `PRAGMA analysis_limit=0; ANALYZE main;` on both copies.
 5. `stat_state=analyzed`: pre-warm again, repeat EQP, warm-up, timed
    iterations, and medians.
 
@@ -264,21 +264,21 @@ Separate adoption from benefit:
   multiple iterations.
 
 Adoption is not success. A planner can adopt a candidate index and become
-catastrophically slower. Test each candidate standalone under the empty
-production stat state, because that is exactly where a mis-adopted index fires.
+catastrophically slower. Test each candidate standalone under the current copied
+stat state, because that is exactly where a mis-adopted index fires.
 
-Compare empty and analyzed states:
+Compare current and analyzed states:
 
-- Helps in `empty`: the index can help the current production planner state.
+- Helps in `current`: the index can help the current copied planner state.
 - Helps only in `analyzed`: the index needs maintenance ANALYZE to pay off.
-- Adopted and harmful in `empty`, rejected in `analyzed`: empty stats both hide
-  good indexes and trigger bad ones.
+- Adopted and harmful in `current`, rejected in `analyzed`: sampled or stale
+  stats both hide good indexes and trigger bad ones.
 
 Generic example: a multi-column secondary index can lead with a column that
-looks selective without stats. The statless planner may pivot the join driver to
-a high-fan-out table, adopt the index, and run orders of magnitude slower. After
-`ANALYZE`, STAT4 samples can reveal the fan-out and make the planner reject that
-path.
+looks selective under sampled or stale stats. The planner may pivot the join
+driver to a high-fan-out table, adopt the index, and run orders of magnitude
+slower. After `ANALYZE main`, accurate STAT1 and STAT4 can reveal the fan-out
+and make the planner reject that path.
 
 Distinguish warm planner work from cold I/O. A wall-clock slow-query log entry
 may be cold while the faithful warm natural plan is sub-second. Arbitrary
@@ -288,7 +288,7 @@ and the sort can be a minor fraction of the wall time.
 For sort-heavy shapes, the planner-visible lever is often sort elimination:
 lead an index with the actual sort column, then add equality or join columns
 when that still preserves the desired order. This is one of the few benefits the
-empty-stat planner can see without STAT4.
+current copied planner can see before refreshed stats.
 
 ## Dead Ends
 
@@ -296,8 +296,8 @@ Do not re-try these paths without a new vendor SQL surface or deployment design:
 
 - Vendor SQL is fixed; do not depend on hints, column-list changes, or query
   rewrites that the application will not issue.
-- Empty `sqlite_stat4` is a production state to test, not an argument to ignore
-  planner behavior.
+- Sampled or stale `sqlite_stat1` is a production state to test, not an argument
+  to ignore planner behavior.
 - SQLite expression indexes cannot contain subqueries.
 - Materialized-view or table-substitution rewrites do not apply when the vendor
   SQL never names the substitute table.
