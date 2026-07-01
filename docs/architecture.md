@@ -257,10 +257,12 @@ architecture tuning, LTO, and shared compile flags.
 For `cli`, it builds from `shell.c sqlite3.c`, links statically, preserves
 `sqlite3_orig`, strips `sqlite3`, and optionally compresses the stripped binary.
 
-For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c` and
-`/app/runtime_optimize.c`, with `/app/auto_extension_internal.h` as the
-internal seam header, links a shared object, applies library-only feature
-defaults, and writes `dist/libsqlite3.so`.
+For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c`,
+`/app/runtime_optimize.c`, `/app/observability.c`,
+`/app/slow_query_tracker.c`, and `/app/plex_fts_rewrite.c`, with
+`/app/auto_extension_internal.h` and `/app/plex_fts_rewrite.h` as private
+headers, links a shared object, applies library-only feature defaults, and
+writes `dist/libsqlite3.so`.
 
 For `library`, the link line prepends `MIMALLOC_OBJ`
 (`/opt/mimalloc/lib/mimalloc.o`) and `MIMALLOC_LIB`
@@ -276,7 +278,7 @@ with `local: *;`.
 
 For `library`, it also applies `build/sqlite-amalgamation.patch` to the
 extracted SQLite amalgamation with `patch -p1` before compile. The patch
-renames the six wrapped SQLite API definitions to hidden `*_real` symbols:
+renames the nine wrapped SQLite API definitions to hidden `*_real` symbols:
 
 - `sqlite3_initialize`
 - `sqlite3_config`
@@ -284,6 +286,9 @@ renames the six wrapped SQLite API definitions to hidden `*_real` symbols:
 - `sqlite3_open`
 - `sqlite3_open_v2`
 - `sqlite3_open16`
+- `sqlite3_prepare`
+- `sqlite3_prepare_v2`
+- `sqlite3_prepare_v3`
 
 SQLite version bumps that change any target definition shape cause `patch` to
 reject hunks and fail the build with patch's native error message. The library
@@ -292,12 +297,14 @@ patch also inserts internal runtime optimize hooks into `sqlite3_step`,
 movement on SQLite version bumps is therefore a patch rejection. The library
 build then compiles `sqlite3.c`, `/app/auto_extension.c`,
 `/app/runtime_optimize.c`, `/app/observability.c`, and
-`/app/slow_query_tracker.c`; `/app/auto_extension_internal.h` is the shared
-internal seam header. `/app/auto_extension.c` keeps open-time registration,
-trace-mask setup, target filtering, and the TLS seam, and reaches runtime
-optimize through `runtime_optimize_seed_path`; `/app/runtime_optimize.c` owns
-the runtime optimize logic. The CLI target does not run this patch and does
-not include observability or runtime optimize.
+`/app/slow_query_tracker.c`, and `/app/plex_fts_rewrite.c`;
+`/app/auto_extension_internal.h` is the auto-extension/runtime-optimize seam
+header, and `/app/plex_fts_rewrite.h` is the prepare-wrapper/rewrite seam
+header. `/app/auto_extension.c` keeps open-time registration, trace-mask
+setup, target filtering, and the TLS seam, and reaches runtime optimize
+through `runtime_optimize_seed_path`; `/app/runtime_optimize.c` owns the
+runtime optimize logic. The CLI target does not run this patch and does not
+include observability, runtime optimize, or the Plex FTS rewrite wrapper.
 
 After the library compile, `build/Build.sh` checks every
 `SQLITE_CONFIG_*` and `SQLITE_DBCONFIG_*` define in the pinned `sqlite3.h`
@@ -331,7 +338,9 @@ by Buildx.
 
 It copies `build/Build.sh`,
 `src/auto_extension.c`, `src/runtime_optimize.c`,
-`src/auto_extension_internal.h`, `tests/`,
+`src/auto_extension_internal.h`, `src/observability.c`,
+`src/slow_query_tracker.c`, `src/plex_fts_rewrite.c`,
+`src/plex_fts_rewrite.h`, `tests/`,
 `build/sqlite-amalgamation.patch`, `build/expected-sqlite-config-count.txt`,
 and `build/expected-sqlite-dbconfig-count.txt` into `/app`, with the build
 files under `/app/build/`.
@@ -349,15 +358,22 @@ under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
 For the generic variant, it builds the shared library, requires at least one
 `@GLIBC_`-versioned undefined symbol, rejects any observed `@GLIBC_` reference
 above `GENERIC_GLIBC_MAX` (`2.27`), and runs the config-after-dlopen,
-shutdown/reinit, auto-extension, and runtime optimize smokes.
+shutdown/reinit, auto-extension, runtime optimize, and Plex FTS rewrite smokes
+plus the Plex FTS prepare bench. The bench reports advisory p50/p95 threshold
+verdicts for enabled non-target passthrough and target-DB miss prepare costs;
+timing verdicts do not fail the image build. The generic variant must show the
+rewrite is inert even when the env gate is enabled.
 
 For the Plex variant, it also builds ICU 69.1 under `/opt/icu-69-plex`, exposes
 `PLEX_ICU_INCLUDE` and `PLEX_ICU_LIB`, checks ICU soname and symbol shape with
 `ldd` and `nm`, runs `icu_smoke`, and runs the config-after-dlopen,
-shutdown/reinit, auto-extension, and runtime optimize smokes with the Plex ICU
-path available. The Plex branch builds under Alpine/musl so the resulting
-library does not carry glibc-versioned symbols such as `fcntl64`, which Plex's
-`libgcompat` shim does not provide.
+shutdown/reinit, auto-extension, runtime optimize, and Plex FTS rewrite smokes
+plus the Plex FTS prepare bench with the Plex ICU path available. The bench
+reports advisory p50/p95 threshold verdicts for enabled non-target passthrough
+and target-DB miss prepare costs; timing verdicts do not fail the image build.
+The Plex branch builds under Alpine/musl so the resulting library does not carry
+glibc-versioned symbols such as `fcntl64`, which Plex's `libgcompat` shim does
+not provide.
 
 For the Plex variant, the build stage fails if the produced `libsqlite3.so`
 carries `fcntl64` or any other glibc-versioned symbol. This zero-GLIBC gate is
@@ -753,6 +769,78 @@ tag-search into a tight `fts4_tag_titles_icu_segdir` per-row loop. The spin was
 observed on SQLite 3.53.2; the current 3.53.3 pin does not fix it. Accurate
 `analysis_limit=0` stats flip the plan to the FTS-driver shape.
 
+## Plex FTS Prefix Rewrite
+
+`src/plex_fts_rewrite.c` is compiled into both shared-library variants and is
+active only in the Plex-capable build where `SQLITE_ENABLE_ICU` is set. It is
+default-off. Literal `SQLITE3_DISABLE_PLEX_FTS_REWRITE=0` enables the rewrite;
+unset, literal `1`, and every other value disable it. The env result is cached
+once per process.
+
+The rewrite runs from the public UTF-8 prepare wrappers:
+
+- `sqlite3_prepare`
+- `sqlite3_prepare_v2`
+- `sqlite3_prepare_v3`
+
+`sqlite3_prepare16`, `sqlite3_prepare16_v2`, and `sqlite3_prepare16_v3` are a
+documented non-goal because the observed PMS query is ASCII/UTF-8.
+
+Runtime eligibility requires the main database filename to pass
+`auto_extension_path_is_target()` and have exact basename
+`com.plexapp.plugins.library.db`. This excludes generic `/tmp/library.db`,
+`/tmp/jellyfin.db`, in-memory, temporary, and non-target database handles even
+when the env gate is enabled.
+
+The matcher is structural, not byte-exact. It token-scans outside
+strings/comments, tolerates whitespace variation, and matches a minimal
+anchor set for the current Plex target: a `fts4_tag_titles_icu` reference with
+a `MATCH` on that table, plus exactly one actual unqualified
+`tag_type=<value>` equality in the same syntactic `SELECT` block. The
+`tag_type` equality must be in predicate context reached through `WHERE` or
+`ON`, including `AND`/`OR` continuations and parenthesized predicate
+expressions. Non-predicate `tag_type` mentions in projections or ordering do not
+count as anchors and do not permit a rewrite. The `tag_type` value token may be
+a bare integer, a quoted string, or a bare `?` bind, and the next significant
+token must be EOF, `)`, `AND`, `OR`, or a clause boundary keyword. RHS
+continuations such as `tag_type=6+1`, `tag_type=?+1`, and partial literals such
+as `tag_type=0x1f` are misses. It does not require `DISTINCT`, the
+`metadata_items.library_section_id` or `metadata_items.metadata_type`
+predicates, `GROUP BY tags.id`, `ORDER BY count(*)`, or `LIMIT 100`.
+Unparseable values, duplicate or ambiguous `tag_type=<value>` equality anchors,
+semicolons, embedded NULs, missing anchors, or any scan ambiguity are misses.
+
+`src/plex_fts_rewrite.c` keeps the Plex-specific FTS table name, target
+predicate column, and database basename together as Plex identifier isolation. A
+second target, such as Emby, needs its own DB path, MATCH syntax, and rewrite
+shape after binding design and validation; it is not a trivial config entry.
+
+Rationale: `unlikely(tag_type=X)` preserves affinity by wrapping the boolean result; `+tag_type`
+strips it (`unlikely(tag_type='6')` matched 614279 rows, `+tag_type='6'` matched 0). PMS inlines
+varying literals, so minimal anchors wrap any accepted value instead of a brittle byte-exact/full skeleton.
+MATCH and `tag_type=` share one SELECT block, with `tag_type=` in predicate context, to exclude CTE/subquery/projection/ORDER BY mentions.
+Drift, NOMEM, or prepare denial falls back to original SQL; the rewrite is performance-only.
+
+On a match, the helper inserts only `unlikely(` immediately before `tag_type`
+and `)` immediately after the value token, preserving every other SQL byte.
+The wrapper prepares the rewritten SQL with the matching hidden `_real`
+prepare function and accepts only the end-of-input SQL surface: a successful
+rewrite must prepare through the rewritten statement end. If `pzTail` is
+requested, the helper returns the corresponding end pointer in the caller's
+original SQL buffer and never returns a tail pointer into the temporary rewrite
+buffer. Semicolon and multi-statement tail remapping are unsupported misses. On
+any rewrite-path error, it finalizes any partial statement, resets `*ppStmt`,
+and retries the original SQL once. Misses and disabled paths call the original
+SQL directly.
+
+Enablement gates that query the real Plex FTS table require a Plex-equivalent
+binary/context with STAT4, the PMS `icu_root` collation, and the PMS
+`collating` FTS tokenizer registered. The generic static CLI cannot satisfy
+those Plex-table gates. The committed `tests/plex_fts_stat4_eqp_repro_test.sh`
+is a synthetic version-bump signal against the workflow-produced `cli/sqlite3`
+STAT4/FTS path. It requires `ENABLE_STAT4` and FTS3/FTS4 and asserts the
+original `tag_type`-first plan flips to an FTS-first `unlikely()` plan.
+
 ## Observability Layer
 
 `src/observability.c` is compiled into both shared-library variants and is
@@ -768,12 +856,20 @@ implementations remain available as hidden `*_real` symbols:
 - `sqlite3_open`
 - `sqlite3_open_v2`
 - `sqlite3_open16`
+- `sqlite3_prepare`
+- `sqlite3_prepare_v2`
+- `sqlite3_prepare_v3`
 
-Apart from lazy auto-extension registration in the open wrappers, the wrappers
-are log-only. They call the hidden real implementation, return the real return
-code unchanged, and log after the call with numeric `rc=N`. They do not mutate
-config opcodes, db-config opcodes, open flags, filenames, handles, or return
-codes.
+The initialize/config/db-config/open wrappers call the hidden real
+implementation, return the real return code unchanged, and log after the call
+with numeric `rc=N` where applicable. They do not mutate config opcodes,
+db-config opcodes, open flags, filenames, handles, or return codes. The prepare
+wrappers call `plex_fts_rewrite_prepare()`, which is result-preserving for
+disabled, generic, non-Plex, nonmatching, drift, and failure paths, and
+intentionally prepares rewritten SQL only for enabled Plex prefix-tag matches.
+The helper emits `event=rewrite_applied target=plex db=%p sql="<escaped rewritten>"`
+through `obs_logf` only on effective rewrite success; `SQLITE3_DISABLE_OBSERVABILITY`
+gates it independently of `SQLITE3_DISABLE_STMT_TRACE`, and passthrough, miss, and fallback-to-original paths do not log.
 
 The `sqlite3_open`, `sqlite3_open_v2`, and `sqlite3_open16` wrappers call
 `auto_extension_register_for_open()` after observability initialization and
@@ -812,7 +908,7 @@ Log lines are written to stderr:
 ```
 
 Kernel thread IDs come from `syscall(SYS_gettid)`. SQL text emitted by statement
-trace logging is capped at 3 KiB and receives a `...[TRUNC]` tail when
+trace logging is capped at 4 KiB and receives a `...[TRUNC]` tail when
 truncated.
 
 `sqlite3_initialize` uses a thread-local depth counter so nested initialization
@@ -863,7 +959,7 @@ The tracker keeps a process-global 2048-entry LRU keyed by parameterized
 `sqlite3_sql()` text. It stores and displays at most 1024 SQL bytes per
 template, uses the full SQL FNV-1a hash as the probe accelerator, and uses that
 full hash as the equality proof for templates longer than 1024 bytes. Existing
-STMT logging keeps its separate 3 KiB SQL cap; `SLOW_QUERY_SQL_CAP` does not
+STMT logging keeps its separate 4 KiB SQL cap; `SLOW_QUERY_SQL_CAP` does not
 change `OBS_SQL_CAP`, and config/db-config decode tables stay in
 `src/observability.c`.
 
@@ -904,7 +1000,9 @@ unconditionally. The Dockerfile runs `slow_query_select1_bench`,
 `alloc_latency_bench` as advisory steps on every library build: nonzero exits
 print an `ADVISORY FAIL` line and continue. The generic library image also runs
 `runtime_optimize_close_bench` as advisory output; it prints p50, p95, p99, max,
-and pass/fail verdicts, then exits 0 so benchmark drift never fails CI.
+and pass/fail verdicts, then exits 0 so benchmark drift never fails CI. The Plex
+FTS prepare bench follows the same advisory posture: its timing verdicts report
+prepare-cost drift but do not fail CI.
 
 ## Smoke Tests
 
@@ -983,6 +1081,20 @@ Execution points:
 
 - Generic library Docker build.
 - Plex library Docker build with Plex ICU paths in the loader environment.
+
+### `plex_fts_rewrite_smoke`
+
+`tests/plex_fts_rewrite_smoke.c` runs in generic/Plex library Docker builds.
+
+It proves:
+
+- ICU-only rewrite enablement.
+- env-off/exact-path negatives.
+- three UTF-8 prepare entries with `nByte`/NUL and `pzTail == NULL`.
+- quoted-string/`?` RHS.
+- scope/clause/RHS-continuation negatives.
+- prepare-denial fail-open.
+- grouped-digest row identity.
 
 ### `config_after_dlopen_smoke`
 
@@ -1502,10 +1614,15 @@ Auto-extension:
 
 Observability:
 
-- Observability wrappers must chain to the hidden real SQLite implementation
-  and return its result unchanged.
-- Observability is log-only in the initial pass; it must not inject config,
-  db-config, open-flag, filename, handle, or return-code behavior.
+- Initialize, config, db-config, and open observability wrappers must chain to
+  the hidden real SQLite implementation and return its result unchanged.
+- Prepare wrappers must call the Plex FTS rewrite helper. Disabled, generic,
+  non-Plex, nonmatching, drift, and failure paths must prepare the original SQL
+  unchanged; enabled Plex prefix-tag matches intentionally prepare the
+  `unlikely(tag_type=<value>)` rewrite and log only after the rewritten
+  statement is effectively returned.
+- Observability logging must not inject config, db-config, open-flag,
+  filename, handle, or return-code behavior.
 - Trace registration failure must log and continue; it must never fail
   `sqlite3_open*`.
 - Observability log emission is independent of target filtering, read-only
@@ -1519,7 +1636,7 @@ M-series invariants:
 
 - M7: Source-level amalgamation patching via a checked-in unified-diff `.patch`
   file applied with `patch -p1` after unzip; SQLite version bumps that change
-  any of the six wrapped API target signatures or the internal runtime optimize
+  any of the nine wrapped API target signatures or the internal runtime optimize
   hook hunks cause `patch` to reject hunks and fail the build with patch's
   native error message. `build/sqlite-amalgamation.patch` is the single locus of
   amalgamation modifications.

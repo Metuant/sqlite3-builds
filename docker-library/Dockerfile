@@ -48,6 +48,8 @@ COPY src/runtime_optimize.c /app/runtime_optimize.c
 COPY src/auto_extension_internal.h /app/auto_extension_internal.h
 COPY src/observability.c /app/observability.c
 COPY src/slow_query_tracker.c /app/slow_query_tracker.c
+COPY src/plex_fts_rewrite.c /app/plex_fts_rewrite.c
+COPY src/plex_fts_rewrite.h /app/plex_fts_rewrite.h
 COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
 COPY build/expected-sqlite-config-count.txt /app/build/expected-sqlite-config-count.txt
 COPY build/expected-sqlite-dbconfig-count.txt /app/build/expected-sqlite-dbconfig-count.txt
@@ -247,7 +249,15 @@ RUN set -euo pipefail; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/auto_extension_smoke; \
     gcc -O0 -o /app/runtime_optimize_smoke /app/tests/runtime_optimize_smoke.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
-    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/runtime_optimize_smoke
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/runtime_optimize_smoke; \
+    gcc -O0 -o /app/plex_fts_rewrite_smoke /app/tests/plex_fts_rewrite_smoke.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/plex_fts_rewrite_smoke; \
+    gcc -O2 -o /app/plex_fts_rewrite_prepare_bench \
+        /app/tests/plex_fts_rewrite_prepare_bench.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/plex_fts_rewrite_prepare_bench || \
+      printf "ADVISORY FAIL plex_fts_rewrite_prepare_bench command exited nonzero\n"
 
 RUN set -euo pipefail; \
     LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)"); \

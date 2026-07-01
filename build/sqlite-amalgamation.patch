@@ -69,6 +69,47 @@
    return rc;
  }
  
+@@ -148822,37 +148831,37 @@
+-SQLITE_API int sqlite3_prepare(
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_prepare_real(
+   sqlite3 *db,              /* Database handle. */
+   const char *zSql,         /* UTF-8 encoded SQL statement. */
+   int nBytes,               /* Length of zSql in bytes. */
+   sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+   const char **pzTail       /* OUT: End of parsed string */
+ ){
+   int rc;
+   rc = sqlite3LockAndPrepare(db,zSql,nBytes,0,0,ppStmt,pzTail);
+   assert( rc==SQLITE_OK || ppStmt==0 || *ppStmt==0 );  /* VERIFY: F13021 */
+   return rc;
+ }
+-SQLITE_API int sqlite3_prepare_v2(
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_prepare_v2_real(
+   sqlite3 *db,              /* Database handle. */
+   const char *zSql,         /* UTF-8 encoded SQL statement. */
+   int nBytes,               /* Length of zSql in bytes. */
+   sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+   const char **pzTail       /* OUT: End of parsed string */
+ ){
+   int rc;
+   /* EVIDENCE-OF: R-37923-12173 The sqlite3_prepare_v2() interface works
+   ** exactly the same as sqlite3_prepare_v3() with a zero prepFlags
+   ** parameter.
+   **
+   ** Proof in that the 5th parameter to sqlite3LockAndPrepare is 0 */
+   rc = sqlite3LockAndPrepare(db,zSql,nBytes,SQLITE_PREPARE_SAVESQL,0,
+                              ppStmt,pzTail);
+   assert( rc==SQLITE_OK || ppStmt==0 || *ppStmt==0 );
+   return rc;
+ }
+-SQLITE_API int sqlite3_prepare_v3(
++__attribute__((visibility("hidden"))) SQLITE_API int sqlite3_prepare_v3_real(
+   sqlite3 *db,              /* Database handle. */
+   const char *zSql,         /* UTF-8 encoded SQL statement. */
+   int nBytes,               /* Length of zSql in bytes. */
+   unsigned int prepFlags,   /* Zero or more SQLITE_PREPARE_* flags */
+   sqlite3_stmt **ppStmt,    /* OUT: A pointer to the prepared statement */
+   const char **pzTail       /* OUT: End of parsed string */
 @@ -187385,7 +187401,7 @@
  **    *  Recursive calls to this routine from thread X return immediately
  **       without blocking.

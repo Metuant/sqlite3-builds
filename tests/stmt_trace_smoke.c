@@ -199,6 +199,60 @@ int sqlite3_open16_real(const void *filename, sqlite3 **ppDb) {
     return SQLITE_OK;
 }
 
+int sqlite3_prepare_real(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail
+) {
+    (void)db;
+    (void)nByte;
+    if (ppStmt) *ppStmt = NULL;
+    if (pzTail) *pzTail = zSql ? zSql + strlen(zSql) : NULL;
+    return SQLITE_OK;
+}
+
+int sqlite3_prepare_v2_real(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail
+) {
+    return sqlite3_prepare_real(db, zSql, nByte, ppStmt, pzTail);
+}
+
+int sqlite3_prepare_v3_real(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    unsigned int prepFlags,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail
+) {
+    (void)prepFlags;
+    return sqlite3_prepare_real(db, zSql, nByte, ppStmt, pzTail);
+}
+
+int plex_fts_rewrite_prepare(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    unsigned int prepFlags,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail,
+    int kind
+) {
+    if (kind == 2) {
+        return sqlite3_prepare_v3_real(db, zSql, nByte, prepFlags, ppStmt, pzTail);
+    }
+    if (kind == 1) {
+        return sqlite3_prepare_v2_real(db, zSql, nByte, ppStmt, pzTail);
+    }
+    return sqlite3_prepare_real(db, zSql, nByte, ppStmt, pzTail);
+}
+
 int sqlite3_auto_extension(void (*xEntryPoint)(void)) {
     g_autoext_cb = (int (*)(sqlite3*, char**, const sqlite3_api_routines*))xEntryPoint;
     return SQLITE_OK;

@@ -165,17 +165,20 @@ milestone lands.
 
 - `build/sqlite-amalgamation.patch` is the M7 invariant: source-level
   amalgamation patching via a checked-in unified diff.
-- Six wrapper-target functions (`sqlite3_initialize`, `sqlite3_config`,
+- Nine wrapper-target functions (`sqlite3_initialize`, `sqlite3_config`,
   `sqlite3_db_config`, `sqlite3_open`, `sqlite3_open_v2`,
-  `sqlite3_open16`) renamed to `_real` with hidden visibility. Build
-  fails on rename-drift.
+  `sqlite3_open16`, `sqlite3_prepare`, `sqlite3_prepare_v2`,
+  `sqlite3_prepare_v3`) renamed to `_real` with hidden visibility. Build fails
+  on rename-drift.
 - Runtime optimize is ABI/export neutral. It does not add public SQLite API
   exports, does not alter the version-script public allowlist, and keeps
   `auto_extension_register_for_open`,
   `auto_extension_optimize_before_close`,
   `auto_extension_optimize_after_stmt`,
   `auto_extension_progress_handler_push`, and
-  `auto_extension_progress_handler_pop` absent from `.dynsym`.
+  `auto_extension_progress_handler_pop` absent from `.dynsym`. The Plex FTS
+  rewrite helper `plex_fts_rewrite_prepare` is also hidden and absent from
+  `.dynsym`.
 - `sqlite3_enable_shared_cache` no-op stub at `src/auto_extension.c:6-15`
   is load-bearing for the Plex variant. **KEEP byte-for-byte intact.**
 - `build/libsqlite3-version-script.ld` is load-bearing for symbol-export
@@ -183,10 +186,17 @@ milestone lands.
   `auto_extension_path_is_target`, `auto_extension_sorterref_cfg_rc`,
   `auto_extension_pmasz_cfg_rc`, and `sqlite3_enable_shared_cache`, then
   `local: *;` to deny everything else including `mi_*`. The post-link
-  deny gate in `build/Build.sh:230-277` stays adjacent to the preserved
-  `build/Build.sh:230-248` gates as belt-and-braces.
-- Six `SQLITE_API` wrappers in `src/observability.c` MUST chain to
-  `*_real` and return its result UNMODIFIED.
+  hidden-symbol deny gate in `build/Build.sh:264-281` (including `plex_fts_rewrite_prepare`)
+  stays adjacent to the preserved `build/Build.sh:253-263` `_real` gates as belt-and-braces.
+- Initialize/config/db-config/open `SQLITE_API` wrappers in
+  `src/observability.c` MUST chain to `*_real` and return its result
+  UNMODIFIED. Prepare wrappers in `src/observability.c` MUST call
+  `plex_fts_rewrite_prepare`; disabled, generic, non-Plex, nonmatching, drift,
+  and failure paths must prepare the original SQL unchanged, while enabled Plex
+  prefix-tag matches intentionally prepare the
+  `unlikely(tag_type=<value>)` rewrite. Rewrite-success logging is emitted only
+  after the rewritten statement is the returned statement; passthrough, miss,
+  and fallback-to-original paths do not log.
 - Every `obs_forward_config` / `obs_forward_db_config` case-arm
   preserves the exact arity, types, and argument pass-through to
   `sqlite3_config_real` / `sqlite3_db_config_real`. New SQLite opcodes
@@ -239,7 +249,7 @@ milestone lands.
   `SQLITE3_DISABLE_OBSERVABILITY` and `SQLITE3_DISABLE_STMT_TRACE`, are
   populated before any open-wrapper-triggered callback fires. Do NOT move
   slow-query registration onto the PROFILE hot path.
-- `SLOW_QUERY_SQL_CAP=1024` (tracker key + display) and `OBS_SQL_CAP=3072`
+- `SLOW_QUERY_SQL_CAP=1024` (tracker key + display) and `OBS_SQL_CAP=4096`
   (observability STMT log) are intentionally separate constants. Tracker
   uses its own cap to prevent collision; `tests/check_obs_counts.sh`
   decode-count gate references only `OBS_SQL_CAP`.

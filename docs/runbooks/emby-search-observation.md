@@ -9,7 +9,7 @@ The output is the observed input for Phase-2 search rewrite design.
 This runbook observes live Emby behavior. It does not modify the database,
 Emby query construction, the deployed `libsqlite3.so`, or any Plex-renamed ICU
 runtime files. For query timing and copied-database A/B methodology, use
-`docs/runbooks/slow-query-index-testing.md`.
+`docs/runbooks/slow-query-investigation.md`.
 
 ## Prerequisites
 

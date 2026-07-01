@@ -1,4 +1,5 @@
 #include "sqlite3.h"
+#include "plex_fts_rewrite.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -284,7 +285,11 @@ static void obs_escape_unlimited(const char *src, char *dst, size_t dst_n) {
     obs_escape_string(src, dst, dst_n, SIZE_MAX, &truncated);
 }
 
-static void obs_escape_sql(const char *src, char *dst, size_t dst_n) {
+__attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
+    const char *src,
+    char *dst,
+    size_t dst_n
+) {
     int truncated = 0;
     size_t tail_len = strlen(OBS_TRUNC_TAIL);
     obs_escape_string(src, dst, dst_n, OBS_SQL_CAP, &truncated);
@@ -567,6 +572,43 @@ SQLITE_API int sqlite3_open16(const void *filename, sqlite3 **ppDb) {
         }
     }
     return rc;
+}
+
+SQLITE_API int sqlite3_prepare(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail
+) {
+    return plex_fts_rewrite_prepare(
+        db, zSql, nByte, 0, ppStmt, pzTail, PLEX_FTS_PREPARE_LEGACY
+    );
+}
+
+SQLITE_API int sqlite3_prepare_v2(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail
+) {
+    return plex_fts_rewrite_prepare(
+        db, zSql, nByte, 0, ppStmt, pzTail, PLEX_FTS_PREPARE_V2
+    );
+}
+
+SQLITE_API int sqlite3_prepare_v3(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    unsigned int prepFlags,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail
+) {
+    return plex_fts_rewrite_prepare(
+        db, zSql, nByte, prepFlags, ppStmt, pzTail, PLEX_FTS_PREPARE_V3
+    );
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned trace, void *ctx, void *p, void *x) {

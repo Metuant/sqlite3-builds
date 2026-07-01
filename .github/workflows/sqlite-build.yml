@@ -192,6 +192,8 @@ jobs:
           image: ${{env.docker_cli_image}}
           path: /app/sqlite-amalgamation-${{env.SQLITE_VERSION}}/dist/.
           destination: cli
+      - name: Plex FTS STAT4 EQP repro
+        run: bash tests/plex_fts_stat4_eqp_repro_test.sh cli/sqlite3
       - name: Upload sqlite CLI artifact
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
