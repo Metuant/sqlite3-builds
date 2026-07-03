@@ -57,7 +57,7 @@ out="$(docker run --rm "${docker_library_image}" /bin/sh -c '
     /app/observability.c \
     /app/slow_query_tracker.c \
     /app/tests/runtime_optimize_stubs.c \
-    -I"$AMALG_DIR" -lpthread -lm
+    -I/app -I"$AMALG_DIR" -lpthread -lm
   /tmp/stmt_trace_smoke
 ' 2>&1)"
 status=$?

@@ -1,6 +1,8 @@
 #include "sqlite3.h"
 
 #include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -25,6 +27,10 @@ static const char *MATCH_SQL_QUOTED =
     "select distinct(tags.id) from metadata_items join taggings on taggings.metadata_item_id=metadata_items.id join tags on tags.id=taggings.tag_id join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*' and tag_type='6' and metadata_items.library_section_id in (1) and metadata_items.metadata_type=1 group by tags.id order by count(*) desc limit 100";
 static const char *MATCH_SQL_PARAM =
     "select distinct(tags.id) from metadata_items join taggings on taggings.metadata_item_id=metadata_items.id join tags on tags.id=taggings.tag_id join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*' and tag_type=? and metadata_items.library_section_id in (1) and metadata_items.metadata_type=1 group by tags.id order by count(*) desc limit 100";
+static const char *MATCH_SQL_NAMED_MATCH_PARAM =
+    "select tags.id from tags join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match @SearchTerm and tag_type=6";
+static const char *MATCH_SQL_NUMBERED_MATCH_PARAM =
+    "select tags.id from tags join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match ?1 and tag_type=6";
 static const char *PROJECTED_TAG_TYPE_SQL =
     "select tag_type, tags.id from tags join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*' and tag_type=6 order by tag_type, tags.id";
 static const char *PROJECTED_TAG_TYPE_SQL_REWRITTEN =
@@ -50,6 +56,8 @@ static const char *PROJECTION_ONLY_TAG_TYPE_EQ_SQL =
     "select (tag_type=6) from tags join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*'";
 static const char *ORDER_ONLY_TAG_TYPE_EQ_SQL =
     "select tags.id from tags join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*' order by tag_type=6";
+static const char *LEFT_BOUND_TAG_TYPE_EQ_SQL =
+    "select tags.id from tags join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*' and 1 + tag_type=4";
 
 typedef struct auth_probe {
     int unlikely_calls;
@@ -60,6 +68,8 @@ typedef struct digest_result {
     int rows;
     uint64_t hash;
 } digest_result;
+
+static const char *g_program_path;
 
 static void failf(const char *fmt, ...) {
     va_list ap;
@@ -84,6 +94,47 @@ static void require_contains(const char *label, const char *got, const char *nee
     if (!got || !strstr(got, needle)) {
         failf("FAIL [%s]: got=\"%s\" missing=\"%s\"", label, got ? got : "(null)", needle);
     }
+}
+
+static int count_occurrences(const char *haystack, const char *needle) {
+    int count = 0;
+    size_t needle_len = strlen(needle);
+    const char *p = haystack;
+
+    if (needle_len == 0) return 0;
+    while ((p = strstr(p, needle)) != NULL) {
+        count++;
+        p += needle_len;
+    }
+    return count;
+}
+
+static void require_occurrences(const char *label, const char *got, const char *needle, int want) {
+    int got_count = got ? count_occurrences(got, needle) : 0;
+    if (got_count != want) {
+        failf("FAIL [%s]: occurrences=%d want=%d needle=\"%s\" text=\"%s\"",
+              label, got_count, want, needle, got ? got : "(null)");
+    }
+}
+
+static char *read_text_file(const char *path) {
+    FILE *fp = fopen(path, "rb");
+    long size;
+    char *buf;
+
+    if (!fp) failf("FATAL: open %s failed: %s", path, strerror(errno));
+    if (fseek(fp, 0, SEEK_END) != 0) failf("FATAL: seek end %s failed", path);
+    size = ftell(fp);
+    if (size < 0) failf("FATAL: tell %s failed", path);
+    if (fseek(fp, 0, SEEK_SET) != 0) failf("FATAL: seek start %s failed", path);
+    buf = (char *)malloc((size_t)size + 1);
+    if (!buf) failf("FATAL: malloc file buffer failed");
+    if (fread(buf, 1, (size_t)size, fp) != (size_t)size) {
+        failf("FATAL: read %s failed", path);
+    }
+    if (fclose(fp) != 0) failf("FATAL: close %s failed", path);
+    buf[size] = 0;
+    return buf;
 }
 
 static int safe_setenv(const char *name, const char *value) {
@@ -111,6 +162,14 @@ static void configure_env(const char *rewrite_value) {
     } else {
         if (!safe_unsetenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE")) exit(1);
     }
+}
+
+static int configure_obs_enabled_env(void) {
+    return safe_setenv("SQLITE3_DISABLE_AUTOPRAGMA", "1") &&
+           safe_setenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1") &&
+           safe_setenv("SQLITE3_DISABLE_STMT_TRACE", "1") &&
+           safe_unsetenv("SQLITE3_DISABLE_OBSERVABILITY") &&
+           safe_setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "0");
 }
 
 static void temp_path(char *buf, size_t n, const char *basename) {
@@ -252,6 +311,55 @@ static void expect_saved_sql_contains(
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
 }
 
+static void expect_rewritten_prepare_failed_skip_log(sqlite3 *db, const char *log_path) {
+    sqlite3_stmt *stmt = NULL;
+    const char *tail = NULL;
+    int saved_stderr;
+    int log_fd;
+    int old_limit;
+    int limit;
+    int rc;
+
+    if (strlen(MATCH_SQL_LEAN) + 5 > (size_t)INT_MAX) {
+        failf("FATAL: skip-log SQL length exceeds int range");
+    }
+    limit = (int)strlen(MATCH_SQL_LEAN) + 5;
+
+    saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0) failf("FATAL: dup(stderr) failed: %s", strerror(errno));
+    log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (log_fd < 0) {
+        close(saved_stderr);
+        failf("FATAL: open %s failed: %s", log_path, strerror(errno));
+    }
+    if (dup2(log_fd, STDERR_FILENO) < 0) {
+        close(log_fd);
+        close(saved_stderr);
+        failf("FATAL: dup2(stderr) failed: %s", strerror(errno));
+    }
+    close(log_fd);
+
+    /* Emby's over-limit lever maps to build_failed; Plex maps it to
+       rewritten_prepare_failed, so this Q7 assertion depends on DIV-E keeping
+       Plex wrapper SQL-length handling unchanged. */
+    old_limit = sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, limit);
+    rc = sqlite3_prepare_v2(db, MATCH_SQL_LEAN, -1, &stmt, &tail);
+    sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, old_limit);
+    fflush(stderr);
+    if (dup2(saved_stderr, STDERR_FILENO) < 0) _exit(125);
+    close(saved_stderr);
+
+    if (rc != SQLITE_OK) {
+        failf("FAIL [skip-log/prepare]: rc=%d err=%s", rc, sqlite3_errmsg(db));
+    }
+    require_str_eq("skip-log/sql", sqlite3_sql(stmt), MATCH_SQL_LEAN);
+    if (tail != MATCH_SQL_LEAN + strlen(MATCH_SQL_LEAN)) {
+        failf("FAIL [skip-log/tail]: tail_offset=%ld want=%ld",
+              (long)(tail - MATCH_SQL_LEAN), (long)strlen(MATCH_SQL_LEAN));
+    }
+    require_int("skip-log/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+}
+
 static void expect_legacy_authorizer(sqlite3 *db, int expect_rewrite) {
     auth_probe probe = {0, 0};
     sqlite3_stmt *stmt = NULL;
@@ -379,6 +487,19 @@ static void expect_fail_open(sqlite3 *db, int expect_rewrite_attempt) {
     }
 }
 
+static void expect_original_without_unlikely(sqlite3 *db, const char *label, const char *sql) {
+    auth_probe probe = {0, 1};
+
+    require_int("original-no-unlikely/set-authorizer",
+                sqlite3_set_authorizer(db, authorizer_cb, &probe), SQLITE_OK);
+    expect_saved_sql(db, label, sql, -1, 2, sql);
+    require_int("original-no-unlikely/clear-authorizer",
+                sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
+    if (probe.unlikely_calls != 0) {
+        failf("FAIL [%s]: rewrite attempt count=%d want=0", label, probe.unlikely_calls);
+    }
+}
+
 static sqlite3 *open_seeded_temp(const char *basename) {
     char path[512];
     temp_path(path, sizeof(path), basename);
@@ -425,21 +546,26 @@ static int child_positive(void) {
     return 0;
 }
 
-static int child_env_off(const char *value, const char *label) {
+static int child_env_case(const char *value, const char *label, int env_enables_rewrite) {
+    int expect_rewrite;
     sqlite3 *db;
     configure_env(value);
     make_temp_dir();
+    expect_rewrite = env_enables_rewrite && sqlite3_compileoption_used("ENABLE_ICU") != 0;
     db = open_seeded_temp("com.plexapp.plugins.library.db");
-    expect_saved_sql(db, label, MATCH_SQL_INT, -1, 2, MATCH_SQL_INT);
-    expect_legacy_authorizer(db, 0);
-    require_int("env-off/close", sqlite3_close(db), SQLITE_OK);
+    expect_saved_sql(db, label, MATCH_SQL_INT, -1, 2,
+                     expect_rewrite ? MATCH_SQL_INT_REWRITTEN : MATCH_SQL_INT);
+    expect_legacy_authorizer(db, expect_rewrite);
+    require_int("env-case/close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
-    printf("PASS [%s]\n", label);
+    printf("PASS [%s]: expect_rewrite=%d\n", label, expect_rewrite);
     return 0;
 }
 
 static int child_path_negative(void) {
     const char *names[] = {"library.db", "jellyfin.db", "not-target.db"};
+    char non_ascii_dir[512];
+    char non_ascii_path[768];
     size_t i;
     configure_env("0");
     make_temp_dir();
@@ -454,6 +580,45 @@ static int child_path_negative(void) {
         expect_saved_sql(db, "memory", MATCH_SQL_INT, -1, 2, MATCH_SQL_INT);
         require_int("path-negative/memory-close", sqlite3_close(db), SQLITE_OK);
     }
+    {
+        auth_probe probe = {0, 1};
+        int rc = snprintf(non_ascii_dir, sizeof(non_ascii_dir),
+                          "/tmp/plex-fts-rewrite-smoke-%ld/pl\303\251x",
+                          (long)getpid());
+        sqlite3 *db;
+        if (rc < 0 || (size_t)rc >= sizeof(non_ascii_dir)) {
+            failf("FATAL: non-ASCII temp dir too long");
+        }
+        if (mkdir(non_ascii_dir, 0700) != 0 && errno != EEXIST) {
+            failf("FATAL: mkdir(%s) failed: %s", non_ascii_dir, strerror(errno));
+        }
+        rc = snprintf(non_ascii_path, sizeof(non_ascii_path),
+                      "%s/com.plexapp.plugins.library.db", non_ascii_dir);
+        if (rc < 0 || (size_t)rc >= sizeof(non_ascii_path)) {
+            failf("FATAL: non-ASCII temp path too long");
+        }
+        unlink(non_ascii_path);
+        db = open_db(non_ascii_path);
+        setup_schema(db);
+        require_int("path-negative/non-ascii-set-authorizer",
+                    sqlite3_set_authorizer(db, authorizer_cb, &probe), SQLITE_OK);
+        expect_saved_sql(db, "non-ascii-path", MATCH_SQL_INT, -1, 2, MATCH_SQL_INT);
+        require_int("path-negative/non-ascii-clear-authorizer",
+                    sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
+        if (probe.unlikely_calls != 0) {
+            failf("FAIL [non-ascii-path]: rewrite attempt count=%d want=0",
+                  probe.unlikely_calls);
+        }
+        require_int("path-negative/non-ascii-close", sqlite3_close(db), SQLITE_OK);
+        unlink(non_ascii_path);
+        rc = snprintf(non_ascii_path, sizeof(non_ascii_path),
+                      "%s/com.plexapp.plugins.library.db-wal", non_ascii_dir);
+        if (rc >= 0 && (size_t)rc < sizeof(non_ascii_path)) unlink(non_ascii_path);
+        rc = snprintf(non_ascii_path, sizeof(non_ascii_path),
+                      "%s/com.plexapp.plugins.library.db-shm", non_ascii_dir);
+        if (rc >= 0 && (size_t)rc < sizeof(non_ascii_path)) unlink(non_ascii_path);
+        rmdir(non_ascii_dir);
+    }
     cleanup_temp_dir();
     printf("PASS [path-negative]\n");
     return 0;
@@ -467,6 +632,8 @@ static int child_nonmatch(void) {
     expect_saved_sql(db, "nonmatch-select", NONMATCH_SQL, -1, 2, NONMATCH_SQL);
     expect_saved_sql(db, "no-fts-table", NO_FTS_SQL, -1, 2, NO_FTS_SQL);
     expect_saved_sql(db, "no-target-column", NO_TARGET_SQL, -1, 2, NO_TARGET_SQL);
+    expect_original_without_unlikely(db, "match-named-param", MATCH_SQL_NAMED_MATCH_PARAM);
+    expect_original_without_unlikely(db, "match-numbered-param", MATCH_SQL_NUMBERED_MATCH_PARAM);
     expect_saved_sql(db, "duplicate-target-column", DUPLICATE_TARGET_SQL, -1, 2,
                      DUPLICATE_TARGET_SQL);
     expect_saved_sql(db, "cross-scope-cte", CROSS_SCOPE_CTE_SQL, -1, 2, CROSS_SCOPE_CTE_SQL);
@@ -476,6 +643,7 @@ static int child_nonmatch(void) {
                      2, PROJECTION_ONLY_TAG_TYPE_EQ_SQL);
     expect_saved_sql(db, "order-only-target-column", ORDER_ONLY_TAG_TYPE_EQ_SQL, -1, 2,
                      ORDER_ONLY_TAG_TYPE_EQ_SQL);
+    expect_original_without_unlikely(db, "left-bound-target-column", LEFT_BOUND_TAG_TYPE_EQ_SQL);
     expect_clean_original_single_id(db, "boundary-plus-int", BOUNDARY_PLUS_INT_SQL, 0, 0, 14);
     expect_clean_original_single_id(db, "boundary-plus-param", BOUNDARY_PLUS_PARAM_SQL, 1, 6, 14);
     expect_clean_original_single_id(db, "boundary-hex", BOUNDARY_HEX_SQL, 0, 0, 15);
@@ -486,32 +654,90 @@ static int child_nonmatch(void) {
     return 0;
 }
 
-static void run_child(const char *name) {
-    pid_t pid = fork();
-    int status;
-    if (pid < 0) failf("FATAL: fork(%s) failed: %s", name, strerror(errno));
-    if (pid == 0) {
-        if (strcmp(name, "positive") == 0) _exit(child_positive());
-        if (strcmp(name, "env-unset") == 0) _exit(child_env_off(NULL, "env-unset"));
-        if (strcmp(name, "env-one") == 0) _exit(child_env_off("1", "env-one"));
-        if (strcmp(name, "env-garbage") == 0) _exit(child_env_off("false", "env-garbage"));
-        if (strcmp(name, "path-negative") == 0) _exit(child_path_negative());
-        if (strcmp(name, "nonmatch") == 0) _exit(child_nonmatch());
-        failf("FATAL: unknown child %s", name);
+static int child_skip_log(void) {
+    sqlite3 *db;
+    char log_path[512];
+    char *log_text;
+    static const char *needle =
+        "event=rewrite_skipped target=plex reason=rewritten_prepare_failed";
+
+    if (sqlite3_compileoption_used("ENABLE_ICU") == 0) {
+        printf("SKIP [skip-log]: ENABLE_ICU=0\n");
+        return 0;
     }
+    if (!configure_obs_enabled_env()) return 1;
+    make_temp_dir();
+    temp_path(log_path, sizeof(log_path), "rewrite-skipped.stderr");
+    unlink(log_path);
+    db = open_seeded_temp("com.plexapp.plugins.library.db");
+    expect_rewritten_prepare_failed_skip_log(db, log_path);
+    log_text = read_text_file(log_path);
+    require_occurrences("skip-log/rewrite-skipped", log_text, needle, 1);
+    free(log_text);
+    require_int("skip-log/close", sqlite3_close(db), SQLITE_OK);
+    unlink(log_path);
+    cleanup_temp_dir();
+    printf("PASS [skip-log]\n");
+    return 0;
+}
+
+static int run_child_body(const char *name) {
+    if (strcmp(name, "positive") == 0) return child_positive();
+    if (strcmp(name, "env-default") == 0) return child_env_case(NULL, "env-default", 1);
+    if (strcmp(name, "env-one-disabled") == 0) return child_env_case("1", "env-one-disabled", 0);
+    if (strcmp(name, "env-garbage-enabled") == 0) return child_env_case("false", "env-garbage-enabled", 1);
+    if (strcmp(name, "path-negative") == 0) return child_path_negative();
+    if (strcmp(name, "nonmatch") == 0) return child_nonmatch();
+    if (strcmp(name, "skip-log") == 0) return child_skip_log();
+    failf("FATAL: unknown child %s", name);
+    return 1;
+}
+
+static void wait_for_child(pid_t pid, const char *name) {
+    int status;
     if (waitpid(pid, &status, 0) < 0) failf("FATAL: waitpid(%s) failed: %s", name, strerror(errno));
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
         failf("FATAL: child %s failed status=%d", name, status);
     }
 }
 
-int main(void) {
+static void run_child(const char *name) {
+    pid_t pid = fork();
+    if (pid < 0) failf("FATAL: fork(%s) failed: %s", name, strerror(errno));
+    if (pid == 0) _exit(run_child_body(name));
+    wait_for_child(pid, name);
+}
+
+static void run_exec_child(const char *name) {
+    pid_t pid = fork();
+    if (pid < 0) failf("FATAL: fork-exec(%s) failed: %s", name, strerror(errno));
+    if (pid == 0) {
+        if (!configure_obs_enabled_env()) _exit(127);
+        execlp(g_program_path, g_program_path, "--child", name, (char *)NULL);
+        fprintf(stderr, "exec(%s) failed: %s\n", g_program_path, strerror(errno));
+        _exit(127);
+    }
+    wait_for_child(pid, name);
+}
+
+int main(int argc, char **argv) {
+    g_program_path = argv[0];
+    if (argc == 3 && strcmp(argv[1], "--child") == 0) {
+        return run_child_body(argv[2]);
+    }
+    if (argc != 1) failf("FATAL: unexpected arguments");
+
     run_child("positive");
-    run_child("env-unset");
-    run_child("env-one");
-    run_child("env-garbage");
+    run_child("env-default");
+    run_child("env-one-disabled");
+    run_child("env-garbage-enabled");
     run_child("path-negative");
     run_child("nonmatch");
+    if (sqlite3_compileoption_used("ENABLE_ICU") != 0) {
+        run_exec_child("skip-log");
+    } else {
+        printf("SKIP [skip-log]: ENABLE_ICU=0\n");
+    }
     printf("plex fts rewrite smoke passed\n");
     return 0;
 }

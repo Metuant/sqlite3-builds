@@ -46,5 +46,11 @@ Project-specific guidance:
   defaults exact: `PLEX_OPTIMIZE_API=0`. For configured Plex instances,
   `main()` derives internal STAT4 capability state from `GENERIC_SQLITE_BINARY`
   preflight; the Plex main-DB STAT4 pass runs only when that state is `1`.
+- Keep Plex FTS rewrite opt-out (default-on in the Plex/ICU build): literal
+  `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
+  other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
+  `SQLITE3_DISABLE_SLOW_QUERY`, and `SQLITE3_DISABLE_AUTOPRAGMA` kill-switches.
+  Keep Emby FTS rewrite (`SQLITE3_DISABLE_EMBY_FTS_REWRITE`) opt-in: literal `0`
+  enables; unset, literal `1`, and every other value disable.
 - Do not create or modify `AGENTS.md` here unless explicitly asked; the root
   convention is a symlink to this file.

@@ -124,10 +124,11 @@ Plan:
 ```
 
 The least invasive way to extract the exact app query is to read the
-container's existing stdout/stderr log stream. Reading Docker logs is not live
-database access and does not touch production database files. When statement
-trace is already enabled, extract `trace_stmt` lines from the container log or
-the collector that receives the app process stderr:
+container's existing stdout/stderr log stream. Reading Docker logs, journald, or
+the configured collector is not live database access and does not touch
+production database files. When statement trace is already enabled, extract
+`trace_stmt` lines from the container log source that receives the app process
+stderr:
 
 ```sh
 docker logs --since 30m <container-name> 2>&1 | grep ' trace_stmt '
@@ -143,7 +144,70 @@ SQLITE3_DISABLE_STMT_TRACE=0
 Capture the minimum required lines, then restore the prior setting. Prefer
 `slow_query_expanded` lines when literal bound values are required and the
 incident context allows holding expanded SQL. Expanded SQL is max-PII because it
-inlines bound values.
+inlines all bound values for the statement.
+
+Expanded-SQL slow-query detail is on by default for target database files. Use a
+short observation window when the default threshold does not catch the query
+variant under investigation:
+
+| Env var | Value | Effect |
+|---|---|---|
+| `SQLITE3_SLOW_QUERY_EXPANDED_SQL_THRESHOLD_MS` | Temporary threshold such as `500` to `1000`; unset restores the default `2500` | Captures expanded SQL for statements at or above the effective expanded-detail threshold. |
+| `SQLITE3_SLOW_QUERY_THRESHOLD_MS` | Unset for default `500`, or set no higher than the expanded-detail threshold | Sets the base slow-query threshold. Expanded detail cannot emit below this effective base threshold. |
+| `SQLITE3_DISABLE_SLOW_QUERY_EXPANDED_SQL` | Unset or any value other than `1` | Keeps expanded-SQL detail enabled. Literal `1` disables expanded detail. |
+| `SQLITE3_DISABLE_SLOW_QUERY` | Unset or any value other than `1` | Keeps base slow-query tracking enabled. Literal `1` disables base and expanded slow-query lines. |
+| `SQLITE3_DISABLE_OBSERVABILITY` | Unset or any value other than `1` | Keeps the observability sink enabled. Literal `1` disables all observability and prevents this capture. |
+
+The expanded threshold is clamped up to the effective base slow-query
+threshold. Lowering `SQLITE3_SLOW_QUERY_EXPANDED_SQL_THRESHOLD_MS` does not
+capture a faster statement when `SQLITE3_SLOW_QUERY_THRESHOLD_MS` is higher.
+
+When a search surface can bind different expressions for quoted and unquoted
+input, reproduce both variants through the same UI or API path that produced the
+slow query. Repeat only as much as needed to capture one `slow_query_expanded`
+line per variant. Record the user-visible input, the `sql_expanded_hash`, and
+the extracted bound expression in incident notes; redact the full expanded SQL
+before sharing outside the incident context.
+
+Find the expanded-detail line:
+
+```text
+[sqlite3-builds-obs] ... slow_query_expanded ... db="..." elapsed_ms=... sql_expanded_source=... sql_expanded_len=... sql_expanded_hash=... sql_expanded_truncated=... sql_expanded="..."
+```
+
+Expanded-detail fields:
+
+| Field | Meaning |
+|---|---|
+| `db` | Escaped database filename for the statement. |
+| `elapsed_ms` | PROFILE elapsed time for the statement. |
+| `sql_expanded` | Expanded SQL detail, including bound values when expansion succeeds. |
+| `sql_expanded_source` | `expanded` when `sqlite3_expanded_sql()` supplied detail, `template` when the line fell back to the statement template, or `alloc_failed` when allocation failed and no sensitive partial value was emitted. |
+| `sql_expanded_len` | Length of the capped expanded-detail bytes. |
+| `sql_expanded_hash` | FNV-1a hash of the capped expanded-detail bytes; use it to correlate repeats without resharing the value. |
+| `sql_expanded_truncated` | `1` when the detail hit the 65536-byte cap and carries a `...[TRUNC]` suffix; otherwise `0`. |
+
+`sql_expanded_source=template` does not contain bound values. Reproduce again or
+inspect the logging failure before designing a literal-dependent rewrite from
+that line.
+
+Assume Docker logs, journald, and any configured CI or log-forwarding collector
+receive expanded values. If logs are shipped off-host, disable expanded detail
+with `SQLITE3_DISABLE_SLOW_QUERY_EXPANDED_SQL=1` unless the incident explicitly
+approves the capture.
+
+For a lowered-threshold observation window:
+
+1. Record the prior values of the slow-query and observability env vars.
+2. Set only the temporary threshold or enablement values required for capture.
+3. Restart the container.
+4. Reproduce the quoted and unquoted or otherwise distinct input variants.
+5. Capture the minimum required log lines.
+6. Restore the prior values or set `SQLITE3_DISABLE_SLOW_QUERY_EXPANDED_SQL=1`.
+7. Restart the container again.
+
+After disabling expanded detail, confirm new reproductions no longer emit
+`slow_query_expanded` lines.
 
 Derive literals from the copied database, not from memory or arbitrary ids.
 Write a setup query that finds hot realistic values: for example, the most

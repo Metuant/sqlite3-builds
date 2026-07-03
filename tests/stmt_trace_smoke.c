@@ -253,6 +253,18 @@ int plex_fts_rewrite_prepare(
     return sqlite3_prepare_real(db, zSql, nByte, ppStmt, pzTail);
 }
 
+int emby_fts_rewrite_prepare(
+    sqlite3 *db,
+    const char *zSql,
+    int nByte,
+    unsigned int prepFlags,
+    sqlite3_stmt **ppStmt,
+    const char **pzTail,
+    int kind
+) {
+    return plex_fts_rewrite_prepare(db, zSql, nByte, prepFlags, ppStmt, pzTail, kind);
+}
+
 int sqlite3_auto_extension(void (*xEntryPoint)(void)) {
     g_autoext_cb = (int (*)(sqlite3*, char**, const sqlite3_api_routines*))xEntryPoint;
     return SQLITE_OK;

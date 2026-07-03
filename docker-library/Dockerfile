@@ -48,8 +48,12 @@ COPY src/runtime_optimize.c /app/runtime_optimize.c
 COPY src/auto_extension_internal.h /app/auto_extension_internal.h
 COPY src/observability.c /app/observability.c
 COPY src/slow_query_tracker.c /app/slow_query_tracker.c
+COPY src/fts_lex.c /app/fts_lex.c
+COPY src/fts_lex.h /app/fts_lex.h
 COPY src/plex_fts_rewrite.c /app/plex_fts_rewrite.c
 COPY src/plex_fts_rewrite.h /app/plex_fts_rewrite.h
+COPY src/emby_fts_rewrite.c /app/emby_fts_rewrite.c
+COPY src/emby_fts_rewrite.h /app/emby_fts_rewrite.h
 COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
 COPY build/expected-sqlite-config-count.txt /app/build/expected-sqlite-config-count.txt
 COPY build/expected-sqlite-dbconfig-count.txt /app/build/expected-sqlite-dbconfig-count.txt
@@ -253,11 +257,26 @@ RUN set -euo pipefail; \
     gcc -O0 -o /app/plex_fts_rewrite_smoke /app/tests/plex_fts_rewrite_smoke.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/plex_fts_rewrite_smoke; \
+    gcc -O0 -o /app/emby_fts_rewrite_smoke /app/tests/emby_fts_rewrite_smoke.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/emby_fts_rewrite_smoke; \
+    gcc -O0 -DSQLITE_ENABLE_FTS5 -DEMBY_FTS_REWRITE_DIRECT_TEST=1 \
+        -DEMBY_FTS_REWRITE_TEST_API=1 \
+        -DEMBY_FTS_REWRITE_TEST_LITERAL_MATCH=1 \
+        -o /app/emby_fts_rewrite_direct_test \
+        /app/tests/emby_fts_rewrite_smoke.c /app/emby_fts_rewrite.c /app/fts_lex.c \
+        "$AMALG_DIR/sqlite3-pristine.c" -I"$AMALG_DIR" -I/app -ldl -lpthread -lm; \
+    /app/emby_fts_rewrite_direct_test; \
     gcc -O2 -o /app/plex_fts_rewrite_prepare_bench \
         /app/tests/plex_fts_rewrite_prepare_bench.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/plex_fts_rewrite_prepare_bench || \
-      printf "ADVISORY FAIL plex_fts_rewrite_prepare_bench command exited nonzero\n"
+      printf "ADVISORY FAIL plex_fts_rewrite_prepare_bench command exited nonzero\n"; \
+    gcc -O2 -o /app/emby_fts_rewrite_prepare_bench \
+        /app/tests/emby_fts_rewrite_prepare_bench.c \
+        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \
+    LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/emby_fts_rewrite_prepare_bench || \
+      printf "ADVISORY FAIL emby_fts_rewrite_prepare_bench command exited nonzero\n"
 
 RUN set -euo pipefail; \
     LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)"); \

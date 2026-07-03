@@ -14,16 +14,34 @@
 #include <unistd.h>
 
 #define THREADS 4
-#define ITERATIONS_PER_THREAD 400
+#define ITERATIONS_PER_THREAD 300
 #define RW_FLAGS (SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE)
-#define ADVISORY_LOW_PREPARE_P50_NS 20000ULL
-#define ADVISORY_LOW_PREPARE_P95_NS 100000ULL
+#define ADVISORY_LOW_PREPARE_P50_NS 30000ULL
+#define ADVISORY_LOW_PREPARE_P95_NS 150000ULL
 
 static const char *MATCH_SQL =
-    "select distinct(tags.id) from metadata_items join taggings on taggings.metadata_item_id=metadata_items.id join tags on tags.id=taggings.tag_id  join fts4_tag_titles_icu on fts4_tag_titles_icu.rowid=tags.id where fts4_tag_titles_icu.tag match 'Django*' and tag_type=6  and metadata_items.library_section_id in (1) and metadata_items.metadata_type=1   group by tags.id order by count(*) desc limit 100";
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+    "select count(*) OVER() AS TotalRecordCount,A.type,(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from mediaitems A join fts_search9 on A.Id=fts_search9.RowId and fts_search9 match @SearchTerm where "
+    "A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,16,18,19,20,21,22,23,24,25,26,29,34) "
+    "AND (Coalesce(ShareLevel, 0) > 0 OR A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,29,34) OR A.IsPublic=1) "
+    "AND A.ExtraType is null AND "
+    "(A.Id in WithAncestors OR A.Id in (select ListItemsExemptionForPlaylists.ListId from ListItems ListItemsExemptionForPlaylists join ancestorids2 AncestorIdExemptionForPlaylists on ListItemsExemptionForPlaylists.ListItemId=AncestorIdExemptionForPlaylists.itemid and AncestorIdExemptionForPlaylists.AncestorId in (100)) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds) "
+    "Group by A.Type ORDER BY Rank ASC LIMIT 50";
+
+static const char *LARGE_MISS_SQL =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+    "select count(*) OVER() AS TotalRecordCount,A.type,(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from mediaitems A join fts_search9 on A.Id=fts_search9.RowId and fts_search9 match @SearchTerm where "
+    "A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,16,18,19,20,21,22,23,24,25,26,29,34) "
+    "AND (Coalesce(ShareLevel, 0) > 0 OR A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,29,34) OR A.IsPublic=1) "
+    "AND A.ExtraType is null AND "
+    "(EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid=A.Id)) "
+    "Group by A.Type ORDER BY Rank ASC LIMIT 50";
 
 typedef enum bench_work {
     WORK_PREPARE_SELECT,
+    WORK_PREPARE_LARGE_MISS,
     WORK_PREPARE_MATCH,
     WORK_EXEC_PRAGMA
 } bench_work;
@@ -72,23 +90,24 @@ static void configure_env(const char *rewrite_value) {
     if (setenv("SQLITE3_DISABLE_AUTOPRAGMA", "1", 1) != 0) failf("setenv AUTOPRAGMA failed");
     if (setenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1", 1) != 0) failf("setenv RUNTIME failed");
     if (setenv("SQLITE3_DISABLE_OBSERVABILITY", "1", 1) != 0) failf("setenv OBS failed");
+    if (setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1", 1) != 0) failf("setenv PLEX failed");
     if (rewrite_value) {
-        if (setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", rewrite_value, 1) != 0) {
-            failf("setenv REWRITE failed");
+        if (setenv("SQLITE3_DISABLE_EMBY_FTS_REWRITE", rewrite_value, 1) != 0) {
+            failf("setenv EMBY failed");
         }
-    } else if (unsetenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE") != 0) {
-        failf("unsetenv REWRITE failed");
+    } else if (unsetenv("SQLITE3_DISABLE_EMBY_FTS_REWRITE") != 0) {
+        failf("unsetenv EMBY failed");
     }
 }
 
 static void temp_path(char *buf, size_t n, const char *basename) {
-    int rc = snprintf(buf, n, "/tmp/plex-fts-rewrite-bench-%ld/%s", (long)getpid(), basename);
+    int rc = snprintf(buf, n, "/tmp/emby-fts-rewrite-bench-%ld/%s", (long)getpid(), basename);
     if (rc < 0 || (size_t)rc >= n) failf("temp path too long");
 }
 
 static void make_temp_dir(void) {
     char dir[256];
-    int rc = snprintf(dir, sizeof(dir), "/tmp/plex-fts-rewrite-bench-%ld", (long)getpid());
+    int rc = snprintf(dir, sizeof(dir), "/tmp/emby-fts-rewrite-bench-%ld", (long)getpid());
     if (rc < 0 || (size_t)rc >= sizeof(dir)) failf("temp dir too long");
     if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
         failf("mkdir(%s) failed: %s", dir, strerror(errno));
@@ -98,17 +117,17 @@ static void make_temp_dir(void) {
 static void cleanup_temp_dir(void) {
     char dir[256];
     char path[512];
-    const char *names[] = {"com.plexapp.plugins.library.db", "library.db"};
+    const char *names[] = {"library.db", "com.plexapp.plugins.library.db"};
     size_t i;
     for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
         temp_path(path, sizeof(path), names[i]);
         unlink(path);
-        snprintf(path, sizeof(path), "/tmp/plex-fts-rewrite-bench-%ld/%s-wal", (long)getpid(), names[i]);
+        snprintf(path, sizeof(path), "/tmp/emby-fts-rewrite-bench-%ld/%s-wal", (long)getpid(), names[i]);
         unlink(path);
-        snprintf(path, sizeof(path), "/tmp/plex-fts-rewrite-bench-%ld/%s-shm", (long)getpid(), names[i]);
+        snprintf(path, sizeof(path), "/tmp/emby-fts-rewrite-bench-%ld/%s-shm", (long)getpid(), names[i]);
         unlink(path);
     }
-    snprintf(dir, sizeof(dir), "/tmp/plex-fts-rewrite-bench-%ld", (long)getpid());
+    snprintf(dir, sizeof(dir), "/tmp/emby-fts-rewrite-bench-%ld", (long)getpid());
     rmdir(dir);
 }
 
@@ -129,14 +148,16 @@ static void exec_sql(sqlite3 *db, const char *label, const char *sql) {
 static void setup_schema(const char *path) {
     sqlite3 *db = open_db(path);
     exec_sql(db, "schema",
-        "CREATE TABLE metadata_items(id INTEGER PRIMARY KEY, library_section_id INTEGER NOT NULL, metadata_type INTEGER NOT NULL);"
-        "CREATE TABLE tags(id INTEGER PRIMARY KEY, tag_type INTEGER NOT NULL);"
-        "CREATE TABLE taggings(metadata_item_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);"
-        "CREATE VIRTUAL TABLE fts4_tag_titles_icu USING fts4(tag);"
-        "INSERT INTO metadata_items VALUES(1,1,1),(2,1,1);"
-        "INSERT INTO tags VALUES(10,6),(11,1);"
-        "INSERT INTO taggings VALUES(1,10),(2,11);"
-        "INSERT INTO fts4_tag_titles_icu(rowid, tag) VALUES(10,'Django Alpha'),(11,'Django Other');"
+        "CREATE TABLE mediaitems(Id INTEGER PRIMARY KEY, Type INTEGER, UserDataKeyId INTEGER, IsPublic INTEGER, ExtraType INTEGER);"
+        "CREATE TABLE AncestorIds2(itemid INTEGER, AncestorId INTEGER, Distance INTEGER);"
+        "CREATE TABLE ItemLinks2(ItemId INTEGER, LinkedId INTEGER, Type INTEGER);"
+        "CREATE TABLE itemPeople2(ItemId INTEGER, PersonId INTEGER);"
+        "CREATE TABLE ListItems(ListId INTEGER, ListItemId INTEGER);"
+        "CREATE TABLE UserItemShares(UserId INTEGER, ItemId INTEGER, ShareLevel INTEGER);"
+        "CREATE VIRTUAL TABLE fts_search9 USING fts5(title);"
+        "INSERT INTO mediaitems VALUES(1,1,1,1,NULL);"
+        "INSERT INTO AncestorIds2 VALUES(1,100,0);"
+        "INSERT INTO fts_search9(rowid,title) VALUES(1,'alpha');"
     );
     if (sqlite3_close(db) != SQLITE_OK) failf("schema close failed");
 }
@@ -151,7 +172,9 @@ static void *bench_worker(void *arg) {
             exec_sql(db, "exec pragma", "PRAGMA user_version;");
         } else {
             sqlite3_stmt *stmt = NULL;
-            const char *sql = bt->work == WORK_PREPARE_MATCH ? MATCH_SQL : "SELECT 1";
+            const char *sql = "SELECT 1";
+            if (bt->work == WORK_PREPARE_MATCH) sql = MATCH_SQL;
+            else if (bt->work == WORK_PREPARE_LARGE_MISS) sql = LARGE_MISS_SQL;
             int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
             if (rc != SQLITE_OK) failf("prepare rc=%d err=%s", rc, sqlite3_errmsg(db));
             rc = sqlite3_finalize(stmt);
@@ -273,14 +296,15 @@ static void run_child(
 }
 
 int main(void) {
-    run_child("default-nontarget-select", NULL, "library.db", WORK_PREPARE_SELECT, 0,
+    run_child("disabled-default-select", NULL, "library.db", WORK_PREPARE_SELECT, 0, ASSERT_NONE);
+    run_child("enabled-nontarget-select", "0", "com.plexapp.plugins.library.db",
+              WORK_PREPARE_SELECT, 0, ASSERT_ADVISORY_LOW_PREPARE_COST);
+    run_child("enabled-emby-miss", "0", "library.db", WORK_PREPARE_SELECT, 1,
               ASSERT_ADVISORY_LOW_PREPARE_COST);
-    run_child("enabled-nontarget-select", "0", "library.db", WORK_PREPARE_SELECT, 0,
+    run_child("enabled-emby-large-miss", "0", "library.db", WORK_PREPARE_LARGE_MISS, 1,
               ASSERT_ADVISORY_LOW_PREPARE_COST);
-    run_child("enabled-plex-miss", "0", "com.plexapp.plugins.library.db", WORK_PREPARE_SELECT, 1,
-              ASSERT_ADVISORY_LOW_PREPARE_COST);
-    run_child("enabled-plex-match", "0", "com.plexapp.plugins.library.db", WORK_PREPARE_MATCH, 1, ASSERT_NONE);
-    run_child("enabled-plex-exec-miss", "0", "com.plexapp.plugins.library.db", WORK_EXEC_PRAGMA, 1, ASSERT_NONE);
-    printf("plex fts rewrite prepare bench completed\n");
+    run_child("enabled-emby-match", "0", "library.db", WORK_PREPARE_MATCH, 1, ASSERT_NONE);
+    run_child("enabled-emby-exec-miss", "0", "library.db", WORK_EXEC_PRAGMA, 1, ASSERT_NONE);
+    printf("emby fts rewrite prepare bench completed\n");
     return 0;
 }

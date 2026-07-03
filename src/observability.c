@@ -1,5 +1,5 @@
 #include "sqlite3.h"
-#include "plex_fts_rewrite.h"
+#include "emby_fts_rewrite.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -581,8 +581,8 @@ SQLITE_API int sqlite3_prepare(
     sqlite3_stmt **ppStmt,
     const char **pzTail
 ) {
-    return plex_fts_rewrite_prepare(
-        db, zSql, nByte, 0, ppStmt, pzTail, PLEX_FTS_PREPARE_LEGACY
+    return emby_fts_rewrite_prepare(
+        db, zSql, nByte, 0, ppStmt, pzTail, FTS_REWRITE_PREPARE_LEGACY
     );
 }
 
@@ -593,8 +593,8 @@ SQLITE_API int sqlite3_prepare_v2(
     sqlite3_stmt **ppStmt,
     const char **pzTail
 ) {
-    return plex_fts_rewrite_prepare(
-        db, zSql, nByte, 0, ppStmt, pzTail, PLEX_FTS_PREPARE_V2
+    return emby_fts_rewrite_prepare(
+        db, zSql, nByte, 0, ppStmt, pzTail, FTS_REWRITE_PREPARE_V2
     );
 }
 
@@ -606,8 +606,8 @@ SQLITE_API int sqlite3_prepare_v3(
     sqlite3_stmt **ppStmt,
     const char **pzTail
 ) {
-    return plex_fts_rewrite_prepare(
-        db, zSql, nByte, prepFlags, ppStmt, pzTail, PLEX_FTS_PREPARE_V3
+    return emby_fts_rewrite_prepare(
+        db, zSql, nByte, prepFlags, ppStmt, pzTail, FTS_REWRITE_PREPARE_V3
     );
 }
 

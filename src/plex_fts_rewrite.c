@@ -1,4 +1,5 @@
 #include "plex_fts_rewrite.h"
+#include "fts_lex.h"
 
 #include <limits.h>
 #include <pthread.h>
@@ -9,7 +10,7 @@
 #include <string.h>
 
 #define REWRITE_OPEN "unlikely("
-#define REWRITE_OPEN_LEN 9
+#define REWRITE_OPEN_LEN (sizeof(REWRITE_OPEN) - 1)
 #define REWRITE_CLOSE_LEN 1
 #define REWRITE_LOG_SQLBUF 4352
 #define REWRITE_MAX_QUERY_BLOCKS 64
@@ -29,29 +30,6 @@ static const rewrite_target PLEX_FTS_TARGET = {
     "tag_type",
     "com.plexapp.plugins.library.db"
 };
-
-typedef enum token_type {
-    TOK_EOF = 0,
-    TOK_IDENT,
-    TOK_NUMBER,
-    TOK_STRING,
-    TOK_PARAM,
-    TOK_SYMBOL,
-    TOK_ERROR
-} token_type;
-
-typedef struct token {
-    token_type type;
-    size_t start;
-    size_t end;
-    char symbol;
-} token;
-
-typedef struct lexer {
-    const char *sql;
-    size_t len;
-    size_t pos;
-} lexer;
 
 typedef struct rewrite_match {
     size_t open_off;
@@ -103,25 +81,25 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
     size_t dst_n
 );
 
-static pthread_once_t g_rewrite_once = PTHREAD_ONCE_INIT;
-static atomic_int g_rewrite_enabled;
+static pthread_once_t g_plex_rewrite_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_rewrite_enabled;
 
 static void plex_fts_rewrite_init_once(void) {
     const char *value = getenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE");
     atomic_store_explicit(
-        &g_rewrite_enabled,
-        (value && strcmp(value, "0") == 0) ? 1 : 0,
+        &g_plex_rewrite_enabled,
+        (value && strcmp(value, "1") == 0) ? 0 : 1,
         memory_order_release
     );
 }
 
-static int rewrite_enabled(void) {
-    pthread_once(&g_rewrite_once, plex_fts_rewrite_init_once);
-    return atomic_load_explicit(&g_rewrite_enabled, memory_order_acquire);
+static int plex_rewrite_enabled(void) {
+    pthread_once(&g_plex_rewrite_once, plex_fts_rewrite_init_once);
+    return atomic_load_explicit(&g_plex_rewrite_enabled, memory_order_acquire);
 }
 
 static int call_real_prepare(
-    plex_fts_prepare_kind kind,
+    fts_rewrite_prepare_kind kind,
     sqlite3 *db,
     const char *zSql,
     int nByte,
@@ -130,187 +108,69 @@ static int call_real_prepare(
     const char **pzTail
 ) {
     switch (kind) {
-        case PLEX_FTS_PREPARE_LEGACY:
+        case FTS_REWRITE_PREPARE_LEGACY:
             return sqlite3_prepare_real(db, zSql, nByte, ppStmt, pzTail);
-        case PLEX_FTS_PREPARE_V2:
+        case FTS_REWRITE_PREPARE_V2:
             return sqlite3_prepare_v2_real(db, zSql, nByte, ppStmt, pzTail);
-        case PLEX_FTS_PREPARE_V3:
+        case FTS_REWRITE_PREPARE_V3:
             return sqlite3_prepare_v3_real(db, zSql, nByte, prepFlags, ppStmt, pzTail);
         default:
             return sqlite3_prepare_v2_real(db, zSql, nByte, ppStmt, pzTail);
     }
 }
 
-static int ascii_lower(int c) {
-    if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
-    return c;
+static int parse_match_value(fts_lex *lx, fts_lex_token *value) {
+    *value = fts_lex_next_token(lx);
+    if (!(value->type == FTS_LEX_TOK_NUMBER ||
+          value->type == FTS_LEX_TOK_STRING ||
+          value->type == FTS_LEX_TOK_PARAM)) {
+        return 0;
+    }
+    return fts_lex_match_rhs_is_complete(lx, value);
 }
 
-static int is_ident_start(unsigned char c) {
-    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
+static int is_predicate_boundary_keyword(const char *sql, const fts_lex_token *tok) {
+    return fts_lex_token_text_eq(sql, tok, "and") ||
+           fts_lex_token_text_eq(sql, tok, "or") ||
+           fts_lex_token_text_eq(sql, tok, "group") ||
+           fts_lex_token_text_eq(sql, tok, "having") ||
+           fts_lex_token_text_eq(sql, tok, "order") ||
+           fts_lex_token_text_eq(sql, tok, "limit") ||
+           fts_lex_token_text_eq(sql, tok, "union") ||
+           fts_lex_token_text_eq(sql, tok, "except") ||
+           fts_lex_token_text_eq(sql, tok, "intersect") ||
+           fts_lex_token_text_eq(sql, tok, "window");
 }
 
-static int is_ident_char(unsigned char c) {
-    return is_ident_start(c) || (c >= '0' && c <= '9');
-}
-
-static int is_space(unsigned char c) {
-    return c == ' ' || c == '\t' || c == '\n' || c == '\r' || c == '\f';
-}
-
-static int token_text_eq(const char *sql, const token *tok, const char *want) {
-    size_t n = tok->end - tok->start;
-    size_t i;
-    if (strlen(want) != n) return 0;
-    for (i = 0; i < n; i++) {
-        if (ascii_lower((unsigned char)sql[tok->start + i]) !=
-            ascii_lower((unsigned char)want[i])) {
-            return 0;
-        }
-    }
-    return 1;
-}
-
-static token next_token(lexer *lx) {
-    token tok;
-    const char *sql = lx->sql;
-    size_t len = lx->len;
-    size_t p = lx->pos;
-
-    for (;;) {
-        while (p < len && is_space((unsigned char)sql[p])) p++;
-        if (p + 1 < len && sql[p] == '-' && sql[p + 1] == '-') {
-            p += 2;
-            while (p < len && sql[p] != '\n') p++;
-            continue;
-        }
-        if (p + 1 < len && sql[p] == '/' && sql[p + 1] == '*') {
-            p += 2;
-            while (p + 1 < len && !(sql[p] == '*' && sql[p + 1] == '/')) p++;
-            if (p + 1 >= len) {
-                lx->pos = p;
-                tok.type = TOK_ERROR;
-                tok.start = p;
-                tok.end = p;
-                tok.symbol = 0;
-                return tok;
-            }
-            p += 2;
-            continue;
-        }
-        break;
-    }
-
-    tok.start = p;
-    tok.end = p;
-    tok.symbol = 0;
-    if (p >= len) {
-        lx->pos = p;
-        tok.type = TOK_EOF;
-        return tok;
-    }
-    if (sql[p] == 0) {
-        lx->pos = p;
-        tok.type = TOK_ERROR;
-        return tok;
-    }
-
-    if (is_ident_start((unsigned char)sql[p])) {
-        p++;
-        while (p < len && is_ident_char((unsigned char)sql[p])) p++;
-        tok.type = TOK_IDENT;
-        tok.end = p;
-        lx->pos = p;
-        return tok;
-    }
-
-    if (sql[p] >= '0' && sql[p] <= '9') {
-        p++;
-        while (p < len && sql[p] >= '0' && sql[p] <= '9') p++;
-        tok.type = TOK_NUMBER;
-        tok.end = p;
-        lx->pos = p;
-        return tok;
-    }
-
-    if (sql[p] == '\'' || sql[p] == '"') {
-        char quote = sql[p++];
-        while (p < len) {
-            if (sql[p] == 0) {
-                lx->pos = p;
-                tok.type = TOK_ERROR;
-                tok.end = p;
-                return tok;
-            }
-            if (sql[p] == quote) {
-                p++;
-                if (p < len && sql[p] == quote) {
-                    p++;
-                    continue;
-                }
-                tok.type = TOK_STRING;
-                tok.end = p;
-                lx->pos = p;
-                return tok;
-            }
-            p++;
-        }
-        lx->pos = p;
-        tok.type = TOK_ERROR;
-        tok.end = p;
-        return tok;
-    }
-
-    if (sql[p] == '?') {
-        p++;
-        tok.type = TOK_PARAM;
-        tok.end = p;
-        lx->pos = p;
-        return tok;
-    }
-
-    tok.type = TOK_SYMBOL;
-    tok.symbol = sql[p];
-    tok.end = p + 1;
-    lx->pos = p + 1;
-    return tok;
-}
-
-static int parse_any_value(lexer *lx, token *value) {
-    *value = next_token(lx);
-    return value->type == TOK_NUMBER || value->type == TOK_STRING || value->type == TOK_PARAM;
-}
-
-static int is_predicate_boundary_keyword(const char *sql, const token *tok) {
-    return token_text_eq(sql, tok, "and") ||
-           token_text_eq(sql, tok, "or") ||
-           token_text_eq(sql, tok, "group") ||
-           token_text_eq(sql, tok, "having") ||
-           token_text_eq(sql, tok, "order") ||
-           token_text_eq(sql, tok, "limit") ||
-           token_text_eq(sql, tok, "union") ||
-           token_text_eq(sql, tok, "except") ||
-           token_text_eq(sql, tok, "intersect") ||
-           token_text_eq(sql, tok, "window");
-}
-
-static int is_predicate_value_boundary(const char *sql, const token *tok) {
-    if (tok->type == TOK_EOF) return 1;
-    if (tok->type == TOK_SYMBOL && tok->symbol == ')') return 1;
-    if (tok->type == TOK_IDENT) return is_predicate_boundary_keyword(sql, tok);
+static int is_predicate_value_boundary(const char *sql, const fts_lex_token *tok) {
+    if (tok->type == FTS_LEX_TOK_EOF) return 1;
+    if (tok->type == FTS_LEX_TOK_SYMBOL && tok->symbol == ')') return 1;
+    if (tok->type == FTS_LEX_TOK_IDENT) return is_predicate_boundary_keyword(sql, tok);
     return 0;
 }
 
-static int parse_predicate_value(lexer *lx, token *value) {
-    lexer look;
-    token boundary;
+static int is_predicate_left_boundary(const char *sql, const fts_lex_token *tok) {
+    if (tok->type == FTS_LEX_TOK_EOF) return 1;
+    if (tok->type == FTS_LEX_TOK_SYMBOL && tok->symbol == '(') return 1;
+    if (tok->type == FTS_LEX_TOK_IDENT) {
+        return fts_lex_token_text_eq(sql, tok, "and") ||
+               fts_lex_token_text_eq(sql, tok, "or") ||
+               fts_lex_token_text_eq(sql, tok, "where") ||
+               fts_lex_token_text_eq(sql, tok, "on");
+    }
+    return 0;
+}
 
-    *value = next_token(lx);
-    if (!(value->type == TOK_NUMBER || value->type == TOK_STRING ||
-          (value->type == TOK_PARAM && value->end == value->start + 1))) {
+static int parse_predicate_value(fts_lex *lx, fts_lex_token *value) {
+    fts_lex look;
+    fts_lex_token boundary;
+
+    *value = fts_lex_next_token(lx);
+    if (!(value->type == FTS_LEX_TOK_NUMBER || value->type == FTS_LEX_TOK_STRING ||
+          (value->type == FTS_LEX_TOK_PARAM && value->end == value->start + 1))) {
         return 0;
     }
-    if (value->type == TOK_PARAM) {
+    if (value->type == FTS_LEX_TOK_PARAM) {
         if (value->end < lx->len &&
             lx->sql[value->end] >= '0' &&
             lx->sql[value->end] <= '9') {
@@ -318,26 +178,26 @@ static int parse_predicate_value(lexer *lx, token *value) {
         }
     }
     look = *lx;
-    boundary = next_token(&look);
-    if (boundary.type == TOK_ERROR) return 0;
+    boundary = fts_lex_next_token(&look);
+    if (boundary.type == FTS_LEX_TOK_ERROR) return 0;
     return is_predicate_value_boundary(lx->sql, &boundary);
 }
 
-static int token_starts_fts_match(const char *sql, const lexer *after_target) {
-    lexer look = *after_target;
-    token next = next_token(&look);
-    token value;
+static int token_starts_fts_match(const char *sql, const fts_lex *after_target) {
+    fts_lex look = *after_target;
+    fts_lex_token next = fts_lex_next_token(&look);
+    fts_lex_token value;
 
-    if (next.type == TOK_IDENT && token_text_eq(sql, &next, "match")) {
-        return parse_any_value(&look, &value);
+    if (next.type == FTS_LEX_TOK_IDENT && fts_lex_token_text_eq(sql, &next, "match")) {
+        return parse_match_value(&look, &value);
     }
-    if (next.type == TOK_SYMBOL && next.symbol == '.') {
-        token column = next_token(&look);
-        token match = next_token(&look);
-        if (column.type == TOK_IDENT &&
-            match.type == TOK_IDENT &&
-            token_text_eq(sql, &match, "match") &&
-            parse_any_value(&look, &value)) {
+    if (next.type == FTS_LEX_TOK_SYMBOL && next.symbol == '.') {
+        fts_lex_token column = fts_lex_next_token(&look);
+        fts_lex_token match = fts_lex_next_token(&look);
+        if (column.type == FTS_LEX_TOK_IDENT &&
+            match.type == FTS_LEX_TOK_IDENT &&
+            fts_lex_token_text_eq(sql, &match, "match") &&
+            parse_match_value(&look, &value)) {
             return 1;
         }
     }
@@ -346,23 +206,23 @@ static int token_starts_fts_match(const char *sql, const lexer *after_target) {
 
 static int token_is_keyword(
     const char *sql,
-    const token *tok,
+    const fts_lex_token *tok,
     const char *keyword
 ) {
-    return tok->type == TOK_IDENT && token_text_eq(sql, tok, keyword);
+    return tok->type == FTS_LEX_TOK_IDENT && fts_lex_token_text_eq(sql, tok, keyword);
 }
 
-static void update_query_clause(query_block_match *block, const char *sql, const token *tok) {
-    if (token_text_eq(sql, tok, "select")) {
+static void update_query_clause(query_block_match *block, const char *sql, const fts_lex_token *tok) {
+    if (fts_lex_token_text_eq(sql, tok, "select")) {
         block->clause = QUERY_CLAUSE_SELECT;
-    } else if (token_text_eq(sql, tok, "from") || token_text_eq(sql, tok, "join")) {
+    } else if (fts_lex_token_text_eq(sql, tok, "from") || fts_lex_token_text_eq(sql, tok, "join")) {
         block->clause = QUERY_CLAUSE_FROM;
-    } else if (token_text_eq(sql, tok, "where") || token_text_eq(sql, tok, "on")) {
+    } else if (fts_lex_token_text_eq(sql, tok, "where") || fts_lex_token_text_eq(sql, tok, "on")) {
         block->clause = QUERY_CLAUSE_PREDICATE;
-    } else if (token_text_eq(sql, tok, "group") || token_text_eq(sql, tok, "having") ||
-               token_text_eq(sql, tok, "order") || token_text_eq(sql, tok, "limit") ||
-               token_text_eq(sql, tok, "union") || token_text_eq(sql, tok, "except") ||
-               token_text_eq(sql, tok, "intersect") || token_text_eq(sql, tok, "window")) {
+    } else if (fts_lex_token_text_eq(sql, tok, "group") || fts_lex_token_text_eq(sql, tok, "having") ||
+               fts_lex_token_text_eq(sql, tok, "order") || fts_lex_token_text_eq(sql, tok, "limit") ||
+               fts_lex_token_text_eq(sql, tok, "union") || fts_lex_token_text_eq(sql, tok, "except") ||
+               fts_lex_token_text_eq(sql, tok, "intersect") || fts_lex_token_text_eq(sql, tok, "window")) {
         block->clause = QUERY_CLAUSE_OTHER;
     }
 }
@@ -373,8 +233,8 @@ static int match_target_prefix_query(
     size_t len,
     rewrite_match *out
 ) {
-    lexer lx;
-    token prev;
+    fts_lex lx;
+    fts_lex_token prev;
     query_block_match blocks[REWRITE_MAX_QUERY_BLOCKS];
     int block_at_depth[REWRITE_MAX_QUERY_DEPTH];
     int block_count = 0;
@@ -382,36 +242,34 @@ static int match_target_prefix_query(
     int depth = 0;
     int i;
 
-    lx.sql = sql;
-    lx.len = len;
-    lx.pos = 0;
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_BARE_QMARK);
     memset(blocks, 0, sizeof(blocks));
     for (i = 0; i < REWRITE_MAX_QUERY_DEPTH; i++) block_at_depth[i] = -1;
     memset(&prev, 0, sizeof(prev));
-    prev.type = TOK_EOF;
+    prev.type = FTS_LEX_TOK_EOF;
 
     for (;;) {
-        lexer look;
-        token tok;
+        fts_lex look;
+        fts_lex_token tok;
         int current_block;
 
-        tok = next_token(&lx);
-        if (tok.type == TOK_ERROR) return 0;
-        if (tok.type == TOK_EOF) {
+        tok = fts_lex_next_token(&lx);
+        if (tok.type == FTS_LEX_TOK_ERROR) return 0;
+        if (tok.type == FTS_LEX_TOK_EOF) {
             if (depth != 0) return 0;
             break;
         }
-        if (tok.type == TOK_SYMBOL && tok.symbol == ';') return 0;
+        if (tok.type == FTS_LEX_TOK_SYMBOL && tok.symbol == ';') return 0;
 
         current_block = block_at_depth[depth];
-        if (tok.type == TOK_SYMBOL && tok.symbol == '(') {
+        if (tok.type == FTS_LEX_TOK_SYMBOL && tok.symbol == '(') {
             if (depth + 1 >= REWRITE_MAX_QUERY_DEPTH) return 0;
             block_at_depth[depth + 1] = current_block;
             depth++;
             prev = tok;
             continue;
         }
-        if (tok.type == TOK_SYMBOL && tok.symbol == ')') {
+        if (tok.type == FTS_LEX_TOK_SYMBOL && tok.symbol == ')') {
             if (depth == 0) return 0;
             block_at_depth[depth] = -1;
             depth--;
@@ -429,22 +287,22 @@ static int match_target_prefix_query(
         }
 
         current_block = block_at_depth[depth];
-        if (current_block >= 0 && tok.type == TOK_IDENT) {
+        if (current_block >= 0 && tok.type == FTS_LEX_TOK_IDENT) {
             update_query_clause(&blocks[current_block], sql, &tok);
-            if (token_text_eq(sql, &tok, target->fts_table) &&
+            if (fts_lex_token_text_eq(sql, &tok, target->fts_table) &&
                 token_starts_fts_match(sql, &lx)) {
                 blocks[current_block].fts_match = 1;
             }
         }
-        if (tok.type == TOK_IDENT && token_text_eq(sql, &tok, target->predicate_column)) {
-            token eq;
-            token value;
+        if (tok.type == FTS_LEX_TOK_IDENT && fts_lex_token_text_eq(sql, &tok, target->predicate_column)) {
+            fts_lex_token eq;
+            fts_lex_token value;
 
             look = lx;
-            eq = next_token(&look);
-            if (eq.type == TOK_ERROR) return 0;
-            if (eq.type == TOK_SYMBOL && eq.symbol == '=') {
-                if (prev.type == TOK_SYMBOL && prev.symbol == '.') return 0;
+            eq = fts_lex_next_token(&look);
+            if (eq.type == FTS_LEX_TOK_ERROR) return 0;
+            if (eq.type == FTS_LEX_TOK_SYMBOL && eq.symbol == '=') {
+                if (!is_predicate_left_boundary(sql, &prev)) return 0;
                 if (!parse_predicate_value(&look, &value)) return 0;
                 total_predicate_count++;
                 if (total_predicate_count > 1) return 0;
@@ -469,25 +327,7 @@ static int match_target_prefix_query(
     return 0;
 }
 
-static int target_db_path_matches(const rewrite_target *target, const char *raw_fn) {
-    size_t raw_len;
-    char fnbuf[2048];
-    char *q;
-    const char *base;
-
-    if (!auto_extension_path_is_target(raw_fn)) return 0;
-    if (!raw_fn || raw_fn[0] == 0) return 0;
-    raw_len = strlen(raw_fn);
-    if (raw_len >= sizeof(fnbuf)) return 0;
-    memcpy(fnbuf, raw_fn, raw_len + 1);
-    q = strchr(fnbuf, '?');
-    if (q) *q = 0;
-    base = strrchr(fnbuf, '/');
-    base = base ? base + 1 : fnbuf;
-    return strcmp(base, target->db_basename) == 0;
-}
-
-static int prepare_input_lengths(
+static int plex_prepare_input_lengths(
     const char *zSql,
     int nByte,
     size_t *bounded_len,
@@ -514,7 +354,7 @@ static int prepare_input_lengths(
     return 1;
 }
 
-static char *build_rewritten_sql(
+static char *plex_build_rewritten_sql(
     const char *zSql,
     size_t bounded_len,
     const rewrite_match *match
@@ -539,7 +379,7 @@ static char *build_rewritten_sql(
     return rewritten;
 }
 
-static int map_end_tail(
+static int plex_map_end_tail(
     const char *zSql,
     const char *rewritten,
     const char *rewritten_tail,
@@ -557,7 +397,7 @@ static int map_end_tail(
     return 1;
 }
 
-static void log_rewrite_applied(sqlite3 *db, const char *rewritten) {
+static void plex_log_rewrite_applied(sqlite3 *db, const char *rewritten) {
     char sqlbuf[REWRITE_LOG_SQLBUF];
 
     obs_escape_sql(rewritten, sqlbuf, sizeof(sqlbuf));
@@ -565,8 +405,14 @@ static void log_rewrite_applied(sqlite3 *db, const char *rewritten) {
              (void*)db, sqlbuf);
 }
 
-static int retry_original_after_rewrite_failure(
-    plex_fts_prepare_kind kind,
+static void plex_log_rewrite_skipped(sqlite3 *db, const char *reason) {
+    obs_logf("plex_fts_rewrite",
+             "event=rewrite_skipped target=plex reason=%s db=%p",
+             reason, (void*)db);
+}
+
+static int plex_retry_original_after_rewrite_failure(
+    fts_rewrite_prepare_kind kind,
     sqlite3 *db,
     const char *zSql,
     int nByte,
@@ -588,7 +434,7 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
     unsigned int prepFlags,
     sqlite3_stmt **ppStmt,
     const char **pzTail,
-    plex_fts_prepare_kind kind
+    fts_rewrite_prepare_kind kind
 ) {
 #ifdef SQLITE_ENABLE_ICU
     size_t bounded_len = 0;
@@ -601,23 +447,25 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
     char *rewritten = NULL;
     int rc;
 
-    if (!rewrite_enabled() || !db || !zSql || !ppStmt || nByte == 0) {
+    if (!plex_rewrite_enabled() || !db || !zSql || !ppStmt || nByte == 0) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
 
     raw_fn = sqlite3_db_filename(db, "main");
-    if (!target_db_path_matches(&PLEX_FTS_TARGET, raw_fn)) {
+    if (!auto_extension_path_is_target(raw_fn) ||
+        !fts_rewrite_db_basename_matches(raw_fn, PLEX_FTS_TARGET.db_basename)) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
-    if (!prepare_input_lengths(zSql, nByte, &bounded_len, &scan_len, &rewrite_nbyte)) {
+    if (!plex_prepare_input_lengths(zSql, nByte, &bounded_len, &scan_len, &rewrite_nbyte)) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
     if (!match_target_prefix_query(&PLEX_FTS_TARGET, zSql, scan_len, &match)) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
 
-    rewritten = build_rewritten_sql(zSql, bounded_len, &match);
+    rewritten = plex_build_rewritten_sql(zSql, bounded_len, &match);
     if (!rewritten) {
+        plex_log_rewrite_skipped(db, "build_failed");
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
 
@@ -625,15 +473,22 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
     rc = call_real_prepare(
         kind, db, rewritten, rewrite_nbyte, prepFlags, ppStmt, &rewritten_tail
     );
-    if (rc != SQLITE_OK ||
-        !map_end_tail(zSql, rewritten, rewritten_tail, scan_len, &mapped_tail)) {
+    if (rc != SQLITE_OK) {
+        plex_log_rewrite_skipped(db, "rewritten_prepare_failed");
         free(rewritten);
-        return retry_original_after_rewrite_failure(
+        return plex_retry_original_after_rewrite_failure(
+            kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
+        );
+    }
+    if (!plex_map_end_tail(zSql, rewritten, rewritten_tail, scan_len, &mapped_tail)) {
+        plex_log_rewrite_skipped(db, "tail_mismatch");
+        free(rewritten);
+        return plex_retry_original_after_rewrite_failure(
             kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
         );
     }
 
-    log_rewrite_applied(db, rewritten);
+    plex_log_rewrite_applied(db, rewritten);
     if (pzTail) *pzTail = mapped_tail;
     free(rewritten);
     return rc;

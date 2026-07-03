@@ -32,7 +32,7 @@ case "${target}" in
     ;;
   library)
     target_cflags="-DSQLITE_ENABLE_NORMALIZE -DSQLITE_DISABLE_PAGECACHE_OVERFLOW_STATS -DSQLITE_ENABLE_UNLOCK_NOTIFY -DSQLITE_DEFAULT_PCACHE_INITSZ=256 -DSQLITE_DEFAULT_MEMSTATUS=0"
-    sources="sqlite3.c /app/auto_extension.c /app/runtime_optimize.c /app/observability.c /app/slow_query_tracker.c /app/plex_fts_rewrite.c"
+    sources="sqlite3.c /app/auto_extension.c /app/runtime_optimize.c /app/observability.c /app/slow_query_tracker.c /app/fts_lex.c /app/plex_fts_rewrite.c /app/emby_fts_rewrite.c"
     target_ldflags="-fPIC -shared -Wl,-z,defs -Wl,--version-script=/app/build/libsqlite3-version-script.ld -lm -ldl -pthread"
     output="dist/libsqlite3.so"
     MIMALLOC_OBJ="${MIMALLOC_OBJ:-/opt/mimalloc/lib/mimalloc.o}"
@@ -134,6 +134,7 @@ if [ "${target}" = "library" ]; then
     exit 1
   fi
 
+  cp sqlite3.c sqlite3-pristine.c
   patch --fuzz=0 -p1 < /app/build/sqlite-amalgamation.patch
   for runtime_hook_wrapper in sqlite3_step sqlite3_reset sqlite3_finalize; do
     if ! awk -v wrapper="${runtime_hook_wrapper}" '
@@ -269,7 +270,13 @@ if [ "${target}" = "library" ]; then
     auto_extension_progress_handler_pop \
     auto_extension_error_state_push \
     auto_extension_error_state_pop \
+    fts_lex_init \
+    fts_lex_token_text_eq \
+    fts_lex_next_token \
+    fts_lex_match_rhs_is_complete \
+    fts_rewrite_db_basename_matches \
     plex_fts_rewrite_prepare \
+    emby_fts_rewrite_prepare \
     runtime_optimize_seed_path
   do
     leaked_hidden_symbol="$(readelf --dyn-syms -W "${output}" | awk -v sym="${hidden_runtime_symbol}" '$8 == sym { print }')"

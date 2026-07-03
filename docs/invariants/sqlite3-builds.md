@@ -176,8 +176,12 @@ milestone lands.
   `auto_extension_optimize_before_close`,
   `auto_extension_optimize_after_stmt`,
   `auto_extension_progress_handler_push`, and
-  `auto_extension_progress_handler_pop` absent from `.dynsym`. The Plex FTS
-  rewrite helper `plex_fts_rewrite_prepare` is also hidden and absent from
+  `auto_extension_progress_handler_pop` absent from `.dynsym`. The Plex and
+  Emby FTS rewrite helpers `plex_fts_rewrite_prepare` and
+  `emby_fts_rewrite_prepare`, plus the shared lexer helpers `fts_lex_init`,
+  `fts_lex_token_text_eq`, `fts_lex_next_token`,
+  `fts_lex_match_rhs_is_complete`, and
+  `fts_rewrite_db_basename_matches`, are also hidden and absent from
   `.dynsym`.
 - `sqlite3_enable_shared_cache` no-op stub at `src/auto_extension.c:6-15`
   is load-bearing for the Plex variant. **KEEP byte-for-byte intact.**
@@ -186,17 +190,25 @@ milestone lands.
   `auto_extension_path_is_target`, `auto_extension_sorterref_cfg_rc`,
   `auto_extension_pmasz_cfg_rc`, and `sqlite3_enable_shared_cache`, then
   `local: *;` to deny everything else including `mi_*`. The post-link
-  hidden-symbol deny gate in `build/Build.sh:264-281` (including `plex_fts_rewrite_prepare`)
-  stays adjacent to the preserved `build/Build.sh:253-263` `_real` gates as belt-and-braces.
+  hidden-symbol deny gate in `build/Build.sh:265-286` (including
+  `plex_fts_rewrite_prepare`, `emby_fts_rewrite_prepare`, `fts_lex_init`,
+  `fts_lex_token_text_eq`, `fts_lex_next_token`,
+  `fts_lex_match_rhs_is_complete`, and
+  `fts_rewrite_db_basename_matches`) stays adjacent to the preserved
+  `build/Build.sh:255-263`
+  `_real` gates as belt-and-braces.
 - Initialize/config/db-config/open `SQLITE_API` wrappers in
   `src/observability.c` MUST chain to `*_real` and return its result
   UNMODIFIED. Prepare wrappers in `src/observability.c` MUST call
-  `plex_fts_rewrite_prepare`; disabled, generic, non-Plex, nonmatching, drift,
-  and failure paths must prepare the original SQL unchanged, while enabled Plex
-  prefix-tag matches intentionally prepare the
-  `unlikely(tag_type=<value>)` rewrite. Rewrite-success logging is emitted only
-  after the rewritten statement is the returned statement; passthrough, miss,
-  and fallback-to-original paths do not log.
+  `emby_fts_rewrite_prepare`; that helper MUST chain to
+  `plex_fts_rewrite_prepare`, then the matching `*_real` prepare
+  implementation. Disabled, non-target, nonmatching, drift, and failure paths
+  must prepare the original SQL unchanged, while enabled Emby search matches
+  intentionally prepare the scalar-plus-membership rewrite and enabled Plex
+  prefix-tag matches intentionally prepare the `unlikely(tag_type=<value>)`
+  rewrite. Rewrite-success logging is emitted only after the rewritten
+  statement is the returned statement; passthrough, miss, and
+  fallback-to-original paths do not log.
 - Every `obs_forward_config` / `obs_forward_db_config` case-arm
   preserves the exact arity, types, and argument pass-through to
   `sqlite3_config_real` / `sqlite3_db_config_real`. New SQLite opcodes

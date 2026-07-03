@@ -131,8 +131,12 @@ else
   cp "${repo_root}/src/runtime_optimize.c" "${tmpdir}/runtime_optimize.c"
   cp "${repo_root}/src/auto_extension_internal.h" "${tmpdir}/auto_extension_internal.h"
   cp "${repo_root}/src/observability.c" "${tmpdir}/observability.c"
+  cp "${repo_root}/src/fts_lex.c" "${tmpdir}/fts_lex.c"
+  cp "${repo_root}/src/fts_lex.h" "${tmpdir}/fts_lex.h"
   cp "${repo_root}/src/plex_fts_rewrite.c" "${tmpdir}/plex_fts_rewrite.c"
   cp "${repo_root}/src/plex_fts_rewrite.h" "${tmpdir}/plex_fts_rewrite.h"
+  cp "${repo_root}/src/emby_fts_rewrite.c" "${tmpdir}/emby_fts_rewrite.c"
+  cp "${repo_root}/src/emby_fts_rewrite.h" "${tmpdir}/emby_fts_rewrite.h"
   (
     cd "${amalg_dir}"
     patch -p1 < "${repo_root}/build/sqlite-amalgamation.patch" >/dev/null
@@ -171,7 +175,9 @@ else
     "${tmpdir}/runtime_optimize.c" \
     "${tmpdir}/observability.c" \
     "${repo_root}/src/slow_query_tracker.c" \
+    "${tmpdir}/fts_lex.c" \
     "${tmpdir}/plex_fts_rewrite.c" \
+    "${tmpdir}/emby_fts_rewrite.c" \
     -lpthread -lm ${extra_ldflags} \
     -o "${lib_path}"
 
