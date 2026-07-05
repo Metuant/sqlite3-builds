@@ -17,6 +17,7 @@ readonly _PAGE_SIZE
 if [ -z "${_EMBY_INDEXES+x}" ]; then
     _EMBY_INDEXES=(
         "CREATE INDEX IF NOT EXISTS idx_dshadow_mediaitems_parent_type ON MediaItems(ParentId, Type);"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type = 8;"
     )
 fi
 readonly -a _EMBY_INDEXES
@@ -24,6 +25,7 @@ if [ -z "${_PLEX_INDEXES+x}" ]; then
     _PLEX_INDEXES=(
         "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"
         "CREATE INDEX IF NOT EXISTS idx_dshadow_mis_account_updated_guid_cover ON metadata_item_settings (account_id, updated_at DESC, guid, view_offset, last_viewed_at);"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_section_added ON metadata_items (library_section_id, added_at);"
     )
 fi
 readonly -a _PLEX_INDEXES
@@ -31,6 +33,7 @@ if [ -z "${_PLEX_STAT4_LEADER_INDEXES+x}" ]; then
     _PLEX_STAT4_LEADER_INDEXES=(
         "idx_dshadow_taggings_tag_id_metadata_item_id"
         "idx_dshadow_mis_account_updated_guid_cover"
+        "idx_dshadow_metadata_items_section_added"
     )
 fi
 readonly -a _PLEX_STAT4_LEADER_INDEXES

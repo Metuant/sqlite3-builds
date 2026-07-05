@@ -284,6 +284,7 @@ targets="$(discover_plex_stat4_analyze_targets "$real_sqlite" "$fixture")"
 assert_contains "$targets" $'T\ttaggings' "STAT4 worklist taggings table target"
 assert_contains "$targets" $'T\tmetadata_item_settings' "STAT4 worklist metadata_item_settings table target"
 assert_contains "$targets" $'I\tindex_metadata_items_on_library_section_id' "STAT4 worklist safe metadata_items index target"
+assert_contains "$targets" $'I\tidx_dshadow_metadata_items_section_added' "STAT4 worklist recent metadata_items index target"
 assert_contains "$targets" $'I\tix_auto_icu_safe' "STAT4 worklist safe explicit index beside ICU autoindex"
 assert_contains "$targets" $'T\tquote"table' "STAT4 worklist quote-bearing table target"
 assert_not_contains "$targets" $'T\tmetadata_items' "STAT4 worklist skips table-level metadata_items"
@@ -361,14 +362,17 @@ assert_contains "$(cat "$tmp/stat4-run.out")" "Plex STAT4 analyze targets:" "STA
 stat4_log="$(cat "$STAT4_ANALYZE_LOG")"
 assert_not_contains "$stat4_log" 'ANALYZE "metadata_items"' "STAT4 run skips metadata_items table ANALYZE"
 assert_contains "$stat4_log" 'ANALYZE "index_metadata_items_on_library_section_id"' "STAT4 run analyzes safe metadata_items index"
+assert_contains "$stat4_log" 'ANALYZE "idx_dshadow_metadata_items_section_added"' "STAT4 run analyzes recent metadata_items index"
 assert_not_contains "$stat4_log" 'ANALYZE "index_title_sort_custom_icu"' "STAT4 run skips ICU index"
 assert_contains "$stat4_log" 'ANALYZE "quote""table"' "STAT4 run quotes identifiers"
 if [ "$stat4_available" = "1" ]; then
   assert_contains "$(cat "$tmp/stat4-run.out")" "Plex STAT4 sqlite_stat4 rows:" "STAT4 run final row count"
   taggings_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_taggings_tag_id_metadata_item_id';")"
   settings_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_mis_account_updated_guid_cover';")"
+  recent_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_metadata_items_section_added';")"
   assert_int_gt "$taggings_stat4" 0 "taggings leader index sqlite_stat4 rows"
   assert_int_gt "$settings_stat4" 0 "metadata_item_settings leader index sqlite_stat4 rows"
+  assert_int_gt "$recent_stat4" 0 "recent metadata_items leader index sqlite_stat4 rows"
 else
   printf 'SKIP: sqlite_stat4 unavailable in this sqlite3 build\n'
 fi
@@ -477,6 +481,7 @@ assert_eq "" "$post_swap_repair_line" "no metadata_items repair in post-swap SQL
 if [ "$stat4_available" = "1" ]; then
   assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_taggings_tag_id_metadata_item_id';")" 0 "pipeline taggings STAT4 rows"
   assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_mis_account_updated_guid_cover';")" 0 "pipeline metadata_item_settings STAT4 rows"
+  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_metadata_items_section_added';")" 0 "pipeline recent metadata_items STAT4 rows"
 fi
 
 corrupt_dir="$tmp/corrupt"

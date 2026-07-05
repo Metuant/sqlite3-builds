@@ -65,6 +65,12 @@ mediaitems_eqp() {
   "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT Id FROM MediaItems WHERE ParentId=4600 AND Type=8;" | tr '\r\n' ' '
 }
 
+latest_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT Id FROM MediaItems WHERE Type=8 AND coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey)='series-6' ORDER BY DateCreated DESC LIMIT 1;" | tr '\r\n' ' '
+}
+
 assert_eqp_uses_emby_index() {
   local eqp phase
   eqp="$1"
@@ -72,6 +78,15 @@ assert_eqp_uses_emby_index() {
   assert_contains "$eqp" "SEARCH" "$phase EQP search"
   assert_contains "$eqp" "idx_dshadow_mediaitems_parent_type" "$phase EQP index"
   assert_not_contains "$eqp" "SCAN" "$phase EQP no scan"
+}
+
+assert_eqp_uses_latest_index() {
+  local eqp phase
+  eqp="$1"
+  phase="$2"
+  assert_contains "$eqp" "SEARCH" "$phase latest EQP search"
+  assert_contains "$eqp" "idx_dshadow_emby_latest_gk_dc" "$phase latest EQP index"
+  assert_not_contains "$eqp" "USE TEMP B-TREE" "$phase latest EQP no temp sort"
 }
 
 real_sqlite="$(command -v sqlite3 || true)"
@@ -203,19 +218,36 @@ CREATE TABLE MediaItems(
   Id INTEGER PRIMARY KEY,
   ParentId INTEGER NOT NULL,
   Type INTEGER NOT NULL,
-  Name TEXT
+  Name TEXT,
+  DateCreated INTEGER,
+  SeriesPresentationUniqueKey TEXT,
+  PresentationUniqueKey TEXT,
+  UserDataKeyId INTEGER
 );
 WITH RECURSIVE seq(x) AS (
   VALUES(1)
   UNION ALL
   SELECT x + 1 FROM seq WHERE x < 5000
 )
-INSERT INTO MediaItems(Id, ParentId, Type, Name)
+INSERT INTO MediaItems(
+  Id,
+  ParentId,
+  Type,
+  Name,
+  DateCreated,
+  SeriesPresentationUniqueKey,
+  PresentationUniqueKey,
+  UserDataKeyId
+)
 SELECT
   x,
   CASE WHEN x <= 4500 THEN x % 25 ELSE x END,
   CASE WHEN x % 20 = 0 THEN 8 ELSE 1 END,
-  'item-' || x
+  'item-' || x,
+  2000000 - x,
+  CASE WHEN x % 20 = 0 THEN 'series-' || (x % 7) ELSE NULL END,
+  'presentation-' || (x % 11),
+  500000 + x
 FROM seq;
 EOF_SQL
 }
@@ -437,7 +469,9 @@ assert_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check;" "Emby
 assert_not_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check(1);" "Emby no bounded integrity_check"
 assert_contains "$(cat "$SQLITE_MAINTENANCE_LOG")" "ANALYZE; PRAGMA optimize=0x10002;" "Emby staged ANALYZE before optimize"
 assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_mediaitems_parent_type';")" "Emby pipeline index count"
+assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_emby_latest_gk_dc';")" "Emby pipeline latest index count"
 assert_eqp_uses_emby_index "$(mediaitems_eqp "$emby")" "Emby pipeline"
+assert_eqp_uses_latest_index "$(latest_eqp "$emby")" "Emby pipeline"
 
 printf 'SKIP: Docker stopped-container gate cases require a live Docker daemon and are intentionally not run by this local helper smoke test\n'
 printf 'optimize_media_servers pipeline smoke tests passed\n'

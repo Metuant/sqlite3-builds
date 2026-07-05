@@ -86,17 +86,31 @@ static int cmp_u64(const void *a, const void *b) {
     return (av > bv) - (av < bv);
 }
 
-static void configure_env(const char *rewrite_value) {
+static void configure_env(const char *fts, const char *fanout, const char *dashboard) {
     if (setenv("SQLITE3_DISABLE_AUTOPRAGMA", "1", 1) != 0) failf("setenv AUTOPRAGMA failed");
     if (setenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1", 1) != 0) failf("setenv RUNTIME failed");
     if (setenv("SQLITE3_DISABLE_OBSERVABILITY", "1", 1) != 0) failf("setenv OBS failed");
     if (setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1", 1) != 0) failf("setenv PLEX failed");
-    if (rewrite_value) {
-        if (setenv("SQLITE3_DISABLE_EMBY_FTS_REWRITE", rewrite_value, 1) != 0) {
-            failf("setenv EMBY failed");
+    if (fts) {
+        if (setenv("SQLITE3_DISABLE_EMBY_FTS_REWRITE", fts, 1) != 0) {
+            failf("setenv EMBY FTS failed");
         }
     } else if (unsetenv("SQLITE3_DISABLE_EMBY_FTS_REWRITE") != 0) {
-        failf("unsetenv EMBY failed");
+        failf("unsetenv EMBY FTS failed");
+    }
+    if (fanout) {
+        if (setenv("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", fanout, 1) != 0) {
+            failf("setenv EMBY FANOUT failed");
+        }
+    } else if (unsetenv("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE") != 0) {
+        failf("unsetenv EMBY FANOUT failed");
+    }
+    if (dashboard) {
+        if (setenv("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", dashboard, 1) != 0) {
+            failf("setenv EMBY DASHBOARD failed");
+        }
+    } else if (unsetenv("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE") != 0) {
+        failf("unsetenv EMBY DASHBOARD failed");
     }
 }
 
@@ -248,7 +262,9 @@ static void report_low_prepare_cost(const char *label, bench_stats target) {
 
 static int child_case(
     const char *label,
-    const char *rewrite_value,
+    const char *fts,
+    const char *fanout,
+    const char *dashboard,
     const char *basename,
     bench_work work,
     int seed,
@@ -260,7 +276,7 @@ static int child_case(
     bench_stats baseline;
     bench_stats target;
 
-    configure_env(rewrite_value);
+    configure_env(fts, fanout, dashboard);
     make_temp_dir();
     temp_path(path, sizeof(path), basename);
     unlink(path);
@@ -281,7 +297,9 @@ static int child_case(
 
 static void run_child(
     const char *label,
-    const char *rewrite_value,
+    const char *fts,
+    const char *fanout,
+    const char *dashboard,
     const char *basename,
     bench_work work,
     int seed,
@@ -290,21 +308,23 @@ static void run_child(
     pid_t pid = fork();
     int status;
     if (pid < 0) failf("fork(%s) failed: %s", label, strerror(errno));
-    if (pid == 0) _exit(child_case(label, rewrite_value, basename, work, seed, assertion));
+    if (pid == 0) _exit(child_case(label, fts, fanout, dashboard, basename, work, seed, assertion));
     if (waitpid(pid, &status, 0) < 0) failf("waitpid(%s) failed: %s", label, strerror(errno));
     if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) failf("child %s failed status=%d", label, status);
 }
 
 int main(void) {
-    run_child("disabled-default-select", NULL, "library.db", WORK_PREPARE_SELECT, 0, ASSERT_NONE);
-    run_child("enabled-nontarget-select", "0", "com.plexapp.plugins.library.db",
+    run_child("default-on-select", NULL, NULL, NULL, "library.db", WORK_PREPARE_SELECT, 0, ASSERT_NONE);
+    run_child("enabled-nontarget-select", "0", NULL, NULL, "com.plexapp.plugins.library.db",
               WORK_PREPARE_SELECT, 0, ASSERT_ADVISORY_LOW_PREPARE_COST);
-    run_child("enabled-emby-miss", "0", "library.db", WORK_PREPARE_SELECT, 1,
+    run_child("enabled-emby-miss", "0", NULL, NULL, "library.db", WORK_PREPARE_SELECT, 1,
               ASSERT_ADVISORY_LOW_PREPARE_COST);
-    run_child("enabled-emby-large-miss", "0", "library.db", WORK_PREPARE_LARGE_MISS, 1,
+    run_child("enabled-emby-large-miss", "0", NULL, NULL, "library.db", WORK_PREPARE_LARGE_MISS, 1,
               ASSERT_ADVISORY_LOW_PREPARE_COST);
-    run_child("enabled-emby-match", "0", "library.db", WORK_PREPARE_MATCH, 1, ASSERT_NONE);
-    run_child("enabled-emby-exec-miss", "0", "library.db", WORK_EXEC_PRAGMA, 1, ASSERT_NONE);
+    run_child("enabled-all-large-miss", "0", "0", "0", "library.db", WORK_PREPARE_LARGE_MISS, 1,
+              ASSERT_ADVISORY_LOW_PREPARE_COST);
+    run_child("enabled-emby-match", "0", NULL, NULL, "library.db", WORK_PREPARE_MATCH, 1, ASSERT_NONE);
+    run_child("enabled-emby-exec-miss", "0", NULL, NULL, "library.db", WORK_EXEC_PRAGMA, 1, ASSERT_NONE);
     printf("emby fts rewrite prepare bench completed\n");
     return 0;
 }

@@ -5,6 +5,7 @@ set -euo pipefail
 index_test_init "emby-index"
 
 EMBY_INDEX_NAME="idx_dshadow_mediaitems_parent_type"
+EMBY_LATEST_INDEX_NAME="idx_dshadow_emby_latest_gk_dc"
 
 create_mediaitems_db() {
   local db page_size
@@ -20,19 +21,36 @@ CREATE TABLE MediaItems(
   Id INTEGER PRIMARY KEY,
   ParentId INTEGER NOT NULL,
   Type INTEGER NOT NULL,
-  Name TEXT
+  Name TEXT,
+  DateCreated INTEGER,
+  SeriesPresentationUniqueKey TEXT,
+  PresentationUniqueKey TEXT,
+  UserDataKeyId INTEGER
 );
 WITH RECURSIVE seq(x) AS (
   VALUES(1)
   UNION ALL
   SELECT x + 1 FROM seq WHERE x < 5000
 )
-INSERT INTO MediaItems(Id, ParentId, Type, Name)
+INSERT INTO MediaItems(
+  Id,
+  ParentId,
+  Type,
+  Name,
+  DateCreated,
+  SeriesPresentationUniqueKey,
+  PresentationUniqueKey,
+  UserDataKeyId
+)
 SELECT
   x,
   CASE WHEN x <= 4500 THEN x % 25 ELSE x END,
   CASE WHEN x % 20 = 0 THEN 8 ELSE 1 END,
-  'item-' || x
+  'item-' || x,
+  2000000 - x,
+  CASE WHEN x % 20 = 0 THEN 'series-' || (x % 7) ELSE NULL END,
+  'presentation-' || (x % 11),
+  500000 + x
 FROM seq;
 CREATE TABLE SyncJobs2(Id INTEGER PRIMARY KEY, Name TEXT);
 INSERT INTO SyncJobs2(Id, Name) VALUES(1, 'fixture');
@@ -55,10 +73,22 @@ index_count() {
   index_test_index_count "$db" "$EMBY_INDEX_NAME"
 }
 
+latest_index_count() {
+  local db
+  db="$1"
+  index_test_index_count "$db" "$EMBY_LATEST_INDEX_NAME"
+}
+
 mediaitems_eqp() {
   local db
   db="$1"
   "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT Id FROM MediaItems WHERE ParentId=4600 AND Type=8;" | tr '\r\n' ' '
+}
+
+latest_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT Id FROM MediaItems WHERE Type=8 AND coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey)='series-6' ORDER BY DateCreated DESC LIMIT 1;" | tr '\r\n' ' '
 }
 
 assert_eqp_uses_emby_index() {
@@ -70,6 +100,15 @@ assert_eqp_uses_emby_index() {
   assert_not_contains "$eqp" "SCAN" "$phase EQP no scan"
 }
 
+assert_eqp_uses_latest_index() {
+  local eqp phase
+  eqp="$1"
+  phase="$2"
+  assert_contains "$eqp" "SEARCH" "$phase latest EQP search"
+  assert_contains "$eqp" "$EMBY_LATEST_INDEX_NAME" "$phase latest EQP index"
+  assert_not_contains "$eqp" "USE TEMP B-TREE" "$phase latest EQP no temp sort"
+}
+
 optimize_sql="$(build_emby_optimize_sql)"
 
 published="$tmp/published.db"
@@ -77,9 +116,10 @@ create_mediaitems_db "$published"
 run_rebuild_capture published-first "$published" 4096 "$optimize_sql"
 assert_eq 0 "$(cat "$tmp/published-first.rc")" "first Emby index pipeline rc"
 assert_eq "1" "$(index_count "$published")" "published Emby index count"
+assert_eq "1" "$(latest_index_count "$published")" "published Emby latest index count"
 stat1_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1;")"
 assert_int_gt "$stat1_count" 0 "published sqlite_stat1 row count"
-stat1_mediaitems_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl='MediaItems' OR idx='$EMBY_INDEX_NAME';")"
+stat1_mediaitems_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl='MediaItems' OR idx IN ('$EMBY_INDEX_NAME','$EMBY_LATEST_INDEX_NAME');")"
 assert_int_gt "$stat1_mediaitems_count" 0 "published sqlite_stat1 MediaItems/index row count"
 stat4_exists="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_stat4';")"
 if [ "$stat4_exists" = "1" ]; then
@@ -89,11 +129,13 @@ else
   printf 'SKIP: sqlite_stat4 unavailable in this sqlite3 build\n'
 fi
 assert_eqp_uses_emby_index "$(mediaitems_eqp "$published")" "published post-ANALYZE"
+assert_eqp_uses_latest_index "$(latest_eqp "$published")" "published post-ANALYZE"
 
 run_rebuild_capture published-second "$published" 4096 "$optimize_sql"
 assert_eq 0 "$(cat "$tmp/published-second.rc")" "second Emby index pipeline rc"
 assert_eq "" "$(cat "$tmp/published-second.err")" "second Emby index pipeline stderr"
 assert_eq "1" "$(index_count "$published")" "idempotent Emby index count"
+assert_eq "1" "$(latest_index_count "$published")" "idempotent Emby latest index count"
 
 warn_db="$tmp/warn-not-abort.db"
 create_mediaitems_db "$warn_db" 1024
@@ -106,6 +148,7 @@ assert_eq 0 "$(cat "$tmp/warn-not-abort.rc")" "warn-not-abort rc"
 assert_contains "$(cat "$tmp/warn-not-abort.err")" "WARNING: staged maintenance SQL failed" "warn-not-abort warning"
 assert_eq "4096" "$("$real_sqlite" "$warn_db" "PRAGMA page_size;")" "warn-not-abort published page_size"
 assert_eq "0" "$(index_count "$warn_db")" "warn-not-abort no index"
+assert_eq "0" "$(latest_index_count "$warn_db")" "warn-not-abort no latest index"
 
 gate_db="$tmp/staged-gate.db"
 create_mediaitems_db "$gate_db"
@@ -125,8 +168,12 @@ for ddl in "${_EMBY_INDEXES[@]}"; do
   "$real_sqlite" "$eqp_db" "$ddl"
 done
 assert_eqp_uses_emby_index "$(mediaitems_eqp "$eqp_db")" "pre-ANALYZE"
+assert_eqp_uses_latest_index "$(latest_eqp "$eqp_db")" "pre-ANALYZE"
 "$real_sqlite" "$eqp_db" "ANALYZE;"
 assert_eqp_uses_emby_index "$(mediaitems_eqp "$eqp_db")" "post-ANALYZE"
+assert_eqp_uses_latest_index "$(latest_eqp "$eqp_db")" "post-ANALYZE"
 assert_eq "1" "$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM MediaItems INDEXED BY $EMBY_INDEX_NAME WHERE ParentId=4600 AND Type=8;")" "INDEXED BY usability probe"
+latest_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM MediaItems INDEXED BY $EMBY_LATEST_INDEX_NAME WHERE Type=8 AND coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey)='series-6';")"
+assert_int_gt "$latest_indexed_count" 0 "latest INDEXED BY usability probe"
 
 printf 'optimize_media_servers Emby index tests passed\n'

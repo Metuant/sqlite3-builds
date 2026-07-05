@@ -55,6 +55,7 @@ tags.
 For cold-start runtime support changes, see `docs/extending.md`. For the
 schema v3 `baked-pins.txt` contract and validator rules, see
 `docs/baked-pins-schema.md`.
+For runtime kill-switches and numeric tunables, see `docs/env-vars.md`.
 
 ## Pre-compiled binary
 

@@ -1,0 +1,1 @@
+with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select A.Id,A.Name from mediaitems A join fts_search9 on A.Id=fts_search9.RowId and fts_search9 match @SearchTerm where A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) ORDER BY Rank ASC LIMIT 12

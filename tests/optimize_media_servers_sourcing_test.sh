@@ -176,15 +176,15 @@ assert_unset STATS_BANDWIDTH_RETAIN_DAYS
   printf 'bad-emby-db:%s\n' "${_EMBY_DB:-unset}"
   exit 35
 }
-[ "${#_EMBY_INDEXES[@]}" -eq 1 ] || {
+[ "${#_EMBY_INDEXES[@]}" -eq 2 ] || {
   printf 'bad-emby-index-count:%s\n' "${#_EMBY_INDEXES[@]}"
   exit 36
 }
-[ "${#_PLEX_INDEXES[@]}" -eq 2 ] || {
+[ "${#_PLEX_INDEXES[@]}" -eq 3 ] || {
   printf 'bad-plex-index-count:%s\n' "${#_PLEX_INDEXES[@]}"
   exit 37
 }
-[ "${#_PLEX_STAT4_LEADER_INDEXES[@]}" -eq 2 ] || {
+[ "${#_PLEX_STAT4_LEADER_INDEXES[@]}" -eq 3 ] || {
   printf 'bad-plex-stat4-leader-count:%s\n' "${#_PLEX_STAT4_LEADER_INDEXES[@]}"
   exit 38
 }

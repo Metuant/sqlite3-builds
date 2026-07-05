@@ -12,7 +12,16 @@ large static fixtures.
 ## Manual Host Gate
 
 `tools/ci/emby-fts-rewrite-dump.c` is a manual host-gate utility for SYN-011.
-It opens a copied database whose basename is exactly `library.db`, enables the
-Emby rewrite with `SQLITE3_DISABLE_EMBY_FTS_REWRITE=0`, prepares one raw input
-template, and writes the resulting `sqlite3_sql(stmt)` text. It has no CI
-consumer.
+It opens a copied database whose basename is exactly `library.db`. The Emby FTS
+rewrite is default-on; literal `SQLITE3_DISABLE_EMBY_FTS_REWRITE=1` disables
+it. The utility prepares one raw input template and writes the resulting
+`sqlite3_sql(stmt)` text. It has no CI consumer.
+
+## Inventory
+
+- Fan-out fixtures cover RES-A, People, links-search, Browse-by-name, and
+  Favorites-first membership rewrites.
+- Dashboard Latest fixtures cover LIMIT 12/16/20 and projection variation.
+- Latest capture-miss fixtures cover projection-shape drift after the family
+  pre-gate.
+- Latest aggregate/window negative fixtures prove fail-open projection guards.

@@ -6,9 +6,11 @@ index_test_init "plex-index"
 
 PLEX_TAGGINGS_INDEX="idx_dshadow_taggings_tag_id_metadata_item_id"
 PLEX_SETTINGS_INDEX="idx_dshadow_mis_account_updated_guid_cover"
+PLEX_RECENT_INDEX="idx_dshadow_metadata_items_section_added"
 PLEX_INDEX_NAMES=(
   "$PLEX_TAGGINGS_INDEX"
   "$PLEX_SETTINGS_INDEX"
+  "$PLEX_RECENT_INDEX"
 )
 
 create_plex_index_db() {
@@ -62,14 +64,26 @@ SELECT
 FROM seq;
 CREATE TABLE metadata_items(
   id INTEGER PRIMARY KEY,
+  library_section_id INTEGER NOT NULL,
+  metadata_type INTEGER NOT NULL,
+  parent_id INTEGER,
   added_at INTEGER,
   originally_available_at INTEGER
 );
-INSERT INTO metadata_items(id, added_at, originally_available_at)
-VALUES
-  (1, 9999999999, 1000000),
-  (2, 1000000, 1),
-  (3, 1000000, 1000000);
+WITH RECURSIVE seq(x) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT x + 1 FROM seq WHERE x < 5000
+)
+INSERT INTO metadata_items(id, library_section_id, metadata_type, parent_id, added_at, originally_available_at)
+SELECT
+  x,
+  CASE WHEN x % 2 = 0 THEN 1 ELSE 2 END,
+  CASE WHEN x % 3 = 0 THEN 10 ELSE 4 END,
+  NULL,
+  3000000 - x,
+  2000000 - x
+FROM seq;
 EOF_SQL
 }
 
@@ -110,6 +124,12 @@ settings_eqp() {
   "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT guid, view_offset, last_viewed_at FROM metadata_item_settings WHERE account_id=42 AND view_offset > 0 AND last_viewed_at > 100000 ORDER BY updated_at DESC LIMIT 5;" | tr '\r\n' ' '
 }
 
+recent_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT id FROM metadata_items WHERE library_section_id=2 AND metadata_type IN (4,10) ORDER BY added_at DESC LIMIT 5;" | tr '\r\n' ' '
+}
+
 assert_eqp_uses_taggings_index() {
   local eqp phase
   eqp="$1"
@@ -130,6 +150,15 @@ assert_eqp_uses_settings_index() {
   assert_not_contains "$eqp" "USE TEMP B-TREE" "$phase settings EQP no sort"
 }
 
+assert_eqp_uses_recent_index() {
+  local eqp phase
+  eqp="$1"
+  phase="$2"
+  assert_contains "$eqp" "SEARCH" "$phase recent EQP search"
+  assert_contains "$eqp" "$PLEX_RECENT_INDEX" "$phase recent EQP index"
+  assert_not_contains "$eqp" "USE TEMP B-TREE" "$phase recent EQP no sort"
+}
+
 plex_dir="$tmp/plex-dbs"
 mkdir -p "$plex_dir"
 published="$plex_dir/$_PLEX_DB"
@@ -137,7 +166,7 @@ create_plex_index_db "$published"
 index_test_run_plex_optimize_capture published-first "$plex_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 assert_eq 0 "$(cat "$tmp/published-first.rc")" "first Plex index pipeline rc"
 assert_plex_indexes_present "$published"
-stat1_plex_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('taggings','metadata_item_settings') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX');")"
+stat1_plex_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('taggings','metadata_item_settings','metadata_items') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX','$PLEX_RECENT_INDEX');")"
 assert_int_gt "$stat1_plex_count" 0 "published sqlite_stat1 Plex index row count"
 stat4_exists="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_stat4';")"
 if [ "$stat4_exists" = "1" ]; then
@@ -148,6 +177,7 @@ else
 fi
 assert_eqp_uses_taggings_index "$(taggings_eqp "$published")" "published post-ANALYZE"
 assert_eqp_uses_settings_index "$(settings_eqp "$published")" "published post-ANALYZE"
+assert_eqp_uses_recent_index "$(recent_eqp "$published")" "published post-ANALYZE"
 
 index_test_run_plex_optimize_capture published-second "$plex_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 assert_eq 0 "$(cat "$tmp/published-second.rc")" "second Plex index pipeline rc"
@@ -189,11 +219,15 @@ for ddl in "${_PLEX_INDEXES[@]}"; do
 done
 assert_eqp_uses_taggings_index "$(taggings_eqp "$eqp_db")" "pre-ANALYZE"
 assert_eqp_uses_settings_index "$(settings_eqp "$eqp_db")" "pre-ANALYZE"
+assert_eqp_uses_recent_index "$(recent_eqp "$eqp_db")" "pre-ANALYZE"
 "$real_sqlite" "$eqp_db" "ANALYZE;"
 assert_eqp_uses_taggings_index "$(taggings_eqp "$eqp_db")" "post-ANALYZE"
 assert_eqp_uses_settings_index "$(settings_eqp "$eqp_db")" "post-ANALYZE"
+assert_eqp_uses_recent_index "$(recent_eqp "$eqp_db")" "post-ANALYZE"
 assert_eq "1" "$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM taggings INDEXED BY $PLEX_TAGGINGS_INDEX WHERE tag_id=7 AND metadata_item_id=1007;")" "taggings INDEXED BY usability probe"
 settings_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM metadata_item_settings INDEXED BY $PLEX_SETTINGS_INDEX WHERE account_id=42 AND view_offset > 0 AND last_viewed_at > 100000;")"
 assert_int_gt "$settings_indexed_count" 0 "settings INDEXED BY usability probe"
+recent_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM metadata_items INDEXED BY $PLEX_RECENT_INDEX WHERE library_section_id=2 AND metadata_type IN (4,10);")"
+assert_int_gt "$recent_indexed_count" 0 "recent INDEXED BY usability probe"
 
 printf 'optimize_media_servers Plex index tests passed\n'

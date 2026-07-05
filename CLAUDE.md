@@ -12,6 +12,7 @@ Project-specific guidance:
 - The global kernel still applies; read `~/.claude/CLAUDE.md`.
 - Treat `docs/architecture.md` as the current repository map for build, LSIO
   mod, smoke-test, and maintenance behavior.
+- `docs/architecture.md` is a slim index linking to focused docs under `docs/architecture/` for build, rewrite-engine, observability, smoke-tests, lsio-mods, and maintenance.
 - JF deployment is unsupported until a current binding design and validation
   plan land.
 - Plex uses renamed ICU 69 runtime files. LSIO mod code MUST NOT replace,
@@ -50,7 +51,16 @@ Project-specific guidance:
   `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
   other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
   `SQLITE3_DISABLE_SLOW_QUERY`, and `SQLITE3_DISABLE_AUTOPRAGMA` kill-switches.
-  Keep Emby FTS rewrite (`SQLITE3_DISABLE_EMBY_FTS_REWRITE`) opt-in: literal `0`
-  enables; unset, literal `1`, and every other value disable.
+  Keep Emby FTS rewrite (`SQLITE3_DISABLE_EMBY_FTS_REWRITE`) opt-out (default-on
+  in the Emby build): literal `1` disables; unset, literal `0`, and every other
+  value enable. Keep the two Emby membership/dashboard knobs opt-in:
+  `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` (Browse-by-name / Favorites-first / RES-A /
+  People-Studios-Type-29) and `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE`
+  (Episode-Latest) each enable on literal `0`; unset, literal `1`, and every
+  other value disable. All three are fail-open and independent of
+  `SQLITE3_DISABLE_AUTOPRAGMA`. Advisory: to also optimize the Emby fan-out
+  families, enable `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0`; it is not required
+  and is not code-enforced. Knob naming:
+  `SQLITE3_DISABLE_<ENGINE>_<PURPOSE>_REWRITE`.
 - Do not create or modify `AGENTS.md` here unless explicitly asked; the root
   convention is a symlink to this file.
