@@ -237,18 +237,18 @@ under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
 For the generic variant, it builds the shared library, requires at least one
 `@GLIBC_`-versioned undefined symbol, rejects any observed `@GLIBC_` reference
 above `GENERIC_GLIBC_MAX` (`2.27`), and runs the config-after-dlopen,
-shutdown/reinit, auto-extension, runtime optimize, Plex FTS rewrite, and Emby
-FTS rewrite smokes plus the Plex and Emby FTS prepare benches. The benches
+shutdown/reinit, auto-extension, runtime optimize, Plex rewrite, and Emby
+rewrite smokes plus the Plex and Emby FTS prepare benches. The benches
 report advisory p50/p95 threshold verdicts for enabled non-target passthrough
 and target-DB miss prepare costs; timing verdicts do not fail the image build.
-The generic variant must show the Plex rewrite is inert even when the Plex env
-gate is enabled.
+The generic variant must show the Plex rewrite helper is inert even when the
+Plex env gates are enabled.
 
 For the Plex variant, it also builds ICU 69.1 under `/opt/icu-69-plex`, exposes
 `PLEX_ICU_INCLUDE` and `PLEX_ICU_LIB`, checks ICU soname and symbol shape with
 `ldd` and `nm`, runs `icu_smoke`, and runs the config-after-dlopen,
-shutdown/reinit, auto-extension, runtime optimize, Plex FTS rewrite, and Emby
-FTS rewrite smokes plus the Plex and Emby FTS prepare benches with the Plex ICU
+shutdown/reinit, auto-extension, runtime optimize, Plex rewrite, and Emby
+rewrite smokes plus the Plex and Emby FTS prepare benches with the Plex ICU
 path available. The benches report advisory p50/p95 threshold verdicts for
 enabled non-target passthrough and target-DB miss prepare costs; timing verdicts
 do not fail the image build. The Plex branch builds under Alpine/musl so the
@@ -403,4 +403,3 @@ do not run the runtime `sqlite3_config` re-assert.
 The library profile pins `-DSQLITE_DEFAULT_AUTOVACUUM=0`.
 `scripts/optimize_media_servers.sh` sets `PRAGMA auto_vacuum=NONE` explicitly
 during planned-downtime database rebuilds, matching the compile default.
-

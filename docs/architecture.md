@@ -46,7 +46,9 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `src/slow_query_tracker.c` | Hidden observability satellite for PROFILE-based slow-query logging and bounded per-template stats. |
 | `src/fts_lex.c` | Built into both library variants; owns the shared FTS rewrite SQL token scanner. |
 | `src/fts_lex.h` | Private shared lexer header consumed by the Plex and Emby FTS rewrite wrappers. |
-| `src/emby_fts_rewrite.c` | Built into both library variants; owns the Emby FTS scalar rewrite plus opt-in fan-out and dashboard membership rewrites. |
+| `src/plex_fts_rewrite.c` | Built into both library variants; owns the Plex FTS prefix-tag rewrite plus opt-in taggings-membership and On-Deck rewrites. |
+| `src/plex_fts_rewrite.h` | Private prepare-wrapper seam header between the Emby helper and Plex rewrite helper. |
+| `src/emby_fts_rewrite.c` | Built into both library variants; owns the Emby FTS scalar rewrite plus opt-in fan-out and dashboard Latest rewrites. |
 | `src/emby_fts_rewrite.h` | Private prepare-wrapper seam header between `src/observability.c` and `src/emby_fts_rewrite.c`. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
 | `tests/runtime_optimize_smoke.c` | Runtime smoke for close and inline runtime optimize target gating, STAT1/STAT4 refresh, kill switches, skip gates, cadence, close semantics, and shutdown/reinit. |
@@ -55,6 +57,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
 | `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
+| `tests/plex_fts_rewrite_smoke.c` | Runtime smoke for Plex FTS, taggings-membership, and On-Deck rewrites, env gates, index gates, fail-open paths, and row parity. |
 | `tests/emby_fts_rewrite_smoke.c` | Runtime smoke and direct canary for Emby FTS, fan-out, and dashboard rewrites, fail-open gates, fixtures, scalar behavior, and row parity. |
 | `tests/emby_fts_rewrite_prepare_bench.c` | Advisory prepare-cost bench for default-on-select, enabled-nontarget-select, enabled-emby-miss, enabled-emby-large-miss, enabled-all-large-miss, enabled-emby-match, and enabled-emby-exec-miss Emby rewrite paths. |
 | `tests/fixtures/emby-fts-rewrite/` | Raw Emby search statement fixtures and expected prepare-wrapper output for smoke and manual host-gate checks. |
@@ -220,11 +223,12 @@ Observability:
 - Prepare wrappers must chain through the Emby helper, then the Plex helper,
   then the hidden real SQLite implementation. Disabled, non-target,
   nonmatching, drift, and failure paths must prepare the original SQL unchanged;
-  enabled Emby search matches intentionally prepare the scalar-plus-membership
-  rewrite, and enabled Plex prefix-tag matches intentionally prepare the
-  `unlikely(tag_type=<value>)` rewrite. Rewrite helpers log only after the
-  rewritten statement is effectively returned or after a target-shape
-  rewrite-path failure falls back.
+  enabled Emby matches intentionally prepare the scalar-plus-membership,
+  fan-out, or dashboard Latest rewrite; enabled Plex matches intentionally
+  prepare the `unlikely(tag_type=<value>)`, taggings-membership conjunct, or
+  On-Deck ranked-subquery rewrite. Rewrite helpers log only after the rewritten
+  statement is effectively returned or after a target-shape rewrite-path
+  failure falls back.
 - Observability logging must not inject config, db-config, open-flag,
   filename, handle, or return-code behavior.
 - Trace registration failure must log and continue; it must never fail

@@ -319,6 +319,51 @@ is a synthetic version-bump signal against the workflow-produced `cli/sqlite3`
 STAT4/FTS path. It requires `ENABLE_STAT4` and FTS3/FTS4 and asserts the
 original `tag_type`-first plan flips to an FTS-first `unlikely()` plan.
 
+## Plex Taggings Membership Rewrite
+
+The Plex taggings rewrite is opt-in:
+`SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=0` enables it; unset, literal `1`, and
+every other value disable it. It is independent of
+`SQLITE3_DISABLE_PLEX_FTS_REWRITE` and `SQLITE3_DISABLE_AUTOPRAGMA`.
+
+The matcher accepts one `tags.id=<integer>` predicate in the same syntactic
+SELECT block as canonical `taggings.metadata_item_id=metadata_items.id` and
+`taggings.tag_id=tags.id` joins. It rejects bound, named, string, duplicate, or
+ambiguous tag ids, existing taggings-membership conjuncts, semicolon tails,
+non-Plex basenames, and FTS shape 09 containing `fts4_metadata_titles_icu`.
+Every matched prepare probes `sqlite_master` for
+`idx_dshadow_taggings_tag_id_metadata_item_id`; absence fails open with
+`reason=index_missing`.
+
+On a match, the helper appends
+`AND metadata_items.id IN (SELECT metadata_item_id FROM taggings WHERE tag_id=<N>)`
+after the validated `tags.id=<N>` predicate and preserves all other SQL bytes.
+Build failure, rewritten-prepare failure, tail mismatch, or index-probe failure
+prepares the original SQL.
+
+## Plex On-Deck Rewrite
+
+The Plex On-Deck rewrite is opt-in:
+`SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enables it; unset, literal `1`, and
+every other value disable it. It is independent of
+`SQLITE3_DISABLE_PLEX_FTS_REWRITE` and `SQLITE3_DISABLE_AUTOPRAGMA`.
+
+The matcher is exact-shape for the Plex On-Deck statement. It validates numeric
+`library_section_id`, `grandparents.id IN (...)`, and repeated `account_id`
+slots, rejects parameters, expressions, slot drift, missing required settings
+joins, left joins, projection drift, semicolon tails, and non-Plex basenames.
+Every matched prepare probes `sqlite_master` for
+`idx_dshadow_metadata_item_views_account_grandparent_guid`; absence fails open
+with `reason=index_missing`.
+
+On a match, the helper emits the grandparents-first ranked subquery, strips the
+vendor `INDEXED BY` hints by replacing the whole statement, and returns one row
+per `grandparents.id` with a deterministic `row_number()` tie-breaker ordered by
+`metadata_item_views.viewed_at`, `metadata_item_views.id`,
+`grandparentsSettings.id`, and `metadata_item_settings.id` descending. Build
+failure, rewritten-prepare failure, tail mismatch, or index-probe failure
+prepares the original SQL.
+
 ## Emby FTS Search Rewrite
 
 `src/emby_fts_rewrite.c` is compiled into both shared-library variants. The
@@ -361,9 +406,10 @@ applying the validated rewrite.
 
 The Emby fan-out rewrite family is opt-in:
 `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0` enables it; unset, literal `1`, and
-every other value disable it. It covers RES-A, Browse-by-name,
-Favorites-first, People, Studios, and Type-29 fan-out membership statements.
-It is independent of `SQLITE3_DISABLE_EMBY_FTS_REWRITE` and
+every other value disable it. It covers RES-A/RES-D complex resume,
+resume-simple, Similar-items, Browse-by-name, Favorites-first, People, Studios,
+Type-29, and links-search fan-out statements. It is independent of
+`SQLITE3_DISABLE_EMBY_FTS_REWRITE` and
 `SQLITE3_DISABLE_AUTOPRAGMA`.
 
 The dispatcher first requires a `WithAncestors` byte pre-gate, then validates a
@@ -372,10 +418,13 @@ projection-agnostic membership replacements: `A.Id IN <membership CTE>` becomes
 production-style correlated `EXISTS` arms, while projection, grouping,
 ordering, collation text, `RANDOM()`, and LIMIT stay unchanged. Browse keeps
 `ORDER BY A.SortName collate NATURALSORT ASC` byte-exact.
+Complex resume emits the RES-A ancestor `EXISTS` splice and the RES-D implied
+watched/progress conjunct in one candidate. Resume-simple and Similar-items emit
+the ancestor `EXISTS` splice.
 
 All fan-out families fail open. Applied logs use
-`event=rewrite_applied target=emby mode=fanout+<family>`. Capture-gated People,
-Studios, and Type-29 structural drift logs
+`event=rewrite_applied target=emby mode=fanout+<family>`. Capture-gated
+fan-out structural drift logs
 `event=rewrite_skipped target=emby reason=capture_miss mode=fanout+...` and
 prepares the original SQL.
 
@@ -393,9 +442,11 @@ rewriting. Every matched prepare probes `sqlite_master` for
 `idx_dshadow_emby_latest_gk_dc`; absence fails open with
 `reason=index_missing mode=dashboard+latest`.
 
-The rewrite uses SQLite's single-`max()` bare-column rule at
-`(coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), max(DateCreated))`
-grain and does not add a tie-breaker. Latest structural drift after the family
-pre-gate fails open with `reason=capture_miss mode=dashboard+latest`. Applied
-and skipped logs use `mode=dashboard+latest`.
-
+The generated `keys(gk)` CTE uses
+`FROM MediaItems INDEXED BY idx_dshadow_emby_latest_gk_dc WHERE Type = 8`.
+The rewrite materializes group keys, picks one Type=8 item per group ordered by
+`DateCreated DESC`, ranks groups by the picked row's `DateCreated`, preserves
+the accepted projection, and keeps FH-1 anti-join out of this build. Latest
+structural drift after the family pre-gate fails open with
+`reason=capture_miss mode=dashboard+latest`. Applied and skipped logs use
+`mode=dashboard+latest`.

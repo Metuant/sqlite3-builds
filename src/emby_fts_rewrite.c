@@ -19,7 +19,7 @@
 #define EMBY_SCALAR_INPUT_CAP (64u * 1024u)
 #define EMBY_CLIENTDATA_KEY "sqlite3-builds-emby-fts-rewrite"
 #define EMBY_OWNER_PROBE "__dshadow_emby_owner_probe__"
-
+#define EMBY_LATEST_INDEX_NAME "idx_dshadow_emby_latest_gk_dc"
 typedef struct emby_span {
     size_t start;
     size_t end;
@@ -411,7 +411,7 @@ static emby_latest_index_state emby_latest_index_ready(sqlite3 *db) {
     static const char probe_sql[] =
         "SELECT 1 FROM sqlite_master "
         "WHERE type='index' "
-        "AND name='idx_dshadow_emby_latest_gk_dc' "
+        "AND name='" EMBY_LATEST_INDEX_NAME "' "
         "AND tbl_name='MediaItems' COLLATE NOCASE "
         "LIMIT 1";
     sqlite3_stmt *stmt = NULL;
@@ -724,16 +724,22 @@ static const char EMBY_ANCHOR_TWOLEVEL_BARE[] =
 static const char EMBY_ANCHOR_CTE_END3[] = ")))select";
 static const char EMBY_ANCHOR_CTE_END2[] = "))select";
 static const char EMBY_ANCHOR_SELECT_AFTER_L1[] = ") )select";
+static const char EMBY_ANCHOR_SIMILAR_AFTER_L1[] = ") ),SimB_Ids AS (";
 static const char EMBY_MEMBER_LINKS[] = "A.Id in WithItemLinkItemIds";
 static const char EMBY_MEMBER_ANCESTORS[] = "A.Id in WithAncestors";
 static const char EMBY_MEMBER_FAVORITES[] =
     "(A.Id in WithAncestors OR A.Id in WithItemLinkItemIds)";
 static const char EMBY_MEMBER_PEOPLE[] =
     "A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors)";
-static const char EMBY_ANCHOR_RESUME_SELECT[] =
-    ") )select count(*) OVER() AS TotalRecordCount,";
+static const char EMBY_ANCHOR_RESUME_GROUP[] = " Group by coalesce(";
+static const char EMBY_GUARD_RESUME_LASTWATCHED_NOT_NULL[] =
+    "AND LastWatchedEpisodes.LastPlayedDateInt not null";
 static const char EMBY_ANCHOR_RESUME_TAIL[] =
-    "AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT";
+    "Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT";
+static const char EMBY_ANCHOR_RESUME_SIMPLE_TAIL[] =
+    "AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY UserDatas.LastPlayedDateInt DESC LIMIT";
+static const char EMBY_ANCHOR_SIMILAR_TAIL[] =
+    "Group by A.PresentationUniqueKey ORDER BY SimilarityScore DESC,RANDOM() ASC LIMIT";
 static const char EMBY_GUARD_PLAYLISTS[] = "ListItemsExemptionForPlaylists";
 
 static const char EMBY_ANCHOR_LATEST_SELECT[] = ") )select ";
@@ -743,7 +749,7 @@ static const char EMBY_ANCHOR_LATEST_TAIL[] =
     "where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT";
 /* Correctness relies on Emby's UserDatas PK uniqueness on (UserDataKeyId, UserId). */
 static const char EMBY_LATEST_TPL_0[] =
-    "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey) FROM MediaItems WHERE Type = 8), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (";
+    "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey) FROM MediaItems INDEXED BY " EMBY_LATEST_INDEX_NAME " WHERE Type = 8), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (";
 static const char EMBY_LATEST_TPL_1[] =
     ")) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U2 WHERE U2.UserDataKeyId = A2.UserDataKeyId AND U2.UserId = ";
 static const char EMBY_LATEST_TPL_2[] =
@@ -802,6 +808,35 @@ static int emby_find_unique_bytes_between(
         if (found) return 0;
         out->start = i;
         out->end = i + needle_len;
+        found = 1;
+    }
+    return found;
+}
+
+static int emby_find_unique_token_between(
+    const char *sql,
+    size_t len,
+    size_t start,
+    size_t end,
+    const char *needle,
+    emby_span *out
+) {
+    size_t needle_len = strlen(needle);
+    fts_lex lx;
+    int found = 0;
+    if (needle_len == 0 || start > end || end > len || needle_len > end - start) return 0;
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_NUMBERED_OR_NAMED);
+
+    for (;;) {
+        fts_lex_token tok = fts_lex_next_token(&lx);
+        if (tok.type == FTS_LEX_TOK_ERROR) return 0;
+        if (tok.type == FTS_LEX_TOK_EOF) break;
+        if (tok.start < start) continue;
+        if (tok.start > end - needle_len) break;
+        if (memcmp(sql + tok.start, needle, needle_len) != 0) continue;
+        if (found) return 0;
+        out->start = tok.start;
+        out->end = tok.start + needle_len;
         found = 1;
     }
     return found;
@@ -909,6 +944,150 @@ static emby_match_result emby_capture_miss(
     return EMBY_MATCH_MISS;
 }
 
+static int emby_spans_byte_equal(
+    const char *sql,
+    const emby_span *left,
+    const emby_span *right
+) {
+    size_t left_len = left->end - left->start;
+    size_t right_len = right->end - right->start;
+    return left_len == right_len &&
+           memcmp(sql + left->start, sql + right->start, left_len) == 0;
+}
+
+static int emby_span_is_single_space(const char *sql, size_t start, size_t end) {
+    return end == start + 1 && sql[start] == ' ';
+}
+
+static int emby_resume_membership_has_context(
+    const char *sql,
+    size_t len,
+    size_t start,
+    const emby_span *membership,
+    const emby_span *tail
+) {
+    fts_lex lx;
+    fts_lex_token prev = {FTS_LEX_TOK_EOF, 0, 0, 0};
+    fts_lex_token tok;
+
+    if (start > len || membership->start < start || membership->end > tail->start) return 0;
+    if (!emby_span_is_single_space(sql, membership->end, tail->start)) return 0;
+
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_NUMBERED_OR_NAMED);
+    lx.pos = start;
+    for (;;) {
+        tok = fts_lex_next_token(&lx);
+        if (tok.type == FTS_LEX_TOK_ERROR) return 0;
+        if (tok.type == FTS_LEX_TOK_EOF || tok.start >= membership->start) break;
+        prev = tok;
+    }
+    if (tok.type != FTS_LEX_TOK_IDENT || tok.start != membership->start) return 0;
+    return prev.type == FTS_LEX_TOK_IDENT && fts_lex_token_text_eq(sql, &prev, "AND");
+}
+
+static int emby_capture_literal_user_id_after(
+    const char *sql,
+    size_t len,
+    size_t start,
+    const char *anchor,
+    emby_span *slot
+) {
+    emby_span a;
+    fts_lex lx;
+    fts_lex_token tok;
+
+    if (!find_unique_token_after(sql, len, start, anchor, &a)) return 0;
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_NUMBERED_OR_NAMED);
+    lx.pos = a.end;
+    tok = fts_lex_next_token(&lx);
+    if (tok.type != FTS_LEX_TOK_NUMBER) return 0;
+    slot->start = tok.start;
+    slot->end = tok.end;
+    return emby_validate_integer_slot(sql, slot);
+}
+
+static char *emby_build_resume_conjunct(
+    const char *sql,
+    const emby_span *user_id,
+    size_t *out_len
+) {
+    emby_piece pieces[3];
+
+    pieces[0].lit =
+        " AND ((A.Type=5 AND A.UserDataKeyId IN (SELECT UserDataKeyId FROM UserDatas WHERE UserId=";
+    pieces[0].slot = user_id;
+    pieces[1].lit =
+        " AND playbackPositionTicks>0)) OR (A.Type=8 AND A.SeriesPresentationUniqueKey IN (SELECT N2.SeriesPresentationUniqueKey FROM MediaItems N2 JOIN UserDatas UN2 ON N2.UserDataKeyId=UN2.UserDataKeyId AND UN2.UserId=";
+    pieces[1].slot = user_id;
+    pieces[2].lit =
+        " WHERE N2.Type=8 AND Coalesce(N2.SortParentIndexNumber,N2.ParentIndexNumber,-1) <> 0 AND (UN2.Played=1 OR UN2.playbackPositionTicks>0))))";
+    pieces[2].slot = NULL;
+    return emby_build_pieces(sql, pieces, 3, out_len);
+}
+
+static emby_match_result emby_build_resume_candidate(
+    sqlite3 *db,
+    const char *zSql,
+    size_t bounded_len,
+    size_t scan_len,
+    emby_span target,
+    emby_span insert_before,
+    const emby_slots *slots,
+    const emby_exists_arm_id *arms,
+    size_t arm_count,
+    const emby_span *user_id,
+    emby_rewrite_candidate *candidate
+) {
+    size_t repl_len = 0;
+    size_t conjunct_len = 0;
+    size_t old_len;
+    size_t out_len;
+    size_t limit;
+    char *repl = NULL;
+    char *conjunct = NULL;
+    char *buf = NULL;
+    char *p;
+
+    candidate->mode = "fanout+resume";
+    if (target.start > target.end || target.end > scan_len ||
+        insert_before.start > scan_len || target.end > insert_before.start) {
+        return EMBY_MATCH_BUILD_FAILED;
+    }
+    repl = build_exists_arms_for_family(zSql, slots, arms, arm_count, 0, &repl_len);
+    conjunct = emby_build_resume_conjunct(zSql, user_id, &conjunct_len);
+    if (!repl || !conjunct) goto fail;
+
+    old_len = target.end - target.start;
+    if (bounded_len < old_len) goto fail;
+    out_len = bounded_len - old_len;
+    if (!add_size(&out_len, repl_len) || !add_size(&out_len, conjunct_len)) goto fail;
+    limit = (size_t)sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1);
+    if (out_len > limit || out_len > (size_t)INT_MAX) goto fail;
+
+    buf = (char *)malloc(out_len + 1);
+    if (!buf) goto fail;
+    p = buf;
+    append_bytes(&p, zSql, target.start);
+    append_bytes(&p, repl, repl_len);
+    append_bytes(&p, zSql + target.end, insert_before.start - target.end);
+    append_bytes(&p, conjunct, conjunct_len);
+    append_bytes(&p, zSql + insert_before.start, bounded_len - insert_before.start);
+    buf[out_len] = 0;
+
+    candidate->sql = buf;
+    candidate->scan_out_len = scan_len - old_len + repl_len + conjunct_len;
+    candidate->rewrite_len = out_len;
+    free(repl);
+    free(conjunct);
+    return EMBY_MATCH_BUILT;
+
+fail:
+    free(repl);
+    free(conjunct);
+    free(buf);
+    return EMBY_MATCH_BUILD_FAILED;
+}
+
 static emby_match_result emby_match_resume(
     sqlite3 *db,
     const char *zSql,
@@ -921,23 +1100,59 @@ static emby_match_result emby_match_resume(
     emby_span a1;
     emby_span a2;
     emby_span a3;
+    emby_span group_anchor;
     emby_span limit_slot;
+    emby_span not_null_gate;
+    emby_span user_derived;
+    emby_span user_outer;
+    emby_span user_hide;
 
     memset(&slots, 0, sizeof(slots));
+    if (!emby_token_present(zSql, scan_len, "LastWatchedEpisodes")) return EMBY_MATCH_MISS;
     if (!find_unique_token_after(zSql, scan_len, 0, EMBY_ANCHOR_PRE_L1, &a1)) return EMBY_MATCH_MISS;
-    if (!find_unique_token_after(zSql, scan_len, a1.end, EMBY_ANCHOR_RESUME_SELECT, &a2)) return EMBY_MATCH_MISS;
+    if (!find_unique_token_after(zSql, scan_len, a1.end, EMBY_ANCHOR_SELECT_AFTER_L1, &a2)) return EMBY_MATCH_MISS;
     slots.l1.start = a1.end;
     slots.l1.end = a2.start;
     emby_span_rtrim(zSql, &slots.l1);
     if (!validate_numeric_slot(zSql, &slots.l1)) return EMBY_MATCH_MISS;
     if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_RESUME_TAIL, &a3)) return EMBY_MATCH_MISS;
     if (!emby_parse_trailing_integer(zSql, scan_len, a3.end, &limit_slot)) return EMBY_MATCH_MISS;
-    if (!emby_find_unique_bytes_between(zSql, a3.start, a3.end, EMBY_MEMBER_ANCESTORS, &slots.membership)) {
+    if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_GUARD_RESUME_LASTWATCHED_NOT_NULL,
+                                 &not_null_gate)) {
         return EMBY_MATCH_MISS;
     }
-    return emby_build_splice_candidate(
-        db, zSql, bounded_len, scan_len, slots.membership, &slots,
-        arms, sizeof(arms) / sizeof(arms[0]), 0, "fanout+resume", candidate
+    if (not_null_gate.end > a3.start) return EMBY_MATCH_MISS;
+    if (!emby_find_unique_token_between(zSql, scan_len, 0, scan_len, EMBY_MEMBER_ANCESTORS,
+                                        &slots.membership)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (slots.membership.end > a3.start || slots.membership.start < a2.end) return EMBY_MATCH_MISS;
+    if (!emby_resume_membership_has_context(zSql, scan_len, a2.end, &slots.membership, &a3)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (!emby_find_unique_bytes_between(zSql, slots.membership.end, a3.end, EMBY_ANCHOR_RESUME_GROUP,
+                                        &group_anchor)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (!emby_capture_literal_user_id_after(zSql, scan_len, a2.end, "UserDatas_N.UserId=",
+                                            &user_derived)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (!emby_capture_literal_user_id_after(zSql, scan_len, a2.end, "UserDatas.UserId=",
+                                            &user_outer)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (!emby_capture_literal_user_id_after(zSql, scan_len, a2.end, "userdatas.userid=",
+                                            &user_hide)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (!emby_spans_byte_equal(zSql, &user_derived, &user_outer) ||
+        !emby_spans_byte_equal(zSql, &user_derived, &user_hide)) {
+        return EMBY_MATCH_MISS;
+    }
+    return emby_build_resume_candidate(
+        db, zSql, bounded_len, scan_len, slots.membership, group_anchor, &slots,
+        arms, sizeof(arms) / sizeof(arms[0]), &user_derived, candidate
     );
 }
 
@@ -1109,6 +1324,90 @@ static emby_match_result emby_match_links_search(
     return emby_build_splice_candidate(
         db, zSql, bounded_len, scan_len, slots.membership, &slots,
         arms, sizeof(arms) / sizeof(arms[0]), 0, "fanout+links_search", candidate
+    );
+}
+
+static emby_match_result emby_match_resume_simple(
+    sqlite3 *db,
+    const char *zSql,
+    size_t bounded_len,
+    size_t scan_len,
+    emby_rewrite_candidate *candidate
+) {
+    static const emby_exists_arm_id arms[] = {EMBY_EXISTS_ARM_ANCESTOR};
+    emby_slots slots;
+    emby_span a1;
+    emby_span a2;
+    emby_span a3;
+    emby_span limit_slot;
+
+    if (emby_token_present(zSql, scan_len, EMBY_GUARD_PLAYLISTS)) return EMBY_MATCH_MISS;
+    if (emby_token_present(zSql, scan_len, "LastWatchedEpisodes")) return EMBY_MATCH_MISS;
+    if (emby_token_present(zSql, scan_len, "SimB_Ids")) return EMBY_MATCH_MISS;
+    if (!emby_sql_has_bytes(zSql, scan_len, "UserDatas.playbackPositionTicks > 0")) {
+        return EMBY_MATCH_MISS;
+    }
+    memset(&slots, 0, sizeof(slots));
+    if (!find_unique_token_after(zSql, scan_len, 0, EMBY_ANCHOR_PRE_L1, &a1)) return EMBY_MATCH_MISS;
+    if (!find_unique_token_after(zSql, scan_len, a1.end, EMBY_ANCHOR_SELECT_AFTER_L1, &a2)) return EMBY_MATCH_MISS;
+    slots.l1.start = a1.end;
+    slots.l1.end = a2.start;
+    emby_span_rtrim(zSql, &slots.l1);
+    if (!validate_numeric_slot(zSql, &slots.l1)) return EMBY_MATCH_MISS;
+    if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_RESUME_SIMPLE_TAIL, &a3)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (!emby_parse_trailing_integer(zSql, scan_len, a3.end, &limit_slot)) return EMBY_MATCH_MISS;
+    if (!emby_find_unique_token_between(zSql, scan_len, 0, scan_len, EMBY_MEMBER_ANCESTORS,
+                                        &slots.membership)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (slots.membership.start < a3.start || slots.membership.end > a3.end) return EMBY_MATCH_MISS;
+    return emby_build_splice_candidate(
+        db, zSql, bounded_len, scan_len, slots.membership, &slots,
+        arms, sizeof(arms) / sizeof(arms[0]), 0, "fanout+resume_simple", candidate
+    );
+}
+
+static emby_match_result emby_match_similar(
+    sqlite3 *db,
+    const char *zSql,
+    size_t bounded_len,
+    size_t scan_len,
+    emby_rewrite_candidate *candidate
+) {
+    static const emby_exists_arm_id arms[] = {EMBY_EXISTS_ARM_ANCESTOR};
+    emby_slots slots;
+    emby_span a1;
+    emby_span a2;
+    emby_span a3;
+    emby_span limit_slot;
+
+    if (emby_token_present(zSql, scan_len, EMBY_GUARD_PLAYLISTS)) return EMBY_MATCH_MISS;
+    if (!emby_token_present(zSql, scan_len, "SimB_Ids")) return EMBY_MATCH_MISS;
+    if (!emby_token_present(zSql, scan_len, "LinkedCounts")) return EMBY_MATCH_MISS;
+    if (!emby_token_present(zSql, scan_len, "SimilarityScore")) return EMBY_MATCH_MISS;
+    memset(&slots, 0, sizeof(slots));
+    if (!find_unique_token_after(zSql, scan_len, 0, EMBY_ANCHOR_PRE_L1, &a1)) return EMBY_MATCH_MISS;
+    if (!find_unique_token_after(zSql, scan_len, a1.end, EMBY_ANCHOR_SIMILAR_AFTER_L1, &a2)) {
+        return EMBY_MATCH_MISS;
+    }
+    slots.l1.start = a1.end;
+    slots.l1.end = a2.start;
+    emby_span_rtrim(zSql, &slots.l1);
+    if (!validate_numeric_slot(zSql, &slots.l1)) return EMBY_MATCH_MISS;
+    if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_SIMILAR_TAIL, &a3)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (!emby_parse_trailing_integer(zSql, scan_len, a3.end, &limit_slot)) return EMBY_MATCH_MISS;
+    if (!emby_find_unique_token_between(zSql, scan_len, 0, scan_len, EMBY_MEMBER_ANCESTORS,
+                                        &slots.membership)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (slots.membership.end > a3.start || slots.membership.start < a2.end) return EMBY_MATCH_MISS;
+    return emby_build_splice_candidate(
+        db, zSql, bounded_len, scan_len, slots.membership, &slots,
+        arms, sizeof(arms) / sizeof(arms[0]), 0, "fanout+similar", candidate
     );
 }
 
@@ -1369,7 +1668,11 @@ static emby_match_result emby_try_fanout_matchers(
     if (mr != EMBY_MATCH_MISS) return mr;
     mr = emby_match_people(db, zSql, bounded_len, scan_len, candidate);
     if (mr != EMBY_MATCH_MISS) return mr;
-    return emby_match_links_search(db, zSql, bounded_len, scan_len, candidate);
+    mr = emby_match_links_search(db, zSql, bounded_len, scan_len, candidate);
+    if (mr != EMBY_MATCH_MISS) return mr;
+    mr = emby_match_resume_simple(db, zSql, bounded_len, scan_len, candidate);
+    if (mr != EMBY_MATCH_MISS) return mr;
+    return emby_match_similar(db, zSql, bounded_len, scan_len, candidate);
 }
 
 static int emby_slow_rewrite_prepare(

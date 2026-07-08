@@ -51,6 +51,12 @@ Project-specific guidance:
   `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
   other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
   `SQLITE3_DISABLE_SLOW_QUERY`, and `SQLITE3_DISABLE_AUTOPRAGMA` kill-switches.
+  Keep Plex taggings/On-Deck rewrites opt-in:
+  `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE` (taggings-membership) and
+  `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE` (On-Deck) each enable on literal `0`;
+  unset, literal `1`, and every other value disable. Both fail open and are
+  independent of `SQLITE3_DISABLE_AUTOPRAGMA` and
+  `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
   Keep Emby FTS rewrite (`SQLITE3_DISABLE_EMBY_FTS_REWRITE`) opt-out (default-on
   in the Emby build): literal `1` disables; unset, literal `0`, and every other
   value enable. Keep the two Emby membership/dashboard knobs opt-in:

@@ -164,8 +164,11 @@ ICU-enabled binary.
 The Plex main-database staged optimize SQL creates the runbook-validated
 `idx_dshadow_taggings_tag_id_metadata_item_id` and
 `idx_dshadow_mis_account_updated_guid_cover`, and
-`idx_dshadow_metadata_items_section_added` indexes before `REINDEX`, `ANALYZE`,
-and `PRAGMA optimize`. The existing Plex SQLite `ANALYZE` remains as the STAT1
+`idx_dshadow_metadata_items_section_added`,
+`idx_dshadow_metadata_items_guid_nocase`, and
+`idx_dshadow_metadata_item_views_account_grandparent_guid` indexes before
+`REINDEX`, `ANALYZE`, and `PRAGMA optimize`. The existing Plex SQLite `ANALYZE`
+remains as the STAT1
 floor for ICU-collated or skipped objects. The subsequent STAT4 pass uses
 `GENERIC_SQLITE_BINARY`, runs only after the Plex staged SQL, discovers safe
 targets from `pragma_index_list`/`pragma_index_xinfo`, skips unsupported
@@ -173,7 +176,8 @@ collations and unsafe identifier transport, sets `analysis_limit=0`, and warns
 without aborting on preflight, discovery, per-target `ANALYZE`, or final
 `sqlite_stat4` row-count failures. `main()` derives the internal STAT4 gate
 from `GENERIC_SQLITE_BINARY` preflight for configured Plex instances, so the
-pass runs only when that binary reports `ENABLE_STAT4`.
+pass runs only when that binary reports `ENABLE_STAT4`. The explicit Plex STAT4
+leader list includes all five `idx_dshadow_*` Plex indexes.
 
 ### Emby Flow
 
@@ -218,4 +222,3 @@ DELETE/VACUUM failure before a clean post-deflate integrity result, staged
 maintenance SQL failure, staged metadata date-repair failure, Plex STAT4
 preflight/worklist/per-target/final-count failures, and post-swap FTS
 maintenance failures.
-

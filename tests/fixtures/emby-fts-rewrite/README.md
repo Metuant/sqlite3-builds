@@ -19,8 +19,9 @@ it. The utility prepares one raw input template and writes the resulting
 
 ## Inventory
 
-- Fan-out fixtures cover RES-A, People, links-search, Browse-by-name, and
-  Favorites-first membership rewrites.
+- Fan-out coverage includes RES-A, People, links-search, Browse-by-name,
+  Favorites-first, resume-simple, Similar-items, and RES-D membership rewrites;
+  only canary-backed families keep fixture pairs here.
 - Dashboard Latest fixtures cover LIMIT 12/16/20 and projection variation.
 - Latest capture-miss fixtures cover projection-shape drift after the family
   pre-gate.

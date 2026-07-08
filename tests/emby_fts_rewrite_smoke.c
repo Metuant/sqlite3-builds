@@ -489,6 +489,13 @@ static char *make_exists_ancestor(const char *l1) {
     );
 }
 
+static char *make_resume_d_conjunct(const char *user_id) {
+    return xasprintf(
+        " AND ((A.Type=5 AND A.UserDataKeyId IN (SELECT UserDataKeyId FROM UserDatas WHERE UserId=%s AND playbackPositionTicks>0)) OR (A.Type=8 AND A.SeriesPresentationUniqueKey IN (SELECT N2.SeriesPresentationUniqueKey FROM MediaItems N2 JOIN UserDatas UN2 ON N2.UserDataKeyId=UN2.UserDataKeyId AND UN2.UserId=%s WHERE N2.Type=8 AND Coalesce(N2.SortParentIndexNumber,N2.ParentIndexNumber,-1) <> 0 AND (UN2.Played=1 OR UN2.playbackPositionTicks>0))))",
+        user_id, user_id
+    );
+}
+
 static char *make_exists_people(const char *l1) {
     return xasprintf(
         "EXISTS (SELECT 1 FROM itemPeople2 JOIN AncestorIds2 ON AncestorIds2.itemid = itemPeople2.ItemId WHERE itemPeople2.PersonId = A.Id and AncestorIds2.AncestorId in (%s))",
@@ -512,12 +519,79 @@ static char *make_exists_links_two(const char *l1, const char *t2) {
 
 static char *make_resume_sql(void) {
     return xasprintf(
-        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select count(*) OVER() AS TotalRecordCount,A.Id,A.SeriesPresentationUniqueKey "
-        "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 "
-        "left join (select N.SeriesPresentationUniqueKey,max(userdatas.lastplayeddateint) as lastplayeddateint from mediaitems N left join UserDatas on N.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where N.Type=8 Group by N.SeriesPresentationUniqueKey) LastWatchedEpisodes on LastWatchedEpisodes.SeriesPresentationUniqueKey=A.SeriesPresentationUniqueKey "
-        "where A.Type=8 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT 12"
+        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select count(*) OVER() AS TotalRecordCount,A.type,A.Id,A.SeriesPresentationUniqueKey,UserDatas.PlaybackPositionTicks,"
+        "((Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, 1) * 1000000) + Coalesce(A.SortIndexNumber, A.IndexNumber, 0) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then (Cast(Coalesce(A.IndexNumber, 0) as REAL) / 100000) Else 0 End)) EpisodeAbsoluteIndexNumber "
+        "from mediaitems A left join (Select N.SeriesPresentationUniqueKey,((Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber, 1) * 1000000) + Coalesce(N.SortIndexNumber, N.IndexNumber, 0) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then (Cast(Coalesce(N.IndexNumber, 0) as REAL) / 100000) Else 0 End)) AbsoluteIndexNumber,max(UserDatas_N.LastPlayedDateInt) LastPlayedDateInt,UserDatas_N.playbackPositionTicks from MediaItems N join UserDatas UserDatas_N on N.UserDataKeyId=UserDatas_N.UserDataKeyId And UserDatas_N.UserId=1 where N.Type=8 and Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber,-1) <> 0 and (UserDatas_N.Played=1 or UserDatas_N.playbackPositionTicks > 0) Group By N.SeriesPresentationUniqueKey ORDER BY UserDatas_N.LastPlayedDateInt desc, AbsoluteIndexNumber desc) LastWatchedEpisodes on LastWatchedEpisodes.SeriesPresentationUniqueKey=A.SeriesPresentationUniqueKey "
+        "left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where ((A.Type=5 and UserDatas.playbackPositionTicks > 0) OR (A.Type=8 AND (UserDatas.playbackPositionTicks > 0 or Coalesce(UserDatas.played,0) = 0) AND (select case when LastWatchedEpisodes.playbackPositionTicks > 0 then EpisodeAbsoluteIndexNumber >= Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) else EpisodeAbsoluteIndexNumber > Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) end) AND LastWatchedEpisodes.LastPlayedDateInt not null)) "
+        "AND (A.Type=5 OR Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, -1) <> 0) AND A.Type in (5,8) AND Coalesce(UserDatas.HideFromResume,0)=0 AND COALESCE((select hidefromresume from userdatas where userdatas.userid=1 and userdatas.userdatakeyid=(select userdatakeyid from mediaitems where mediaitems.id=A.seriesid)),0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT 12"
     );
 }
+
+static char *make_resume_0065_sql(void) {
+    return xasprintf(
+        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.RunTimeTicks,A.DateCreated,A.ParentId,A.SeriesName,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,"
+        "((Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, 1) * 1000000) + Coalesce(A.SortIndexNumber, A.IndexNumber, 0) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then (Cast(Coalesce(A.IndexNumber, 0) as REAL) / 100000) Else 0 End)) EpisodeAbsoluteIndexNumber "
+        "from mediaitems A left join (Select N.SeriesPresentationUniqueKey,((Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber, 1) * 1000000) + Coalesce(N.SortIndexNumber, N.IndexNumber, 0) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then (Cast(Coalesce(N.IndexNumber, 0) as REAL) / 100000) Else 0 End)) AbsoluteIndexNumber,max(UserDatas_N.LastPlayedDateInt) LastPlayedDateInt,UserDatas_N.playbackPositionTicks from MediaItems N join UserDatas UserDatas_N on N.UserDataKeyId=UserDatas_N.UserDataKeyId And UserDatas_N.UserId=13 where N.Type=8 and Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber,-1) <> 0 and (UserDatas_N.Played=1 or UserDatas_N.playbackPositionTicks > 0) Group By N.SeriesPresentationUniqueKey ORDER BY UserDatas_N.LastPlayedDateInt desc, AbsoluteIndexNumber desc) LastWatchedEpisodes on LastWatchedEpisodes.SeriesPresentationUniqueKey=A.SeriesPresentationUniqueKey "
+        "left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=13 where ((UserDatas.playbackPositionTicks > 0 or Coalesce(UserDatas.played,0) = 0) AND (select case when LastWatchedEpisodes.playbackPositionTicks > 0 then EpisodeAbsoluteIndexNumber >= Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) else EpisodeAbsoluteIndexNumber > Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) end) AND LastWatchedEpisodes.LastPlayedDateInt not null) "
+        "AND Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, -1) <> 0 AND A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND Coalesce(UserDatas.HideFromResume,0)=0 AND COALESCE((select hidefromresume from userdatas where userdatas.userid=13 and userdatas.userdatakeyid=(select userdatakeyid from mediaitems where mediaitems.id=A.seriesid)),0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT 30"
+    );
+}
+
+static char *make_resume_expected(const char *sql, const char *l1, const char *user_id) {
+    char *ancestor = make_exists_ancestor(l1);
+    char *with_ancestor = replace_once(sql, "A.Id in WithAncestors", ancestor);
+    char *conjunct = make_resume_d_conjunct(user_id);
+    char *group = xasprintf("%s Group by coalesce(", conjunct);
+    char *expected = replace_once(with_ancestor, " Group by coalesce(", group);
+
+    free(ancestor);
+    free(with_ancestor);
+    free(conjunct);
+    free(group);
+    return expected;
+}
+
+static char *make_resume_simple_sql(int count_projection, const char *limit) {
+    return xasprintf(
+        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )%s%s "
+        "from mediaitems A join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 "
+        "where A.Type in (5,8) AND UserDatas.playbackPositionTicks > 0 AND Coalesce(UserDatas.HideFromResume,0)=0 AND COALESCE((select hidefromresume from userdatas where userdatas.userid=1 and userdatas.userdatakeyid=(select userdatakeyid from mediaitems where mediaitems.id=A.seriesid)),0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY UserDatas.LastPlayedDateInt DESC LIMIT %s",
+        count_projection ? "select count(*) OVER() AS TotalRecordCount," : "select ",
+        count_projection ? "A.type,A.Id,A.SeriesPresentationUniqueKey,UserDatas.PlaybackPositionTicks" : "A.Id,A.SeriesPresentationUniqueKey,UserDatas.PlaybackPositionTicks",
+        limit
+    );
+}
+
+static char *make_resume_simple_expected(const char *sql) {
+    char *ancestor = make_exists_ancestor("100");
+    char *expected = replace_once(sql, "A.Id in WithAncestors", ancestor);
+
+    free(ancestor);
+    return expected;
+}
+
+static const char *EMBY_RESUME_SIMPLE_LEFT_JOIN_UNPLAYED_SHAPE_07_SQL =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (9,10,11,12,13,14,3923221,3923222,3923223) )select A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12;";
+
+static char *make_similar_sql(void) {
+    return xasprintf(
+        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+        "SimB_Ids AS (SELECT DISTINCT ItemLinks2SimB.LinkedId FROM ItemLinks2 ItemLinks2SimB WHERE ItemLinks2SimB.Type in (2,7) AND ItemLinks2SimB.ItemId=1),"
+        "LinkedCounts AS (SELECT A.Id AS AId, COUNT(ItemLinks2SimA.LinkedId) AS LinkedCount FROM MediaItems A JOIN ItemLinks2 ItemLinks2SimA ON ItemLinks2SimA.ItemId = A.Id JOIN SimB_Ids ON SimB_Ids.LinkedId = ItemLinks2SimA.LinkedId WHERE ItemLinks2SimA.Type in (2,7) GROUP BY A.Id)"
+        "select A.type,A.Id,A.PresentationUniqueKey,(LinkedCounts_Joined.LinkedCount * 15) as SimilarityScore from mediaitems A join LinkedCounts LinkedCounts_Joined ON A.Id = LinkedCounts_Joined.AId left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where SimilarityScore > 19 AND A.Type in (5,6) AND A.Id<>1 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY SimilarityScore DESC,RANDOM() ASC LIMIT 16"
+    );
+}
+
+static char *make_similar_expected(const char *sql) {
+    char *ancestor = make_exists_ancestor("100");
+    char *expected = replace_once(sql, "A.Id in WithAncestors", ancestor);
+
+    free(ancestor);
+    return expected;
+}
+
+static const char *EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (15,16,17,18,19,20,3923210) ),WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6,4,3,2) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7,0,1,5,6,2)))select A.Type from mediaitems A where A.Type in (34,9,29,21) AND A.Id in WithItemLinkItemIds Group by A.Type;";
 
 static char *make_favorites_sql(void) {
     return xasprintf(
@@ -560,7 +634,7 @@ static char *make_latest_sql(const char *projection, const char *limit) {
 
 static char *make_latest_expected(const char *projection, const char *limit) {
     return xasprintf(
-        "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey) FROM MediaItems WHERE Type = 8), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (100)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U2 WHERE U2.UserDataKeyId = A2.UserDataKeyId AND U2.UserId = 42 AND U2.played <> 0) ORDER BY A2.DateCreated DESC LIMIT 1) AS id FROM keys AS K), exact_groups AS MATERIALIZED (SELECT P.gk, P.id, Amax.DateCreated AS maxdc FROM picked AS P JOIN MediaItems AS Amax ON Amax.Id = P.id WHERE P.id IS NOT NULL), ranked AS MATERIALIZED (SELECT gk, id, maxdc FROM exact_groups ORDER BY maxdc DESC LIMIT %s) SELECT %s FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = 42 ORDER BY R.maxdc DESC LIMIT %s",
+        "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey) FROM MediaItems INDEXED BY idx_dshadow_emby_latest_gk_dc WHERE Type = 8), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (100)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U2 WHERE U2.UserDataKeyId = A2.UserDataKeyId AND U2.UserId = 42 AND U2.played <> 0) ORDER BY A2.DateCreated DESC LIMIT 1) AS id FROM keys AS K), exact_groups AS MATERIALIZED (SELECT P.gk, P.id, Amax.DateCreated AS maxdc FROM picked AS P JOIN MediaItems AS Amax ON Amax.Id = P.id WHERE P.id IS NOT NULL), ranked AS MATERIALIZED (SELECT gk, id, maxdc FROM exact_groups ORDER BY maxdc DESC LIMIT %s) SELECT %s FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = 42 ORDER BY R.maxdc DESC LIMIT %s",
         limit, projection, limit
     );
 }
@@ -859,6 +933,62 @@ static void collect_first_ints(sqlite3 *db, const char *label, const char *sql,
     }
     if (rows == 0) failf("FAIL [%s]: expected rows", label);
     require_int("first-ints/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static void collect_int_column(sqlite3 *db, const char *label, const char *sql,
+                               const char *want_sql, int nbyte, int column,
+                               char *out, size_t out_n) {
+    const char *tail = NULL;
+    sqlite3_stmt *stmt = prepare_entry(db, label, sql, nbyte, 2, &tail);
+    int rc;
+    size_t used = 0;
+    int rows = 0;
+
+    require_str_eq(label, sqlite3_sql(stmt), want_sql);
+    if (tail != sql + strlen(sql)) {
+        failf("FAIL [%s/tail]: tail_offset=%ld want=%ld",
+              label, (long)(tail - sql), (long)strlen(sql));
+    }
+    if (sqlite3_column_count(stmt) <= column) {
+        failf("FAIL [%s]: column=%d count=%d", label, column, sqlite3_column_count(stmt));
+    }
+    if (out_n == 0) failf("FAIL [%s]: output buffer empty", label);
+    out[0] = 0;
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        int n = snprintf(out + used, out_n - used, "%d,", sqlite3_column_int(stmt, column));
+        if (n < 0 || (size_t)n >= out_n - used) {
+            failf("FAIL [%s]: output buffer too small", label);
+        }
+        used += (size_t)n;
+        rows++;
+    }
+    if (rc != SQLITE_DONE) {
+        failf("FAIL [%s/step]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
+    }
+    if (rows == 0) failf("FAIL [%s]: expected rows", label);
+    require_int("int-column/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static void seed_resume_d_parity_rows(sqlite3 *db) {
+    exec_sql(db, "resume-d-parity-seed",
+        "INSERT INTO MediaItems("
+        "Id, Type, Name, SortName, DateCreated, EpisodeAbsoluteIndexNumber,"
+        "ParentIndexNumber, SortIndexNumber, SortParentIndexNumber, IndexNumber,"
+        "SeriesName, SeriesPresentationUniqueKey, PresentationUniqueKey,"
+        "UserDataKeyId, IsPublic, ExtraType"
+        ") VALUES"
+        "(100,5,'resume movie','resume movie',800,1,NULL,NULL,NULL,NULL,NULL,NULL,'resume-movie',100,1,NULL),"
+        "(101,8,'resume watched','resume watched',900,1,1,1,1,1,'resume series','resume-series','resume-episode-1',101,1,NULL),"
+        "(102,8,'resume next','resume next',901,1000002,1,2,1,2,'resume series','resume-series','resume-episode-2',102,1,NULL);"
+        "INSERT INTO AncestorIds2 VALUES(100,100,0),(102,100,0);"
+        "INSERT INTO UserDatas("
+        "UserDataKeyId, UserId, IsFavorite, Played, PlaybackPositionTicks,"
+        "AudioStreamIndex, SubtitleStreamIndex, HideFromResume, LastPlayedDateInt"
+        ") VALUES"
+        "(100,1,0,0,500,0,0,0,800),"
+        "(101,1,0,1,0,0,0,0,900),"
+        "(102,1,0,0,0,0,0,0,0);"
+    );
 }
 
 static int child_positive(void) {
@@ -1175,15 +1305,10 @@ static int child_fixture_canary(void) {
         "fast-exists",
         "string-anchor-passthrough",
         "comment-anchor-passthrough",
-        "fanout-resume",
         "fanout-people",
         "fanout-links-search",
         "fanout-browse",
         "fanout-favorites",
-        "latest-limit12",
-        "latest-limit16",
-        "latest-limit20",
-        "latest-seriesname-projection",
         "latest-star-projection-negative",
         "latest-capture-miss-negative",
         "latest-aggregate-projection-negative",
@@ -1239,6 +1364,39 @@ static int child_row_parity(void) {
     return 0;
 }
 
+static int child_resume_d_row_parity(void) {
+    sqlite3 *original_db;
+    sqlite3 *rewritten_db;
+    char *sql;
+    char *expected;
+    char original_ids[128];
+    char rewritten_ids[128];
+
+    configure_env("1", "0", NULL);
+    make_temp_dir();
+    original_db = open_seeded_temp("not-target.db");
+    rewritten_db = open_seeded_temp("library.db");
+    seed_resume_d_parity_rows(original_db);
+    seed_resume_d_parity_rows(rewritten_db);
+    sql = make_resume_sql();
+    expected = make_resume_expected(sql, "100", "1");
+
+    collect_int_column(original_db, "resume-d-row-original", sql, sql, -1, 2,
+                       original_ids, sizeof(original_ids));
+    collect_int_column(rewritten_db, "resume-d-row-rewritten", sql, expected,
+                       (int)strlen(sql) + 1, 2, rewritten_ids, sizeof(rewritten_ids));
+    require_str_eq("resume-d-row-parity/ids", rewritten_ids, original_ids);
+    require_str_eq("resume-d-row-parity/expected", rewritten_ids, "102,100,");
+
+    free(sql);
+    free(expected);
+    require_int("resume-d-row-parity/original-close", sqlite3_close(original_db), SQLITE_OK);
+    require_int("resume-d-row-parity/rewrite-close", sqlite3_close(rewritten_db), SQLITE_OK);
+    cleanup_temp_dir();
+    printf("PASS [resume-d-row-parity]\n");
+    return 0;
+}
+
 static int child_fanout_default_off(void) {
     sqlite3 *db;
     char *browse_sql;
@@ -1284,7 +1442,6 @@ static int child_fanout_matrix(void) {
     char *favorites_repl;
     char *favorites_expected;
     char *resume_sql;
-    char *resume_ancestor;
     char *resume_expected;
     char *people_sql;
     char *people_repl;
@@ -1313,8 +1470,7 @@ static int child_fanout_matrix(void) {
     expect_sql(db, "fanout-favorites", favorites_sql, -1, 2, favorites_expected, 0);
 
     resume_sql = make_resume_sql();
-    resume_ancestor = make_exists_ancestor("100");
-    resume_expected = replace_once(resume_sql, "A.Id in WithAncestors", resume_ancestor);
+    resume_expected = make_resume_expected(resume_sql, "100", "1");
     expect_sql(db, "fanout-resume", resume_sql, -1, 2, resume_expected, 0);
 
     people_sql = make_people_sql();
@@ -1341,7 +1497,6 @@ static int child_fanout_matrix(void) {
     free(favorites_repl);
     free(favorites_expected);
     free(resume_sql);
-    free(resume_ancestor);
     free(resume_expected);
     free(people_sql);
     free(people_repl);
@@ -1353,6 +1508,263 @@ static int child_fanout_matrix(void) {
     require_int("fanout-matrix/close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
     printf("PASS [fanout-matrix]\n");
+    return 0;
+}
+
+static int child_emby_slow_search_matrix(void) {
+    sqlite3 *db;
+    char *resume_simple_count_sql;
+    char *resume_simple_count_expected;
+    char *resume_simple_bare_sql;
+    char *resume_simple_bare_expected;
+    char *resume_unplayed_sql;
+    char *resume_bad_l1_sql;
+    char *resume_bad_limit_sql;
+    char *resume_simple_string_sql;
+    char *resume_simple_string_expected;
+    char *resume_simple_string_only_sql;
+    char *resume_simple_duplicate_sql;
+    char *resume_complex_sql;
+    char *resume_complex_expected;
+    char *resume_complex_no_not_null_sql;
+    char *resume_complex_comment_sql;
+    char *resume_complex_comment_expected;
+    char *resume_0065_sql;
+    char *resume_0065_expected;
+    char *resume_bound_user_sql;
+    char *resume_named_user_sql;
+    char *resume_derived_param_sql;
+    char *resume_conflict_user_sql;
+    char *resume_duplicate_sql;
+    char *similar_sql;
+    char *similar_expected;
+    char *similar_comment_sql;
+    char *similar_comment_expected;
+    char *similar_comment_only_sql;
+    char *people_sql;
+    char *people_repl;
+    char *people_expected;
+    char *links_sql;
+    char *links_repl;
+    char *links_expected;
+    char *fts_sql;
+    char *latest_sql;
+
+    configure_env("1", "0", NULL);
+    make_temp_dir();
+    db = open_seeded_temp("library.db");
+
+    resume_simple_count_sql = make_resume_simple_sql(1, "12");
+    resume_simple_count_expected = make_resume_simple_expected(resume_simple_count_sql);
+    expect_sql(db, "resume-simple-count", resume_simple_count_sql, -1, 2,
+               resume_simple_count_expected, 0);
+
+    resume_simple_bare_sql = make_resume_simple_sql(0, "24");
+    resume_simple_bare_expected = make_resume_simple_expected(resume_simple_bare_sql);
+    expect_sql(db, "resume-simple-bare", resume_simple_bare_sql, -1, 2,
+               resume_simple_bare_expected, 0);
+
+    resume_unplayed_sql = replace_once(
+        resume_simple_count_sql,
+        "UserDatas.playbackPositionTicks > 0",
+        "Coalesce(UserDatas.played, 0)=0"
+    );
+    expect_sql(db, "resume-simple-unplayed-negative", resume_unplayed_sql, -1, 2,
+               resume_unplayed_sql, 0);
+    expect_sql(db, "resume-simple-shape-07-547bab3e-negative",
+               EMBY_RESUME_SIMPLE_LEFT_JOIN_UNPLAYED_SHAPE_07_SQL, -1, 2,
+               EMBY_RESUME_SIMPLE_LEFT_JOIN_UNPLAYED_SHAPE_07_SQL, 0);
+
+    resume_bad_l1_sql = replace_once(resume_simple_count_sql, "AncestorId in (100)",
+                                     "AncestorId in (@AncestorId)");
+    expect_sql(db, "resume-simple-bad-l1-negative", resume_bad_l1_sql, -1, 2,
+               resume_bad_l1_sql, 0);
+
+    resume_bad_limit_sql = replace_once(resume_simple_count_sql, "LIMIT 12", "LIMIT @Limit");
+    expect_sql(db, "resume-simple-bad-limit-negative", resume_bad_limit_sql, -1, 2,
+               resume_bad_limit_sql, 0);
+
+    resume_simple_string_sql = replace_once(
+        resume_simple_count_sql,
+        "AND A.Id in WithAncestors",
+        "AND 'A.Id in WithAncestors' IS NOT NULL AND A.Id in WithAncestors"
+    );
+    resume_simple_string_expected = replace_once(
+        resume_simple_count_expected,
+        "AND EXISTS (SELECT 1 FROM AncestorIds2",
+        "AND 'A.Id in WithAncestors' IS NOT NULL AND EXISTS (SELECT 1 FROM AncestorIds2"
+    );
+    expect_sql(db, "resume-simple-string-embedded-immunity", resume_simple_string_sql,
+               -1, 2, resume_simple_string_expected, 0);
+
+    resume_simple_string_only_sql = replace_once(
+        resume_simple_count_sql,
+        "AND A.Id in WithAncestors",
+        "AND 'A.Id in WithAncestors' IS NOT NULL"
+    );
+    expect_sql(db, "resume-simple-string-only-negative", resume_simple_string_only_sql,
+               -1, 2, resume_simple_string_only_sql, 0);
+
+    resume_simple_duplicate_sql = replace_once(
+        resume_simple_count_sql,
+        "AND A.Id in WithAncestors",
+        "AND A.Id in WithAncestors AND A.Id in WithAncestors"
+    );
+    expect_sql(db, "resume-simple-duplicate-negative", resume_simple_duplicate_sql, -1, 2,
+               resume_simple_duplicate_sql, 0);
+
+    resume_complex_sql = make_resume_sql();
+    resume_complex_expected = make_resume_expected(resume_complex_sql, "100", "1");
+    expect_sql(db, "resume-complex-count", resume_complex_sql, -1, 2,
+               resume_complex_expected, 0);
+
+    resume_complex_no_not_null_sql = replace_once(
+        resume_complex_sql,
+        " AND LastWatchedEpisodes.LastPlayedDateInt not null",
+        ""
+    );
+    expect_sql(db, "resume-complex-missing-lastwatched-not-null-negative",
+               resume_complex_no_not_null_sql, -1, 2,
+               resume_complex_no_not_null_sql, 0);
+
+    resume_complex_comment_sql = replace_once(
+        resume_complex_sql,
+        "AND A.Id in WithAncestors Group by",
+        "AND /* A.Id in WithAncestors */ A.Id in WithAncestors Group by"
+    );
+    resume_complex_comment_expected = replace_once(
+        resume_complex_expected,
+        "AND EXISTS (SELECT 1 FROM AncestorIds2",
+        "AND /* A.Id in WithAncestors */ EXISTS (SELECT 1 FROM AncestorIds2"
+    );
+    expect_sql(db, "resume-complex-comment-embedded-immunity",
+               resume_complex_comment_sql, -1, 2, resume_complex_comment_expected, 0);
+
+    resume_0065_sql = make_resume_0065_sql();
+    resume_0065_expected = make_resume_expected(resume_0065_sql, "100", "13");
+    expect_sql(db, "resume-complex-0065", resume_0065_sql, -1, 2,
+               resume_0065_expected, 0);
+
+    resume_bound_user_sql = replace_once(resume_complex_sql, "UserDatas.UserId=1",
+                                         "UserDatas.UserId=?1");
+    expect_sql(db, "resume-complex-bound-user-negative", resume_bound_user_sql, -1, 2,
+               resume_bound_user_sql, 0);
+
+    resume_named_user_sql = replace_once(resume_complex_sql, "userdatas.userid=1",
+                                         "userdatas.userid=@UserId");
+    expect_sql(db, "resume-complex-named-user-negative", resume_named_user_sql, -1, 2,
+               resume_named_user_sql, 0);
+
+    resume_derived_param_sql = replace_once(resume_complex_sql, "UserDatas_N.UserId=1",
+                                            "UserDatas_N.UserId=:UserId");
+    expect_sql(db, "resume-complex-derived-param-negative", resume_derived_param_sql, -1, 2,
+               resume_derived_param_sql, 0);
+
+    resume_conflict_user_sql = replace_once(resume_complex_sql, "userdatas.userid=1",
+                                            "userdatas.userid=2");
+    expect_sql(db, "resume-complex-conflicting-user-negative", resume_conflict_user_sql, -1, 2,
+               resume_conflict_user_sql, 0);
+
+    resume_duplicate_sql = replace_once(
+        resume_complex_sql,
+        "AND A.Id in WithAncestors",
+        "AND A.Id in WithAncestors AND A.Id in WithAncestors"
+    );
+    expect_sql(db, "resume-complex-duplicate-negative", resume_duplicate_sql, -1, 2,
+               resume_duplicate_sql, 0);
+
+    similar_sql = make_similar_sql();
+    similar_expected = make_similar_expected(similar_sql);
+    expect_sql(db, "fanout-similar", similar_sql, -1, 2, similar_expected, 0);
+
+    similar_comment_sql = replace_once(
+        similar_sql,
+        "AND A.Id in WithAncestors",
+        "AND /* A.Id in WithAncestors */ A.Id in WithAncestors"
+    );
+    similar_comment_expected = replace_once(
+        similar_expected,
+        "AND EXISTS (SELECT 1 FROM AncestorIds2",
+        "AND /* A.Id in WithAncestors */ EXISTS (SELECT 1 FROM AncestorIds2"
+    );
+    expect_sql(db, "similar-comment-embedded-immunity", similar_comment_sql,
+               -1, 2, similar_comment_expected, 0);
+
+    similar_comment_only_sql = replace_once(
+        similar_sql,
+        "AND A.Id in WithAncestors",
+        "AND /* A.Id in WithAncestors */ 1=1"
+    );
+    expect_sql(db, "similar-comment-only-negative", similar_comment_only_sql, -1, 2,
+               similar_comment_only_sql, 0);
+
+    people_sql = make_people_sql();
+    people_repl = make_exists_people("100");
+    people_expected = replace_once(
+        people_sql,
+        "A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors)",
+        people_repl
+    );
+    expect_sql(db, "similar-people-negative", people_sql, -1, 2, people_expected, 0);
+
+    links_sql = make_links_search_sql("2,3");
+    links_repl = make_exists_links_one("100", "2,3");
+    links_expected = replace_once(links_sql, "A.Id in WithItemLinkItemIds", links_repl);
+    expect_sql(db, "similar-links-search-negative", links_sql, -1, 2, links_expected, 0);
+    /* Links/type-count family (NM-7, shape 05 be6193690e7649e0): a must-not-match
+       negative for the similar-items matcher (misses on the SimB_Ids guard). The exact
+       people/studios/type-29 similar sibling has no census specimen yet -> backlog. */
+    expect_sql(db, "similar-link-type-count-nm7-shape-05-be619369-negative",
+               EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2,
+               EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, 0);
+
+    fts_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
+    expect_sql(db, "fanout-search-fts-negative", fts_sql, -1, 2, fts_sql, 0);
+
+    latest_sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
+    expect_sql(db, "fanout-latest-negative", latest_sql, -1, 2, latest_sql, 0);
+    require_absent("fanout-latest-negative/indexed-by", latest_sql,
+                   "INDEXED BY idx_dshadow_emby_latest_gk_dc");
+
+    free(resume_simple_count_sql);
+    free(resume_simple_count_expected);
+    free(resume_simple_bare_sql);
+    free(resume_simple_bare_expected);
+    free(resume_unplayed_sql);
+    free(resume_bad_l1_sql);
+    free(resume_bad_limit_sql);
+    free(resume_simple_string_sql);
+    free(resume_simple_string_expected);
+    free(resume_simple_string_only_sql);
+    free(resume_simple_duplicate_sql);
+    free(resume_complex_sql);
+    free(resume_complex_expected);
+    free(resume_complex_no_not_null_sql);
+    free(resume_complex_comment_sql);
+    free(resume_complex_comment_expected);
+    free(resume_0065_sql);
+    free(resume_0065_expected);
+    free(resume_bound_user_sql);
+    free(resume_named_user_sql);
+    free(resume_derived_param_sql);
+    free(resume_conflict_user_sql);
+    free(resume_duplicate_sql);
+    free(similar_sql);
+    free(similar_expected);
+    free(similar_comment_sql);
+    free(similar_comment_expected);
+    free(similar_comment_only_sql);
+    free(people_sql);
+    free(people_repl);
+    free(people_expected);
+    free(links_sql);
+    free(links_repl);
+    free(links_expected);
+    free(fts_sql);
+    free(latest_sql);
+    require_int("emby-slow-search-matrix/close", sqlite3_close(db), SQLITE_OK);
+    cleanup_temp_dir();
+    printf("PASS [emby-slow-search-matrix]\n");
     return 0;
 }
 
@@ -1405,11 +1817,17 @@ static int child_dashboard_matrix(void) {
     db = open_seeded_temp_with_latest_index("library.db", 1);
     latest_sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
     latest_expected = make_latest_expected("A.Id,A.SeriesName,A.SortName ", "12");
+    require_absent("dashboard-latest-original/indexed-by", latest_sql,
+                   "INDEXED BY idx_dshadow_emby_latest_gk_dc");
+    require_contains("dashboard-latest-expected/indexed-by", latest_expected,
+                     "FROM MediaItems INDEXED BY idx_dshadow_emby_latest_gk_dc WHERE Type = 8");
     expect_sql(db, "dashboard-latest", latest_sql, -1, 2, latest_expected, 0);
     expect_sql(db, "dashboard-latest-nbyte-with-nul", latest_sql,
                (int)strlen(latest_sql) + 1, 2, latest_expected, 0);
     latest16_sql = make_latest_sql("A.Id ", "16");
     latest16_expected = make_latest_expected("A.Id ", "16");
+    require_contains("dashboard-latest-limit16/indexed-by", latest16_expected,
+                     "FROM MediaItems INDEXED BY idx_dshadow_emby_latest_gk_dc WHERE Type = 8");
     expect_sql(db, "dashboard-latest-limit16", latest16_sql, -1, 2, latest16_expected, 0);
 
     aggregate_sql = make_latest_sql("MAX(A.DateCreated) ", "12");
@@ -1447,11 +1865,19 @@ static int child_dashboard_matrix(void) {
 
 static int child_latest_limit20(void) {
     sqlite3 *db;
+    char *latest_sql;
+    char *latest_expected;
 
     configure_env("1", NULL, "0");
     make_temp_dir();
     db = open_seeded_temp_with_latest_index("library.db", 1);
-    expect_fixture(db, "latest-limit20");
+    latest_sql = make_latest_sql("A.Id ", "20");
+    latest_expected = make_latest_expected("A.Id ", "20");
+    require_contains("latest-limit20/indexed-by", latest_expected,
+                     "FROM MediaItems INDEXED BY idx_dshadow_emby_latest_gk_dc WHERE Type = 8");
+    expect_sql(db, "latest-limit20", latest_sql, -1, 2, latest_expected, 0);
+    free(latest_sql);
+    free(latest_expected);
     require_int("latest-limit20/close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
     printf("PASS [latest-limit20]\n");
@@ -1495,6 +1921,10 @@ static int child_observability_logs(void) {
     char *links_repl;
     char *links_expected;
     char *links_miss_sql;
+    char *resume_simple_sql;
+    char *resume_simple_expected;
+    char *similar_sql;
+    char *similar_expected;
     char *latest_sql;
     char *latest_expected;
     char *latest_miss_sql;
@@ -1513,6 +1943,15 @@ static int child_observability_logs(void) {
 
     links_miss_sql = make_links_search_sql("'bad'");
     expect_sql(db, "obs-fanout-links-capture-miss", links_miss_sql, -1, 2, links_miss_sql, 0);
+
+    resume_simple_sql = make_resume_simple_sql(1, "12");
+    resume_simple_expected = make_resume_simple_expected(resume_simple_sql);
+    expect_sql(db, "obs-fanout-resume-simple-applied", resume_simple_sql,
+               -1, 2, resume_simple_expected, 0);
+
+    similar_sql = make_similar_sql();
+    similar_expected = make_similar_expected(similar_sql);
+    expect_sql(db, "obs-fanout-similar-applied", similar_sql, -1, 2, similar_expected, 0);
 
     latest_sql = make_latest_sql("A.Id ", "12");
     latest_expected = make_latest_expected("A.Id ", "12");
@@ -1549,6 +1988,16 @@ static int child_observability_logs(void) {
         "observability/fanout-applied",
         log_output,
         "event=rewrite_applied target=emby mode=fanout+links_search"
+    );
+    require_contains(
+        "observability/fanout-resume-simple-applied",
+        log_output,
+        "event=rewrite_applied target=emby mode=fanout+resume_simple"
+    );
+    require_contains(
+        "observability/fanout-similar-applied",
+        log_output,
+        "event=rewrite_applied target=emby mode=fanout+similar"
     );
     require_contains(
         "observability/dashboard-applied",
@@ -1589,6 +2038,10 @@ static int child_observability_logs(void) {
     free(links_repl);
     free(links_expected);
     free(links_miss_sql);
+    free(resume_simple_sql);
+    free(resume_simple_expected);
+    free(similar_sql);
+    free(similar_expected);
     free(latest_sql);
     free(latest_expected);
     free(latest_miss_sql);
@@ -1693,10 +2146,12 @@ static void run_child(const char *name) {
         if (strcmp(name, "authorizer-ownership") == 0) _exit(child_authorizer_and_ownership());
         if (strcmp(name, "fixture-canary") == 0) _exit(child_fixture_canary());
         if (strcmp(name, "row-parity") == 0) _exit(child_row_parity());
+        if (strcmp(name, "resume-d-row-parity") == 0) _exit(child_resume_d_row_parity());
         if (strcmp(name, "fanout-default-off") == 0) _exit(child_fanout_default_off());
         if (strcmp(name, "fanout-one-off") == 0) _exit(child_fanout_off_value("1", "fanout-one-off"));
         if (strcmp(name, "fanout-garbage-off") == 0) _exit(child_fanout_off_value("false", "fanout-garbage-off"));
         if (strcmp(name, "fanout-matrix") == 0) _exit(child_fanout_matrix());
+        if (strcmp(name, "emby-slow-search-matrix") == 0) _exit(child_emby_slow_search_matrix());
         if (strcmp(name, "dashboard-default-off") == 0) _exit(child_dashboard_default_off());
         if (strcmp(name, "dashboard-one-off") == 0) _exit(child_dashboard_off_value("1", "dashboard-one-off"));
         if (strcmp(name, "dashboard-garbage-off") == 0) _exit(child_dashboard_off_value("false", "dashboard-garbage-off"));
@@ -1740,10 +2195,12 @@ int main(int argc, char **argv) {
     run_child("authorizer-ownership");
     run_child("fixture-canary");
     run_child("row-parity");
+    run_child("resume-d-row-parity");
     run_child("fanout-default-off");
     run_child("fanout-one-off");
     run_child("fanout-garbage-off");
     run_child("fanout-matrix");
+    run_child("emby-slow-search-matrix");
     run_child("dashboard-default-off");
     run_child("dashboard-one-off");
     run_child("dashboard-garbage-off");

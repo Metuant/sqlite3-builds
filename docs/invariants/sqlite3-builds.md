@@ -203,11 +203,12 @@ milestone lands.
   `emby_fts_rewrite_prepare`; that helper MUST chain to
   `plex_fts_rewrite_prepare`, then the matching `*_real` prepare
   implementation. Disabled, non-target, nonmatching, drift, and failure paths
-  must prepare the original SQL unchanged, while enabled Emby search matches
-  intentionally prepare the scalar-plus-membership rewrite and enabled Plex
-  prefix-tag matches intentionally prepare the `unlikely(tag_type=<value>)`
-  rewrite. Rewrite-success logging is emitted only after the rewritten
-  statement is the returned statement; passthrough, miss, and
+  must prepare the original SQL unchanged, while enabled Emby matches
+  intentionally prepare scalar-plus-membership, fan-out, or dashboard Latest
+  rewrites and enabled Plex matches intentionally prepare the
+  `unlikely(tag_type=<value>)`, taggings-membership conjunct, or On-Deck
+  ranked-subquery rewrite. Rewrite-success logging is emitted only after the
+  rewritten statement is the returned statement; passthrough, miss, and
   fallback-to-original paths do not log.
 - Every `obs_forward_config` / `obs_forward_db_config` case-arm
   preserves the exact arity, types, and argument pass-through to
@@ -318,6 +319,19 @@ milestone lands.
   optimize; unset, literal `1`, and every other value disable runtime
   optimize. Literal `SQLITE3_DISABLE_AUTOPRAGMA=1` disables open-time PRAGMAs
   and runtime optimize.
+- Plex FTS rewrite is opt-out in the Plex/ICU build: literal
+  `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
+  other value enable. Plex taggings and On-Deck rewrites are opt-in:
+  `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE=0` and
+  `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enable; unset, literal `1`, and every
+  other value disable. These Plex opt-in rewrites fail open and are independent
+  of `SQLITE3_DISABLE_AUTOPRAGMA` and `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
+- Emby FTS rewrite is opt-out: literal `SQLITE3_DISABLE_EMBY_FTS_REWRITE=1`
+  disables; unset, literal `0`, and every other value enable. Emby fan-out and
+  dashboard rewrites are opt-in: `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0` and
+  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enable; unset, literal `1`, and
+  every other value disable. These Emby rewrites fail open and are independent
+  of `SQLITE3_DISABLE_AUTOPRAGMA`.
 - Runtime optimize has two successful per-path cadences: LIMITED defaults to
   1800 seconds, sets `PRAGMA main.analysis_limit=0`, and runs
   `PRAGMA main.optimize=0x10002` with a 3-second deadline; FULL defaults to

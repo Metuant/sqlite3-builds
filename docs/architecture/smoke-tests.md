@@ -86,12 +86,18 @@ Execution points:
 
 It proves:
 
-- ICU-only rewrite enablement.
-- literal env kill switch, default-enabled, non-`1` env, and exact-path
-  negatives.
+- ICU-only FTS rewrite enablement.
+- FTS opt-out env behavior: default-enabled, literal `1` disabled, non-`1`
+  enabled, and exact-path negatives.
+- taggings and On-Deck opt-in env behavior: literal `0` enabled, unset,
+  literal `1`, and non-`0` disabled.
 - three UTF-8 prepare entries with `nByte`/NUL and `pzTail == NULL`.
 - quoted-string/`?` RHS.
-- scope/clause/RHS-continuation negatives.
+- FTS scope/clause/RHS-continuation negatives.
+- taggings membership same-SELECT-block guards, FTS-shape exclusion, index gate,
+  and duplicate/bound/string tag-id negatives.
+- On-Deck exact-shape guards, g2 index gate, duplicate ID preservation, and
+  deterministic ranked-subquery output.
 - prepare-denial fail-open.
 - grouped-digest row identity.
 
@@ -107,9 +113,11 @@ It proves:
 - FTS rewrite default-on behavior: unset, literal `0`, and garbage values
   enable; literal `1` disables.
 - FANOUT default-off behavior and enabled Browse-by-name, Favorites-first,
-  RES-A, People, Studios, and Type-29 membership rewrites.
+  RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and
+  links-search rewrites.
 - DASHBOARD default-off behavior and enabled Episode-Latest rewrite with
-  LIMIT/projection variation.
+  LIMIT/projection variation and the `idx_dshadow_emby_latest_gk_dc` keys CTE
+  `INDEXED BY`.
 - exact `library.db` target basename and non-target negatives.
 - three UTF-8 prepare entries with `nByte`/NUL and tail handling.
 - MATCH scalar insertion plus membership `EXISTS` rewrite for type and
@@ -214,6 +222,7 @@ A duplicate disabled-mode smoke starts PMS with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
 `[sqlite3-builds-obs]` line is emitted.
 
+
 ### Emby first-init smoke
 
 The CI Emby first-init smoke runs after generic library artifact extraction.
@@ -241,4 +250,3 @@ contain startup `sqlite3_config` operations returning `rc=21` (CI pattern:
 A duplicate disabled-mode smoke starts Emby with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
 `[sqlite3-builds-obs]` line is emitted.
-

@@ -8,3 +8,5 @@
 *.log
 *.lock
 *.tmp
+docs/runbooks/emby-search-measure/env
+docs/runbooks/canary/env

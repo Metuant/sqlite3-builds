@@ -47,8 +47,11 @@ stage_scratch() {
   cp "$repo_root/docker-build-base/Dockerfile" "$scratch/docker-build-base/Dockerfile"
   cp "$repo_root/docker-build-base/ubuntu-toolchain-r-test.asc" "$scratch/docker-build-base/ubuntu-toolchain-r-test.asc"
   cp "$repo_root/src/auto_extension.c" "$scratch/src/auto_extension.c"
+  cp "$repo_root/src/emby_fts_rewrite.c" "$scratch/src/emby_fts_rewrite.c"
+  cp "$repo_root/src/plex_fts_rewrite.c" "$scratch/src/plex_fts_rewrite.c"
   cp "$repo_root/tools/ci/mod-bake-smoke.sh" "$scratch/tools/ci/mod-bake-smoke.sh"
   cp "$repo_root/tools/lsio-mod/render-lsio-mod-baked-pins.sh" "$scratch/tools/lsio-mod/render-lsio-mod-baked-pins.sh"
+  cp "$repo_root/scripts/optimize_media_servers.sh" "$scratch/scripts/optimize_media_servers.sh"
 }
 
 assert_rejected() {

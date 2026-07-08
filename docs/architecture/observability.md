@@ -36,8 +36,9 @@ prepare rewritten SQL only for enabled target matches. The Plex helper emits
 only on effective rewrite success and emits `rewrite_skipped` for rewrite-path
 failures after a target-shape match. Emby modes are `fts+membership`,
 `fanout+resume`, `fanout+browse`, `fanout+favorites`, `fanout+people`,
-`fanout+links_search`, and `dashboard+latest`. Capture-gated fan-out and
-dashboard misses log `reason=capture_miss`; missing Latest index logs
+`fanout+links_search`, `fanout+resume_simple`, `fanout+similar`, and
+`dashboard+latest`. Capture-gated fan-out and dashboard misses log
+`reason=capture_miss`; missing Emby Latest or Plex taggings/On-Deck indexes log
 `reason=index_missing`. `SQLITE3_DISABLE_OBSERVABILITY` gates helper logs
 independently of `SQLITE3_DISABLE_STMT_TRACE`; pure passthrough and miss paths
 do not log.
@@ -175,4 +176,3 @@ print an `ADVISORY FAIL` line and continue. The generic library image also runs
 and pass/fail verdicts, then exits 0 so benchmark drift never fails CI. The Plex
 and Emby FTS prepare benches follow the same advisory posture: their timing
 verdicts report prepare-cost drift but do not fail CI.
-

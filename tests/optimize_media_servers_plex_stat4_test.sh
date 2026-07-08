@@ -104,6 +104,15 @@ esac
 old_binary_name="EMBY""_BINARY"
 [ -z "${!old_binary_name+x}" ] || fail "$old_binary_name hard rename" "unset" "${!old_binary_name}"
 
+PLEX_TAGGINGS_INDEX="idx_dshadow_taggings_tag_id_metadata_item_id"
+PLEX_SETTINGS_INDEX="idx_dshadow_mis_account_updated_guid_cover"
+PLEX_RECENT_INDEX="idx_dshadow_metadata_items_section_added"
+PLEX_GUID_NOCASE_INDEX="idx_dshadow_metadata_items_guid_nocase"
+PLEX_VIEWS_GRANDPARENT_GUID_INDEX="idx_dshadow_metadata_item_views_account_grandparent_guid"
+plex_stat4_leaders="$(printf '%s\n' "${_PLEX_STAT4_LEADER_INDEXES[@]}")"
+assert_contains "$plex_stat4_leaders" "$PLEX_GUID_NOCASE_INDEX" "STAT4 leader list guid NOCASE index"
+assert_contains "$plex_stat4_leaders" "$PLEX_VIEWS_GRANDPARENT_GUID_INDEX" "STAT4 leader list views grandparent index"
+
 mkdir -p "$tmp/bin" "$tmp/backups"
 export REAL_SQLITE="$real_sqlite"
 
@@ -195,6 +204,7 @@ cur.executescript(
     CREATE INDEX index_metadata_item_settings_on_account_id ON metadata_item_settings(account_id);
     CREATE TABLE metadata_items(
       id INTEGER PRIMARY KEY,
+      guid TEXT NOT NULL,
       title_sort TEXT,
       library_section_id INTEGER NOT NULL,
       metadata_type INTEGER NOT NULL,
@@ -202,6 +212,15 @@ cur.executescript(
       originally_available_at INTEGER
     );
     CREATE INDEX index_metadata_items_on_library_section_id ON metadata_items(library_section_id);
+    CREATE INDEX index_metadata_items_on_guid ON metadata_items(guid);
+    CREATE TABLE metadata_item_views(
+      id INTEGER PRIMARY KEY,
+      account_id INTEGER NOT NULL,
+      guid TEXT NOT NULL,
+      grandparent_guid TEXT NOT NULL,
+      viewed_at INTEGER
+    );
+    CREATE INDEX index_metadata_item_views_on_guid ON metadata_item_views(guid);
     CREATE TABLE "quote""table"(id INTEGER PRIMARY KEY, value TEXT NOT NULL);
     CREATE INDEX "quote""idx" ON "quote""table"(value);
     """
@@ -246,8 +265,26 @@ cur.executemany(
     ),
 )
 cur.executemany(
-    "INSERT INTO metadata_items(id, title_sort, library_section_id, metadata_type, added_at, originally_available_at) VALUES(?, ?, ?, ?, ?, ?)",
-    ((i, f"title-{i % 100}", i % 12, i % 5, 9999999999 if i == 1 else 1000000 + i, 1 if i == 2 else 1000000 + i) for i in range(1, 5001)),
+    "INSERT INTO metadata_items(id, guid, title_sort, library_section_id, metadata_type, added_at, originally_available_at) VALUES(?, ?, ?, ?, ?, ?, ?)",
+    (
+        (
+            i,
+            ("plex://movie/" if i % 2 == 0 else "plex://show/") + f"{i:06d}",
+            f"title-{i % 100}",
+            i % 12,
+            i % 5,
+            9999999999 if i == 1 else 1000000 + i,
+            1 if i == 2 else 1000000 + i,
+        )
+        for i in range(1, 5001)
+    ),
+)
+cur.executemany(
+    "INSERT INTO metadata_item_views(id, account_id, guid, grandparent_guid, viewed_at) VALUES(?, ?, ?, ?, ?)",
+    (
+        (i, 42 if i <= 4500 else i, f"plex://episode/{i}", f"plex://show/{i % 100}", 4000000 - i)
+        for i in range(1, 5001)
+    ),
 )
 if include_icu_names:
     cur.executemany(
@@ -283,8 +320,10 @@ create_plex_stat4_fixture "$fixture"
 targets="$(discover_plex_stat4_analyze_targets "$real_sqlite" "$fixture")"
 assert_contains "$targets" $'T\ttaggings' "STAT4 worklist taggings table target"
 assert_contains "$targets" $'T\tmetadata_item_settings' "STAT4 worklist metadata_item_settings table target"
+assert_contains "$targets" $'T\tmetadata_item_views' "STAT4 worklist metadata_item_views table target"
 assert_contains "$targets" $'I\tindex_metadata_items_on_library_section_id' "STAT4 worklist safe metadata_items index target"
 assert_contains "$targets" $'I\tidx_dshadow_metadata_items_section_added' "STAT4 worklist recent metadata_items index target"
+assert_contains "$targets" $'I\tidx_dshadow_metadata_items_guid_nocase' "STAT4 worklist guid NOCASE metadata_items index target"
 assert_contains "$targets" $'I\tix_auto_icu_safe' "STAT4 worklist safe explicit index beside ICU autoindex"
 assert_contains "$targets" $'T\tquote"table' "STAT4 worklist quote-bearing table target"
 assert_not_contains "$targets" $'T\tmetadata_items' "STAT4 worklist skips table-level metadata_items"
@@ -361,18 +400,26 @@ assert_not_contains "$(cat "$tmp/stat4-run.err")" "no such collation sequence" "
 assert_contains "$(cat "$tmp/stat4-run.out")" "Plex STAT4 analyze targets:" "STAT4 run progress"
 stat4_log="$(cat "$STAT4_ANALYZE_LOG")"
 assert_not_contains "$stat4_log" 'ANALYZE "metadata_items"' "STAT4 run skips metadata_items table ANALYZE"
+assert_contains "$stat4_log" 'ANALYZE "metadata_item_views"' "STAT4 run analyzes metadata_item_views table"
 assert_contains "$stat4_log" 'ANALYZE "index_metadata_items_on_library_section_id"' "STAT4 run analyzes safe metadata_items index"
 assert_contains "$stat4_log" 'ANALYZE "idx_dshadow_metadata_items_section_added"' "STAT4 run analyzes recent metadata_items index"
+assert_contains "$stat4_log" 'ANALYZE "idx_dshadow_metadata_items_guid_nocase"' "STAT4 run analyzes guid NOCASE metadata_items index"
 assert_not_contains "$stat4_log" 'ANALYZE "index_title_sort_custom_icu"' "STAT4 run skips ICU index"
 assert_contains "$stat4_log" 'ANALYZE "quote""table"' "STAT4 run quotes identifiers"
 if [ "$stat4_available" = "1" ]; then
   assert_contains "$(cat "$tmp/stat4-run.out")" "Plex STAT4 sqlite_stat4 rows:" "STAT4 run final row count"
-  taggings_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_taggings_tag_id_metadata_item_id';")"
-  settings_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_mis_account_updated_guid_cover';")"
-  recent_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_metadata_items_section_added';")"
+  assert_contains "$(cat "$tmp/stat4-run.out")" "Plex STAT4 $PLEX_GUID_NOCASE_INDEX rows:" "STAT4 run guid leader progress"
+  assert_contains "$(cat "$tmp/stat4-run.out")" "Plex STAT4 $PLEX_VIEWS_GRANDPARENT_GUID_INDEX rows:" "STAT4 run views leader progress"
+  taggings_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_TAGGINGS_INDEX';")"
+  settings_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_SETTINGS_INDEX';")"
+  recent_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_RECENT_INDEX';")"
+  guid_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_GUID_NOCASE_INDEX';")"
+  views_stat4="$("$real_sqlite" "$fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_VIEWS_GRANDPARENT_GUID_INDEX';")"
   assert_int_gt "$taggings_stat4" 0 "taggings leader index sqlite_stat4 rows"
   assert_int_gt "$settings_stat4" 0 "metadata_item_settings leader index sqlite_stat4 rows"
   assert_int_gt "$recent_stat4" 0 "recent metadata_items leader index sqlite_stat4 rows"
+  assert_int_gt "$guid_stat4" 0 "guid NOCASE metadata_items leader index sqlite_stat4 rows"
+  assert_int_gt "$views_stat4" 0 "views grandparent leader index sqlite_stat4 rows"
 else
   printf 'SKIP: sqlite_stat4 unavailable in this sqlite3 build\n'
 fi
@@ -385,7 +432,9 @@ run_plex_stat4_analyze "$tmp/bin/stat4-sqlite" "$failure_fixture" >"$tmp/stat4-f
 unset STAT4_FAIL_NEEDLE
 assert_contains "$(cat "$tmp/stat4-failure.err")" "WARNING: Plex STAT4 ANALYZE failed for ix_auto_icu_safe" "STAT4 per-target failure warning"
 if [ "$stat4_available" = "1" ]; then
-  assert_int_gt "$("$real_sqlite" "$failure_fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_taggings_tag_id_metadata_item_id';")" 0 "STAT4 per-target failure preserves earlier safe target rows"
+  assert_int_gt "$("$real_sqlite" "$failure_fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_TAGGINGS_INDEX';")" 0 "STAT4 per-target failure preserves earlier safe target rows"
+  assert_int_gt "$("$real_sqlite" "$failure_fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_GUID_NOCASE_INDEX';")" 0 "STAT4 per-target failure preserves guid NOCASE rows"
+  assert_int_gt "$("$real_sqlite" "$failure_fixture" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_VIEWS_GRANDPARENT_GUID_INDEX';")" 0 "STAT4 per-target failure preserves views grandparent rows"
 fi
 
 cat > "$tmp/bin/plex-sqlite" <<'EOF_PLEX_SQLITE'
@@ -479,9 +528,11 @@ assert_eq "" "$later_repair_line" "no metadata_items repair after STAT4"
 post_swap_repair_line="$(first_line_of "$ORDER_LOG" "post-swap-metadata-repair")"
 assert_eq "" "$post_swap_repair_line" "no metadata_items repair in post-swap SQL path"
 if [ "$stat4_available" = "1" ]; then
-  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_taggings_tag_id_metadata_item_id';")" 0 "pipeline taggings STAT4 rows"
-  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_mis_account_updated_guid_cover';")" 0 "pipeline metadata_item_settings STAT4 rows"
-  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='idx_dshadow_metadata_items_section_added';")" 0 "pipeline recent metadata_items STAT4 rows"
+  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_TAGGINGS_INDEX';")" 0 "pipeline taggings STAT4 rows"
+  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_SETTINGS_INDEX';")" 0 "pipeline metadata_item_settings STAT4 rows"
+  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_RECENT_INDEX';")" 0 "pipeline recent metadata_items STAT4 rows"
+  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_GUID_NOCASE_INDEX';")" 0 "pipeline guid NOCASE STAT4 rows"
+  assert_int_gt "$("$real_sqlite" "$integration_db" "SELECT COUNT(*) FROM sqlite_stat4 WHERE idx='$PLEX_VIEWS_GRANDPARENT_GUID_INDEX';")" 0 "pipeline views grandparent STAT4 rows"
 fi
 
 corrupt_dir="$tmp/corrupt"

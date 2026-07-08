@@ -26,6 +26,8 @@ if [ -z "${_PLEX_INDEXES+x}" ]; then
         "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"
         "CREATE INDEX IF NOT EXISTS idx_dshadow_mis_account_updated_guid_cover ON metadata_item_settings (account_id, updated_at DESC, guid, view_offset, last_viewed_at);"
         "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_section_added ON metadata_items (library_section_id, added_at);"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_guid_nocase ON metadata_items (guid COLLATE NOCASE);"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_item_views_account_grandparent_guid ON metadata_item_views (account_id, grandparent_guid);"
     )
 fi
 readonly -a _PLEX_INDEXES
@@ -34,6 +36,8 @@ if [ -z "${_PLEX_STAT4_LEADER_INDEXES+x}" ]; then
         "idx_dshadow_taggings_tag_id_metadata_item_id"
         "idx_dshadow_mis_account_updated_guid_cover"
         "idx_dshadow_metadata_items_section_added"
+        "idx_dshadow_metadata_items_guid_nocase"
+        "idx_dshadow_metadata_item_views_account_grandparent_guid"
     )
 fi
 readonly -a _PLEX_STAT4_LEADER_INDEXES
