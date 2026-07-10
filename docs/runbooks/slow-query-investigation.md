@@ -235,6 +235,101 @@ vendor query:
 - Do not wrap it in `SELECT count(*) FROM (...)`; SQLite can drop or reshape the
   sort, and the test stops measuring the logged work.
 
+## Mandatory Harness Guardrails
+
+Every harness built from this runbook MUST implement these. They are recurring
+failure modes that have cost real time repeatedly — not optional niceties. Do not
+hand-roll a harness that omits any of them.
+
+1. **Timeout EVERY sqlite invocation, in every phase (regression + hang cap).**
+   No `$SQLITE_BIN` call runs uncapped — not only the timed query. This covers
+   copy, index-prep, literal-derivation, preflight-count, identity, EQP,
+   vendor-stability, warm-up, AND timed iterations. Route ALL invocations through
+   timeout-wrapped runners, and enforce it with a startup self-check that greps the
+   script's own source and refuses to run if any `"$SQLITE_BIN" -batch` line lacks a
+   `timeout` prefix (reference: the `_ss=...grep -vF 'timeout "${'...exit 2` guard in
+   `fh1-measure.sh` / `nm10-measure.sh`). Two caps:
+   - Query phases (timed / identity / EQP / vendor-stability): `timeout ${TIMEOUT_S:-10}s`,
+     above good-case and far below the pathological. A candidate can regress
+     catastrophically — orders of magnitude — on a worst-case literal/user cell;
+     never time it fully N× uncapped.
+   - Setup phases (copy / prep / derive-literals / preflight): a generous bounded cap
+     `timeout ${SETUP_TIMEOUT_S:-300}s`; on rc=124 `die ... BLOCKED` naming the phase.
+     NEVER leave a setup/derivation query unbounded — a pathological derivation (e.g. an
+     `AncestorIds2 × MediaItems` aggregation with a null-safe dup-count join) hangs the
+     whole run indefinitely. Fail-fast, then optimize that query.
+   On timeout: mark that arm timed-out and SKIP the cell's remaining iterations.
+   Verdict from the pattern: candidate-timeout + baseline-fast = REGRESSION;
+   baseline-timeout + candidate-fast = WIN (speedup >= timeout / candidate_median);
+   both timed out = inconclusive-both-slow. (Cost of omitting: a ~175 s regression
+   query timed 3× per cell → multi-hour runs.)
+   Warm-up runs are subject to the same regression risk. A candidate that spins
+   on a worst-case literal will burn the full regression cost in the pre-warm
+   query even if the timed iterations are properly capped. Wrap warm-up calls in
+   the same timeout wrapper, or: if the arm has already been marked timed-out
+   from a prior timed iteration or prior stat-state run for this cell, skip the
+   warm-up for that arm entirely.
+   Reference implementation:
+   `.codex.local/emby-slow-search/measure/fh1-measure.sh` wraps both timed
+   iterations and the warm-up via `run_timed_sql_file` (rc=124 on timeout),
+   including the warm-up call around line 1739. Keep that shape: on timeout, set
+   `arm_timed_out[$arm]=1` immediately and skip all subsequent iterations for
+   that arm.
+
+2. **Bounded disk footprint.** NEVER materialize all arm×stat copies up front. Use
+   per-candidate 2-arm batches (baseline vs one candidate); `ANALYZE`-in-place for
+   the analyzed state (no separate analyzed copies); delete both copies between
+   candidates; disk-preflight (free >= 2×source-size + margin, else `die`); an
+   EXIT/signal trap that removes this run's copies (never the source or original).
+   Peak <= ~2 DB copies + the source copy. (A full arms×stats materialization is
+   O(copies) × multi-GB and will exhaust the volume.)
+
+3. **Identity scope.** The grouped `(id, count)` / `(gk, maxdc, n)` identity digest
+   is presentation-independent — run it ONCE per (literal × user × stat state),
+   NEVER per-`LIMIT`/N. Compute each shipped-baseline identity ONCE and reuse it
+   across all candidates (the baseline output is identical for every candidate).
+
+4. **Warm the cache.** Pre-warm every copy (`cat db db-wal db-shm >/dev/null`)
+   before its timing block; a cold first read of a multi-GB DB dominates and mimics
+   a slow query.
+
+5. **Test the RAW prepare form.** Matchers/rewrites run on the raw `zSql` (bound
+   params = literal `?`); the census/captures are `sql_expanded` (inlined).
+   Validate rewrite firing AND identity against the RAW `trace_stmt` form, NOT
+   `sql_expanded` — a rewrite can pass on inlined SQL yet `capture_miss` live where
+   the app binds that slot.
+
+   **Live-docker-log RAW-prepare validation technique (Emby/Plex instrumented instance):**
+
+   1. Inspect the container log for `trace_stmt` or rewrite-decision lines:
+      ```sh
+      docker logs --since 30m <container-name> 2>&1 | grep -E ' (trace_stmt|emby_fts_rewrite|slow_query) '
+      ```
+   2. From `trace_stmt` lines, the `sql=` field is the **raw `zSql`** — bound
+      parameters appear as literal `?`, not as inlined values.
+   3. From `slow_query_expanded` lines, the `sql_expanded=` field has inlined
+      bound values. These are NOT what the matcher sees.
+   4. To validate a matcher fires on the raw form: confirm the rewrite-decision
+      log line (`emby_fts_rewrite` or equivalent) appears for the `sql=` shape
+      (with `?`), not only for the `sql_expanded` form.
+   5. To build a shape census: extract all `sql=` values from `trace_stmt`
+      lines, normalize whitespace, group by shape. Candidates that appear in
+      the census but show `capture_miss` indicate the matcher is checking an
+      expanded or inline form, not the raw form.
+   6. Cross-tab `capture_miss` entries by mode: if misses appear for the
+      `?`-form shape but not for the inlined shape, the matcher pattern must be
+      adjusted to match the raw zSql.
+
+   **Root cause of the On-Deck capture-miss (2026-07-09):** The (f) On-Deck
+   rewrite candidate was validated against `sql_expanded` (which inlines
+   `library_section_id=123`), but the production `zSql` binds it as
+   `library_section_id=?`. The matcher string did not match the raw form,
+   producing 116/116 `capture_miss` on plex-backup-1.
+
+6. **Clean up.** Delete the whole host scratch subdir at the end, INCLUDING on
+   kill/abort. If you deliberately keep the source copy for a re-run, delete
+   everything else and say so.
+
 ## Harness Methodology
 
 Use a two-copy candidate A/B harness. The baseline copy has the candidate
@@ -348,6 +443,11 @@ cat "$copy" "$copy-wal" "$copy-shm" 2>/dev/null >/dev/null
 ```
 
 Then run one untimed warm-up query per arm before timed iterations.
+
+Note: the warm-up query MUST be covered by the same timeout guard as the timed
+iterations. See Mandatory Harness Guardrail 1 for the timeout wrapper
+requirement. "Untimed" here means the warm-up output is not recorded in the
+timing file, not that the query is free to run uncapped.
 
 Counterbalance order. A single first-run pair can mispredict because the first
 arm warms shared cache state for the second. Interleave the arms and run both

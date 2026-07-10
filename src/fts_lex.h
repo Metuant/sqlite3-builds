@@ -15,7 +15,8 @@ typedef enum fts_lex_token_type {
 
 typedef enum fts_lex_param_policy {
     FTS_LEX_PARAM_BARE_QMARK = 0,
-    FTS_LEX_PARAM_NUMBERED_OR_NAMED = 1
+    FTS_LEX_PARAM_NUMBERED_OR_NAMED = 1,
+    FTS_LEX_PARAM_SQLITE_VARIABLE = 2
 } fts_lex_param_policy;
 
 typedef struct fts_lex_token {

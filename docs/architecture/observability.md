@@ -36,12 +36,15 @@ prepare rewritten SQL only for enabled target matches. The Plex helper emits
 only on effective rewrite success and emits `rewrite_skipped` for rewrite-path
 failures after a target-shape match. Emby modes are `fts+membership`,
 `fanout+resume`, `fanout+browse`, `fanout+favorites`, `fanout+people`,
-`fanout+links_search`, `fanout+resume_simple`, `fanout+similar`, and
-`dashboard+latest`. Capture-gated fan-out and dashboard misses log
-`reason=capture_miss`; missing Emby Latest or Plex taggings/On-Deck indexes log
-`reason=index_missing`. `SQLITE3_DISABLE_OBSERVABILITY` gates helper logs
-independently of `SQLITE3_DISABLE_STMT_TRACE`; pure passthrough and miss paths
-do not log.
+`fanout+links_search`, `fanout+resume_simple`, `fanout+similar`,
+`dashboard+episodes_latest`, and `dashboard+movies_latest`. The Episodes mode
+name is a shipped telemetry rename with no compatibility alias. Each dashboard
+family logs `capture_miss` only after its own Type discriminator; valid sibling
+traffic is an unlogged clean miss. Capture-gated fan-out and dashboard misses
+log `reason=capture_miss`; missing required Emby dashboard or Plex
+taggings/On-Deck indexes log `reason=index_missing`.
+`SQLITE3_DISABLE_OBSERVABILITY` gates helper logs independently of
+`SQLITE3_DISABLE_STMT_TRACE`; pure passthrough and clean-miss paths do not log.
 
 The `sqlite3_open`, `sqlite3_open_v2`, and `sqlite3_open16` wrappers call
 `auto_extension_register_for_open()` after observability initialization and

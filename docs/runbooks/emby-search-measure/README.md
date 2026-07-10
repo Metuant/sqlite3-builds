@@ -9,7 +9,8 @@ This harness measures candidate SQL rewrites for the Emby FTS fan-out query. It 
 - A readable Emby library database copy.
 - A tuned `sqlite3` binary with read-only access to that copy.
 - A writable scratch directory on the host.
-- POSIX `sh`, `awk`, `grep`, `mkdir`, `sed`, `sha256sum`, `tee`, `tr`, and `date`.
+- POSIX `sh`, `awk`, `grep`, `mkdir`, `rm`, `sed`, `sha256sum`, `tee`,
+  `timeout`, `tr`, and `date`.
 
 The scripts open the database with `-readonly -batch` and generated SQL starts with `PRAGMA query_only=1`. They do not run `ANALYZE`, create indexes, use `INDEXED BY`, or wrap timed SQL in `count(*)`.
 
@@ -30,7 +31,13 @@ sh identity.sh
 sh timing.sh
 ```
 
-Run `identity.sh` first for all default candidates, variants, and match cases. Run `timing.sh` only after identity output is clean. To narrow an expensive timing pass, set `CANDIDATES`, `VARIANTS`, or `MATCH_CASES` to space-separated names before invoking the script.
+Run `identity.sh` first for all default candidates, variants, and match cases.
+Only proceed to timing when `identity-summary.tsv` shows
+`STATUS identity_complete mismatches=0`. Do not run `timing.sh` if identity
+mismatches exist — a candidate with identity failures produces meaningless
+timing comparisons. To narrow an expensive timing pass, set `CANDIDATES`,
+`VARIANTS`, or `MATCH_CASES` to space-separated names before invoking the
+script.
 
 Default candidates are `COMBINED B8 B1 B2 B3 B4 B5 B5_INLINE B7`. Default variants are `type presentation`. Default match cases are `case1_or case1_and case2_or case2_and`.
 
@@ -63,3 +70,24 @@ Each run writes a timestamped directory under `SCRATCH_ROOT`.
 - `medians.tsv`: median warm real time by candidate, variant, match case, and arm.
 
 Check for empty identity diffs, candidate EQP changes that match the intended rewrite, median drops on OR residual cases, and no regression on AND controls.
+
+## Guardrail Compliance
+
+- Per-query timeout: `timing.sh` wraps warm-up and timed query execution with
+  `timeout`, records `TIMEOUT` markers in `timings.tsv`, and skips remaining
+  iterations for a timed-out arm.
+- Disk footprint: both scripts open the DB read-only (`-readonly -batch`); no
+  copies are created; disk usage is run-output only.
+- Identity scope: honored — one identity check per (variant × match_case ×
+  candidate) pair before timing.
+- Pre-warm: honored in `timing.sh` (`prewarm_db` before each iteration pair).
+  Not implemented in `identity.sh` because it is not needed for correctness.
+- RAW prepare form: the harness inlines `__MATCH_LITERAL__`, `__ANCESTORS__`,
+  and `__EMBY_USER_ID__` as literal SQL text. If any of these correspond to
+  bound parameters (`?`) in the production `zSql` seen by the prepare-wrapper
+  matcher, the tested form differs from the production form. Validate against
+  `trace_stmt` raw output from a running container before treating harness
+  identity as a faithful matcher-layer proof.
+- Cleanup: failed runs remove their incomplete `$RUN_DIR`. Successful run
+  directories remain under `SCRATCH_ROOT` for inspection; operators should clean
+  old run directories after reviewing results.

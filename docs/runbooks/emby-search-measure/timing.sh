@@ -24,21 +24,39 @@ require_env() {
 
 require_env SQLITE_BIN EMBY_DB SCRATCH_ROOT EMBY_USER_ID EMBY_ANCESTORS   MATCH_CASE1_OR MATCH_CASE1_AND MATCH_CASE2_OR MATCH_CASE2_AND   MATCH_PHRASE MATCH_PHRASE_PREFIX MATCH_CASE3_AND
 
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_run_id() {
+  case "$1" in
+    ''|*/*|*..*) die "RUN_ID must be a single path segment without '/' or '..'" ;;
+  esac
+}
+
 BIN=$SQLITE_BIN
 DB=$EMBY_DB
 SCRATCH=$SCRATCH_ROOT
 RUN_ID=${RUN_ID:-emby-search-measure-timing-$(date -u +%Y%m%dT%H%M%SZ)}
+validate_run_id "$RUN_ID"
 RUN_DIR=$SCRATCH/$RUN_ID
 ITERS=${ITERS:-4}
+QUERY_TIMEOUT_S=${QUERY_TIMEOUT_S:-10}
 
 CANDIDATES=${CANDIDATES:-"COMBINED B8 B1 B2 B3 B4 B5 B5_INLINE B7"}
 VARIANTS=${VARIANTS:-"type presentation"}
 MATCH_CASES=${MATCH_CASES:-"case1_or case1_and case2_or case2_and"}
 
-die() {
-  printf 'error: %s\n' "$*" >&2
-  exit 1
+cleanup_on_exit() {
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "${RUN_DIR:-}" ]; then
+    case "$RUN_DIR" in
+      "$SCRATCH"/*) rm -rf "$RUN_DIR" ;;
+    esac
+  fi
 }
+trap cleanup_on_exit EXIT
 
 match_literal() {
   case "$1" in
@@ -210,6 +228,21 @@ run_sql() {
   "$BIN" -readonly -batch "$DB" < "$sql" > "$out" 2>&1 || die "$label failed; see $out"
 }
 
+run_timed_sql() {
+  sql=$1
+  out=$2
+  label=$3
+  set +e
+  timeout "${QUERY_TIMEOUT_S}s" "$BIN" -readonly -batch "$DB" < "$sql" > "$out" 2>&1
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    124) return 124 ;;
+    *) die "$label failed rc=$rc; see $out" ;;
+  esac
+}
+
 prewarm_db() {
   cat "$DB" "$DB-wal" "$DB-shm" 2>/dev/null >/dev/null || :
 }
@@ -247,6 +280,17 @@ parse_time() {
       }
     }
   ' "$out" >> "$RUN_DIR/timings.tsv"
+}
+
+record_timeout() {
+  timeout_variant=$1
+  timeout_match_case=$2
+  timeout_target=$3
+  timeout_arm=$4
+  timeout_phase=$5
+  timeout_iter=$6
+  timeout_out=$7
+  printf 'TIMEOUT\tstat_state=current\tvariant=%s\tmatch_case=%s\tcandidate=%s\tarm=%s\tphase=%s\titer=%s\ttimeout_s=%s\tfile=%s\n' "$timeout_variant" "$timeout_match_case" "$timeout_target" "$timeout_arm" "$timeout_phase" "$timeout_iter" "$QUERY_TIMEOUT_S" "$timeout_out" >> "$RUN_DIR/timings.tsv"
 }
 
 write_medians() {
@@ -299,6 +343,8 @@ run_pair() {
   target=$3
   pair_match=$(match_literal "$pair_match_case")
   pair_dir=$RUN_DIR/$target/$pair_variant/$pair_match_case
+  baseline_timed_out=0
+  candidate_timed_out=0
   mkdir -p "$pair_dir"
 
   for arm in baseline candidate; do
@@ -324,7 +370,17 @@ run_pair() {
     warm_sql=$pair_dir/warm-$arm.sql
     warm_out=$pair_dir/warm-$arm.out
     write_timed_sql "$warm_sql" "$pair_variant" "$arm_candidate" "$pair_match" "$arm" warm 0
-    run_sql "$warm_sql" "$warm_out" "warm $target $pair_variant $pair_match_case $arm"
+    if run_timed_sql "$warm_sql" "$warm_out" "warm $target $pair_variant $pair_match_case $arm"; then
+      :
+    else
+      rc=$?
+      if [ "$rc" -eq 124 ]; then
+        [ "$arm" = baseline ] && baseline_timed_out=1 || candidate_timed_out=1
+        record_timeout "$pair_variant" "$pair_match_case" "$target" "$arm" warm 0 "$warm_out"
+        continue
+      fi
+      die "warm query returned unexpected rc=$rc for $target $pair_variant $pair_match_case $arm"
+    fi
   done
 
   iter=1
@@ -336,6 +392,14 @@ run_pair() {
     fi
     prewarm_db
     for arm in $order; do
+      if [ "$arm" = baseline ] && [ "$baseline_timed_out" -eq 1 ]; then
+        printf 'TIME_SKIP\tstat_state=current\tvariant=%s\tmatch_case=%s\tcandidate=%s\tarm=%s\titer=%s\treason=prior_timeout\n' "$pair_variant" "$pair_match_case" "$target" "$arm" "$iter" >> "$RUN_DIR/timings.tsv"
+        continue
+      fi
+      if [ "$arm" = candidate ] && [ "$candidate_timed_out" -eq 1 ]; then
+        printf 'TIME_SKIP\tstat_state=current\tvariant=%s\tmatch_case=%s\tcandidate=%s\tarm=%s\titer=%s\treason=prior_timeout\n' "$pair_variant" "$pair_match_case" "$target" "$arm" "$iter" >> "$RUN_DIR/timings.tsv"
+        continue
+      fi
       if [ "$arm" = baseline ]; then
         arm_candidate=BASE
       else
@@ -344,9 +408,22 @@ run_pair() {
       timed_sql=$pair_dir/timed-$iter-$arm.sql
       timed_out=$pair_dir/timed-$iter-$arm.out
       write_timed_sql "$timed_sql" "$pair_variant" "$arm_candidate" "$pair_match" "$arm" timed "$iter"
-      run_sql "$timed_sql" "$timed_out" "timed $target $pair_variant $pair_match_case iter $iter $arm"
+      if run_timed_sql "$timed_sql" "$timed_out" "timed $target $pair_variant $pair_match_case iter $iter $arm"; then
+        :
+      else
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+          [ "$arm" = baseline ] && baseline_timed_out=1 || candidate_timed_out=1
+          record_timeout "$pair_variant" "$pair_match_case" "$target" "$arm" timed "$iter" "$timed_out"
+          continue
+        fi
+        die "timed query returned unexpected rc=$rc for $target $pair_variant $pair_match_case iter $iter $arm"
+      fi
       parse_time "$timed_out" "$pair_variant" "$pair_match_case" "$target" "$arm" "$iter"
     done
+    if [ "$baseline_timed_out" -eq 1 ] && [ "$candidate_timed_out" -eq 1 ]; then
+      break
+    fi
     iter=$((iter + 1))
   done
 }
@@ -354,6 +431,11 @@ run_pair() {
 [ -x "$BIN" ] || die "sqlite3 binary not executable: $BIN"
 [ -r "$DB" ] || die "database copy not readable: $DB"
 [ "$ITERS" -ge 3 ] || die "ITERS must be at least 3"
+case "$QUERY_TIMEOUT_S" in
+  ''|*[!0-9]*) die "QUERY_TIMEOUT_S must be a positive integer, got $QUERY_TIMEOUT_S" ;;
+esac
+[ "$QUERY_TIMEOUT_S" -ge 1 ] || die "QUERY_TIMEOUT_S must be a positive integer, got $QUERY_TIMEOUT_S"
+command -v timeout >/dev/null 2>&1 || die "timeout command is required"
 mkdir -p "$RUN_DIR"
 
 printf 'emby-search-measure timing run\nBIN=%s\nDB=%s\nSCRATCH=%s\nRUN_DIR=%s\nstat_state=current\nquery_only=1\niters=%s\n' "$BIN" "$DB" "$SCRATCH" "$RUN_DIR" "$ITERS" > "$RUN_DIR/manifest.txt"

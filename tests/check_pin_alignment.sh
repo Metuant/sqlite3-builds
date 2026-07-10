@@ -312,7 +312,15 @@ require_line scripts/optimize_media_servers.sh '        "idx_dshadow_metadata_it
 require_line scripts/optimize_media_servers.sh '        "idx_dshadow_metadata_item_views_account_grandparent_guid"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_INDEX_NAME "idx_dshadow_emby_latest_gk_dc"'
 require_line src/emby_fts_rewrite.c "        \"AND name='\" EMBY_LATEST_INDEX_NAME \"' \""
-require_line src/emby_fts_rewrite.c '    "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey) FROM MediaItems INDEXED BY " EMBY_LATEST_INDEX_NAME " WHERE Type = 8), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (";'
+require_line src/emby_fts_rewrite.c '    "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(A0.SeriesPresentationUniqueKey, A0.PresentationUniqueKey) FROM (SELECT DISTINCT itemid FROM AncestorIds2 WHERE AncestorId IN (";'
+require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_dcn_puk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5;"'
+require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_puk_dc_cover ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5;"'
+require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MOVIES_INDEX_NAME "idx_dshadow_emby_latest_movies_dcn_puk"'
+require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME "idx_dshadow_emby_latest_movies_puk_dc_cover"'
+require_line src/emby_fts_rewrite.c "        \"AND name='\" EMBY_LATEST_MOVIES_INDEX_NAME \"' \""
+require_line src/emby_fts_rewrite.c "        \"AND name='\" EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME \"' \""
+require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EMBY_LATEST_MOVIES_INDEX_NAME " "'
+require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME " "'
 require_line src/plex_fts_rewrite.c '#define PLEX_TAG_INDEX_NAME "idx_dshadow_taggings_tag_id_metadata_item_id"'
 require_line src/plex_fts_rewrite.c '#define PLEX_ONDECK_INDEX_NAME "idx_dshadow_metadata_item_views_account_grandparent_guid"'
 

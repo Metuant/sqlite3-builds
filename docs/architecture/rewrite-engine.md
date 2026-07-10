@@ -428,25 +428,32 @@ fan-out structural drift logs
 `event=rewrite_skipped target=emby reason=capture_miss mode=fanout+...` and
 prepares the original SQL.
 
-## Emby Dashboard Latest Rewrite
+## Emby Dashboard Latest Rewrites
 
-The dashboard Latest rewrite is opt-in:
-`SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enables it; unset, literal `1`, and
-every other value disable it. It covers Episode-Latest Type=8 statements only
-and is independent of the FTS, FANOUT, and AUTOPRAGMA gates.
+The dashboard rewrites are opt-in: literal
+`SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enables both; unset, literal `1`, and
+every other value disable both. They are independent of FTS, FANOUT, and
+AUTOPRAGMA. Both reject bare, numbered, and named bind tokens across the whole
+statement before readiness probes.
 
-The matcher returns clean unlogged misses for `OVER`, Resume, and series-browse
-shapes. It accepts bare-column projection variation, including `A.SeriesName`
-and `A.SortName`, and rejects aggregate/window projection shapes before
-rewriting. Every matched prepare probes `sqlite_master` for
-`idx_dshadow_emby_latest_gk_dc`; absence fails open with
-`reason=index_missing mode=dashboard+latest`.
+`emby_match_episodes_latest` first requires exact Type=8. It emits mode
+`dashboard+episodes_latest` and K1: `keys(gk)` enumerates ancestor-visible,
+unplayed groups, while the existing picked/ranked tail and
+`idx_dshadow_emby_latest_gk_dc` readiness contract remain. The readiness gate
+is advisory: absence or probe failure falls open, while an unexpected same-name
+index shape is a performance-only risk because K1 contains no `INDEXED BY`.
 
-The generated `keys(gk)` CTE uses
-`FROM MediaItems INDEXED BY idx_dshadow_emby_latest_gk_dc WHERE Type = 8`.
-The rewrite materializes group keys, picks one Type=8 item per group ordered by
-`DateCreated DESC`, ranks groups by the picked row's `DateCreated`, preserves
-the accepted projection, and keeps FH-1 anti-join out of this build. Latest
-structural drift after the family pre-gate fails open with
-`reason=capture_miss mode=dashboard+latest`. Applied and skipped logs use
-`mode=dashboard+latest`.
+`emby_match_movies_latest` first requires exact Type=5 and the guarded played
+tail. It emits mode `dashboard+movies_latest` and C2 using
+`idx_dshadow_emby_latest_movies_dcn_puk` plus
+`idx_dshadow_emby_latest_movies_puk_dc_cover`; it has no native-index
+dependency. A no-guard statement is matcher-non-applying: Type=5 passes, the
+guarded tail misses, `capture_miss` logs when observability is enabled, and the
+original statement prepares.
+
+Sibling Type traffic is an unlogged clean miss, so neither family produces a
+cross-family capture miss. Missing indexes, probe errors, build/allocation
+failure, candidate prepare failure, and tail mismatch fail open to original
+SQL. The two exact Type=5 indexes are required only to prepare C2; DateCreated
+storage class is not an enablement condition because C2 uses only native
+comparison and ordering with no cast, arithmetic, or coercion.

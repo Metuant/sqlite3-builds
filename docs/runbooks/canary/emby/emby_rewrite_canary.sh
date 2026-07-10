@@ -30,6 +30,8 @@ EMBY_COPY="$SCRATCH_ROOT/emby-cand.db"
 STATIC_CAPTURE_DIR="$HARNESS_DIR/static-captures"
 LATEST_INDEX="$EMBY_LATEST_INDEX"
 ITERATIONS="${ITERATIONS:-$EMBY_ITERATIONS}"
+QUERY_TIMEOUT_S="${QUERY_TIMEOUT_S:-10}"
+DISK_MARGIN_BYTES="${DISK_MARGIN_BYTES:-1073741824}"
 
 RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 RUN_DIR="$SCRATCH_ROOT/emby-canary-$RUN_ID"
@@ -101,9 +103,19 @@ on_exit() {
     cleanup_orphan_sqlite
     printf 'HARNESS_STATUS failed rc=%s run_dir=%s results=%s\n' "$rc" "$RUN_DIR" "$RESULTS_TSV" >&2
   fi
+  cleanup_copy_files
   exit "$rc"
 }
 trap on_exit EXIT
+
+cleanup_copy_files() {
+  [ -n "${EMBY_COPY:-}" ] || return 0
+  case "$EMBY_COPY" in
+    "$SCRATCH_ROOT"/*) ;;
+    *) return 0 ;;
+  esac
+  rm -f "$EMBY_COPY" "$EMBY_COPY-wal" "$EMBY_COPY-shm" "$EMBY_COPY-journal"
+}
 
 require_host() {
   [ -x "$SQLITE_BIN" ] || die "GEN_BIN is not executable: $SQLITE_BIN"
@@ -124,6 +136,16 @@ require_host() {
   if [ "$ITERATIONS" -lt 3 ]; then
     die "ITERATIONS must be >=3, got $ITERATIONS"
   fi
+  case "$QUERY_TIMEOUT_S" in
+    ''|*[!0-9]*) die "QUERY_TIMEOUT_S must be a positive integer, got $QUERY_TIMEOUT_S" ;;
+  esac
+  if [ "$QUERY_TIMEOUT_S" -lt 1 ]; then
+    die "QUERY_TIMEOUT_S must be a positive integer, got $QUERY_TIMEOUT_S"
+  fi
+  case "$DISK_MARGIN_BYTES" in
+    ''|*[!0-9]*) die "DISK_MARGIN_BYTES must be a non-negative integer, got $DISK_MARGIN_BYTES" ;;
+  esac
+  command -v timeout >/dev/null 2>&1 || die "timeout command is required"
 }
 
 init_run_dir() {
@@ -153,6 +175,35 @@ SQL
   log "copy_refresh done dest=$EMBY_COPY"
 }
 
+file_size_bytes() {
+  path="$1"
+  if size="$(stat -c %s "$path" 2>/dev/null)"; then
+    printf '%s\n' "$size"
+  elif size="$(stat -f %z "$path" 2>/dev/null)"; then
+    printf '%s\n' "$size"
+  else
+    die "could not stat file size: $path"
+  fi
+}
+
+available_bytes() {
+  path="$1"
+  df -Pk "$path" | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }'
+}
+
+disk_preflight() {
+  source_bytes="$(file_size_bytes "$EMBY_ORIG")"
+  free_bytes="$(available_bytes "$SCRATCH_ROOT")"
+  case "$free_bytes" in
+    ''|*[!0-9]*) die "could not determine free bytes for $SCRATCH_ROOT" ;;
+  esac
+  required_bytes=$((source_bytes * 2 + DISK_MARGIN_BYTES))
+  if [ "$free_bytes" -lt "$required_bytes" ]; then
+    die "insufficient free space under $SCRATCH_ROOT: free=$free_bytes required=$required_bytes source_bytes=$source_bytes margin=$DISK_MARGIN_BYTES"
+  fi
+  log "disk_preflight ok scratch=$SCRATCH_ROOT free=$free_bytes required=$required_bytes source_bytes=$source_bytes margin=$DISK_MARGIN_BYTES"
+}
+
 run_sql_file() {
   db="$1"
   sql_file="$2"
@@ -160,6 +211,22 @@ run_sql_file() {
   label="$4"
   "$SQLITE_BIN" -batch "$db" < "$sql_file" > "$out_file" 2>&1 ||
     die "$label failed; see $out_file"
+}
+
+run_timed_sql_file() {
+  db="$1"
+  sql_file="$2"
+  out_file="$3"
+  label="$4"
+  set +e
+  timeout "${QUERY_TIMEOUT_S}s" "$SQLITE_BIN" -batch "$db" < "$sql_file" > "$out_file" 2>&1
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    124) return 124 ;;
+    *) die "$label failed rc=$rc; see $out_file" ;;
+  esac
 }
 
 run_sql_no_db() {
@@ -798,7 +865,17 @@ run_timed_arm() {
   sql="$OUT_DIR/$stat_state-$family_shape-$arm-$iter.sql"
   out="$OUT_DIR/$stat_state-$family_shape-$arm-$iter.out"
   write_timed_sql "$query_file" "$sql" "$stat_state" "$family_shape" "$arm" "$adoption" "timed" "$iter"
-  run_sql_file "$EMBY_COPY" "$sql" "$out" "timing $family_shape $stat_state $arm iter=$iter"
+  if run_timed_sql_file "$EMBY_COPY" "$sql" "$out" "timing $family_shape $stat_state $arm iter=$iter"; then
+    :
+  else
+    rc=$?
+    if [ "$rc" -eq 124 ]; then
+      printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stat_state" "$family_shape" "$arm" "$adoption" "$iter" "TIMEOUT" >> "$TIMINGS_TSV"
+      printf 'TIMEOUT stat_state=%s family_shape=%s arm=%s adoption=%s iter=%s timeout_s=%s out=%s\n' "$stat_state" "$family_shape" "$arm" "$adoption" "$iter" "$QUERY_TIMEOUT_S" "$out" >> "$NOTES_LOG"
+      return 124
+    fi
+    die "timing query returned unexpected rc=$rc for $family_shape $stat_state $arm iter=$iter; see $out"
+  fi
   ms="$(extract_timer_ms "$out")" || die "missing timer output for $family_shape $stat_state $arm iter=$iter; see $out"
   printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stat_state" "$family_shape" "$arm" "$adoption" "$iter" "$ms" >> "$TIMINGS_TSV"
   printf 'TIME stat_state=%s family_shape=%s arm=%s adoption=%s iter=%s ms=%s\n' "$stat_state" "$family_shape" "$arm" "$adoption" "$iter" "$ms" >> "$RUN_DIR/timing-tagged.log"
@@ -809,7 +886,10 @@ median_for() {
   family_shape="$2"
   arm="$3"
   awk -F '\t' -v s="$stat_state" -v f="$family_shape" -v a="$arm" '
-    NR > 1 && $1 == s && $2 == f && $3 == a {
+    function is_number(s) {
+      return s ~ /^[-+]?[0-9]+([.][0-9]+)?([eE][-+]?[0-9]+)?$|^[-+]?[.][0-9]+([eE][-+]?[0-9]+)?$/
+    }
+    NR > 1 && $1 == s && $2 == f && $3 == a && is_number($6) {
       vals[++n] = $6 + 0
     }
     END {
@@ -830,6 +910,20 @@ median_for() {
   ' "$TIMINGS_TSV"
 }
 
+timeout_verdict_for_pair() {
+  baseline_timed_out="$1"
+  candidate_timed_out="$2"
+  if [ "$candidate_timed_out" -eq 1 ] && [ "$baseline_timed_out" -eq 0 ]; then
+    printf 'REGRESSION\n'
+  elif [ "$baseline_timed_out" -eq 1 ] && [ "$candidate_timed_out" -eq 0 ]; then
+    printf 'WIN\n'
+  elif [ "$baseline_timed_out" -eq 1 ] && [ "$candidate_timed_out" -eq 1 ]; then
+    printf 'INCONCLUSIVE_BOTH_SLOW\n'
+  else
+    printf 'NONE\n'
+  fi
+}
+
 run_warm_and_timing() {
   family_shape="$1"
   stat_state="$2"
@@ -838,6 +932,8 @@ run_warm_and_timing() {
   identity_result="$5"
   baseline_adoption="$6"
   candidate_adoption="$7"
+  baseline_timed_out=0
+  candidate_timed_out=0
 
   prewarm "$EMBY_COPY"
   for arm in baseline candidate; do
@@ -851,7 +947,18 @@ run_warm_and_timing() {
     sql="$OUT_DIR/$stat_state-$family_shape-$arm-warm.sql"
     out="$OUT_DIR/$stat_state-$family_shape-$arm-warm.out"
     write_timed_sql "$query_file" "$sql" "$stat_state" "$family_shape" "$arm" "$adoption" "warm" "0"
-    run_sql_file "$EMBY_COPY" "$sql" "$out" "warm-up $family_shape $stat_state $arm"
+    if run_timed_sql_file "$EMBY_COPY" "$sql" "$out" "warm-up $family_shape $stat_state $arm"; then
+      :
+    else
+      rc=$?
+      if [ "$rc" -eq 124 ]; then
+        [ "$arm" = "baseline" ] && baseline_timed_out=1 || candidate_timed_out=1
+        printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$stat_state" "$family_shape" "$arm" "$adoption" "warm" "TIMEOUT" >> "$TIMINGS_TSV"
+        printf 'TIMEOUT_WARMUP stat_state=%s family_shape=%s arm=%s adoption=%s timeout_s=%s out=%s\n' "$stat_state" "$family_shape" "$arm" "$adoption" "$QUERY_TIMEOUT_S" "$out" >> "$NOTES_LOG"
+        continue
+      fi
+      die "warm-up query returned unexpected rc=$rc for $family_shape $stat_state $arm; see $out"
+    fi
   done
 
   iter=1
@@ -862,19 +969,55 @@ run_warm_and_timing() {
       order="candidate baseline"
     fi
     for arm in $order; do
+      if [ "$arm" = "baseline" ] && [ "$baseline_timed_out" -eq 1 ]; then
+        printf 'TIME_SKIP stat_state=%s family_shape=%s arm=%s iter=%s reason=prior_timeout\n' "$stat_state" "$family_shape" "$arm" "$iter" >> "$NOTES_LOG"
+        continue
+      fi
+      if [ "$arm" = "candidate" ] && [ "$candidate_timed_out" -eq 1 ]; then
+        printf 'TIME_SKIP stat_state=%s family_shape=%s arm=%s iter=%s reason=prior_timeout\n' "$stat_state" "$family_shape" "$arm" "$iter" >> "$NOTES_LOG"
+        continue
+      fi
       if [ "$arm" = "baseline" ]; then
-        run_timed_arm "$family_shape" "$stat_state" "$arm" "$baseline_adoption" "$baseline_query" "$iter"
+        if run_timed_arm "$family_shape" "$stat_state" "$arm" "$baseline_adoption" "$baseline_query" "$iter"; then
+          :
+        else
+          rc=$?
+          [ "$rc" -eq 124 ] || die "timing $family_shape $stat_state $arm returned unexpected rc=$rc"
+          baseline_timed_out=1
+        fi
       else
-        run_timed_arm "$family_shape" "$stat_state" "$arm" "$candidate_adoption" "$candidate_query" "$iter"
+        if run_timed_arm "$family_shape" "$stat_state" "$arm" "$candidate_adoption" "$candidate_query" "$iter"; then
+          :
+        else
+          rc=$?
+          [ "$rc" -eq 124 ] || die "timing $family_shape $stat_state $arm returned unexpected rc=$rc"
+          candidate_timed_out=1
+        fi
       fi
     done
+    if [ "$baseline_timed_out" -eq 1 ] && [ "$candidate_timed_out" -eq 1 ]; then
+      break
+    fi
     iter=$((iter + 1))
   done
 
-  bmedian="$(median_for "$stat_state" "$family_shape" "baseline")" ||
-    die "could not compute baseline median for $family_shape $stat_state"
-  cmedian="$(median_for "$stat_state" "$family_shape" "candidate")" ||
-    die "could not compute candidate median for $family_shape $stat_state"
+  if [ "$baseline_timed_out" -eq 1 ]; then
+    bmedian=TIMEOUT
+  else
+    bmedian="$(median_for "$stat_state" "$family_shape" "baseline")" ||
+      die "could not compute baseline median for $family_shape $stat_state"
+  fi
+  if [ "$candidate_timed_out" -eq 1 ]; then
+    cmedian=TIMEOUT
+  else
+    cmedian="$(median_for "$stat_state" "$family_shape" "candidate")" ||
+      die "could not compute candidate median for $family_shape $stat_state"
+  fi
+  timeout_verdict="$(timeout_verdict_for_pair "$baseline_timed_out" "$candidate_timed_out")"
+  if [ "$timeout_verdict" != NONE ]; then
+    printf 'TIMEOUT_VERDICT stat_state=%s family_shape=%s verdict=%s timeout_s=%s\n' "$stat_state" "$family_shape" "$timeout_verdict" "$QUERY_TIMEOUT_S" >> "$NOTES_LOG"
+    record_concern "$family_shape" "$stat_state" "timeout_verdict" "verdict=$timeout_verdict timeout_s=$QUERY_TIMEOUT_S"
+  fi
   printf 'MEDIAN stat_state=%s family_shape=%s arm=baseline adoption=%s iter=median median_ms=%s identity=%s\n' "$stat_state" "$family_shape" "$baseline_adoption" "$bmedian" "$identity_result" >> "$MEDIANS_LOG"
   printf 'MEDIAN stat_state=%s family_shape=%s arm=candidate adoption=%s iter=median median_ms=%s identity=%s\n' "$stat_state" "$family_shape" "$candidate_adoption" "$cmedian" "$identity_result" >> "$MEDIANS_LOG"
   printf '%s\t%s\tbaseline\t%s\t%s\t%s\n' "$family_shape" "$stat_state" "$baseline_adoption" "$bmedian" "$identity_result" >> "$RESULTS_TSV"
@@ -977,6 +1120,7 @@ run_all_for_state() {
 main() {
   require_host
   init_run_dir
+  disk_preflight
   refresh_copy
   materialize_queries
 

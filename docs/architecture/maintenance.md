@@ -195,8 +195,10 @@ staged FTS integrity gate, FTS re-curation, staged optimize SQL, and the
 `user_version`/`application_id` preservation gate before the script replaces the
 live database with `mv` and removes stale WAL/SHM siblings.
 The Emby staged optimize SQL creates the runbook-validated
-`idx_dshadow_mediaitems_parent_type` and `idx_dshadow_emby_latest_gk_dc` indexes
-before `REINDEX`, `ANALYZE`, and `PRAGMA optimize`.
+`idx_dshadow_mediaitems_parent_type`, `idx_dshadow_emby_latest_gk_dc`,
+`idx_dshadow_emby_latest_movies_dcn_puk`, and
+`idx_dshadow_emby_latest_movies_puk_dc_cover` indexes before `REINDEX`,
+`ANALYZE`, and `PRAGMA optimize`.
 
 Post-swap FTS maintenance is optimize-only because the database has already
 passed the source and staged validation gates.

@@ -2,6 +2,10 @@
 
 #include <string.h>
 
+static int fts_lex_is_sqlite_id_char(unsigned char c) {
+    return fts_lex_is_ident_char(c) || c == '$' || c >= 0x80;
+}
+
 __attribute__((visibility("hidden"))) void fts_lex_init(
     fts_lex *lx,
     const char *sql,
@@ -123,10 +127,47 @@ __attribute__((visibility("hidden"))) fts_lex_token fts_lex_next_token(fts_lex *
 
     if (sql[p] == '?') {
         p++;
-        if (lx->param_policy == FTS_LEX_PARAM_NUMBERED_OR_NAMED) {
+        if (lx->param_policy == FTS_LEX_PARAM_NUMBERED_OR_NAMED ||
+            lx->param_policy == FTS_LEX_PARAM_SQLITE_VARIABLE) {
             while (p < len && sql[p] >= '0' && sql[p] <= '9') p++;
         }
         tok.type = FTS_LEX_TOK_PARAM;
+        tok.end = p;
+        lx->pos = p;
+        return tok;
+    }
+
+    if (lx->param_policy == FTS_LEX_PARAM_SQLITE_VARIABLE &&
+        (sql[p] == '@' || sql[p] == ':' || sql[p] == '$')) {
+        size_t name_chars = 0;
+        int valid = 1;
+
+        p++;
+        while (p < len && sql[p] != 0) {
+            unsigned char c = (unsigned char)sql[p];
+            if (fts_lex_is_sqlite_id_char(c)) {
+                name_chars++;
+                p++;
+            } else if (c == '(' && name_chars > 0) {
+                p++;
+                while (p < len && sql[p] != 0 &&
+                       !fts_lex_is_space((unsigned char)sql[p]) && sql[p] != ')') {
+                    p++;
+                }
+                if (p < len && sql[p] == ')') {
+                    p++;
+                } else {
+                    valid = 0;
+                }
+                break;
+            } else if (c == ':' && p + 1 < len && sql[p + 1] == ':') {
+                p += 2;
+            } else {
+                break;
+            }
+        }
+        if (name_chars == 0) valid = 0;
+        tok.type = valid ? FTS_LEX_TOK_PARAM : FTS_LEX_TOK_ERROR;
         tok.end = p;
         lx->pos = p;
         return tok;

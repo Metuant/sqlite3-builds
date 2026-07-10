@@ -24,20 +24,37 @@ require_env() {
 
 require_env SQLITE_BIN EMBY_DB SCRATCH_ROOT EMBY_USER_ID EMBY_ANCESTORS   MATCH_CASE1_OR MATCH_CASE1_AND MATCH_CASE2_OR MATCH_CASE2_AND   MATCH_PHRASE MATCH_PHRASE_PREFIX MATCH_CASE3_AND
 
+die() {
+  printf 'error: %s\n' "$*" >&2
+  exit 1
+}
+
+validate_run_id() {
+  case "$1" in
+    ''|*/*|*..*) die "RUN_ID must be a single path segment without '/' or '..'" ;;
+  esac
+}
+
 BIN=$SQLITE_BIN
 DB=$EMBY_DB
 SCRATCH=$SCRATCH_ROOT
 RUN_ID=${RUN_ID:-emby-search-measure-identity-$(date -u +%Y%m%dT%H%M%SZ)}
+validate_run_id "$RUN_ID"
 RUN_DIR=$SCRATCH/$RUN_ID
 
 CANDIDATES=${CANDIDATES:-"COMBINED B8 B1 B2 B3 B4 B5 B5_INLINE B7"}
 VARIANTS=${VARIANTS:-"type presentation"}
 MATCH_CASES=${MATCH_CASES:-"case1_or case1_and case2_or case2_and"}
 
-die() {
-  printf 'error: %s\n' "$*" >&2
-  exit 1
+cleanup_on_exit() {
+  rc=$?
+  if [ "$rc" -ne 0 ] && [ -n "${RUN_DIR:-}" ]; then
+    case "$RUN_DIR" in
+      "$SCRATCH"/*) rm -rf "$RUN_DIR" ;;
+    esac
+  fi
 }
+trap cleanup_on_exit EXIT
 
 match_literal() {
   case "$1" in

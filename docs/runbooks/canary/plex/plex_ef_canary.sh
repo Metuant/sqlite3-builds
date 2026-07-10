@@ -44,6 +44,8 @@ RESULTS_TSV="${RUN_DIR}/results.tsv"
 CONCERNS_TSV="${RUN_DIR}/concerns.tsv"
 STATUS_FILE="${RUN_DIR}/STATUS.txt"
 TIMED_ITERS="${TIMED_ITERS:-$PLEX_TIMED_ITERS}"
+QUERY_TIMEOUT_S="${QUERY_TIMEOUT_S:-10}"
+DISK_MARGIN_BYTES="${DISK_MARGIN_BYTES:-1073741824}"
 
 TAG_SECTION_ID="$PLEX_TAG_SECTION_ID"
 TAG_ID="$PLEX_TAG_ID"
@@ -116,6 +118,7 @@ on_exit() {
       write_status "BLOCKED"
     fi
   fi
+  cleanup_copy_files
 }
 
 trap 'exit 130' INT
@@ -128,6 +131,14 @@ die() {
   log "ERROR ${msg}"
   write_status "$status"
   exit 1
+}
+
+cleanup_copy_files() {
+  case "$PLEX_CAND" in
+    "$SCRATCH_ROOT"/*) ;;
+    *) return 0 ;;
+  esac
+  rm -f "$PLEX_CAND" "$PLEX_CAND-wal" "$PLEX_CAND-shm" "$PLEX_CAND-journal"
 }
 
 require_file() {
@@ -145,6 +156,16 @@ validate_iter_count() {
   if [ "$TIMED_ITERS" -lt 3 ]; then
     die "TIMED_ITERS must be >=3, got ${TIMED_ITERS}"
   fi
+  case "$QUERY_TIMEOUT_S" in
+    ''|*[!0-9]*) die "QUERY_TIMEOUT_S must be a positive integer, got ${QUERY_TIMEOUT_S}" ;;
+  esac
+  if [ "$QUERY_TIMEOUT_S" -lt 1 ]; then
+    die "QUERY_TIMEOUT_S must be a positive integer, got ${QUERY_TIMEOUT_S}"
+  fi
+  case "$DISK_MARGIN_BYTES" in
+    ''|*[!0-9]*) die "DISK_MARGIN_BYTES must be a non-negative integer, got ${DISK_MARGIN_BYTES}" ;;
+  esac
+  command -v timeout >/dev/null 2>&1 || die "timeout command is required"
 }
 
 run_sql_file() {
@@ -162,6 +183,25 @@ run_sql_file() {
   if [ "$rc" -ne 0 ]; then
     die "${label} failed rc=${rc} out=${out}"
   fi
+}
+
+run_timed_sql_file() {
+  local label=$1
+  local bin=$2
+  local db=$3
+  local sql=$4
+  local out=$5
+  local rc
+  log "PHASE label=${label} bin=${bin} db=${db} sql=${sql} out=${out} timeout_s=${QUERY_TIMEOUT_S}"
+  set +e
+  timeout "${QUERY_TIMEOUT_S}s" "$bin" -batch "$db" < "$sql" > "$out" 2>&1
+  rc=$?
+  set -e
+  case "$rc" in
+    0) return 0 ;;
+    124) return 124 ;;
+    *) die "${label} failed rc=${rc} out=${out}" ;;
+  esac
 }
 
 run_sql_no_db() {
@@ -306,6 +346,37 @@ refresh_copy() {
 .backup '${PLEX_CAND}'
 SQL
   run_sql_no_db "refresh_copy" "$GEN_BIN" "$backup_sql" "$backup_out"
+}
+
+file_size_bytes() {
+  local path=$1
+  local size
+  if size=$(stat -c %s "$path" 2>/dev/null); then
+    printf '%s\n' "$size"
+  elif size=$(stat -f %z "$path" 2>/dev/null); then
+    printf '%s\n' "$size"
+  else
+    die "could not stat file size: ${path}"
+  fi
+}
+
+available_bytes() {
+  local path=$1
+  df -Pk "$path" | awk 'NR == 2 { printf "%.0f\n", $4 * 1024 }'
+}
+
+disk_preflight() {
+  local source_bytes free_bytes required_bytes
+  source_bytes=$(file_size_bytes "$PLEX_ORIG")
+  free_bytes=$(available_bytes "$SCRATCH_ROOT")
+  case "$free_bytes" in
+    ''|*[!0-9]*) die "could not determine free bytes for ${SCRATCH_ROOT}" ;;
+  esac
+  required_bytes=$((source_bytes * 2 + DISK_MARGIN_BYTES))
+  if [ "$free_bytes" -lt "$required_bytes" ]; then
+    die "insufficient free space under ${SCRATCH_ROOT}: free=${free_bytes} required=${required_bytes} source_bytes=${source_bytes} margin=${DISK_MARGIN_BYTES}"
+  fi
+  log "PHASE label=disk_preflight scratch=${SCRATCH_ROOT} free=${free_bytes} required=${required_bytes} source_bytes=${source_bytes} margin=${DISK_MARGIN_BYTES}"
 }
 
 create_g2() {
@@ -995,6 +1066,20 @@ median_file() {
   ' "$src"
 }
 
+timeout_verdict_for_pair() {
+  local baseline_timed_out=$1
+  local candidate_timed_out=$2
+  if [ "$candidate_timed_out" -eq 1 ] && [ "$baseline_timed_out" -eq 0 ]; then
+    printf 'REGRESSION\n'
+  elif [ "$baseline_timed_out" -eq 1 ] && [ "$candidate_timed_out" -eq 0 ]; then
+    printf 'WIN\n'
+  elif [ "$baseline_timed_out" -eq 1 ] && [ "$candidate_timed_out" -eq 1 ]; then
+    printf 'INCONCLUSIVE_BOTH_SLOW\n'
+  else
+    printf 'NONE\n'
+  fi
+}
+
 run_timed_family() {
   local stat_state=$1
   local family_shape=$2
@@ -1002,7 +1087,10 @@ run_timed_family() {
   local baseline_query="${SQL_DIR}/${family_shape}-baseline.query.sql"
   local candidate_query="${SQL_DIR}/${family_shape}-candidate.query.sql"
   local arm query eqp_sql eqp_out adoption adoption_detail
-  local iter first second run_sql out real_ms timings median_ms
+  local iter first second run_sql out real_ms timings median_ms rc
+  local baseline_timed_out=0
+  local candidate_timed_out=0
+  local timeout_verdict
 
   for arm in baseline candidate; do
     if [ "$arm" = "baseline" ]; then
@@ -1026,6 +1114,10 @@ run_timed_family() {
     printf '%s\n' "$adoption" > "${OUT_DIR}/${stat_state}-${family_shape}-${arm}-adoption.txt"
   done
 
+  for arm in baseline candidate; do
+    : > "${OUT_DIR}/${stat_state}-${family_shape}-${arm}-timings.ms"
+  done
+
   prewarm_copy
   for arm in baseline candidate; do
     if [ "$arm" = "baseline" ]; then
@@ -1037,12 +1129,17 @@ run_timed_family() {
     run_sql="${SQL_DIR}/${stat_state}-${family_shape}-${arm}-warm.sql"
     out="${OUT_DIR}/${stat_state}-${family_shape}-${arm}-warm.out"
     write_run_sql "$query" "$run_sql" "$stat_state" "$family_shape" "$arm" "$adoption" "warm" "0"
-    run_sql_file "warm_${stat_state}_${family_shape}_${arm}" "$GEN_BIN" "$PLEX_CAND" "$run_sql" "$out"
-    log "WARM stat_state=${stat_state} family_shape=${family_shape} arm=${arm} adoption=${adoption} iter=0 out=${out}"
-  done
-
-  for arm in baseline candidate; do
-    : > "${OUT_DIR}/${stat_state}-${family_shape}-${arm}-timings.ms"
+    if run_timed_sql_file "warm_${stat_state}_${family_shape}_${arm}" "$GEN_BIN" "$PLEX_CAND" "$run_sql" "$out"; then
+      log "WARM stat_state=${stat_state} family_shape=${family_shape} arm=${arm} adoption=${adoption} iter=0 out=${out}"
+    else
+      rc=$?
+      if [ "$rc" -eq 124 ]; then
+        [ "$arm" = "baseline" ] && baseline_timed_out=1 || candidate_timed_out=1
+        log "TIMEOUT_WARMUP stat_state=${stat_state} family_shape=${family_shape} arm=${arm} adoption=${adoption} timeout_s=${QUERY_TIMEOUT_S} out=${out}"
+        continue
+      fi
+      die "warm-up query returned unexpected rc=${rc} for ${stat_state} ${family_shape} ${arm}"
+    fi
   done
 
   iter=1
@@ -1060,12 +1157,30 @@ run_timed_family() {
       else
         query=$candidate_query
       fi
+      if [ "$arm" = "baseline" ] && [ "$baseline_timed_out" -eq 1 ]; then
+        log "TIME_SKIP stat_state=${stat_state} family_shape=${family_shape} arm=${arm} iter=${iter} reason=prior_timeout"
+        continue
+      fi
+      if [ "$arm" = "candidate" ] && [ "$candidate_timed_out" -eq 1 ]; then
+        log "TIME_SKIP stat_state=${stat_state} family_shape=${family_shape} arm=${arm} iter=${iter} reason=prior_timeout"
+        continue
+      fi
       adoption=$(first_normalized_line "${OUT_DIR}/${stat_state}-${family_shape}-${arm}-adoption.txt")
       run_sql="${SQL_DIR}/${stat_state}-${family_shape}-${arm}-iter-${iter}.sql"
       out="${OUT_DIR}/${stat_state}-${family_shape}-${arm}-iter-${iter}.out"
       timings="${OUT_DIR}/${stat_state}-${family_shape}-${arm}-timings.ms"
       write_run_sql "$query" "$run_sql" "$stat_state" "$family_shape" "$arm" "$adoption" "timed" "$iter"
-      run_sql_file "timed_${stat_state}_${family_shape}_${arm}_${iter}" "$GEN_BIN" "$PLEX_CAND" "$run_sql" "$out"
+      if run_timed_sql_file "timed_${stat_state}_${family_shape}_${arm}_${iter}" "$GEN_BIN" "$PLEX_CAND" "$run_sql" "$out"; then
+        :
+      else
+        rc=$?
+        if [ "$rc" -eq 124 ]; then
+          [ "$arm" = "baseline" ] && baseline_timed_out=1 || candidate_timed_out=1
+          log "TIMEOUT stat_state=${stat_state} family_shape=${family_shape} arm=${arm} adoption=${adoption} iter=${iter} timeout_s=${QUERY_TIMEOUT_S} out=${out}"
+          continue
+        fi
+        die "timed query returned unexpected rc=${rc} for ${stat_state} ${family_shape} ${arm} iter=${iter}"
+      fi
       if ! real_ms=$(extract_real_ms "$out"); then
         die "missing or invalid timer output for ${stat_state} ${family_shape} ${arm} iter=${iter}"
       fi
@@ -1073,18 +1188,32 @@ run_timed_family() {
       printf '%s\n' "$real_ms" >> "$timings"
       log "TIMING stat_state=${stat_state} family_shape=${family_shape} arm=${arm} adoption=${adoption} iter=${iter} real_ms=${real_ms} out=${out}"
     done
+    if [ "$baseline_timed_out" -eq 1 ] && [ "$candidate_timed_out" -eq 1 ]; then
+      break
+    fi
     iter=$((iter + 1))
   done
 
   for arm in baseline candidate; do
     adoption=$(first_normalized_line "${OUT_DIR}/${stat_state}-${family_shape}-${arm}-adoption.txt")
     timings="${OUT_DIR}/${stat_state}-${family_shape}-${arm}-timings.ms"
-    if ! median_ms=$(median_file "$timings"); then
-      die "missing or invalid median input for ${stat_state} ${family_shape} ${arm}"
+    if [ "$arm" = "baseline" ] && [ "$baseline_timed_out" -eq 1 ]; then
+      median_ms=TIMEOUT
+    elif [ "$arm" = "candidate" ] && [ "$candidate_timed_out" -eq 1 ]; then
+      median_ms=TIMEOUT
+    else
+      if ! median_ms=$(median_file "$timings"); then
+        die "missing or invalid median input for ${stat_state} ${family_shape} ${arm}"
+      fi
     fi
     log "MEDIAN stat_state=${stat_state} family_shape=${family_shape} arm=${arm} adoption=${adoption} iter=median median_ms=${median_ms} runs=${TIMED_ITERS}"
     append_result "$family_shape" "$stat_state" "$arm" "$adoption" "$median_ms" "$identity"
   done
+  timeout_verdict=$(timeout_verdict_for_pair "$baseline_timed_out" "$candidate_timed_out")
+  if [ "$timeout_verdict" != NONE ]; then
+    log "TIMEOUT_VERDICT stat_state=${stat_state} family_shape=${family_shape} verdict=${timeout_verdict} timeout_s=${QUERY_TIMEOUT_S}"
+    record_concern "$family_shape" "$stat_state" "timeout_verdict" "verdict=${timeout_verdict} timeout_s=${QUERY_TIMEOUT_S}"
+  fi
 }
 
 analyze_copy() {
@@ -1120,6 +1249,7 @@ main() {
   log "HOST_CONSTRAINT scratch_root=${SCRATCH_ROOT} copy=${PLEX_CAND} originals_read_only=${PLEX_ORIG}"
   log "MEDIAN_POLICY timed_iters=${TIMED_ITERS} report=median_not_fastest order=counterbalanced"
   write_query_files
+  disk_preflight
   refresh_copy
   create_g2
   run_stat_state "current"

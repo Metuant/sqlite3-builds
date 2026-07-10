@@ -115,9 +115,9 @@ It proves:
 - FANOUT default-off behavior and enabled Browse-by-name, Favorites-first,
   RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and
   links-search rewrites.
-- DASHBOARD default-off behavior and enabled Episode-Latest rewrite with
-  LIMIT/projection variation and the `idx_dshadow_emby_latest_gk_dc` keys CTE
-  `INDEXED BY`.
+- DASHBOARD default-off behavior and literal-0 Episodes-Latest K1 plus guarded
+  movies-Latest C2 behavior, LIMIT/projection variation, all five bind-token
+  negatives, family Type clean misses, and zero cross-family capture misses.
 - exact `library.db` target basename and non-target negatives.
 - three UTF-8 prepare entries with `nByte`/NUL and tail handling.
 - MATCH scalar insertion plus membership `EXISTS` rewrite for type and
@@ -129,11 +129,17 @@ It proves:
 - structural misses for fast-form input, duplicate MATCH sites, literal RHS
   outside direct-test mode, over-cap slots, ambiguous anchors, semicolon tails,
   and embedded NUL inputs.
-- Latest index-absent fail-open, capture-on-miss fixtures, aggregate/window
-  projection negatives, and series-browse no-misfire fixtures.
+- Episodes index-absent/probe-error fail-open; movies outer-missing,
+  inner-missing, and probe-error fail-open; native movies-index absence;
+  capture-on-miss, aggregate/window, series-browse, XB, UB, and direct
+  candidate-error/partial-statement/wrong-tail coverage. No-guard is
+  matcher-non-applying: Type=5 passes, guarded-tail miss logs capture_miss, and
+  original SQL prepares.
 - fixture canaries under `tests/fixtures/emby-fts-rewrite/`.
-- row parity between original and rewritten seeded data, including Latest
-  `(gk,maxdc)` row identity.
+- ordered all-column type-tagged byte identity between separate non-target
+  vendor and indexed `library.db` candidate databases: K1 LIMIT 12/16/20,
+  guarded C2 36/36 literal cells plus expanded regimes in both stat states,
+  and separate 36/36 no-guard original-SQL/tail passthrough.
 
 ### `config_after_dlopen_smoke`
 

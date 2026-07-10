@@ -62,9 +62,9 @@ Project-specific guidance:
   value enable. Keep the two Emby membership/dashboard knobs opt-in:
   `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` (Browse-by-name / Favorites-first / RES-A /
   People-Studios-Type-29) and `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE`
-  (Episode-Latest) each enable on literal `0`; unset, literal `1`, and every
-  other value disable. All three are fail-open and independent of
-  `SQLITE3_DISABLE_AUTOPRAGMA`. Advisory: to also optimize the Emby fan-out
+  (Episodes-Latest and movies-Latest) each enable on literal `0`; unset, literal
+  `1`, and every other value disable. All three are fail-open and independent
+  of `SQLITE3_DISABLE_AUTOPRAGMA`. Advisory: to also optimize the Emby fan-out
   families, enable `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0`; it is not required
   and is not code-enforced. Knob naming:
   `SQLITE3_DISABLE_<ENGINE>_<PURPOSE>_REWRITE`.
