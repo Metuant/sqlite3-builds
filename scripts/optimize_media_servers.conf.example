@@ -30,5 +30,8 @@ PLEX_OPTIMIZE_API=0
 # Literal 1 enables the optional Plex blob-database rebuild pass.
 PLEX_PROCESS_BLOB_DB=0
 
+# Both this and PLEX_PROCESS_BLOB_DB must be literal 1 to trim finished-season blobs.
+PLEX_TRIM_FINISHED_SEASON_BLOBS=0
+
 # Plex statistics_bandwidth deflate retention window, in days.
 STATS_BANDWIDTH_RETAIN_DAYS=90

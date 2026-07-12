@@ -452,7 +452,7 @@ run_plex_case() {
     . ./scripts/optimize_media_servers.sh
     plex_stat4_preflight() { return 1; }
     optimize_plex_db() {
-      printf 'plex-db %s\n' "$1" >> "$OPTIMIZE_API_CASE_DIR/maintenance.log"
+      printf 'plex-db %s|%s|%s|%s\n' "$1" "${2:-}" "${3:-}" "${4:-}" >> "$OPTIMIZE_API_CASE_DIR/maintenance.log"
       if [ "$OPTIMIZE_API_MAINTENANCE_SCENARIO" = "exit-fail" ]; then
         exit 42
       fi
@@ -461,11 +461,16 @@ run_plex_case() {
       map_test_opt_path "/opt/$1/Library/Application Support/Plex Media Server/Preferences.xml"
     }
     run_plex_maintenance_safely() {
+      local blob_final_pre_publish_hook
       (
         set -e
         optimize_plex_db "${_PLEX_DB}" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" "try_deflate_plex_statistics_bandwidth"
         if [ "${PLEX_PROCESS_BLOB_DB:-0}" = "1" ]; then
-          optimize_plex_db "${_PLEX_BLOB_DB}" "" ""
+          blob_final_pre_publish_hook=""
+          if [ "${PLEX_TRIM_FINISHED_SEASON_BLOBS:-0}" = "1" ]; then
+            blob_final_pre_publish_hook="try_trim_plex_finished_season_blobs"
+          fi
+          optimize_plex_db "${_PLEX_BLOB_DB}" "" "" "${blob_final_pre_publish_hook}"
         fi
       )
     }
@@ -485,6 +490,7 @@ GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
 BACKUP_PATH="$case_dir/backups"
 PLEX_OPTIMIZE_API=$flag
 PLEX_PROCESS_BLOB_DB=0
+PLEX_TRIM_FINISHED_SEASON_BLOBS=0
 STATS_BANDWIDTH_RETAIN_DAYS=90
 EOF_CONF
     export OPTIMIZE_MEDIA_SERVERS_CONF="$case_dir/optimize.conf"
@@ -496,6 +502,7 @@ EOF_CONF
     assert_eq "$case_dir/backups" "$BACKUP_PATH" "$name config BACKUP_PATH"
     assert_eq "$flag" "$PLEX_OPTIMIZE_API" "$name config PLEX_OPTIMIZE_API"
     assert_eq "0" "$PLEX_PROCESS_BLOB_DB" "$name config PLEX_PROCESS_BLOB_DB"
+    assert_eq "0" "$PLEX_TRIM_FINISHED_SEASON_BLOBS" "$name config PLEX_TRIM_FINISHED_SEASON_BLOBS"
     assert_eq "90" "$STATS_BANDWIDTH_RETAIN_DAYS" "$name config STATS_BANDWIDTH_RETAIN_DAYS"
     assert_eq "$instance" "${PLEX_INSTANCES[*]}" "$name config PLEX_INSTANCES"
     assert_eq "" "${EMBY_INSTANCES[*]}" "$name config EMBY_INSTANCES"
@@ -576,6 +583,7 @@ GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
 BACKUP_PATH="$case_dir/backups"
 PLEX_OPTIMIZE_API=1
 PLEX_PROCESS_BLOB_DB=0
+PLEX_TRIM_FINISHED_SEASON_BLOBS=0
 STATS_BANDWIDTH_RETAIN_DAYS=90
 EOF_CONF
     export OPTIMIZE_MEDIA_SERVERS_CONF="$case_dir/optimize.conf"
@@ -587,6 +595,7 @@ EOF_CONF
     assert_eq "$case_dir/backups" "$BACKUP_PATH" "$name config BACKUP_PATH"
     assert_eq "1" "$PLEX_OPTIMIZE_API" "$name config PLEX_OPTIMIZE_API"
     assert_eq "0" "$PLEX_PROCESS_BLOB_DB" "$name config PLEX_PROCESS_BLOB_DB"
+    assert_eq "0" "$PLEX_TRIM_FINISHED_SEASON_BLOBS" "$name config PLEX_TRIM_FINISHED_SEASON_BLOBS"
     assert_eq "90" "$STATS_BANDWIDTH_RETAIN_DAYS" "$name config STATS_BANDWIDTH_RETAIN_DAYS"
     assert_eq "" "${PLEX_INSTANCES[*]}" "$name config PLEX_INSTANCES"
     assert_eq "$instance" "${EMBY_INSTANCES[*]}" "$name config EMBY_INSTANCES"

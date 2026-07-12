@@ -53,6 +53,9 @@ for arg in "$@"; do
   sql_text="${sql_text}${arg}
 "
 done
+case "$sql_text" in
+  *"VACUUM;"*) printf '%s\n' "$sql_text" >> "$SQLITE_VACUUM_LOG" ;;
+esac
 
 if [ "${FAIL_DELETE:-0}" = "1" ]; then
   case "$sql_text" in
@@ -95,7 +98,8 @@ exit "$rc"
 EOF_SQLITE
 chmod +x "$tmp/bin/sqlite3"
 PATH="$tmp/bin:$PATH"
-export PATH REAL_SQLITE="$real_sqlite"
+export PATH REAL_SQLITE="$real_sqlite" SQLITE_VACUUM_LOG="$tmp/vacuum.log"
+: > "$SQLITE_VACUUM_LOG"
 
 create_stats_fixture() {
   local db
@@ -148,6 +152,11 @@ positive="$tmp/positive.db"
 create_stats_fixture "$positive"
 schema_before="$("$real_sqlite" "$positive" "$schema_sql")"
 try_deflate_plex_statistics_bandwidth sqlite3 "$positive" 90 >"$tmp/positive.out" 2>"$tmp/positive.err"
+positive_vacuum_sql="$(cat "$SQLITE_VACUUM_LOG")"
+assert_contains "$positive_vacuum_sql" "PRAGMA threads=8;" "positive VACUUM threads"
+case "$positive_vacuum_sql" in
+  *"PRAGMA temp_store=MEMORY"*|*"PRAGMA temp_store=2"*) fail "positive VACUUM temp_store" "absent" "$positive_vacuum_sql" ;;
+esac
 assert_contains "$(cat "$tmp/positive.out")" "Deflating Plex statistics_bandwidth" "deflate log"
 assert_eq "2,5,6" "$("$real_sqlite" "$positive" "$remaining_sql")" "remaining statistics_bandwidth ids"
 assert_eq "index_statistics_bandwidth_on_account_id_and_timespan_and_at
@@ -176,9 +185,15 @@ assert_eq "ok" "$("$real_sqlite" "$delete_fail" "PRAGMA integrity_check;")" "DEL
 
 vacuum_fail="$tmp/vacuum-fail.db"
 create_stats_fixture "$vacuum_fail"
+: > "$SQLITE_VACUUM_LOG"
 export FAIL_VACUUM=1
 try_deflate_plex_statistics_bandwidth sqlite3 "$vacuum_fail" 90 >"$tmp/vacuum-fail.out" 2>"$tmp/vacuum-fail.err"
 unset FAIL_VACUUM
+vacuum_fail_sql="$(cat "$SQLITE_VACUUM_LOG")"
+assert_contains "$vacuum_fail_sql" "PRAGMA threads=8;" "failed VACUUM threads"
+case "$vacuum_fail_sql" in
+  *"PRAGMA temp_store=MEMORY"*|*"PRAGMA temp_store=2"*) fail "failed VACUUM temp_store" "absent" "$vacuum_fail_sql" ;;
+esac
 assert_contains "$(cat "$tmp/vacuum-fail.err")" "WARNING: post-deflate VACUUM failed" "VACUUM failure warning"
 assert_eq "2,5,6" "$("$real_sqlite" "$vacuum_fail" "$remaining_sql")" "VACUUM failure retained deflated rows"
 assert_eq "ok" "$("$real_sqlite" "$vacuum_fail" "PRAGMA integrity_check;")" "VACUUM failure DB integrity"

@@ -417,6 +417,7 @@ jobs:
           bash tests/optimize_media_servers_plex_index_test.sh
           bash tests/optimize_media_servers_plex_stat4_test.sh
           bash tests/optimize_media_servers_plex_blob_gate_test.sh
+          bash tests/optimize_media_servers_plex_blob_trim_test.sh
           bash tests/optimize_media_servers_foreign_key_warn_test.sh
           bash tests/optimize_media_servers_fts_discovery_test.sh
           bash tests/optimize_media_servers_fts_integrity_gate_test.sh

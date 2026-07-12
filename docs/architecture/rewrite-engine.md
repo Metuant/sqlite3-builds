@@ -348,11 +348,20 @@ The Plex On-Deck rewrite is opt-in:
 every other value disable it. It is independent of
 `SQLITE3_DISABLE_PLEX_FTS_REWRITE` and `SQLITE3_DISABLE_AUTOPRAGMA`.
 
-The matcher is exact-shape for the Plex On-Deck statement. It validates numeric
-`library_section_id`, `grandparents.id IN (...)`, and repeated `account_id`
-slots, rejects parameters, expressions, slot drift, missing required settings
-joins, left joins, projection drift, semicolon tails, and non-Plex basenames.
-Every matched prepare probes `sqlite_master` for
+The matcher consumes raw `zSql` and is exact-shape for the Plex On-Deck
+statement. `library_section_id` and `account_id` accept an inlined decimal
+integer or a positional `?`/canonical `?N`; the nonempty id-list accepts only
+inlined decimal integers. Each of the two scalar slots is parsed sequentially
+with SQLite numbering: bare `?` takes the next maximum index, explicit `?N` may
+create holes or be reused, and the rewrite emits each captured variable as an
+explicit `?N`. Only the two scalar slots can hold a variable. Named variables,
+id-list variables, and noncanonical or out-of-limit indices fail open. The
+prepared rewrite's bind count is the two-slot maximum, verified against
+`sqlite3_bind_parameter_count` after prepare (`bind_count_mismatch` fails open).
+The matcher also rejects
+expressions, slot drift, missing required settings joins, left joins,
+projection drift, semicolon tails, and non-Plex basenames. Every matched
+prepare probes `sqlite_master` for
 `idx_dshadow_metadata_item_views_account_grandparent_guid`; absence fails open
 with `reason=index_missing`.
 
@@ -361,8 +370,9 @@ vendor `INDEXED BY` hints by replacing the whole statement, and returns one row
 per `grandparents.id` with a deterministic `row_number()` tie-breaker ordered by
 `metadata_item_views.viewed_at`, `metadata_item_views.id`,
 `grandparentsSettings.id`, and `metadata_item_settings.id` descending. Build
-failure, rewritten-prepare failure, tail mismatch, or index-probe failure
-prepares the original SQL.
+failure, rewritten-prepare failure, tail mismatch, bind-count mismatch, or
+index-probe failure finalizes any rewritten statement and prepares the original
+SQL.
 
 ## Emby FTS Search Rewrite
 

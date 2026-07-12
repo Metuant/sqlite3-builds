@@ -667,6 +667,7 @@ write_f01_identity_sql() {
     cat <<'SQL'
 DROP TABLE IF EXISTS temp.f01_original;
 DROP TABLE IF EXISTS temp.f01_rewrite;
+DROP TABLE IF EXISTS temp.f01_bound;
 DROP TABLE IF EXISTS temp.f01_joined;
 DROP TABLE IF EXISTS temp.f01_oracle;
 DROP TABLE IF EXISTS temp.f01_tie_counts;
@@ -678,6 +679,12 @@ SQL
 CREATE TEMP TABLE f01_rewrite AS
 SQL
     emit_f01_candidate_query_body
+    cat <<SQL
+.parameter init
+.parameter set ?1 ${ONDECK_SECTION_ID}
+CREATE TEMP TABLE f01_bound AS
+select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.\`index\`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id=? and grandparents.id in (${ONDECK_IDLIST}) and metadata_item_settings.view_count>0  and metadata_item_views.account_id=${ONDECK_ACCOUNT_ID} group by grandparents.id order by viewed_at desc;
+SQL
     cat <<'SQL'
 CREATE TEMP TABLE f01_joined AS
 SELECT grandparents.id AS id,
@@ -753,6 +760,7 @@ SQL
     cat <<SQL
 SELECT 'IDENTITY_DETAIL stat_state=${stat_state} family_shape=plex-f01 key=original_groups value=' || count(*) FROM f01_original;
 SELECT 'IDENTITY_DETAIL stat_state=${stat_state} family_shape=plex-f01 key=rewrite_groups value=' || count(*) FROM f01_rewrite;
+SELECT 'IDENTITY_DETAIL stat_state=${stat_state} family_shape=plex-f01 key=bound_groups value=' || count(*) FROM f01_bound;
 SELECT 'IDENTITY_DETAIL stat_state=${stat_state} family_shape=plex-f01 key=projection_diff_groups value=' || count(*) FROM f01_projection_diff;
 SELECT 'IDENTITY_DETAIL stat_state=${stat_state} family_shape=plex-f01 key=all_null_viewed_at_tie_groups value=' || count(*)
 FROM f01_oracle AS o
@@ -763,6 +771,16 @@ WITH checks AS (
     (SELECT count(*) FROM f01_original AS o LEFT JOIN f01_rewrite AS r USING (id) WHERE r.id IS NULL) AS missing_rewrite,
     (SELECT count(*) FROM f01_rewrite AS r LEFT JOIN f01_original AS o USING (id) WHERE o.id IS NULL) AS extra_rewrite,
     (SELECT count(*) FROM f01_original AS o JOIN f01_rewrite AS r USING (id) WHERE NOT (o."max(viewed_at)" IS r."max(viewed_at)")) AS max_mismatch,
+    (SELECT count(*) FROM f01_original AS o LEFT JOIN f01_bound AS b USING (id) WHERE b.id IS NULL) AS missing_bound,
+    (SELECT count(*) FROM f01_bound AS b LEFT JOIN f01_original AS o USING (id) WHERE o.id IS NULL) AS extra_bound,
+    (SELECT count(*) FROM f01_original AS o JOIN f01_bound AS b USING (id) WHERE NOT (
+      o.originally_available_at IS b.originally_available_at
+      AND o.parent_index IS b.parent_index
+      AND o."index" IS b."index"
+      AND o."max(viewed_at)" IS b."max(viewed_at)"
+      AND o.library_section_id IS b.library_section_id
+      AND o.extra_data IS b.extra_data
+    )) AS bound_mismatch,
     (SELECT count(*) FROM f01_projection_diff AS d LEFT JOIN f01_tie_counts AS t USING (id) WHERE coalesce(t.tie_count, 0) <= 1) AS untied_projection_diff,
     (SELECT count(*)
        FROM f01_projection_diff AS d
@@ -790,9 +808,19 @@ WITH checks AS (
 )
 SELECT 'IDENTITY_RESULT stat_state=${stat_state} family_shape=plex-f01 identity=' ||
        CASE
-         WHEN missing_rewrite=0
+         WHEN (SELECT count(*) FROM f01_original)=0
+          AND (SELECT count(*) FROM f01_rewrite)=0
+          AND (SELECT count(*) FROM f01_bound)=0
+         THEN 'VACUOUS'
+         WHEN (SELECT count(*) FROM f01_original)>0
+          AND (SELECT count(*) FROM f01_rewrite)>0
+          AND (SELECT count(*) FROM f01_bound)>0
+          AND missing_rewrite=0
           AND extra_rewrite=0
           AND max_mismatch=0
+          AND missing_bound=0
+          AND extra_bound=0
+          AND bound_mismatch=0
           AND untied_projection_diff=0
           AND differing_group_oracle_mismatch=0
           AND rewrite_oracle_mismatch=0
@@ -802,6 +830,9 @@ SELECT 'IDENTITY_RESULT stat_state=${stat_state} family_shape=plex-f01 identity=
        ' missing_rewrite=' || missing_rewrite ||
        ' extra_rewrite=' || extra_rewrite ||
        ' max_mismatch=' || max_mismatch ||
+       ' missing_bound=' || missing_bound ||
+       ' extra_bound=' || extra_bound ||
+       ' bound_mismatch=' || bound_mismatch ||
        ' projection_diff_untied=' || untied_projection_diff ||
        ' differing_group_oracle_mismatch=' || differing_group_oracle_mismatch ||
        ' rewrite_oracle_mismatch=' || rewrite_oracle_mismatch
@@ -831,7 +862,13 @@ run_identity_sql() {
     log "$line"
   done < "$tagged"
   identity_result=$(sqlite_kv_value "$tagged" "IDENTITY_RESULT stat_state=${stat_state} family_shape=${family_shape}" "identity")
-  [ "$identity_result" = "PASS" ]
+  if [ "$family_shape" = "plex-f01" ]; then
+    f01_identity_result="$identity_result"
+  fi
+  case "$identity_result" in
+    PASS|VACUOUS) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 run_e_identities() {
@@ -1237,7 +1274,7 @@ run_stat_state() {
   run_e_identities "$stat_state"
   run_f_identity "$stat_state"
   run_timed_family "$stat_state" "plex-e07" "PASS"
-  run_timed_family "$stat_state" "plex-f01" "PASS"
+  run_timed_family "$stat_state" "plex-f01" "$f01_identity_result"
 }
 
 main() {

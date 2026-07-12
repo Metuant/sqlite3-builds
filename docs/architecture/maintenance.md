@@ -116,6 +116,7 @@ Maintenance controls:
 | `BACKUP_PATH` | `/mnt/media-backup` | Set in the config file | If the path exists, backups publish under an instance-specific subdirectory there; otherwise backups stay beside the source database. |
 | `PLEX_OPTIMIZE_API` | `0` | Set in the config file | Literal `1` enables the optional post-start Plex `PUT /library/optimize?async=1` trigger. |
 | `PLEX_PROCESS_BLOB_DB` | `0` | Set in the config file | Literal `1` enables the optional Plex blob database rebuild pass. |
+| `PLEX_TRIM_FINISHED_SEASON_BLOBS` | `0` | Set in the config file | Together with literal `PLEX_PROCESS_BLOB_DB=1`, literal `1` enables the fixed 24-month finished-season blob trim. |
 | `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Set in the config file | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside this retention window. |
 | `_PAGE_SIZE` | `16384` | Edit the in-script `_PAGE_SIZE` constant | Rebuilt Plex and Emby databases target 16 KiB pages. |
 | Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Controlled by `STATS_BANDWIDTH_RETAIN_DAYS` | Runs on the staged database before swap; DELETE or VACUUM failures warn, but a post-deflate `integrity_check` failure aborts before touching the live DB. |
@@ -146,9 +147,10 @@ to a same-directory staged `<db>.new` file. The staged file must pass page-size
 and auto-vacuum checks, staged `integrity_check == ok`, staged FTS integrity,
 and an exhaustive source-vs-staged per-table row-count sweep before any swap is
 attempted. If the main Plex database has `statistics_bandwidth`, the pre-swap
-hook can deflate it inside the staged file with `PRAGMA temp_store=MEMORY`,
-`PRAGMA threads=8`, and `VACUUM`, then hard-gates post-deflate
-`integrity_check`.
+hook can deflate it inside the staged file with `PRAGMA threads=8` and
+`VACUUM`, then hard-gates post-deflate `integrity_check`. Every maintenance
+`VACUUM` invoked through Plex SQLite uses its default file-backed temp storage
+and retains `PRAGMA threads=8`.
 
 After the rebuild and validation sweep, the staged Plex path runs FTS rebuild,
 the staged FTS integrity gate, FTS re-curation, staged optimize SQL, the staged
@@ -158,7 +160,20 @@ pass is enabled, a post-STAT4 `integrity_check` gate before the
 Post-swap FTS maintenance is optimize-only.
 `PLEX_PROCESS_BLOB_DB=1` enables the same staged rebuild for the Plex blob
 database without the `statistics_bandwidth` hook, metadata date repair, or
-STAT4 pass. Plex SQLite is required because Plex data can require the
+STAT4 pass. When `PLEX_TRIM_FINISHED_SEASON_BLOBS=1` is also set, a separate
+`sqlite3 -readonly` process reads the main database and writes distinct
+`media_part` ids to an owned scratch file beside the staged blob database. It
+selects episode rows (`metadata_type=4`) owned by season rows
+(`metadata_type=3`) whose integer maximum coalesced episode air/add date is at
+or before the fixed 24-month cutoff. A staged-only write connection imports
+that file into a TEMP table and deletes only `blob_type=5` rows with
+`linked_type='media_part'`. Candidate, deleted, total, and target counts must
+conserve before COMMIT. This trim is the final staged mutation; zero candidates
+skip its threads-only VACUUM, while nonzero or unparseable counts run it. A
+fresh integrity gate follows before the outer `user_version`, `application_id`,
+and atomic publication gates. Read, import, DELETE, and VACUUM failures keep the
+existing warn-and-continue envelope; post-trim integrity failure blocks
+publication. Plex SQLite is required because Plex data can require the
 ICU-enabled binary.
 
 The Plex main-database staged optimize SQL creates the runbook-validated

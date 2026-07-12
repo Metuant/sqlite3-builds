@@ -896,7 +896,6 @@ try_deflate_plex_statistics_bandwidth() {
         return 0
     fi
     if ! "${binary}" "${staged_db}" \
-      "PRAGMA temp_store=MEMORY;" \
       "PRAGMA threads=8;" \
       "VACUUM;"; then
         echo "WARNING: post-deflate VACUUM failed for ${staged_db}; continuing to post-deflate integrity gate" >&2
@@ -913,6 +912,161 @@ try_deflate_plex_statistics_bandwidth() {
     return 0
 }
 
+try_trim_plex_finished_season_blobs() (
+    local binary="${1}"
+    local staged_db="${2}"
+    local main_db="${plex_databases_path}/${_PLEX_DB}"
+    local trim_work_dir=""
+    local finished_ids_framed_file
+    local finished_ids_file
+    local finished_ids_sql
+    local trim_out
+    local deleted_count=""
+    local post_integrity
+
+    if ! trim_work_dir=$(mktemp -d "${staged_db}.trim.XXXXXX"); then
+        echo "WARNING: could not create Plex blob trim scratch beside ${staged_db}; skipping finished-season blob trim" >&2
+        return 0
+    fi
+    trap 'rm -rf -- "${trim_work_dir}"' EXIT
+    finished_ids_framed_file="${trim_work_dir}/finished-season-media-part-ids.framed.txt"
+    finished_ids_file="${trim_work_dir}/finished-season-media-part-ids.txt"
+
+    finished_ids_sql="SELECT DISTINCT 'ID|' || mp.id
+FROM media_parts AS mp
+JOIN media_items AS mi
+  ON mi.id=mp.media_item_id
+JOIN metadata_items AS ep
+  ON ep.id=mi.metadata_item_id
+ AND ep.metadata_type=4
+JOIN metadata_items AS season
+  ON season.id=ep.parent_id
+ AND season.metadata_type=3
+JOIN (
+  SELECT parent_id AS season_id,
+         max(coalesce(originally_available_at, added_at)) AS last_air
+  FROM metadata_items
+  WHERE metadata_type=4
+  GROUP BY parent_id
+) AS sl
+  ON sl.season_id=season.id
+WHERE typeof(sl.last_air)='integer'
+  AND sl.last_air <= CAST(strftime('%s','now','-24 months') AS INTEGER)
+ORDER BY mp.id;"
+
+    if ! "${binary}" -init /dev/null -readonly -batch -noheader "${main_db}" "${finished_ids_sql}" > "${finished_ids_framed_file}"; then
+        echo "WARNING: could not read finished-season media_part ids from ${main_db}; skipping Plex finished-season blob trim" >&2
+        return 0
+    fi
+    if ! awk '
+      $0 == "" { next }
+      $0 ~ /^ID[|][0-9]+$/ { print substr($0, 4); next }
+      { exit 1 }
+    ' "${finished_ids_framed_file}" > "${finished_ids_file}"; then
+        echo "WARNING: non-conforming finished-season media_part id output from ${main_db}; skipping Plex finished-season blob trim" >&2
+        return 0
+    fi
+
+    if ! trim_out=$("${binary}" -batch -noheader "${staged_db}" <<SQL
+.bail on
+CREATE TEMP TABLE finished_season_media_part_ids(
+  id INTEGER PRIMARY KEY
+) WITHOUT ROWID;
+.mode list
+.import '${finished_ids_file}' finished_season_media_part_ids
+
+BEGIN IMMEDIATE;
+CREATE TEMP TABLE trim_candidates(
+  id INTEGER PRIMARY KEY
+) WITHOUT ROWID;
+INSERT INTO trim_candidates(id)
+SELECT b.id
+FROM blobs AS b
+JOIN finished_season_media_part_ids AS f
+  ON f.id=b.linked_id
+WHERE b.blob_type=5
+  AND b.linked_type='media_part';
+
+CREATE TEMP TABLE trim_counts(
+  label TEXT PRIMARY KEY,
+  value INTEGER NOT NULL
+) WITHOUT ROWID;
+INSERT INTO trim_counts VALUES
+  ('candidate',(SELECT count(*) FROM trim_candidates)),
+  ('total',(SELECT count(*) FROM blobs)),
+  ('target',(SELECT count(*) FROM blobs
+             WHERE blob_type=5 AND linked_type='media_part'));
+
+DELETE FROM blobs
+WHERE blob_type=5
+  AND linked_type='media_part'
+  AND linked_id IN (SELECT id FROM finished_season_media_part_ids);
+INSERT INTO trim_counts VALUES ('deleted',changes());
+INSERT INTO trim_counts VALUES
+  ('post_total',(SELECT count(*) FROM blobs)),
+  ('post_target',(SELECT count(*) FROM blobs
+                  WHERE blob_type=5 AND linked_type='media_part')),
+  ('post_candidate',(SELECT count(*) FROM blobs
+                     WHERE id IN (SELECT id FROM trim_candidates)));
+
+CREATE TEMP TABLE invariant_guard(
+  ok INTEGER NOT NULL CHECK(ok=1)
+);
+INSERT INTO invariant_guard
+SELECT (SELECT value FROM trim_counts WHERE label='deleted')
+     = (SELECT value FROM trim_counts WHERE label='candidate');
+INSERT INTO invariant_guard
+SELECT (SELECT value FROM trim_counts WHERE label='post_candidate')=0;
+INSERT INTO invariant_guard
+SELECT (SELECT value FROM trim_counts WHERE label='post_total')
+     + (SELECT value FROM trim_counts WHERE label='deleted')
+     = (SELECT value FROM trim_counts WHERE label='total');
+INSERT INTO invariant_guard
+SELECT (SELECT value FROM trim_counts WHERE label='post_target')
+     + (SELECT value FROM trim_counts WHERE label='deleted')
+     = (SELECT value FROM trim_counts WHERE label='target');
+
+SELECT 'DELETED|' || value FROM trim_counts WHERE label='deleted';
+COMMIT;
+SQL
+); then
+        echo "WARNING: Plex finished-season blob trim DELETE failed for ${staged_db}; continuing with validated staged DB" >&2
+        return 0
+    fi
+
+    if ! deleted_count=$(awk -F '|' '
+      $1 == "DELETED" { count++; value=$2 }
+      END {
+        if (count == 1 && value ~ /^[0-9]+$/) print value;
+        else exit 1;
+      }
+    ' <<< "${trim_out}"); then
+        echo "WARNING: could not parse Plex finished-season deleted count for ${staged_db}; running VACUUM conservatively" >&2
+        deleted_count=""
+    fi
+
+    if [ "${deleted_count}" = "0" ]; then
+        echo "Plex finished-season blob trim deleted 0 rows from ${staged_db}; skipping trim VACUUM"
+    else
+        if ! "${binary}" "${staged_db}" \
+          "PRAGMA threads=8;" \
+          "VACUUM;"; then
+            echo "WARNING: post-trim VACUUM failed for ${staged_db}; continuing to post-trim integrity gate" >&2
+        fi
+    fi
+
+    if ! post_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
+        echo "ERROR: post-trim integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
+        return 1
+    fi
+    if [ "${post_integrity}" != "ok" ]; then
+        echo "ERROR: post-trim DB failed integrity_check: ${post_integrity}; live DB has NOT been touched" >&2
+        return 1
+    fi
+
+    return 0
+)
+
 rebuild_db_vacuum_into() {
     local binary="${1}"
     local db_path="${2}"
@@ -924,6 +1078,7 @@ rebuild_db_vacuum_into() {
     local pre_swap_hook="${8:-}"
     local post_maintenance_hook="${9:-}"
     local post_maintenance_binary="${10:-}"
+    local final_pre_publish_hook="${11:-}"
     local db_file="${db_path##*/}"
     local backup_path
     local backup_tmp
@@ -1049,7 +1204,6 @@ rebuild_db_vacuum_into() {
     cleanup_staged_db "${staged_db}"
     if [ -n "${auto_vacuum_mode}" ]; then
         if ! "${binary}" "${db_path}" \
-          "PRAGMA temp_store=MEMORY;" \
           "PRAGMA threads=8;" \
           "PRAGMA page_size=${page_size};" \
           "PRAGMA auto_vacuum=${auto_vacuum_mode};" \
@@ -1060,7 +1214,6 @@ rebuild_db_vacuum_into() {
         fi
     else
         if ! "${binary}" "${db_path}" \
-          "PRAGMA temp_store=MEMORY;" \
           "PRAGMA threads=8;" \
           "PRAGMA page_size=${page_size};" \
           "VACUUM INTO '${staged_db}';"; then
@@ -1092,7 +1245,6 @@ rebuild_db_vacuum_into() {
     if [ "${needs_fixup}" = "1" ]; then
         if [ -n "${auto_vacuum_mode}" ]; then
             if ! "${binary}" "${staged_db}" \
-              "PRAGMA temp_store=MEMORY;" \
               "PRAGMA threads=8;" \
               "PRAGMA page_size=${page_size};" \
               "PRAGMA auto_vacuum=${auto_vacuum_mode};" \
@@ -1103,7 +1255,6 @@ rebuild_db_vacuum_into() {
             fi
         else
             if ! "${binary}" "${staged_db}" \
-              "PRAGMA temp_store=MEMORY;" \
               "PRAGMA threads=8;" \
               "PRAGMA page_size=${page_size};" \
               "VACUUM;"; then
@@ -1212,6 +1363,13 @@ rebuild_db_vacuum_into() {
             exit 1
         fi
     fi
+    if [ -n "${final_pre_publish_hook}" ]; then
+        if ! "${final_pre_publish_hook}" "${binary}" "${staged_db}"; then
+            echo "ERROR: final pre-publication hook failed for ${staged_db}; live DB has NOT been touched" >&2
+            cleanup_staged_db "${staged_db}"
+            exit 1
+        fi
+    fi
     if ! staged_user_version=$("${binary}" "${staged_db}" "PRAGMA user_version;" | tr -d '\r\n'); then
         echo "ERROR: staged user_version check failed for ${staged_db}; live DB has NOT been touched" >&2
         cleanup_staged_db "${staged_db}"
@@ -1242,6 +1400,7 @@ optimize_plex_db() {
     local db_file="${1}"
     local sanity_sql="${2}"
     local pre_swap_hook="${3:-}"
+    local final_pre_publish_hook="${4:-}"
     local db_path="${plex_databases_path}/${db_file}"
     local backup_dir
     local optimize_sql
@@ -1274,7 +1433,8 @@ optimize_plex_db() {
       "${optimize_sql}" \
       "${pre_swap_hook}" \
       "${post_maintenance_hook}" \
-      "${post_maintenance_binary}"
+      "${post_maintenance_binary}" \
+      "${final_pre_publish_hook}"
 }
 
 plex_preferences_file() {
@@ -1813,6 +1973,7 @@ start_container_after_maintenance() {
 run_plex_maintenance_safely() {
     local rc
     local restore_errexit=0
+    local blob_final_pre_publish_hook
 
     case "$-" in
         *e*)
@@ -1836,7 +1997,11 @@ run_plex_maintenance_safely() {
           "try_deflate_plex_statistics_bandwidth"
 
         if [ "${PLEX_PROCESS_BLOB_DB:-0}" = "1" ]; then
-            optimize_plex_db "${_PLEX_BLOB_DB}" "" ""
+            blob_final_pre_publish_hook=""
+            if [ "${PLEX_TRIM_FINISHED_SEASON_BLOBS:-0}" = "1" ]; then
+                blob_final_pre_publish_hook="try_trim_plex_finished_season_blobs"
+            fi
+            optimize_plex_db "${_PLEX_BLOB_DB}" "" "" "${blob_final_pre_publish_hook}"
         fi
     )
     rc=$?
@@ -1915,12 +2080,15 @@ The config is sourced as Bash and owns:
   BACKUP_PATH
   PLEX_OPTIMIZE_API
   PLEX_PROCESS_BLOB_DB
+  PLEX_TRIM_FINISHED_SEASON_BLOBS
   STATS_BANDWIDTH_RETAIN_DAYS
 
 Each PLEX_INSTANCES or EMBY_INSTANCES entry is both the Docker container name
 and the /opt/<instance> filesystem stem. Only literal PLEX_OPTIMIZE_API=1
 triggers the post-start Plex optimize API. Only literal PLEX_PROCESS_BLOB_DB=1
-enables the Plex blob database rebuild pass.
+enables the Plex blob database rebuild pass. Both literal
+PLEX_PROCESS_BLOB_DB=1 and PLEX_TRIM_FINISHED_SEASON_BLOBS=1 enable the fixed
+24-month finished-season blob trim as the final staged mutation.
 
 Stage consumed binaries before running:
   release/cli/sqlite3 -> ${HOME}/bin/sqlite3

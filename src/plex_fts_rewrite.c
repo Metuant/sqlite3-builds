@@ -49,6 +49,17 @@ typedef struct plex_span {
     size_t end;
 } plex_span;
 
+typedef enum plex_value_slot_kind {
+    PLEX_VALUE_LITERAL = 0,
+    PLEX_VALUE_POSITIONAL = 1
+} plex_value_slot_kind;
+
+typedef struct plex_value_slot {
+    plex_value_slot_kind kind;
+    plex_span span;
+    int assigned_index;
+} plex_value_slot;
+
 typedef enum query_clause {
     QUERY_CLAUSE_NONE = 0,
     QUERY_CLAUSE_SELECT,
@@ -91,6 +102,8 @@ typedef struct plex_rewrite_candidate {
     char *sql;
     size_t scan_out_len;
     size_t rewrite_len;
+    int expected_bind_count;
+    int verify_bind_count;
 } plex_rewrite_candidate;
 
 __attribute__((visibility("hidden"))) SQLITE_API int sqlite3_prepare_real(
@@ -600,25 +613,6 @@ static int token_closes_into_value_scope(const char *sql, const fts_lex *after_c
     return token_is_value_comparison_operator(sql, &next);
 }
 
-static int plex_validate_single_statement(const char *sql, size_t len) {
-    fts_lex lx;
-    int depth = 0;
-
-    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_NUMBERED_OR_NAMED);
-    for (;;) {
-        fts_lex_token tok = fts_lex_next_token(&lx);
-        if (tok.type == FTS_LEX_TOK_ERROR) return 0;
-        if (tok.type == FTS_LEX_TOK_EOF) return depth == 0;
-        if (tok.type == FTS_LEX_TOK_SYMBOL && tok.symbol == ';') return 0;
-        if (tok.type == FTS_LEX_TOK_SYMBOL && tok.symbol == '(') {
-            depth++;
-        } else if (tok.type == FTS_LEX_TOK_SYMBOL && tok.symbol == ')') {
-            if (depth == 0) return 0;
-            depth--;
-        }
-    }
-}
-
 static int plex_trailing_space_only(const char *sql, size_t len, size_t pos) {
     size_t i;
 
@@ -1007,26 +1001,90 @@ static int plex_expect_bytes(
     return 1;
 }
 
-static int plex_parse_integer_at(
+static int plex_parse_ondeck_value_at(
     const char *sql,
     size_t len,
     size_t pos,
-    plex_span *slot,
+    int variable_limit,
+    int *max_index,
+    plex_value_slot *slot,
     size_t *after
 ) {
     fts_lex lx;
     fts_lex_token tok;
+    int assigned_index;
+    size_t i;
 
     if (pos > len) return 0;
-    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_NUMBERED_OR_NAMED);
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_SQLITE_VARIABLE);
     lx.pos = pos;
     tok = fts_lex_next_token(&lx);
-    if (tok.type != FTS_LEX_TOK_NUMBER || tok.start != pos) return 0;
-    slot->start = tok.start;
-    slot->end = tok.end;
-    if (!plex_validate_integer_span(sql, slot)) return 0;
+    if (tok.start != pos) return 0;
+    if (tok.type == FTS_LEX_TOK_NUMBER) {
+        slot->kind = PLEX_VALUE_LITERAL;
+        slot->span.start = tok.start;
+        slot->span.end = tok.end;
+        slot->assigned_index = 0;
+        if (!plex_validate_integer_span(sql, &slot->span)) return 0;
+        *after = tok.end;
+        return 1;
+    }
+    if (tok.type != FTS_LEX_TOK_PARAM) return 0;
+    if (sql[tok.start] != '?') return 0;
+    if (tok.end == tok.start + 1) {
+        if (*max_index == INT_MAX || *max_index >= variable_limit) return 0;
+        assigned_index = ++*max_index;
+    } else {
+        int value = 0;
+
+        if (sql[tok.start + 1] < '1' || sql[tok.start + 1] > '9') return 0;
+        for (i = tok.start + 1; i < tok.end; i++) {
+            int digit;
+            if (sql[i] < '0' || sql[i] > '9') return 0;
+            digit = sql[i] - '0';
+            if (value > (INT_MAX - digit) / 10) return 0;
+            value = value * 10 + digit;
+        }
+        if (value > variable_limit) return 0;
+        assigned_index = value;
+        if (assigned_index > *max_index) *max_index = assigned_index;
+    }
+
+    slot->kind = PLEX_VALUE_POSITIONAL;
+    slot->span.start = tok.start;
+    slot->span.end = tok.end;
+    slot->assigned_index = assigned_index;
     *after = tok.end;
     return 1;
+}
+
+static size_t plex_positional_render_len(int assigned_index) {
+    size_t len = 2;
+    while (assigned_index >= 10) {
+        len++;
+        assigned_index /= 10;
+    }
+    return len;
+}
+
+static void plex_append_value_slot(
+    char **p,
+    const char *sql,
+    const plex_value_slot *slot
+) {
+    if (slot->kind == PLEX_VALUE_LITERAL) {
+        plex_append_span(p, sql, &slot->span);
+    } else {
+        char digits[16];
+        size_t count = 0;
+        int n = slot->assigned_index;
+        *(*p)++ = '?';
+        do {
+            digits[count++] = (char)('0' + n % 10);
+            n /= 10;
+        } while (n > 0);
+        while (count > 0) *(*p)++ = digits[--count];
+    }
 }
 
 static int plex_parse_integer_list_at(
@@ -1063,9 +1121,9 @@ static int plex_parse_integer_list_at(
 static char *plex_build_ondeck_sql(
     sqlite3 *db,
     const char *sql,
-    const plex_span *section_id,
+    const plex_value_slot *section_id,
     const plex_span *id_list,
-    const plex_span *account_id,
+    const plex_value_slot *account_id,
     size_t *rewrite_len
 ) {
     static const char tpl0[] =
@@ -1111,13 +1169,22 @@ static char *plex_build_ondeck_sql(
     size_t limit;
     char *rewritten;
     char *p;
+    size_t section_len;
+    size_t account_len;
+
+    section_len = section_id->kind == PLEX_VALUE_LITERAL
+        ? section_id->span.end - section_id->span.start
+        : plex_positional_render_len(section_id->assigned_index);
+    account_len = account_id->kind == PLEX_VALUE_LITERAL
+        ? account_id->span.end - account_id->span.start
+        : plex_positional_render_len(account_id->assigned_index);
 
     if (!plex_add_size(&out_len, sizeof(tpl0) - 1) ||
-        !plex_add_size(&out_len, section_id->end - section_id->start) ||
+        !plex_add_size(&out_len, section_len) ||
         !plex_add_size(&out_len, sizeof(tpl1) - 1) ||
         !plex_add_size(&out_len, id_list->end - id_list->start) ||
         !plex_add_size(&out_len, sizeof(tpl2) - 1) ||
-        !plex_add_size(&out_len, account_id->end - account_id->start) ||
+        !plex_add_size(&out_len, account_len) ||
         !plex_add_size(&out_len, sizeof(tpl3) - 1)) {
         return NULL;
     }
@@ -1128,11 +1195,11 @@ static char *plex_build_ondeck_sql(
     if (!rewritten) return NULL;
     p = rewritten;
     plex_append_bytes(&p, tpl0, sizeof(tpl0) - 1);
-    plex_append_span(&p, sql, section_id);
+    plex_append_value_slot(&p, sql, section_id);
     plex_append_bytes(&p, tpl1, sizeof(tpl1) - 1);
     plex_append_span(&p, sql, id_list);
     plex_append_bytes(&p, tpl2, sizeof(tpl2) - 1);
-    plex_append_span(&p, sql, account_id);
+    plex_append_value_slot(&p, sql, account_id);
     plex_append_bytes(&p, tpl3, sizeof(tpl3) - 1);
     rewritten[out_len] = 0;
     *rewrite_len = out_len;
@@ -1151,25 +1218,28 @@ static plex_match_result match_ondeck_query(
     static const char after_ids[] =
         " and metadata_item_settings.view_count>0  and metadata_item_views.account_id=";
     static const char after_account[] = " group by grandparents.id order by viewed_at desc";
-    plex_span section_id;
+    plex_value_slot section_id;
     plex_span id_list;
-    plex_span account_id;
+    plex_value_slot account_id;
     plex_index_state index_state;
+    int max_index = 0;
+    int variable_limit;
     size_t pos = 0;
 
     if (scan_len < sizeof(head) - 1 || memcmp(sql, head, sizeof(head) - 1) != 0) {
         return PLEX_MATCH_MISS;
     }
-    if (!plex_validate_single_statement(sql, scan_len)) {
-        plex_log_rewrite_skipped(db, "capture_miss", PLEX_MODE_ONDECK);
-        return PLEX_MATCH_MISS;
-    }
+    variable_limit = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
     pos = sizeof(head) - 1;
-    if (!plex_parse_integer_at(sql, scan_len, pos, &section_id, &pos) ||
+    if (!plex_parse_ondeck_value_at(
+            sql, scan_len, pos, variable_limit, &max_index, &section_id, &pos
+        ) ||
         !plex_expect_bytes(sql, scan_len, pos, after_section, &pos) ||
         !plex_parse_integer_list_at(sql, scan_len, pos, &id_list, &pos) ||
         !plex_expect_bytes(sql, scan_len, pos, after_ids, &pos) ||
-        !plex_parse_integer_at(sql, scan_len, pos, &account_id, &pos) ||
+        !plex_parse_ondeck_value_at(
+            sql, scan_len, pos, variable_limit, &max_index, &account_id, &pos
+        ) ||
         !plex_expect_bytes(sql, scan_len, pos, after_account, &pos) ||
         !plex_trailing_space_only(sql, scan_len, pos)) {
         plex_log_rewrite_skipped(db, "capture_miss", PLEX_MODE_ONDECK);
@@ -1189,6 +1259,8 @@ static plex_match_result match_ondeck_query(
     );
     if (!candidate->sql) return PLEX_MATCH_BUILD_FAILED;
     candidate->scan_out_len = candidate->rewrite_len;
+    candidate->expected_bind_count = max_index;
+    candidate->verify_bind_count = 1;
     return PLEX_MATCH_BUILT;
 }
 
@@ -1301,6 +1373,8 @@ static int plex_prepare_rewritten_sql(
     size_t scan_len,
     size_t scan_out_len,
     size_t rewrite_len,
+    int expected_bind_count,
+    int verify_bind_count,
     const char *mode
 ) {
     int rewrite_nbyte = nByte < 0 ? -1 : (int)rewrite_len;
@@ -1321,6 +1395,14 @@ static int plex_prepare_rewritten_sql(
     }
     if (!plex_map_end_tail(zSql, rewritten, rewritten_tail, scan_len, scan_out_len, &mapped_tail)) {
         plex_log_rewrite_skipped(db, "tail_mismatch", mode);
+        free(rewritten);
+        return plex_retry_original_after_rewrite_failure(
+            kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
+        );
+    }
+    if (verify_bind_count &&
+        sqlite3_bind_parameter_count(*ppStmt) != expected_bind_count) {
+        plex_log_rewrite_skipped(db, "bind_count_mismatch", mode);
         free(rewritten);
         return plex_retry_original_after_rewrite_failure(
             kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
@@ -1382,6 +1464,7 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
             scan_len,
             scan_len + REWRITE_OPEN_LEN + REWRITE_CLOSE_LEN,
             bounded_len + REWRITE_OPEN_LEN + REWRITE_CLOSE_LEN,
+            0, 0,
             PLEX_MODE_FTS
         );
     }
@@ -1393,6 +1476,7 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
             return plex_prepare_rewritten_sql(
                 kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
                 candidate.sql, scan_len, candidate.scan_out_len, candidate.rewrite_len,
+                0, 0,
                 PLEX_MODE_TAGGINGS
             );
         }
@@ -1410,6 +1494,7 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
             return plex_prepare_rewritten_sql(
                 kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
                 candidate.sql, scan_len, candidate.scan_out_len, candidate.rewrite_len,
+                candidate.expected_bind_count, candidate.verify_bind_count,
                 PLEX_MODE_ONDECK
             );
         }
