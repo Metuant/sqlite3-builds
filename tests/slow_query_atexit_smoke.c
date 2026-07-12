@@ -1,4 +1,5 @@
 #include "sqlite3.h"
+#include "observability.h"
 
 /* Atexit smoke: triggers enough tracker records for stats eligibility, exits
  * normally, expects the atexit-registered dump to emit either a

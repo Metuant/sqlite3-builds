@@ -25,6 +25,7 @@ stage_scratch() {
     "$scratch/docker-cli" \
     "$scratch/docker-library" \
     "$scratch/docker-build-base" \
+    "$scratch/docs" \
     "$scratch/src" \
     "$scratch/tools/ci" \
     "$scratch/tools/lsio-mod" \
@@ -46,8 +47,11 @@ stage_scratch() {
   cp "$repo_root/docker-library/Dockerfile" "$scratch/docker-library/Dockerfile"
   cp "$repo_root/docker-build-base/Dockerfile" "$scratch/docker-build-base/Dockerfile"
   cp "$repo_root/docker-build-base/ubuntu-toolchain-r-test.asc" "$scratch/docker-build-base/ubuntu-toolchain-r-test.asc"
+  cp "$repo_root/CLAUDE.md" "$scratch/CLAUDE.md"
+  cp "$repo_root/docs/env-vars.md" "$scratch/docs/env-vars.md"
   cp "$repo_root/src/auto_extension.c" "$scratch/src/auto_extension.c"
   cp "$repo_root/src/emby_fts_rewrite.c" "$scratch/src/emby_fts_rewrite.c"
+  cp "$repo_root/src/observability.c" "$scratch/src/observability.c"
   cp "$repo_root/src/plex_fts_rewrite.c" "$scratch/src/plex_fts_rewrite.c"
   cp "$repo_root/tools/ci/mod-bake-smoke.sh" "$scratch/tools/ci/mod-bake-smoke.sh"
   cp "$repo_root/tools/lsio-mod/render-lsio-mod-baked-pins.sh" "$scratch/tools/lsio-mod/render-lsio-mod-baked-pins.sh"
@@ -119,6 +123,31 @@ assert_fails_with() {
       ' "$scratch/docker-library/Dockerfile" > "$scratch/docker-library/Dockerfile.tmp"
       mv "$scratch/docker-library/Dockerfile.tmp" "$scratch/docker-library/Dockerfile"
       ;;
+    stmt-sampling-source-literal)
+      awk '
+        $0 == "        (stmt_sampling && strcmp(stmt_sampling, \"1\") == 0) ? 1 : 0," {
+          print "        (stmt_sampling && strcmp(stmt_sampling, \"0\") == 0) ? 1 : 0,"
+          next
+        }
+        { print }
+      ' "$scratch/src/observability.c" > "$scratch/src/observability.c.tmp"
+      mv "$scratch/src/observability.c.tmp" "$scratch/src/observability.c"
+      ;;
+    stmt-sampling-doc-literal)
+      awk '
+        index($0, "| `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` |") == 1 {
+          sub("Literal `1` logs every", "Literal `0` logs every")
+        }
+        { print }
+      ' "$scratch/docs/env-vars.md" > "$scratch/docs/env-vars.md.tmp"
+      mv "$scratch/docs/env-vars.md.tmp" "$scratch/docs/env-vars.md"
+      ;;
+    stmt-sampling-claude-literal)
+      awk '
+        { gsub("SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1", "SQLITE3_DISABLE_STMT_TRACE_SAMPLING=0"); print }
+      ' "$scratch/CLAUDE.md" > "$scratch/CLAUDE.md.tmp"
+      mv "$scratch/CLAUDE.md.tmp" "$scratch/CLAUDE.md"
+      ;;
     *)
       fail "unsupported failure case: $name"
       ;;
@@ -145,5 +174,8 @@ assert_rejected scripts-source scripts/reintroduced-pin.sh
 assert_rejected retired-scalar-under-base-context docker-build-base/reintroduced-pin.sh
 assert_fails_with missing-base-ref-script-input CMAKE_SHA256_AARCH64
 assert_fails_with inline-generic-base BASE_IMAGE
+assert_fails_with stmt-sampling-source-literal 'STMT trace sampling literal-1 override missing'
+assert_fails_with stmt-sampling-doc-literal 'docs/env-vars.md missing exact line'
+assert_fails_with stmt-sampling-claude-literal 'CLAUDE STMT sampling knob missing from CLAUDE.md'
 
 printf 'negative pin-alignment checks passed\n'

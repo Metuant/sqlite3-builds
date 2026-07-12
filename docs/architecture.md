@@ -43,22 +43,24 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `src/auto_extension.c` | Built into both library variants; owns open-time auto-extension registration, trace-mask setup, target filtering, and the TLS seam into runtime optimize. |
 | `src/runtime_optimize.c` | Built into both library variants; owns runtime optimize state, cadence, eligibility, and hook helpers. |
 | `src/auto_extension_internal.h` | Shared internal seam header between `src/auto_extension.c` and `src/runtime_optimize.c`. |
+| `src/observability.c` | Built into both library variants; owns SQLite wrappers, observability state, record formatting, and prepare-chain entry points. |
+| `src/observability.h` | Private cross-translation-unit seam for shared observability functions. |
 | `src/slow_query_tracker.c` | Hidden observability satellite for PROFILE-based slow-query logging and bounded per-template stats. |
 | `src/fts_lex.c` | Built into both library variants; owns the shared FTS rewrite SQL token scanner. |
 | `src/fts_lex.h` | Private shared lexer header consumed by the Plex and Emby FTS rewrite wrappers. |
-| `src/plex_fts_rewrite.c` | Built into both library variants; owns the Plex FTS prefix-tag rewrite plus opt-in taggings-membership and On-Deck rewrites. |
+| `src/plex_fts_rewrite.c` | Built into both library variants; owns the Plex FTS prefix-tag rewrite plus opt-in taggings-membership and On-Deck id-list/threshold rewrites. |
 | `src/plex_fts_rewrite.h` | Private prepare-wrapper seam header between the Emby helper and Plex rewrite helper. |
 | `src/emby_fts_rewrite.c` | Built into both library variants; owns the Emby FTS scalar rewrite plus opt-in fan-out and dashboard Latest rewrites. |
 | `src/emby_fts_rewrite.h` | Private prepare-wrapper seam header between `src/observability.c` and `src/emby_fts_rewrite.c`. |
 | `tests/auto_extension_smoke.c` | Runtime smoke for filter, kill switch, read-only skip, and emitted PRAGMAs. |
 | `tests/runtime_optimize_smoke.c` | Runtime smoke for close and inline runtime optimize target gating, STAT1/STAT4 refresh, kill switches, skip gates, cadence, close semantics, and shutdown/reinit. |
 | `tests/slow_query_smoke.c` | Runtime smoke for the slow-query tracker threshold parser, kill switches, LRU bound, truncation, and stats dump. |
-| `tests/stmt_trace_smoke.c` | Runtime smoke for the STMT trace env contract and trace mask registration against the shared STMT/PROFILE callback. |
+| `tests/stmt_trace_smoke.c` | Runtime smoke for the STMT trace env, sampling, correlation, SQL-cap, and shared STMT/PROFILE registration contracts. |
 | `tests/config_after_dlopen_smoke.c` | Runtime smoke proving startup-only config remains legal after library load and before first open. |
 | `tests/shutdown_reinit_smoke.c` | Runtime smoke proving lazy auto-extension registration survives `sqlite3_shutdown()` and later reopen. |
 | `tests/icu_smoke.c` | Runtime smoke for Plex ICU collation registration and comparator use. |
-| `tests/plex_fts_rewrite_smoke.c` | Runtime smoke for Plex FTS, taggings-membership, and On-Deck rewrites, env gates, index gates, fail-open paths, and row parity. |
-| `tests/emby_fts_rewrite_smoke.c` | Runtime smoke and direct canary for Emby FTS, fan-out, and dashboard rewrites, fail-open gates, fixtures, scalar behavior, and row parity. |
+| `tests/plex_fts_rewrite_smoke.c` | Runtime smoke for Plex FTS, taggings-membership, both On-Deck selectors, observability sampling/dedup, env/index gates, fail-open paths, and row parity. |
+| `tests/emby_fts_rewrite_smoke.c` | Runtime smoke and direct canary for Emby FTS, fan-out, dashboard projection/scalar forms, observability sampling/dedup, fail-open gates, fixtures, and row parity. |
 | `tests/emby_fts_rewrite_prepare_bench.c` | Advisory prepare-cost bench for default-on-select, enabled-nontarget-select, enabled-emby-miss, enabled-emby-large-miss, enabled-all-large-miss, enabled-emby-match, and enabled-emby-exec-miss Emby rewrite paths. |
 | `tests/fixtures/emby-fts-rewrite/` | Raw Emby search statement fixtures and expected prepare-wrapper output for smoke and manual host-gate checks. |
 | `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: schema v3 metadata, detector, artifact, pre, Plex pool-site, unsupported rows, and malformed-input rejection. |
@@ -127,7 +129,8 @@ Everything else is shared: the SQLite amalgamation pin, `src/auto_extension.c`,
 `src/runtime_optimize.c`, `src/observability.c`, `src/slow_query_tracker.c`,
 `src/fts_lex.c`, `src/plex_fts_rewrite.c`, `src/emby_fts_rewrite.c`, seam
 headers `src/auto_extension_internal.h`, `src/fts_lex.h`,
-`src/plex_fts_rewrite.h`, and `src/emby_fts_rewrite.h`, feature families,
+`src/observability.h`, `src/plex_fts_rewrite.h`, and
+`src/emby_fts_rewrite.h`, feature families,
 tuning defaults, high-capacity limits, shared-cache omission, and page-cache
 overflow stat posture.
 
@@ -228,11 +231,21 @@ Observability:
   prepare the `unlikely(tag_type=<value>)`, taggings-membership conjunct, or
   On-Deck ranked-subquery rewrite. Rewrite helpers log only after the rewritten
   statement is effectively returned or after a target-shape rewrite-path
-  failure falls back.
+  failure falls back. Applied records combine a per-connection/per-mode first
+  and every 1024th sampler with a bounded per-connection first-seen-`corr` set;
+  emitted labels are `sample=first`, `sample=periodic`, and `sample=new`, and
+  every emitted record carries the full bounded SQL fields unless their text is
+  disabled. Capture misses allocate and log the full uncapped source SQL on the
+  low-volume miss path with first-failure `sub_reason`, length, and correlation
+  fields; allocation or record-size failure falls back to a bounded diagnostic
+  without affecting prepare behavior.
 - Observability logging must not inject config, db-config, open-flag,
   filename, handle, or return-code behavior.
 - Trace registration failure must log and continue; it must never fail
   `sqlite3_open*`.
+- `obs_logf` must emit each bounded record with one `fwrite()` under the stderr
+  stream lock. Missing-index logs are once per connection/mode; index probe
+  errors are not deduplicated.
 - Observability log emission is independent of target filtering, read-only
   filtering, and `SQLITE3_DISABLE_AUTOPRAGMA`.
 - The observability kill switch must remain literal

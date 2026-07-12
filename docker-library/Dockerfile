@@ -47,6 +47,7 @@ COPY src/auto_extension.c /app/auto_extension.c
 COPY src/runtime_optimize.c /app/runtime_optimize.c
 COPY src/auto_extension_internal.h /app/auto_extension_internal.h
 COPY src/observability.c /app/observability.c
+COPY src/observability.h /app/observability.h
 COPY src/slow_query_tracker.c /app/slow_query_tracker.c
 COPY src/fts_lex.c /app/fts_lex.c
 COPY src/fts_lex.h /app/fts_lex.h
@@ -289,13 +290,13 @@ RUN set -euo pipefail; \
         /app/tests/slow_query_smoke.c /app/slow_query_tracker.c \
         /app/tests/slow_query_tracker_stubs.c \
         /app/tests/runtime_optimize_stubs.c \
-        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
+        -I/app -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_smoke; \
     gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -o /app/slow_query_atexit_smoke \
         /app/tests/slow_query_atexit_smoke.c /app/slow_query_tracker.c \
         /app/tests/slow_query_tracker_stubs.c \
         /app/tests/runtime_optimize_stubs.c \
-        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
+        -I/app -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
     atexit_output="$(LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_atexit_smoke 2>&1)"; \
     printf "%s\n" "$atexit_output"; \
     printf "%s\n" "$atexit_output" | grep -E 'slow_query_stats|dump_skipped'; \
@@ -303,7 +304,7 @@ RUN set -euo pipefail; \
         /app/tests/slow_query_concurrency_smoke.c /app/slow_query_tracker.c \
         /app/tests/slow_query_tracker_stubs.c \
         /app/tests/runtime_optimize_stubs.c \
-        -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
+        -I/app -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread -lm; \
     LD_LIBRARY_PATH="$LIB_DIR${LDPATH_VARIANT}" /app/slow_query_concurrency_smoke; \
     gcc -O2 -o /app/slow_query_select1_bench /app/tests/slow_query_select1_bench.c \
         -I"$AMALG_DIR" -L"$LIB_DIR" $LDFLAGS_VARIANT -lsqlite3 -ldl -lpthread; \

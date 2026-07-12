@@ -80,6 +80,25 @@ Execution points:
 - Generic library Docker build.
 - Plex library Docker build with Plex ICU paths in the loader environment.
 
+### `stmt_trace_smoke`
+
+`tests/stmt_trace_smoke.c` links against the just-built library inside both
+library Docker images.
+
+It proves:
+
+- STMT trace remains default-off and requires literal
+  `SQLITE3_DISABLE_STMT_TRACE=0`.
+- Enabled STMT trace logs the first callback, every 1024th callback, and each
+  first-seen `corr` shape on other counts within a bounded per-connection set,
+  using `sample=first`, `sample=periodic`, and `sample=new` with `count`,
+  `sql_len`, and `corr` fields.
+- Literal `SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1` logs every enabled STMT
+  callback and never enables STMT trace by itself.
+- Capture-miss logging includes full uncapped source SQL on the allocated
+  low-volume path and emits a bounded `...[TRUNC]` fallback when allocation
+  fails.
+
 ### `plex_fts_rewrite_smoke`
 
 `tests/plex_fts_rewrite_smoke.c` runs in generic/Plex library Docker builds.
@@ -91,13 +110,20 @@ It proves:
   enabled, and exact-path negatives.
 - taggings and On-Deck opt-in env behavior: literal `0` enabled, unset,
   literal `1`, and non-`0` disabled.
+- On-Deck Variant B threshold rewriting with the common On-Deck opt-in enabled.
 - three UTF-8 prepare entries with `nByte`/NUL and `pzTail == NULL`.
 - quoted-string/`?` RHS.
 - FTS scope/clause/RHS-continuation negatives.
 - taggings membership same-SELECT-block guards, FTS-shape exclusion, index gate,
   and duplicate/bound/string tag-id negatives.
-- On-Deck exact-shape guards, g2 index gate, duplicate ID preservation, and
+- On-Deck Variant A id-list and Variant B literal-threshold exact-shape guards,
+  section/account bind combinations, cross-product and invalid-threshold
+  negatives, g2 index gate, duplicate ID preservation, fail-open paths, and
   deterministic ranked-subquery output.
+- Full capture-miss source SQL, `sub_reason`, length/correlation fields,
+  early-miss silence, hybrid `sample=first|periodic|new` applied records with
+  full SQL fields, applied-SQL suppression, and connection-local taggings
+  `index_missing` deduplication.
 - prepare-denial fail-open.
 - grouped-digest row identity.
 
@@ -116,7 +142,9 @@ It proves:
   RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and
   links-search rewrites.
 - DASHBOARD default-off behavior and literal-0 Episodes-Latest K1 plus guarded
-  movies-Latest C2 behavior, LIMIT/projection variation, all five bind-token
+  movies-Latest C2 behavior, list and one-parenthesis scalar ancestor forms,
+  structural wide/compact projection preservation, movies `over` and
+  `LastWatchedEpisodes` guards, LIMIT variation, bind/grammar/projection
   negatives, family Type clean misses, and zero cross-family capture misses.
 - exact `library.db` target basename and non-target negatives.
 - three UTF-8 prepare entries with `nByte`/NUL and tail handling.
@@ -131,8 +159,12 @@ It proves:
   and embedded NUL inputs.
 - Episodes index-absent/probe-error fail-open; movies outer-missing,
   inner-missing, and probe-error fail-open; native movies-index absence;
-  capture-on-miss, aggregate/window, series-browse, XB, UB, and direct
-  candidate-error/partial-statement/wrong-tail coverage. No-guard is
+  capture-on-miss with full source SQL, `sub_reason`, and correlation; hybrid
+  first/periodic/new applied-record sampling; aggregate,
+  window, bare-star, parenthesized-projection, series-browse, XB, UB, and direct
+  candidate-error/partial-statement/wrong-tail coverage. Missing-index logs are
+  deduplicated per connection and mode while probe errors remain unsuppressed.
+  No-guard is
   matcher-non-applying: Type=5 passes, guarded-tail miss logs capture_miss, and
   original SQL prepares.
 - fixture canaries under `tests/fixtures/emby-fts-rewrite/`.

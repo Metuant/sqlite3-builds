@@ -183,19 +183,19 @@ milestone lands.
   `fts_lex_match_rhs_is_complete`, and
   `fts_rewrite_db_basename_matches`, are also hidden and absent from
   `.dynsym`.
-- `sqlite3_enable_shared_cache` no-op stub at `src/auto_extension.c:6-15`
+- `sqlite3_enable_shared_cache` no-op stub at `src/auto_extension.c:7-16`
   is load-bearing for the Plex variant. **KEEP byte-for-byte intact.**
 - `build/libsqlite3-version-script.ld` is load-bearing for symbol-export
   discipline: exact list from the pinned `sqlite3.h` plus
   `auto_extension_path_is_target`, `auto_extension_sorterref_cfg_rc`,
   `auto_extension_pmasz_cfg_rc`, and `sqlite3_enable_shared_cache`, then
   `local: *;` to deny everything else including `mi_*`. The post-link
-  hidden-symbol deny gate in `build/Build.sh:265-286` (including
+  hidden-symbol deny gate in `build/Build.sh:265-288` (including
   `plex_fts_rewrite_prepare`, `emby_fts_rewrite_prepare`, `fts_lex_init`,
   `fts_lex_token_text_eq`, `fts_lex_next_token`,
   `fts_lex_match_rhs_is_complete`, and
   `fts_rewrite_db_basename_matches`) stays adjacent to the preserved
-  `build/Build.sh:255-263`
+  `build/Build.sh:255-264`
   `_real` gates as belt-and-braces.
 - Initialize/config/db-config/open `SQLITE_API` wrappers in
   `src/observability.c` MUST chain to `*_real` and return its result
@@ -208,8 +208,17 @@ milestone lands.
   rewrites and enabled Plex matches intentionally prepare the
   `unlikely(tag_type=<value>)`, taggings-membership conjunct, or On-Deck
   ranked-subquery rewrite. Rewrite-success logging is emitted only after the
-  rewritten statement is the returned statement; passthrough, miss, and
-  fallback-to-original paths do not log.
+  rewritten statement is the returned statement. Applied records combine
+  per-connection/per-mode first-and-every-1024th sampling with a bounded
+  per-connection first-seen-`corr` set. Full emitted records use
+  `sample=first`, `sample=periodic`, or `sample=new`; a full or unavailable set
+  falls back to the periodic sampler. If per-connection sampler state cannot be
+  allocated or registered, known-mode `rewrite_applied` and STMT diagnostics
+  are skipped; sampler failure never increases output. Capture-gated misses
+  allocate and carry full uncapped raw source SQL, first-failure `sub_reason`,
+  exact length, and full-span correlation; allocation or record-size failure
+  emits a bounded fallback without changing prepare behavior. Clean misses and
+  fallback-to-original paths do not emit applied records.
 - Every `obs_forward_config` / `obs_forward_db_config` case-arm
   preserves the exact arity, types, and argument pass-through to
   `sqlite3_config_real` / `sqlite3_db_config_real`. New SQLite opcodes
@@ -262,16 +271,28 @@ milestone lands.
   `SQLITE3_DISABLE_OBSERVABILITY` and `SQLITE3_DISABLE_STMT_TRACE`, are
   populated before any open-wrapper-triggered callback fires. Do NOT move
   slow-query registration onto the PROFILE hot path.
-- `SLOW_QUERY_SQL_CAP=1024` (tracker key + display) and `OBS_SQL_CAP=4096`
-  (observability STMT log) are intentionally separate constants. Tracker
-  uses its own cap to prevent collision; `tests/check_obs_counts.sh`
-  decode-count gate references only `OBS_SQL_CAP`.
-- `SLOW_QUERY_MAX_ENTRIES=2048` is the tracker LRU entry cap.
+- `SLOW_QUERY_SQL_CAP=2048` (tracker key + display) and `OBS_SQL_CAP=4096`
+  (observability STMT plus rewrite-applied source/rewritten SQL) are separate
+  constants. Capture-miss source SQL instead uses an allocated, uncapped
+  full-record path with bounded fallback on allocation or record-size failure.
+  The tracker uses its own cap to prevent collision;
+  `tests/check_obs_counts.sh` references only `OBS_SQL_CAP`.
+- `obs_logf` formats outside the stderr stream lock, allocates a full record
+  when formatted output exceeds its inline buffer, and emits one `fwrite()`
+  plus one terminal newline per record. Allocation or record-size failure uses
+  a bounded fallback. `index_missing` is logged
+  once per connection and mode for Plex taggings/On-Deck and Emby
+  Episodes/movies Latest; probe errors stay unsuppressed.
+- Full `capture_miss` records allocate and format outside the stderr stream
+  lock, then emit one `fwrite()` plus one terminal newline; failure to build the
+  full record falls back to `obs_logf` and never affects prepare behavior.
+- `SLOW_QUERY_MAX_ENTRIES=4096` is the tracker LRU entry cap.
 - `auto_extension_pmasz_cfg_rc()` mirrors
-  `auto_extension_sorterref_cfg_rc()` in `src/auto_extension.c:31-37`;
+  `auto_extension_sorterref_cfg_rc()` in `src/auto_extension.c:28-34`;
   both remain default-visibility C getters consumed by
-  `tests/auto_extension_smoke.c:426-459` through `-lsqlite3` linkage and
-  both MUST stay in the version-script `global:` allowlist.
+  `tests/auto_extension_smoke.c:538-567`, linked through `-lsqlite3` by
+  `docker-library/Dockerfile:252-254`, and both MUST stay in the version-script
+  `global:` allowlist.
 - Tracker registration via `sqlite3_trace_v2` MUST stay in the
   per-connection init path (`autopragma_init` in `src/auto_extension.c`)
   that runs BEFORE the connection escapes to application code. Do not move
@@ -293,10 +314,10 @@ milestone lands.
   `slow_query_stats` line emits only when `mean_ns >= threshold_ns` and
   `count >= 5`; `mean_ms`, `stddev_ms`, `min_ms`, and `max_ms` render with
   `%.6f` precision.
-- Slow-query stats key identity: full-SQL `memcmp` for templates <=1024
-  bytes; 64-bit FNV-1a hash equality for templates >1024 bytes (collision
-  probability negligible at <=2048 templates). FNV-1a MUST NEVER be used
-  as equality for <=1024-byte templates.
+- Slow-query stats key identity: full-SQL `memcmp` for templates <=2048
+  bytes; 64-bit FNV-1a hash equality for templates >2048 bytes (collision
+  probability negligible at <=4096 templates). FNV-1a MUST NEVER be used
+  as equality for <=2048-byte templates.
 - Slow-query LRU eviction tombstones the evicted bucket slot
   (`SLOW_QUERY_NIL = UINT16_MAX`) and increments `g_slow.tombstones`.
   Bucket rebuild triggers only when `tombstones >= entries_used / 4`
@@ -326,6 +347,15 @@ milestone lands.
   `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enable; unset, literal `1`, and every
   other value disable. These Plex opt-in rewrites fail open and are independent
   of `SQLITE3_DISABLE_AUTOPRAGMA` and `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
+  The On-Deck id-list and threshold arms both run whenever the base On-Deck
+  rewrite is enabled.
+- Literal `SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1` omits source and rewritten
+  SQL text from every emitted applied record; unset, literal `0`, and every
+  other value retain it on `sample=first`, `sample=periodic`, and
+  `sample=new` records. Literal
+  `SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1` logs every enabled STMT callback;
+  unset, literal `0`, and every other value retain hybrid first/periodic/new
+  sampling. The sampling override never enables STMT trace.
 - Emby FTS rewrite is opt-out: literal `SQLITE3_DISABLE_EMBY_FTS_REWRITE=1`
   disables; unset, literal `0`, and every other value enable. Emby fan-out and
   dashboard rewrites are opt-in: `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=0` and
@@ -406,7 +436,7 @@ milestone lands.
 ## 7. Performance non-regression
 
 - New mechanisms in the observability / optimization layers
-  (`src/observability.c`, `src/auto_extension.c`, future tracker /
+  (`src/observability.c`, `src/auto_extension.c`, tracker /
   profiler modules) MUST NOT regress runtime performance to a
   user-noticeable degree.
 - **Threshold**: nanosecond-scale per-query overhead is acceptable;

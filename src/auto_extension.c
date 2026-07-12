@@ -1,4 +1,5 @@
 #include "auto_extension_internal.h"
+#include "observability.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -14,10 +15,6 @@ SQLITE_API int sqlite3_enable_shared_cache(int enable) {
     return SQLITE_OK;
 }
 
-__attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void);
-__attribute__((visibility("hidden"))) SQLITE_API int obs_stmt_trace_disabled(void);
-__attribute__((visibility("hidden"))) SQLITE_API int obs_trace_cb(unsigned trace, void *ctx, void *p, void *x);
-__attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
 
 /* WHY: Constructor stores cfg_rc here so tests can assert that the runtime

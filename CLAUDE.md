@@ -41,7 +41,10 @@ Project-specific guidance:
   keep `BASEIMAGE_ALPINE` = `ghcr.io/linuxserver/baseimage-alpine:3.23` and
   `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`, and
-  `tests/check_pin_alignment.sh`.
+  `tests/check_pin_alignment.sh`; keep the literal semantics for
+  `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` and
+  `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` aligned across their `src/*.c` owners,
+  `docs/env-vars.md`, this file, and `tests/check_pin_alignment.sh`.
 - Keep runtime optimize opt-in: literal `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0`
   enables; unset, literal `1`, and every other value disable. Keep maintenance
   defaults exact: `PLEX_OPTIMIZE_API=0`. For configured Plex instances,
@@ -56,7 +59,22 @@ Project-specific guidance:
   `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE` (On-Deck) each enable on literal `0`;
   unset, literal `1`, and every other value disable. Both fail open and are
   independent of `SQLITE3_DISABLE_AUTOPRAGMA` and
-  `SQLITE3_DISABLE_PLEX_FTS_REWRITE`.
+  `SQLITE3_DISABLE_PLEX_FTS_REWRITE`. The Plex On-Deck `viewed_at > <literal>`
+  arm runs whenever `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enables the base
+  On-Deck rewrite.
+  Keep rewrite-applied SQL text enabled by default: literal
+  `SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1` omits source and rewritten SQL text;
+  unset, literal `0`, and every other value retain the text fields on every
+  emitted `sample=first`, `sample=periodic`, and `sample=new` record. Applied
+  rewrites use a per-connection/per-mode first-and-every-1024th sampler plus a
+  bounded per-connection first-seen-`corr` set; enabled STMT trace uses the same
+  hybrid shape with a per-connection callback count. Literal
+  `SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1` logs every enabled STMT callback;
+  unset, literal `0`, and every other value retain hybrid sampling. A full or
+  unavailable correlation set falls back to the 1024th sampler. If
+  per-connection sampler state cannot be allocated or registered, known-mode
+  `rewrite_applied` and STMT diagnostics are skipped; sampler failure never
+  increases output. This sampling knob never enables STMT trace by itself.
   Keep Emby FTS rewrite (`SQLITE3_DISABLE_EMBY_FTS_REWRITE`) opt-out (default-on
   in the Emby build): literal `1` disables; unset, literal `0`, and every other
   value enable. Keep the two Emby membership/dashboard knobs opt-in:

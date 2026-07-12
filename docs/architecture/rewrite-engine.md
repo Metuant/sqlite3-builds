@@ -333,7 +333,7 @@ ambiguous tag ids, existing taggings-membership conjuncts, semicolon tails,
 non-Plex basenames, and FTS shape 09 containing `fts4_metadata_titles_icu`.
 Every matched prepare probes `sqlite_master` for
 `idx_dshadow_taggings_tag_id_metadata_item_id`; absence fails open with
-`reason=index_missing`.
+`reason=index_missing`, logged once per connection for this mode.
 
 On a match, the helper appends
 `AND metadata_items.id IN (SELECT metadata_item_id FROM taggings WHERE tag_id=<N>)`
@@ -347,32 +347,45 @@ The Plex On-Deck rewrite is opt-in:
 `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE=0` enables it; unset, literal `1`, and
 every other value disable it. It is independent of
 `SQLITE3_DISABLE_PLEX_FTS_REWRITE` and `SQLITE3_DISABLE_AUTOPRAGMA`.
+Both Variant A id-list matching and Variant B threshold matching run whenever
+the base On-Deck rewrite is enabled.
 
 The matcher consumes raw `zSql` and is exact-shape for the Plex On-Deck
-statement. `library_section_id` and `account_id` accept an inlined decimal
-integer or a positional `?`/canonical `?N`; the nonempty id-list accepts only
-inlined decimal integers. Each of the two scalar slots is parsed sequentially
+statement and accepts exactly one selector after `library_section_id`. Variant
+A accepts a nonempty `grandparents.id IN (...)` list of inlined decimal
+integers. Variant B accepts one unsigned decimal literal after `viewed_at >`;
+binds, signs, decimals, expressions, overflow beyond signed 64-bit range, and
+an id-list-plus-threshold cross-product fail open. `library_section_id` and
+`account_id` accept an inlined decimal integer or a positional `?`/canonical
+`?N` in both variants. Each of those two scalar slots is parsed sequentially
 with SQLite numbering: bare `?` takes the next maximum index, explicit `?N` may
 create holes or be reused, and the rewrite emits each captured variable as an
-explicit `?N`. Only the two scalar slots can hold a variable. Named variables,
+explicit `?N`. Only those two scalar slots can hold a variable. Named variables,
 id-list variables, and noncanonical or out-of-limit indices fail open. The
 prepared rewrite's bind count is the two-slot maximum, verified against
 `sqlite3_bind_parameter_count` after prepare (`bind_count_mismatch` fails open).
-The matcher also rejects
-expressions, slot drift, missing required settings joins, left joins,
-projection drift, semicolon tails, and non-Plex basenames. Every matched
+The matcher also rejects slot drift, missing required settings joins, left
+joins, projection drift, semicolon tails, and non-Plex basenames. Every matched
 prepare probes `sqlite_master` for
 `idx_dshadow_metadata_item_views_account_grandparent_guid`; absence fails open
-with `reason=index_missing`.
+with `reason=index_missing`, logged once per connection for this mode.
+
+An exact-head miss is silent. After the exact head matches, parse drift emits
+`reason=capture_miss mode=ondeck` with first-failure `sub_reason` from
+`section`, `selector`, `id_list`, `threshold`, `post_id`, `account`, `tail`, or
+`trailing`. Both selector arms use this same diagnostic path whenever the base
+On-Deck rewrite is enabled.
 
 On a match, the helper emits the grandparents-first ranked subquery, strips the
-vendor `INDEXED BY` hints by replacing the whole statement, and returns one row
-per `grandparents.id` with a deterministic `row_number()` tie-breaker ordered by
-`metadata_item_views.viewed_at`, `metadata_item_views.id`,
-`grandparentsSettings.id`, and `metadata_item_settings.id` descending. Build
-failure, rewritten-prepare failure, tail mismatch, bind-count mismatch, or
-index-probe failure finalizes any rewritten statement and prepares the original
-SQL.
+vendor `INDEXED BY` hints by replacing the whole statement, and copies either
+the Variant A `grandparents.id IN (...)` predicate or the Variant B
+`metadata_item_views.viewed_at > <literal>` predicate into the inner `WHERE`.
+It returns one row per `grandparents.id` with a deterministic `row_number()`
+tie-breaker ordered by `metadata_item_views.viewed_at`,
+`metadata_item_views.id`, `grandparentsSettings.id`, and
+`metadata_item_settings.id` descending. Build failure, rewritten-prepare
+failure, tail mismatch, bind-count mismatch, or index-probe failure finalizes
+any rewritten statement and prepares the original SQL.
 
 ## Emby FTS Search Rewrite
 
@@ -405,9 +418,11 @@ return the original value unchanged.
 Misses and disabled paths call the downstream Plex rewrite helper unchanged.
 Scalar collision, authorizer denial, ownership mismatch, allocation failure,
 rewrite-build failure, rewritten-prepare failure, and tail mismatch all fail
-open to the original SQL. Effective rewrites log
-`event=rewrite_applied target=emby mode=fts+membership`; scalar-unavailable,
-build-failed, rewritten-prepare-failed, and tail-mismatch paths log
+open to the original SQL. Effective rewrites log the shared hybrid
+first/every-1024th/new `rewrite_applied` schema with
+`target=emby mode=fts+membership`; `reason=scalar_unavailable`,
+`reason=build_failed`, `reason=rewritten_prepare_failed`, and
+`reason=tail_mismatch` paths log
 `event=rewrite_skipped target=emby reason=... mode=fts+membership`. L1/L2 list
 mismatches log `event=slot_mismatch target=emby slot=L1_L2` while still
 applying the validated rewrite.
@@ -432,11 +447,12 @@ Complex resume emits the RES-A ancestor `EXISTS` splice and the RES-D implied
 watched/progress conjunct in one candidate. Resume-simple and Similar-items emit
 the ancestor `EXISTS` splice.
 
-All fan-out families fail open. Applied logs use
-`event=rewrite_applied target=emby mode=fanout+<family>`. Capture-gated
-fan-out structural drift logs
-`event=rewrite_skipped target=emby reason=capture_miss mode=fanout+...` and
-prepares the original SQL.
+All fan-out families fail open. Applied logs use the shared
+first/every-1024th/new schema with `target=emby mode=fanout+<family>`.
+Capture-gated fan-out structural drift logs the shared full raw-source record with
+`event=rewrite_skipped target=emby reason=capture_miss mode=fanout+...`, a
+first-failure `sub_reason`, length, and correlation, then prepares the original
+SQL.
 
 ## Emby Dashboard Latest Rewrites
 
@@ -446,15 +462,31 @@ every other value disable both. They are independent of FTS, FANOUT, and
 AUTOPRAGMA. Both reject bare, numbered, and named bind tokens across the whole
 statement before readiness probes.
 
+Both matchers accept exactly one ancestor CTE grammar: the list form
+`AncestorId in (<integers>) )select` or the scalar form
+`AncestorId=<integer> )select`. The scalar form has one closing parenthesis;
+the list form retains its list-closing plus CTE-closing pair. Mixed, duplicate,
+bound, nonnumeric, or mismatched anchor pairs fail open. Generated SQL renders
+either validated source form as `AncestorId IN (<captured slot>)`.
+
 `emby_match_episodes_latest` first requires exact Type=8. It emits mode
 `dashboard+episodes_latest` and K1: `keys(gk)` enumerates ancestor-visible,
 unplayed groups, while the existing picked/ranked tail and
 `idx_dshadow_emby_latest_gk_dc` readiness contract remain. The readiness gate
 is advisory: absence or probe failure falls open, while an unexpected same-name
 index shape is a performance-only risk because K1 contains no `INDEXED BY`.
+It rejects `over`, `LastWatchedEpisodes`, series-browse ordering/collation, and
+unsafe projections before copying the validated projection verbatim into the
+owned outer SELECT.
 
 `emby_match_movies_latest` first requires exact Type=5 and the guarded played
-tail. It emits mode `dashboard+movies_latest` and C2 using
+tail. Before the capture boundary it silently rejects `over` and
+`LastWatchedEpisodes`, matching the Episodes guard posture. It captures the
+outer projection structurally instead of requiring one fixed column list:
+empty or over-cap spans, `WithAncestors`, parentheses, aggregate/window
+identifiers, and bare `*` fail open; accepted projection bytes are copied
+verbatim into the owned outer SELECT. It emits mode
+`dashboard+movies_latest` and C2 using
 `idx_dshadow_emby_latest_movies_dcn_puk` plus
 `idx_dshadow_emby_latest_movies_puk_dc_cover`; it has no native-index
 dependency. A no-guard statement is matcher-non-applying: Type=5 passes, the
@@ -464,6 +496,7 @@ original statement prepares.
 Sibling Type traffic is an unlogged clean miss, so neither family produces a
 cross-family capture miss. Missing indexes, probe errors, build/allocation
 failure, candidate prepare failure, and tail mismatch fail open to original
-SQL. The two exact Type=5 indexes are required only to prepare C2; DateCreated
-storage class is not an enablement condition because C2 uses only native
-comparison and ordering with no cast, arithmetic, or coercion.
+SQL. Missing-index records are once per connection and dashboard mode; probe
+errors remain unsuppressed. The two exact Type=5 indexes are required only to
+prepare C2; DateCreated storage class is not an enablement condition because C2
+uses only native comparison and ordering with no cast, arithmetic, or coercion.

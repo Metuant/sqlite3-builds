@@ -13,6 +13,7 @@
 
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST
 #include "emby_fts_rewrite.h"
+#include "observability.h"
 
 enum direct_fault_mode {
     DIRECT_FAULT_NONE = 0,
@@ -90,6 +91,51 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
     if (dst_n == 0) return;
     for (i = 0; i + 1 < dst_n && src[i]; i++) dst[i] = src[i];
     dst[i] = 0;
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_capture_miss(
+    const char *target,
+    const char *mode,
+    const char *sub_reason,
+    sqlite3 *db,
+    const char *sql,
+    size_t len
+) {
+    (void)target;
+    (void)mode;
+    (void)sub_reason;
+    (void)db;
+    (void)sql;
+    (void)len;
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API int obs_should_log_index_missing(
+    sqlite3 *db,
+    const char *target,
+    const char *mode
+) {
+    (void)db;
+    (void)target;
+    (void)mode;
+    return 1;
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_applied(
+    const char *target,
+    const char *mode,
+    sqlite3 *db,
+    const char *source,
+    size_t source_len,
+    const char *rewritten,
+    size_t rewritten_len
+) {
+    (void)target;
+    (void)mode;
+    (void)db;
+    (void)source;
+    (void)source_len;
+    (void)rewritten;
+    (void)rewritten_len;
 }
 #endif
 
@@ -257,6 +303,17 @@ static int count_occurrences(const char *haystack, const char *needle) {
     return count;
 }
 
+static uint64_t sql_corr_key(const char *sql, size_t len) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        hash ^= (unsigned char)sql[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
 static void configure_env_common(
     const char *fts,
     const char *fanout,
@@ -381,7 +438,8 @@ static sqlite3 *open_seeded_temp(const char *basename) {
         "ParentId INTEGER, SeriesName TEXT, AlbumId INTEGER, SeriesId INTEGER,"
         "SeriesPresentationUniqueKey TEXT, PresentationUniqueKey TEXT, Images TEXT, Status TEXT, SortIndexNumber INTEGER,"
         "SortParentIndexNumber INTEGER, IndexNumberEnd INTEGER, UserDataKeyId INTEGER,"
-        "IsPublic INTEGER, ExtraType INTEGER);"
+        "IsPublic INTEGER, ExtraType INTEGER, CommunityRating REAL, PremiereDate INTEGER,"
+        "OfficialRating TEXT, guid TEXT, CriticRating REAL);"
         "CREATE TABLE AncestorIds2(itemid INTEGER, AncestorId INTEGER, Distance INTEGER);"
         "CREATE TABLE ItemLinks2(ItemId INTEGER, LinkedId INTEGER, Type INTEGER);"
         "CREATE TABLE itemPeople2(ItemId INTEGER, PersonId INTEGER);"
@@ -649,7 +707,7 @@ static char *make_resume_simple_expected(const char *sql) {
 }
 
 static const char *EMBY_RESUME_SIMPLE_LEFT_JOIN_UNPLAYED_SHAPE_07_SQL =
-    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (9,10,11,12,13,14,3923221,3923222,3923223) )select A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12;";
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (9,10,11,12,13,14,101,102,103) )select A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12;";
 
 static char *make_similar_sql(void) {
     return xasprintf(
@@ -669,7 +727,7 @@ static char *make_similar_expected(const char *sql) {
 }
 
 static const char *EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL =
-    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (15,16,17,18,19,20,3923210) ),WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6,4,3,2) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7,0,1,5,6,2)))select A.Type from mediaitems A where A.Type in (34,9,29,21) AND A.Id in WithItemLinkItemIds Group by A.Type;";
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (15,16,17,18,19,20,107) ),WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6,4,3,2) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7,0,1,5,6,2)))select A.Type from mediaitems A where A.Type in (34,9,29,21) AND A.Id in WithItemLinkItemIds Group by A.Type;";
 
 static char *make_favorites_sql(void) {
     return xasprintf(
@@ -702,20 +760,46 @@ static char *make_links_search_sql(const char *types) {
     );
 }
 
-static char *make_movies_latest_sql(int played_guard, const char *ancestor_ids,
-                                    const char *user_id, const char *limit) {
+static const char EMBY_MOVIES_LATEST_COMPACT_PROJECTION[] =
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ";
+static const char EMBY_MOVIES_LATEST_WIDE_PROJECTION[] =
+    "A.Id,A.EndDate,A.CommunityRating,A.Name,A.Path,A.PremiereDate,A.ProductionYear,A.OfficialRating,A.RunTimeTicks,A.guid,A.ParentId,A.CriticRating,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ";
+static const char EMBY_EPISODES_LATEST_WIDE_PROJECTION[] =
+    "A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ";
+
+static char *make_movies_latest_sql_form(
+    int played_guard,
+    const char *ancestor_ids,
+    int scalar_ancestor,
+    const char *projection,
+    const char *user_id,
+    const char *limit
+) {
     return xasprintf(
-        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (%s) )select "
-        "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId%s%s%s )select "
+        "%s"
         "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=%s "
         "where A.Type=5 %sA.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT %s",
-        ancestor_ids, user_id,
+        scalar_ancestor ? "=" : " in (", ancestor_ids, scalar_ancestor ? "" : ")",
+        projection, user_id,
         played_guard ? "AND Coalesce(UserDatas.played, 0)=0 AND " : "AND ", limit
     );
 }
 
-static char *make_movies_latest_expected(const char *ancestor_ids,
-                                         const char *user_id, const char *limit) {
+static char *make_movies_latest_sql(int played_guard, const char *ancestor_ids,
+                                    const char *user_id, const char *limit) {
+    return make_movies_latest_sql_form(
+        played_guard, ancestor_ids, 0, EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
+        user_id, limit
+    );
+}
+
+static char *make_movies_latest_expected_projection(
+    const char *ancestor_ids,
+    const char *projection,
+    const char *user_id,
+    const char *limit
+) {
     return xasprintf(
         "WITH ranked(id, dc, puk) AS MATERIALIZED ("
         "  SELECT A.Id, A.DateCreated, A.PresentationUniqueKey "
@@ -730,27 +814,52 @@ static char *make_movies_latest_expected(const char *ancestor_ids,
         "AND EXISTS ( SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId = B.Id AND XB.AncestorId IN (%s) ) "
         "AND NOT EXISTS ( SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId = B.UserDataKeyId AND UB.UserId = %s AND UB.played <> 0 ) ) "
         "ORDER BY (A.DateCreated IS NULL) ASC, A.DateCreated DESC, A.PresentationUniqueKey ASC LIMIT %s ) "
-        "SELECT A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+        "SELECT %s"
         "FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas "
         "ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = %s "
         "ORDER BY (R.dc IS NULL) ASC, R.dc DESC, R.puk ASC LIMIT %s",
-        ancestor_ids, user_id, ancestor_ids, user_id, limit, user_id, limit
+        ancestor_ids, user_id, ancestor_ids, user_id, limit, projection, user_id, limit
     );
 }
 
-static char *make_latest_sql(const char *projection, const char *limit) {
+static char *make_movies_latest_expected(const char *ancestor_ids,
+                                         const char *user_id, const char *limit) {
+    return make_movies_latest_expected_projection(
+        ancestor_ids, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, user_id, limit
+    );
+}
+
+static char *make_latest_sql_form(
+    const char *projection,
+    const char *ancestor_ids,
+    int scalar_ancestor,
+    const char *limit
+) {
     return xasprintf(
-        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select %sfrom mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId%s%s%s )select %sfrom mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
         "where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT %s",
+        scalar_ancestor ? "=" : " in (", ancestor_ids, scalar_ancestor ? "" : ")",
         projection, limit
     );
 }
 
-static char *make_latest_expected(const char *projection, const char *limit) {
+static char *make_latest_sql(const char *projection, const char *limit) {
+    return make_latest_sql_form(projection, "100", 0, limit);
+}
+
+static char *make_latest_expected_form(
+    const char *projection,
+    const char *ancestor_ids,
+    const char *limit
+) {
     return xasprintf(
-        "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(A0.SeriesPresentationUniqueKey, A0.PresentationUniqueKey) FROM (SELECT DISTINCT itemid FROM AncestorIds2 WHERE AncestorId IN (100)) AS W CROSS JOIN MediaItems AS A0 WHERE A0.Id = W.itemid AND A0.Type = 8 AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId = A0.UserDataKeyId AND U0.UserId = 42 AND U0.played <> 0)), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (100)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U2 WHERE U2.UserDataKeyId = A2.UserDataKeyId AND U2.UserId = 42 AND U2.played <> 0) ORDER BY A2.DateCreated DESC LIMIT 1) AS id FROM keys AS K), exact_groups AS MATERIALIZED (SELECT P.gk, P.id, Amax.DateCreated AS maxdc FROM picked AS P JOIN MediaItems AS Amax ON Amax.Id = P.id WHERE P.id IS NOT NULL), ranked AS MATERIALIZED (SELECT gk, id, maxdc FROM exact_groups ORDER BY maxdc DESC LIMIT %s) SELECT %s FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = 42 ORDER BY R.maxdc DESC LIMIT %s",
-        limit, projection, limit
+        "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(A0.SeriesPresentationUniqueKey, A0.PresentationUniqueKey) FROM (SELECT DISTINCT itemid FROM AncestorIds2 WHERE AncestorId IN (%s)) AS W CROSS JOIN MediaItems AS A0 WHERE A0.Id = W.itemid AND A0.Type = 8 AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId = A0.UserDataKeyId AND U0.UserId = 42 AND U0.played <> 0)), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (%s)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U2 WHERE U2.UserDataKeyId = A2.UserDataKeyId AND U2.UserId = 42 AND U2.played <> 0) ORDER BY A2.DateCreated DESC LIMIT 1) AS id FROM keys AS K), exact_groups AS MATERIALIZED (SELECT P.gk, P.id, Amax.DateCreated AS maxdc FROM picked AS P JOIN MediaItems AS Amax ON Amax.Id = P.id WHERE P.id IS NOT NULL), ranked AS MATERIALIZED (SELECT gk, id, maxdc FROM exact_groups ORDER BY maxdc DESC LIMIT %s) SELECT %s FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = 42 ORDER BY R.maxdc DESC LIMIT %s",
+        ancestor_ids, ancestor_ids, limit, projection, limit
     );
+}
+
+static char *make_latest_expected(const char *projection, const char *limit) {
+    return make_latest_expected_form(projection, "100", limit);
 }
 
 static sqlite3_stmt *prepare_entry(sqlite3 *db, const char *label, const char *sql,
@@ -801,6 +910,17 @@ static void expect_sql(sqlite3 *db, const char *label, const char *sql, int nbyt
         require_absent(label, sqlite3_sql(stmt), "dshadow_emby_fts_rewrite(");
     }
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static void expect_dashboard_negative(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    const char *boundary_needle,
+    int boundary_count
+) {
+    require_int(label, count_occurrences(sql, boundary_needle), boundary_count);
+    expect_sql(db, label, sql, -1, 2, sql, 0);
 }
 
 static void expect_legacy_authorizer(sqlite3 *db, const char *label, const char *sql,
@@ -1222,6 +1342,55 @@ static void require_ordered_full_row_identity(const char *label,
               (unsigned long)candidate->len, (const char *)vendor->bytes,
               (const char *)candidate->bytes);
     }
+}
+
+static void require_column_metadata_identity(
+    sqlite3 *vendor_db,
+    sqlite3 *candidate_db,
+    const char *label,
+    const char *vendor_sql,
+    const char *candidate_source,
+    const char *candidate_sql
+) {
+    const char *vendor_tail = NULL;
+    const char *candidate_tail = NULL;
+    sqlite3_stmt *vendor = prepare_entry(
+        vendor_db, label, vendor_sql, -1, 2, &vendor_tail
+    );
+    sqlite3_stmt *candidate = prepare_entry(
+        candidate_db, label, candidate_source, -1, 2, &candidate_tail
+    );
+    int columns = sqlite3_column_count(vendor);
+    int i;
+
+    require_str_eq(label, sqlite3_sql(vendor), vendor_sql);
+    require_str_eq(label, sqlite3_sql(candidate), candidate_sql);
+    require_int(label, sqlite3_column_count(candidate), columns);
+    if (vendor_tail != vendor_sql + strlen(vendor_sql) ||
+        candidate_tail != candidate_source + strlen(candidate_source)) {
+        failf("FAIL [%s/tail]: vendor=%ld/%ld candidate=%ld/%ld", label,
+              (long)(vendor_tail - vendor_sql), (long)strlen(vendor_sql),
+              (long)(candidate_tail - candidate_source),
+              (long)strlen(candidate_source));
+    }
+    for (i = 0; i < columns; i++) {
+        const char *vendor_name = sqlite3_column_name(vendor, i);
+        const char *candidate_name = sqlite3_column_name(candidate, i);
+        const char *vendor_type = sqlite3_column_decltype(vendor, i);
+        const char *candidate_type = sqlite3_column_decltype(candidate, i);
+        if (!vendor_name || !candidate_name || strcmp(vendor_name, candidate_name) != 0 ||
+            ((vendor_type || candidate_type) &&
+             (!vendor_type || !candidate_type || strcmp(vendor_type, candidate_type) != 0))) {
+            failf("FAIL [%s/column-%d]: vendor_name=%s candidate_name=%s "
+                  "vendor_type=%s candidate_type=%s", label, i,
+                  vendor_name ? vendor_name : "(null)",
+                  candidate_name ? candidate_name : "(null)",
+                  vendor_type ? vendor_type : "(null)",
+                  candidate_type ? candidate_type : "(null)");
+        }
+    }
+    require_int("metadata/vendor-finalize", sqlite3_finalize(vendor), SQLITE_OK);
+    require_int("metadata/candidate-finalize", sqlite3_finalize(candidate), SQLITE_OK);
 }
 
 static void require_typed_rows_differ(const char *label,
@@ -2310,6 +2479,254 @@ static int child_dashboard_matrix(void) {
     return 0;
 }
 
+#define TEST_MOVIES_LIST_PREFIX \
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select "
+#define TEST_MOVIES_FROM \
+    "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+#define TEST_MOVIES_TAIL \
+    "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12"
+
+static const char TEST_E1_FAVORITES[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select "
+    "count(*) OVER() AS TotalRecordCount,A.Id,A.Name,UserDatas.IsFavorite "
+    "from mediaitems A join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 and UserDatas.IsFavorite=1 "
+    "where A.Type=8 AND UserDatas.IsFavorite=1 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.SeriesName collate NATURALSORT ASC,A.SortName collate NATURALSORT ASC LIMIT 30";
+static const char TEST_M1_FAVORITES[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select "
+    "count(*) OVER() AS TotalRecordCount,A.Id,A.Name,UserDatas.IsFavorite "
+    "from mediaitems A join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 and UserDatas.IsFavorite=1 "
+    "where A.Type=5 AND UserDatas.IsFavorite=1 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.SortName collate NATURALSORT ASC LIMIT 30";
+static const char TEST_TYPE5_RESUME[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select A.Id,A.Name "
+    "from mediaitems A left join MediaItems AS LastWatchedEpisodes ON LastWatchedEpisodes.SeriesPresentationUniqueKey=A.SeriesPresentationUniqueKey "
+    "left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type=5 AND UserDatas.PlaybackPositionTicks>0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY UserDatas.LastPlayedDateInt DESC LIMIT 12";
+static const char TEST_M2_PREMIERE_TAIL[] =
+    TEST_MOVIES_LIST_PREFIX
+    "A.Id,A.EndDate,A.CommunityRating,A.Name,A.Path,A.PremiereDate,A.ProductionYear,A.OfficialRating,A.RunTimeTicks,A.guid,A.ParentId,A.CriticRating,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM
+    "where A.Type=5 AND A.PremiereDate>=1752355308 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.ProductionYear DESC,A.PremiereDate DESC,A.SortName collate NATURALSORT DESC LIMIT 30";
+static const char TEST_MOVIES_AGGREGATE_PROJECTION[] =
+    TEST_MOVIES_LIST_PREFIX "MAX(A.DateCreated) AS DateCreated,A.Id " TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_WINDOW_PROJECTION[] =
+    TEST_MOVIES_LIST_PREFIX "count(*) OVER() AS TotalRecordCount,A.Id " TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_BARE_STAR_PROJECTION[] =
+    TEST_MOVIES_LIST_PREFIX "* " TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_PAREN_PROJECTION[] =
+    TEST_MOVIES_LIST_PREFIX "(A.Id) AS Id,A.Name " TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_BAD_LIMIT[] =
+    TEST_MOVIES_LIST_PREFIX
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM
+    "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 11";
+static const char TEST_MOVIES_SCALAR_BIND[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId=? )select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_SCALAR_NONINTEGER[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId=+100 )select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_SCALAR_OPERATOR[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId=100 OR AncestorId=200 )select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_MIXED_ANCESTOR[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "ScalarCarrier AS (WITH WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId=200 )select itemid FROM WithAncestors) select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_DUPLICATE_LIST_ANCESTOR[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "Other AS (WITH WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (200) )select itemid FROM WithAncestors) select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_AMBIGUOUS_SELECT[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "Other1 AS (WITH withancestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (200) )select itemid FROM withancestors),"
+    "Other2 AS (WITH withancestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (300) )select itemid FROM withancestors) select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+static const char TEST_MOVIES_MISSING_INDEX[] =
+    TEST_MOVIES_LIST_PREFIX
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    TEST_MOVIES_FROM TEST_MOVIES_TAIL;
+
+#undef TEST_MOVIES_LIST_PREFIX
+#undef TEST_MOVIES_FROM
+#undef TEST_MOVIES_TAIL
+
+static int child_dashboard_fix_b_c(void) {
+    static const char *wide_ancestors[] = {"100", "100,200"};
+    static const char *compact_ancestors[] = {
+        "201,202,203,204", "9,10,11,12,13,14"
+    };
+    sqlite3 *vendor_db;
+    sqlite3 *candidate_db;
+    sqlite3 *missing_index_db;
+    size_t i;
+
+    configure_env("1", NULL, "0");
+    make_temp_dir();
+    vendor_db = open_seeded_temp_with_dashboard_indexes("not-target.db", 0, 0, 0);
+    candidate_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1);
+    seed_movies_latest_rows(vendor_db);
+    seed_movies_latest_rows(candidate_db);
+
+    for (i = 0; i < sizeof(wide_ancestors) / sizeof(wide_ancestors[0]); i++) {
+        char label[64];
+        char *raw = make_movies_latest_sql_form(
+            1, wide_ancestors[i], 0, EMBY_MOVIES_LATEST_WIDE_PROJECTION, "42", "20"
+        );
+        char *expected = make_movies_latest_expected_projection(
+            wide_ancestors[i], EMBY_MOVIES_LATEST_WIDE_PROJECTION, "42", "20"
+        );
+        char *outer_select = xasprintf(
+            " ) SELECT %sFROM ranked AS R", EMBY_MOVIES_LATEST_WIDE_PROJECTION
+        );
+        typed_rows vendor;
+        typed_rows candidate;
+        snprintf(label, sizeof(label), "dashboard-movies-wide-m%lu", (unsigned long)i + 3);
+        require_contains(label, expected, outer_select);
+        expect_sql(candidate_db, label, raw, -1, 2, expected, 0);
+        require_column_metadata_identity(
+            vendor_db, candidate_db, label, raw, raw, expected
+        );
+        vendor = collect_typed_rows(vendor_db, label, raw, raw);
+        candidate = collect_typed_rows(candidate_db, label, raw, expected);
+        require_ordered_full_row_identity(label, &vendor, &candidate);
+        free_typed_rows(&vendor);
+        free_typed_rows(&candidate);
+        free(raw);
+        free(expected);
+        free(outer_select);
+    }
+
+    for (i = 0; i < sizeof(compact_ancestors) / sizeof(compact_ancestors[0]); i++) {
+        char *raw = make_movies_latest_sql(1, compact_ancestors[i], "42", "12");
+        char *expected = make_movies_latest_expected(compact_ancestors[i], "42", "12");
+        expect_sql(candidate_db, i == 0 ? "dashboard-movies-m5-byte-identical"
+                                       : "dashboard-movies-m6-byte-identical",
+                   raw, -1, 2, expected, 0);
+        free(raw);
+        free(expected);
+    }
+
+    {
+        char *oracle = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 0, "12"
+        );
+        char *scalar = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 1, "12"
+        );
+        char *expected = make_latest_expected_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", "12"
+        );
+        typed_rows vendor;
+        typed_rows candidate;
+        expect_sql(candidate_db, "dashboard-episodes-e2-scalar", scalar, -1, 2, expected, 0);
+        require_column_metadata_identity(
+            vendor_db, candidate_db, "dashboard-episodes-e2-metadata",
+            oracle, scalar, expected
+        );
+        vendor = collect_typed_rows(vendor_db, "dashboard-episodes-e2-oracle", oracle, oracle);
+        candidate = collect_typed_rows(
+            candidate_db, "dashboard-episodes-e2-candidate", scalar, expected
+        );
+        require_ordered_full_row_identity("dashboard-episodes-e2-parity", &vendor, &candidate);
+        free_typed_rows(&vendor);
+        free_typed_rows(&candidate);
+        free(oracle);
+        free(scalar);
+        free(expected);
+    }
+
+    {
+        char *oracle = make_movies_latest_sql(1, "100", "42", "12");
+        char *scalar = make_movies_latest_sql_form(
+            1, "100", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        char *expected = make_movies_latest_expected("100", "42", "12");
+        typed_rows vendor;
+        typed_rows candidate;
+        expect_sql(candidate_db, "dashboard-movies-m7-scalar", scalar, -1, 2, expected, 0);
+        vendor = collect_typed_rows(vendor_db, "dashboard-movies-m7-oracle", oracle, oracle);
+        candidate = collect_typed_rows(
+            candidate_db, "dashboard-movies-m7-candidate", scalar, expected
+        );
+        require_ordered_full_row_identity("dashboard-movies-m7-parity", &vendor, &candidate);
+        free_typed_rows(&vendor);
+        free_typed_rows(&candidate);
+        free(oracle);
+        free(scalar);
+        free(expected);
+    }
+
+    {
+        FILE *capture;
+        char *log_output;
+        int saved_stderr_fd;
+        capture = begin_stderr_capture(&saved_stderr_fd);
+        expect_dashboard_negative(candidate_db, "dashboard-e1-favorites-silent",
+                                  TEST_E1_FAVORITES, "where A.Type=8 ", 1);
+        expect_dashboard_negative(candidate_db, "dashboard-m1-favorites-silent",
+                                  TEST_M1_FAVORITES, "where A.Type=5 ", 1);
+        expect_dashboard_negative(candidate_db, "dashboard-type5-resume-silent",
+                                  TEST_TYPE5_RESUME, "LastWatchedEpisodes", 2);
+        expect_dashboard_negative(candidate_db, "dashboard-m2-tail-miss",
+                                  TEST_M2_PREMIERE_TAIL, "A.PremiereDate>=1752355308", 1);
+        log_output = end_stderr_capture(capture, saved_stderr_fd);
+        require_int("dashboard-fix-b-c/episodes-silent",
+                    count_occurrences(log_output,
+                        "reason=capture_miss mode=dashboard+episodes_latest"), 0);
+        require_int("dashboard-fix-b-c/movies-only-m2-capture",
+                    count_occurrences(log_output,
+                        "reason=capture_miss mode=dashboard+movies_latest"), 1);
+        free(log_output);
+    }
+
+    expect_dashboard_negative(candidate_db, "dashboard-movies-aggregate-projection",
+                              TEST_MOVIES_AGGREGATE_PROJECTION, "MAX(A.DateCreated)", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-window-projection",
+                              TEST_MOVIES_WINDOW_PROJECTION, "count(*) OVER()", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-bare-star-projection",
+                              TEST_MOVIES_BARE_STAR_PROJECTION, "select * from", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-parenthesized-projection",
+                              TEST_MOVIES_PAREN_PROJECTION, "select (A.Id)", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-scalar-bind",
+                              TEST_MOVIES_SCALAR_BIND, "AncestorId=?", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-bad-limit",
+                              TEST_MOVIES_BAD_LIMIT, "LIMIT 11", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-scalar-noninteger",
+                              TEST_MOVIES_SCALAR_NONINTEGER, "AncestorId=+100", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-scalar-operator",
+                              TEST_MOVIES_SCALAR_OPERATOR, "AncestorId=100 OR AncestorId=200", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-mixed-ancestor",
+                              TEST_MOVIES_MIXED_ANCESTOR,
+                              "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId=", 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-duplicate-list-ancestor",
+                              TEST_MOVIES_DUPLICATE_LIST_ANCESTOR,
+                              "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (", 2);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-ambiguous-select",
+                              TEST_MOVIES_AMBIGUOUS_SELECT, ") )select ", 2);
+
+    require_int("dashboard-fix-b-c/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
+    require_int("dashboard-fix-b-c/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
+    cleanup_temp_dir();
+
+    make_temp_dir();
+    missing_index_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 0, 1);
+    seed_movies_latest_rows(missing_index_db);
+    expect_dashboard_negative(missing_index_db, "dashboard-movies-missing-index",
+                              TEST_MOVIES_MISSING_INDEX,
+                              "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0", 1);
+    require_int("dashboard-fix-b-c/missing-index-close",
+                sqlite3_close(missing_index_db), SQLITE_OK);
+    cleanup_temp_dir();
+    printf("PASS [dashboard-fix-b-c]\n");
+    return 0;
+}
+
 static void seed_movies_latest_rows(sqlite3 *db) {
     exec_sql(db, "movies-matrix-seed",
         "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<30) "
@@ -2675,13 +3092,34 @@ static int child_dashboard_matcher_negatives(void) {
         };
         size_t c;
         for (c = 0; c < sizeof(episode_needles) / sizeof(episode_needles[0]); c++) {
+            char label[128];
             char *mutated = replace_once(episodes, episode_needles[c], episode_repls[c]);
-            expect_sql(db, "episodes-structural-negative", mutated, -1, 2, mutated, 0);
+            snprintf(label, sizeof(label), "episodes-structural-negative[%lu]",
+                     (unsigned long)c);
+            expect_sql(db, label, mutated, -1, 2, mutated, 0);
             free(mutated);
         }
         for (c = 0; c < sizeof(movies_needles) / sizeof(movies_needles[0]); c++) {
+            char label[128];
             char *mutated = replace_once(movies, movies_needles[c], movies_repls[c]);
-            expect_sql(db, "movies-structural-negative", mutated, -1, 2, mutated, 0);
+            if (c == 0) {
+                char *projection = replace_once(
+                    EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
+                    movies_needles[c], movies_repls[c]
+                );
+                char *expected = make_movies_latest_expected_projection(
+                    "100", projection, "42", "12"
+                );
+                snprintf(label, sizeof(label), "movies-structural-positive[%lu]",
+                         (unsigned long)c);
+                expect_sql(db, label, mutated, -1, 2, expected, 0);
+                free(projection);
+                free(expected);
+            } else {
+                snprintf(label, sizeof(label), "movies-structural-negative[%lu]",
+                         (unsigned long)c);
+                expect_sql(db, label, mutated, -1, 2, mutated, 0);
+            }
             free(mutated);
         }
     }
@@ -2694,21 +3132,32 @@ static int child_dashboard_matcher_negatives(void) {
             "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0",
             "where A.Type=5 /* guarded tail text: where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 */ AND Coalesce(UserDatas.played, 0)=0"
         );
-        char *movies_string = replace_once(
-            movies,
+        char *movies_string_projection = replace_once(
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
             "A.Id,A.Name",
-            "'where A.Type=5 AND Coalesce(UserDatas.played, 0)=0' AS marker,A.Id,A.Name"
+            "'where A.Type=5 ' AS marker,A.Id,A.Name"
+        );
+        char *movies_string = make_movies_latest_sql_form(
+            1, "100", 0, movies_string_projection, "42", "12"
+        );
+        char *movies_string_expected = make_movies_latest_expected_projection(
+            "100", movies_string_projection, "42", "12"
         );
         char *episodes_explain = xasprintf("EXPLAIN %s", episodes);
         expect_sql(db, "movies-no-guard-negative", movies_no_guard, -1, 2, movies_no_guard, 0);
         expect_sql(db, "movies-empty-ancestor-negative", movies_empty, -1, 2, movies_empty, 0);
         expect_sql(db, "movies-comment-tail-negative", movies_comment, -1, 2, movies_comment, 0);
-        expect_sql(db, "movies-string-tail-negative", movies_string, -1, 2, movies_string, 0);
+        require_int("movies-string-type-gate-immunity/type-gate-count",
+                    count_occurrences(movies_string, "where A.Type=5 "), 2);
+        expect_sql(db, "movies-string-type-gate-immunity", movies_string, -1, 2,
+                   movies_string_expected, 0);
         expect_sql(db, "episodes-explain-negative", episodes_explain, -1, 2, episodes_explain, 0);
         free(movies_no_guard);
         free(movies_empty);
         free(movies_comment);
+        free(movies_string_projection);
         free(movies_string);
+        free(movies_string_expected);
         free(episodes_explain);
     }
 
@@ -2730,10 +3179,13 @@ static int child_observability_logs(void) {
     char *links_miss_sql;
     char *resume_simple_sql;
     char *resume_simple_expected;
+    char *resume_early_sql;
     char *similar_sql;
     char *similar_expected;
     char *latest_sql;
     char *latest_expected;
+    char *latest_new_corr_sql;
+    char *latest_new_corr_expected;
     char *latest_miss_sql;
     char *latest_series_sql;
     char *movies_sql;
@@ -2761,6 +3213,18 @@ static int child_observability_logs(void) {
     expect_sql(db, "obs-fanout-resume-simple-applied", resume_simple_sql,
                -1, 2, resume_simple_expected, 0);
 
+    {
+        char *resume_sql = make_resume_sql();
+        resume_early_sql = replace_once(
+            resume_sql,
+            "AND LastWatchedEpisodes.LastPlayedDateInt not null",
+            "AND 1=1"
+        );
+        free(resume_sql);
+    }
+    expect_sql(db, "obs-fanout-resume-early-miss", resume_early_sql,
+               -1, 2, resume_early_sql, 0);
+
     similar_sql = make_similar_sql();
     similar_expected = make_similar_expected(similar_sql);
     expect_sql(db, "obs-fanout-similar-applied", similar_sql, -1, 2, similar_expected, 0);
@@ -2768,6 +3232,12 @@ static int child_observability_logs(void) {
     latest_sql = make_latest_sql("A.Id ", "12");
     latest_expected = make_latest_expected("A.Id ", "12");
     expect_sql(db, "obs-dashboard-latest-applied", latest_sql, -1, 2, latest_expected, 0);
+    latest_new_corr_sql = replace_once(latest_sql, "in (100)", "in (101)");
+    latest_new_corr_expected = make_latest_expected_form("A.Id ", "101", "12");
+    expect_sql(db, "obs-dashboard-latest-new-corr", latest_new_corr_sql,
+               -1, 2, latest_new_corr_expected, 0);
+    expect_sql(db, "obs-dashboard-latest-new-corr-repeat", latest_new_corr_sql,
+               -1, 2, latest_new_corr_expected, 0);
 
     latest_miss_sql = make_latest_sql("(A.DateCreated) ", "12");
     expect_sql(db, "obs-dashboard-capture-miss", latest_miss_sql, -1, 2, latest_miss_sql, 0);
@@ -2796,6 +3266,8 @@ static int child_observability_logs(void) {
     seed_movies_latest_rows(db);
     expect_sql(db, "obs-dashboard-movies-outer-missing", movies_sql, -1, 2,
                movies_sql, 0);
+    expect_sql(db, "obs-dashboard-movies-outer-missing-repeat", movies_sql, -1, 2,
+               movies_sql, 0);
     require_int("observability/movies-outer-close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
 
@@ -2804,13 +3276,24 @@ static int child_observability_logs(void) {
     seed_movies_latest_rows(db);
     expect_sql(db, "obs-dashboard-movies-inner-missing", movies_sql, -1, 2,
                movies_sql, 0);
+    expect_sql(db, "obs-dashboard-movies-inner-missing-repeat", movies_sql, -1, 2,
+               movies_sql, 0);
     require_int("observability/movies-inner-close", sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
 
     make_temp_dir();
     db = open_seeded_temp_with_latest_index("library.db", 0);
     expect_sql(db, "obs-dashboard-index-missing", latest_sql, -1, 2, latest_sql, 0);
+    expect_sql(db, "obs-dashboard-index-missing-repeat", latest_sql, -1, 2, latest_sql, 0);
     require_int("observability/no-index-close", sqlite3_close(db), SQLITE_OK);
+    cleanup_temp_dir();
+
+    make_temp_dir();
+    db = open_seeded_temp_with_latest_index("library.db", 0);
+    expect_sql(db, "obs-dashboard-index-missing-new-connection", latest_sql,
+               -1, 2, latest_sql, 0);
+    require_int("observability/no-index-new-connection-close",
+                sqlite3_close(db), SQLITE_OK);
     cleanup_temp_dir();
 
     make_temp_dir();
@@ -2819,8 +3302,12 @@ static int child_observability_logs(void) {
     require_int("observability/probe-authorizer/set",
                 sqlite3_set_authorizer(db, deny_sqlite_master_read, NULL), SQLITE_OK);
     expect_sql(db, "obs-dashboard-index-probe-error", latest_sql, -1, 2, latest_sql, 0);
+    expect_sql(db, "obs-dashboard-index-probe-error-repeat", latest_sql,
+               -1, 2, latest_sql, 0);
     expect_sql(db, "obs-dashboard-movies-index-probe-error", movies_sql, -1, 2,
                movies_sql, 0);
+    expect_sql(db, "obs-dashboard-movies-index-probe-error-repeat", movies_sql,
+               -1, 2, movies_sql, 0);
     require_int("observability/probe-authorizer/clear", sqlite3_set_authorizer(db, NULL, NULL),
                 SQLITE_OK);
     require_int("observability/probe-error-close", sqlite3_close(db), SQLITE_OK);
@@ -2847,6 +3334,24 @@ static int child_observability_logs(void) {
         log_output,
         "event=rewrite_applied target=emby mode=dashboard+episodes_latest"
     );
+    require_int(
+        "observability/dashboard-applied-count",
+        count_occurrences(
+            log_output,
+            "event=rewrite_applied target=emby mode=dashboard+episodes_latest"
+        ),
+        2
+    );
+    require_contains(
+        "observability/dashboard-applied-new",
+        log_output,
+        "sample=new count=2"
+    );
+    require_contains(
+        "observability/dashboard-applied-new-source",
+        log_output,
+        latest_new_corr_sql
+    );
     require_contains(
         "observability/dashboard-movies-applied",
         log_output,
@@ -2855,13 +3360,29 @@ static int child_observability_logs(void) {
     require_contains(
         "observability/fanout-capture-miss",
         log_output,
-        "event=rewrite_skipped target=emby reason=capture_miss mode=fanout+links_search"
+        "event=rewrite_skipped target=emby reason=capture_miss mode=fanout+links_search sub_reason=type_slot"
     );
     require_contains(
         "observability/dashboard-capture-miss",
         log_output,
-        "event=rewrite_skipped target=emby reason=capture_miss mode=dashboard+episodes_latest"
+        "event=rewrite_skipped target=emby reason=capture_miss mode=dashboard+episodes_latest sub_reason=projection"
     );
+    {
+        char metadata[160];
+        int rc = snprintf(
+            metadata, sizeof(metadata),
+            "sql_len=%lu corr=%016llx",
+            (unsigned long)strlen(latest_miss_sql),
+            (unsigned long long)sql_corr_key(latest_miss_sql, strlen(latest_miss_sql))
+        );
+        if (rc < 0 || (size_t)rc >= sizeof(metadata)) {
+            failf("FATAL: observability capture metadata overflow");
+        }
+        require_contains("observability/dashboard-capture-correlation", log_output, metadata);
+        require_contains("observability/dashboard-capture-source", log_output, latest_miss_sql);
+    }
+    require_absent("observability/series-early-miss-source", log_output, latest_series_sql);
+    require_absent("observability/resume-early-miss-source", log_output, resume_early_sql);
     require_int(
         "observability/dashboard-capture-miss-count",
         count_occurrences(
@@ -2883,10 +3404,26 @@ static int child_observability_logs(void) {
         log_output,
         "event=rewrite_skipped target=emby reason=index_missing mode=dashboard+episodes_latest"
     );
+    require_int(
+        "observability/dashboard-index-missing-count",
+        count_occurrences(
+            log_output,
+            "event=rewrite_skipped target=emby reason=index_missing mode=dashboard+episodes_latest"
+        ),
+        2
+    );
     require_contains(
         "observability/dashboard-index-probe-error",
         log_output,
         "event=rewrite_skipped target=emby reason=index_probe_error mode=dashboard+episodes_latest"
+    );
+    require_int(
+        "observability/dashboard-index-probe-error-count",
+        count_occurrences(
+            log_output,
+            "event=rewrite_skipped target=emby reason=index_probe_error mode=dashboard+episodes_latest"
+        ),
+        2
     );
     require_int(
         "observability/dashboard-movies-index-missing-count",
@@ -2902,7 +3439,7 @@ static int child_observability_logs(void) {
             log_output,
             "event=rewrite_skipped target=emby reason=index_probe_error mode=dashboard+movies_latest"
         ),
-        1
+        2
     );
     require_absent(
         "observability/dashboard-movies-no-rewritten-prepare-failure",
@@ -2918,10 +3455,13 @@ static int child_observability_logs(void) {
     free(links_miss_sql);
     free(resume_simple_sql);
     free(resume_simple_expected);
+    free(resume_early_sql);
     free(similar_sql);
     free(similar_expected);
     free(latest_sql);
     free(latest_expected);
+    free(latest_new_corr_sql);
+    free(latest_new_corr_expected);
     free(latest_miss_sql);
     free(latest_series_sql);
     free(movies_sql);
@@ -2929,6 +3469,43 @@ static int child_observability_logs(void) {
     free(movies_miss_sql);
     free(movies_no_guard_sql);
     printf("PASS [observability-logs]\n");
+    return 0;
+}
+
+static int child_observability_master_disabled(void) {
+    sqlite3 *db;
+    FILE *capture;
+    char *log_output;
+    char *latest_sql;
+    char *latest_expected;
+    char *latest_miss_sql;
+    int saved_stderr_fd;
+
+    configure_env("1", NULL, "0");
+    if (setenv("SQLITE3_DISABLE_STMT_TRACE", "0", 1) != 0) {
+        failf("setenv STMT trace failed");
+    }
+    make_temp_dir();
+    capture = begin_stderr_capture(&saved_stderr_fd);
+    db = open_seeded_temp_with_latest_index("library.db", 1);
+    latest_sql = make_latest_sql("A.Id ", "12");
+    latest_expected = make_latest_expected("A.Id ", "12");
+    latest_miss_sql = make_latest_sql("(A.DateCreated) ", "12");
+    expect_sql(db, "master-disabled-applied", latest_sql, -1, 2, latest_expected, 0);
+    expect_sql(db, "master-disabled-capture", latest_miss_sql, -1, 2,
+               latest_miss_sql, 0);
+    exec_sql(db, "master-disabled-stmt", latest_sql);
+    require_int("master-disabled/close", sqlite3_close(db), SQLITE_OK);
+    log_output = end_stderr_capture(capture, saved_stderr_fd);
+    require_absent("master-disabled/capture", log_output, "reason=capture_miss");
+    require_absent("master-disabled/applied", log_output, "event=rewrite_applied");
+    require_absent("master-disabled/stmt", log_output, "event=SQLITE_TRACE_STMT");
+    free(log_output);
+    free(latest_sql);
+    free(latest_expected);
+    free(latest_miss_sql);
+    cleanup_temp_dir();
+    printf("PASS [observability-master-disabled]\n");
     return 0;
 }
 
@@ -2993,8 +3570,15 @@ static void run_exec_child(const char *program, const char *name) {
     if (pid < 0) failf("FATAL: fork-exec(%s) failed: %s", name, strerror(errno));
     if (pid == 0) {
         char *const args[] = {(char *)program, "--child", (char *)name, NULL};
-        if (unsetenv("SQLITE3_DISABLE_OBSERVABILITY") != 0) {
-            failf("FATAL: exec-child unsetenv OBS failed: %s", strerror(errno));
+        if (strcmp(name, "observability-master-disabled") == 0) {
+            if (setenv("SQLITE3_DISABLE_OBSERVABILITY", "1", 1) != 0 ||
+                setenv("SQLITE3_DISABLE_STMT_TRACE", "0", 1) != 0) {
+                failf("FATAL: exec-child master-disable env failed: %s", strerror(errno));
+            }
+        } else if (unsetenv("SQLITE3_DISABLE_OBSERVABILITY") != 0 ||
+                   setenv("SQLITE3_DISABLE_STMT_TRACE", "1", 1) != 0 ||
+                   unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL") != 0) {
+            failf("FATAL: exec-child observable env failed: %s", strerror(errno));
         }
         if (strchr(program, '/')) {
             execv(program, args);
@@ -3040,6 +3624,7 @@ static void run_child(const char *name) {
         if (strcmp(name, "dashboard-one-off") == 0) _exit(child_dashboard_off_value("1", "dashboard-one-off"));
         if (strcmp(name, "dashboard-garbage-off") == 0) _exit(child_dashboard_off_value("false", "dashboard-garbage-off"));
         if (strcmp(name, "dashboard-matrix") == 0) _exit(child_dashboard_matrix());
+        if (strcmp(name, "dashboard-fix-b-c") == 0) _exit(child_dashboard_fix_b_c());
         if (strcmp(name, "dashboard-matcher-negatives") == 0) _exit(child_dashboard_matcher_negatives());
         if (strcmp(name, "dashboard-release-matrix") == 0) _exit(child_dashboard_release_matrix());
         if (strcmp(name, "latest-limit20") == 0) _exit(child_latest_limit20());
@@ -3070,6 +3655,9 @@ int main(int argc, char **argv) {
 #else
     if (argc == 3 && strcmp(argv[1], "--child") == 0) {
         if (strcmp(argv[2], "observability-logs") == 0) return child_observability_logs();
+        if (strcmp(argv[2], "observability-master-disabled") == 0) {
+            return child_observability_master_disabled();
+        }
         failf("FATAL: unknown exec child %s", argv[2]);
     }
     run_child("positive");
@@ -3093,6 +3681,7 @@ int main(int argc, char **argv) {
     run_child("dashboard-one-off");
     run_child("dashboard-garbage-off");
     run_child("dashboard-matrix");
+    run_child("dashboard-fix-b-c");
     run_child("dashboard-matcher-negatives");
     run_child("dashboard-release-matrix");
     run_child("latest-limit20");
@@ -3100,6 +3689,7 @@ int main(int argc, char **argv) {
     run_child("latest-series-browse-negative");
     run_child("latest-resume-no-misfire");
     run_exec_child(argv[0], "observability-logs");
+    run_exec_child(argv[0], "observability-master-disabled");
     printf("emby fts rewrite smoke passed\n");
     return 0;
 #endif

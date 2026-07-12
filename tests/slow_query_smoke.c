@@ -1,4 +1,5 @@
 #include "sqlite3.h"
+#include "observability.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -32,8 +33,6 @@ uint32_t slow_query_test_expanded_sql_free_count(void);
 uint32_t slow_query_test_expanded_sql_call_count(void);
 void slow_query_test_force_detail_alloc_failure(int enabled);
 void slow_query_test_disable_atexit_dump(void);
-
-void obs_logf(const char *fn, const char *fmt, ...);
 
 int obs_trace_stmt_cb(unsigned trace, void *ctx, void *p, void *x) {
     (void)ctx;

@@ -34,7 +34,7 @@ sh timing.sh
 Run `identity.sh` first for all default candidates, variants, and match cases.
 Only proceed to timing when `identity-summary.tsv` shows
 `STATUS identity_complete mismatches=0`. Do not run `timing.sh` if identity
-mismatches exist — a candidate with identity failures produces meaningless
+mismatches exist -- a candidate with identity failures produces meaningless
 timing comparisons. To narrow an expensive timing pass, set `CANDIDATES`,
 `VARIANTS`, or `MATCH_CASES` to space-separated names before invoking the
 script.
@@ -78,7 +78,7 @@ Check for empty identity diffs, candidate EQP changes that match the intended re
   iterations for a timed-out arm.
 - Disk footprint: both scripts open the DB read-only (`-readonly -batch`); no
   copies are created; disk usage is run-output only.
-- Identity scope: honored — one identity check per (variant × match_case ×
+- Identity scope: honored -- one identity check per (variant × match_case ×
   candidate) pair before timing.
 - Pre-warm: honored in `timing.sh` (`prewarm_db` before each iteration pair).
   Not implemented in `identity.sh` because it is not needed for correctness.
@@ -86,8 +86,12 @@ Check for empty identity diffs, candidate EQP changes that match the intended re
   and `__EMBY_USER_ID__` as literal SQL text. If any of these correspond to
   bound parameters (`?`) in the production `zSql` seen by the prepare-wrapper
   matcher, the tested form differs from the production form. Validate against
-  `trace_stmt` raw output from a running container before treating harness
-  identity as a faithful matcher-layer proof.
+  raw source from a running container before treating harness identity as a
+  faithful matcher-layer proof. Enabled `trace_stmt` uses hybrid sampling by
+  default: count 1 is `sample=first`, every 1024th count is `sample=periodic`,
+  and otherwise a first-seen `corr` is `sample=new`; use an approved short
+  full-trace window or a `capture_miss`/applied source record when the target
+  statement is not in the sample.
 - Cleanup: failed runs remove their incomplete `$RUN_DIR`. Successful run
   directories remain under `SCRATCH_ROOT` for inspection; operators should clean
   old run directories after reviewing results.
