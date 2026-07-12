@@ -105,8 +105,11 @@ stands alone:
 - dbs=<database names> | containers=<count>
 
 Query source:
-- slow_query / slow_query_expanded / trace_stmt source line references.
+- slow_query / slow_query_expanded / trace_stmt / rewrite-decision source line
+  references.
 - Captured literal or bind source.
+- `sql_len` plus `corr`/`source_corr` when present. Treat correlation keys as
+  diagnostic join aids, not unique identifiers or security boundaries.
 
 Schema:
 - Relevant CREATE TABLE statements.
@@ -141,10 +144,27 @@ only the statement-trace knob and restart the container:
 SQLITE3_DISABLE_STMT_TRACE=0
 ```
 
+Enabled STMT trace uses hybrid sampling by default: the first callback emits as
+`sample=first`, every 1024th callback per connection emits as
+`sample=periodic`, and a first-seen `corr` shape on other counts emits as
+`sample=new`. A full or unavailable
+first-seen set falls back to the periodic sampler. When an approved short
+observation needs every statement, also set
+`SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1`; this override never enables STMT trace
+on its own. Restore both prior settings after capture.
+
 Capture the minimum required lines, then restore the prior setting. Prefer
 `slow_query_expanded` lines when literal bound values are required and the
 incident context allows holding expanded SQL. Expanded SQL is max-PII because it
 inlines all bound values for the statement.
+
+For matcher drift, prefer the rewrite-decision record when present. A
+post-boundary `capture_miss` includes raw source `sql`, `sub_reason`, exact
+`sql_len`, and `corr`; the allocated low-volume record includes the full,
+uncapped source SQL, with bounded fallback if the record cannot be allocated.
+Every emitted `rewrite_applied` sample (`first`, `periodic`, or `new`) includes
+raw `source_sql`, rewritten `sql`, and both correlation keys unless literal
+`SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1` suppresses only the text fields.
 
 Expanded-SQL slow-query detail is on by default for target database files. Use a
 short observation window when the default threshold does not catch the query
@@ -238,11 +258,11 @@ vendor query:
 ## Mandatory Harness Guardrails
 
 Every harness built from this runbook MUST implement these. They are recurring
-failure modes that have cost real time repeatedly — not optional niceties. Do not
+failure modes that have cost real time repeatedly -- not optional niceties. Do not
 hand-roll a harness that omits any of them.
 
 1. **Timeout EVERY sqlite invocation, in every phase (regression + hang cap).**
-   No `$SQLITE_BIN` call runs uncapped — not only the timed query. This covers
+   No `$SQLITE_BIN` call runs uncapped -- not only the timed query. This covers
    copy, index-prep, literal-derivation, preflight-count, identity, EQP,
    vendor-stability, warm-up, AND timed iterations. Route ALL invocations through
    timeout-wrapped runners, and enforce it with a startup self-check that greps the
@@ -251,11 +271,11 @@ hand-roll a harness that omits any of them.
    `fh1-measure.sh` / `nm10-measure.sh`). Two caps:
    - Query phases (timed / identity / EQP / vendor-stability): `timeout ${TIMEOUT_S:-10}s`,
      above good-case and far below the pathological. A candidate can regress
-     catastrophically — orders of magnitude — on a worst-case literal/user cell;
+     catastrophically -- orders of magnitude -- on a worst-case literal/user cell;
      never time it fully N× uncapped.
    - Setup phases (copy / prep / derive-literals / preflight): a generous bounded cap
      `timeout ${SETUP_TIMEOUT_S:-300}s`; on rc=124 `die ... BLOCKED` naming the phase.
-     NEVER leave a setup/derivation query unbounded — a pathological derivation (e.g. an
+     NEVER leave a setup/derivation query unbounded -- a pathological derivation (e.g. an
      `AncestorIds2 × MediaItems` aggregation with a null-safe dup-count join) hangs the
      whole run indefinitely. Fail-fast, then optimize that query.
    On timeout: mark that arm timed-out and SKIP the cell's remaining iterations.
@@ -285,7 +305,7 @@ hand-roll a harness that omits any of them.
    O(copies) × multi-GB and will exhaust the volume.)
 
 3. **Identity scope.** The grouped `(id, count)` / `(gk, maxdc, n)` identity digest
-   is presentation-independent — run it ONCE per (literal × user × stat state),
+   is presentation-independent -- run it ONCE per (literal × user × stat state),
    NEVER per-`LIMIT`/N. Compute each shipped-baseline identity ONCE and reuse it
    across all candidates (the baseline output is identical for every candidate).
 
@@ -296,7 +316,7 @@ hand-roll a harness that omits any of them.
 5. **Test the RAW prepare form.** Matchers/rewrites run on the raw `zSql` (bound
    params = literal `?`); the census/captures are `sql_expanded` (inlined).
    Validate rewrite firing AND identity against the RAW `trace_stmt` form, NOT
-   `sql_expanded` — a rewrite can pass on inlined SQL yet `capture_miss` live where
+   `sql_expanded` -- a rewrite can pass on inlined SQL yet `capture_miss` live where
    the app binds that slot.
 
    **Live-docker-log RAW-prepare validation technique (Emby/Plex instrumented instance):**
@@ -305,30 +325,31 @@ hand-roll a harness that omits any of them.
       ```sh
       docker logs --since 30m <container-name> 2>&1 | grep -E ' (trace_stmt|emby_fts_rewrite|slow_query) '
       ```
-   2. From `trace_stmt` lines, the `sql=` field is the **raw `zSql`** — bound
-      parameters appear as literal `?`, not as inlined values.
+   2. From `trace_stmt` lines, the `sql=` field is the **raw `zSql`** -- bound
+      parameters appear as literal `?`, not as inlined values. A distinct shape
+      normally emits once as `sample=new`; sampling may omit later repeats when
+      the bounded first-seen set is full or unavailable unless a 1024th position
+      hits or the full-trace override is active.
    3. From `slow_query_expanded` lines, the `sql_expanded=` field has inlined
       bound values. These are NOT what the matcher sees.
    4. To validate a matcher fires on the raw form: confirm the rewrite-decision
-      log line (`emby_fts_rewrite` or equivalent) appears for the `sql=` shape
-      (with `?`), not only for the `sql_expanded` form.
-   5. To build a shape census: extract all `sql=` values from `trace_stmt`
-      lines, normalize whitespace, group by shape. Candidates that appear in
-      the census but show `capture_miss` indicate the matcher is checking an
-      expanded or inline form, not the raw form.
-   6. Cross-tab `capture_miss` entries by mode: if misses appear for the
-      `?`-form shape but not for the inlined shape, the matcher pattern must be
-      adjusted to match the raw zSql.
+      log line (`emby_fts_rewrite` or equivalent) appears for the raw shape
+      (with `?`), not only for the `sql_expanded` form. Join records with
+      `corr`/`source_corr` plus `sql_len`; do not treat the key alone as unique.
+   5. To build a complete shape census, use a short approved full-STMT window or
+      combine sampled `trace_stmt` with capture/applied source records. Normalize
+      whitespace and group by shape. Candidates that appear in the census but
+      show `capture_miss` indicate matcher drift on the raw form.
+   6. Cross-tab `capture_miss` entries by `(target, mode, sub_reason, db,
+      sql_len, corr)`. If misses appear for the `?`-form shape but not for the
+      inlined shape, the matcher pattern must be adjusted to match raw `zSql`.
 
-   **Motivating example -- the On-Deck capture-miss (2026-07-09):** The original
-   (f) On-Deck rewrite was validated against `sql_expanded` (which inlines
-   `library_section_id=123`), but the production `zSql` binds it as
-   `library_section_id=?`. The exact-literal matcher did not match the raw bound
-   form, producing 116/116 `capture_miss` on plex-backup-1. The (f) matcher was
-   subsequently made bind-tolerant (it accepts an inlined decimal or a positional
-   `?`/`?N` for both `library_section_id` and `account_id`), which resolves this
-   specific capture-miss; the raw-vs-`sql_expanded` gotcha above still applies to
-   any new matcher.
+   **On-Deck raw-shape rule:** The matcher accepts an inlined decimal or a
+   positional `?`/`?N` for both `library_section_id` and `account_id`. The
+   id-list and literal-threshold selectors share the base On-Deck gate. After
+   the exact head matches, parse drift emits `capture_miss` with a stage-specific
+   `sub_reason`, including `threshold` for a threshold parse failure. The
+   raw-vs-`sql_expanded` distinction above applies to every new matcher.
 
 6. **Clean up.** Delete the whole host scratch subdir at the end, INCLUDING on
    kill/abort. If you deliberately keep the source copy for a re-run, delete

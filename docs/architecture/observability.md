@@ -5,7 +5,8 @@ Part of the [Repository Architecture index](../architecture.md).
 ## Observability Layer
 
 `src/observability.c` is compiled into both shared-library variants and is
-excluded from the CLI target.
+excluded from the CLI target. `src/observability.h` declares the private
+cross-translation-unit observability seam.
 
 The library target patches SQLite's amalgamation so these public APIs are
 implemented by wrappers in `src/observability.c` while the original SQLite
@@ -29,20 +30,57 @@ UTF-8 prepare wrappers chain through `src/observability.c` ->
 `emby_fts_rewrite_prepare()` -> `plex_fts_rewrite_prepare()` -> the matching
 hidden `*_real` prepare implementation. The helpers are result-preserving for
 disabled, non-target, nonmatching, drift, and failure paths, and intentionally
-prepare rewritten SQL only for enabled target matches. The Plex helper emits
-`event=rewrite_applied target=plex db=%p sql="<escaped rewritten>"` through
-`obs_logf` only on effective rewrite success. The Emby helper emits
-`event=rewrite_applied target=emby mode=<mode> db=%p sql="<escaped rewritten>"`
-only on effective rewrite success and emits `rewrite_skipped` for rewrite-path
-failures after a target-shape match. Emby modes are `fts+membership`,
+prepare rewritten SQL only for enabled target matches. Effective rewrites use
+per-connection, per-mode applied counters plus a bounded per-connection set of
+first-seen rewritten-SQL `corr` keys. The first record has
+`sample=first count=1`; every 1024th per-mode record has `sample=periodic`; and
+on other counts, the first occurrence of a distinct correlation has
+`sample=new`. Every
+emitted label carries full-span `source_corr` and rewritten `corr` plus raw
+`source_sql` and rewritten `sql`, each capped at 4 KiB. Repeated correlations
+between periodic samples are suppressed. When the 512-key set is full or
+unavailable, logging falls back to the first/every-1024th sampler. If
+per-connection sampler state cannot be allocated or registered, known-mode
+`rewrite_applied` and STMT diagnostics are skipped; sampler failure never
+increases output. Literal
+`SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1` omits both SQL text fields from every
+emitted record while retaining counters and correlation keys; unset, literal
+`0`, and every other value retain them. This control is cached once per
+process, is subordinate to the master observability gate, and does not gate
+rewriting. Emby modes are `fts+membership`,
 `fanout+resume`, `fanout+browse`, `fanout+favorites`, `fanout+people`,
 `fanout+links_search`, `fanout+resume_simple`, `fanout+similar`,
-`dashboard+episodes_latest`, and `dashboard+movies_latest`. The Episodes mode
-name is a shipped telemetry rename with no compatibility alias. Each dashboard
-family logs `capture_miss` only after its own Type discriminator; valid sibling
-traffic is an unlogged clean miss. Capture-gated fan-out and dashboard misses
-log `reason=capture_miss`; missing required Emby dashboard or Plex
-taggings/On-Deck indexes log `reason=index_missing`.
+`dashboard+episodes_latest`, and `dashboard+movies_latest`. No compatibility
+alias exists for the Episodes mode. Each dashboard family logs `capture_miss`
+only after its own Type discriminator; valid sibling traffic is an unlogged
+clean miss. The capture-gated fan-out modes are `fanout+people`, after its
+`itemPeople2` discriminator, and `fanout+links_search`, after its
+`WithItemLinkItemIds` discriminator. Capture-gated fan-out and dashboard misses
+log `reason=capture_miss` with `sub_reason`, `db`, exact `sql_len`, a full raw
+span FNV-1a `corr` key, and the full escaped source `sql`. This capture
+uses `pre_l1`, `select_anchor`, `ancestor_slot`, and `membership` for People;
+links-search also uses `tail_anchor` and `type_slot`; and dashboard Latest uses
+`prefix`, `select_anchor`, `ancestor_slot`, `from_anchor`, `projection`,
+`tail_anchor`, `user_slot`, `limit`, and `bind`. This capture
+path allocates the uncapped record; allocation or record-size failure emits a
+bounded fallback diagnostic and never changes prepare behavior. The key is a
+diagnostic join aid, not a unique identifier or security boundary. Early clean
+misses, missing-index paths, and index-probe errors do not emit capture SQL.
+With the base Plex On-Deck rewrite enabled, both the id-list and
+`viewed_at > <literal>` selector arms run. After the exact On-Deck head matches,
+parse drift emits `capture_miss` with first-failure `sub_reason` from `section`,
+`selector`, `id_list`, `threshold`, `post_id`, `account`, `tail`, or `trailing`.
+The threshold arm has no separate gate or disabled-silence state; a threshold
+parse failure emits `sub_reason=threshold`.
+Missing required Emby dashboard or Plex
+taggings/On-Deck indexes log `reason=index_missing` only once per connection
+and mode; probe errors remain unsuppressed. Clientdata allocation or
+registration failure for missing-index deduplication preserves the diagnostic
+instead of suppressing it.
+Other fail-open rewrite reasons are `scalar_unavailable` for Emby FTS,
+`index_probe_error`, `build_failed`, `rewritten_prepare_failed`,
+`tail_mismatch`, and `bind_count_mismatch` for Plex On-Deck. They do not carry
+capture SQL.
 `SQLITE3_DISABLE_OBSERVABILITY` gates helper logs independently of
 `SQLITE3_DISABLE_STMT_TRACE`; pure passthrough and clean-miss paths do not log.
 
@@ -76,15 +114,34 @@ mode omits `SQLITE_TRACE_STMT` from the per-connection trace mask; PROFILE-side
 slow-query tracking is unaffected. When the resulting trace mask is `0`,
 `sqlite3_trace_v2` is not called.
 
+Enabled STMT logging uses a per-connection hybrid sampler. The first callback
+emits as `sample=first`; every 1024th callback emits as `sample=periodic`; and
+on other counts, the first occurrence of a distinct `corr` shape emits once as
+`sample=new`. The first-seen set is bounded at 512 keys; a full or
+unavailable set falls back to the first/every-1024th sampler. Literal
+`SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1` restores full enabled-STMT logging with
+`sample=full count=N`; unset, literal `0`, and every other value retain
+hybrid sampling. The sampling control never enables STMT trace by itself.
+Unscheduled callbacks with an available first-seen set retrieve and hash SQL;
+already-seen shapes return before filename lookup, escaping, or logging.
+
 Log lines are written to stderr:
 
 ```text
 [sqlite3-builds-obs] <ISO-8601-UTC-ms> <pid> <kernel-tid> <fn> key=value ...
 ```
 
-Kernel thread IDs come from `syscall(SYS_gettid)`. SQL text emitted by statement
-trace logging is capped at 4 KiB and receives a `...[TRUNC]` tail when
-truncated.
+Kernel thread IDs come from `syscall(SYS_gettid)`. `obs_logf` formats inline
+before locking stderr; records that exceed the inline buffer use an allocated
+full-record path. Both paths perform exactly one `fwrite()` while holding the
+stream lock. Every record has one terminal newline; allocation or record-size
+failure receives a bounded `...[TRUNC]` fallback. `OBS_SQL_CAP=4096` governs
+STMT SQL and both the source and
+rewritten SQL fields in `rewrite_applied` records. `capture_miss` instead uses
+its separately allocated full-record path described above. STMT records include
+exact `sql_len` and a full-span `corr` key. For an applied rewrite, the STMT key
+describes the rewritten SQL; join source SQL through the applied record's
+`source_corr`, not the STMT key.
 
 `sqlite3_initialize` uses a thread-local depth counter so nested initialization
 still calls the real implementation but only the outer 0-to-1 transition logs
@@ -111,17 +168,17 @@ The kill-switch hierarchy is:
 ```text
 SQLITE3_DISABLE_OBSERVABILITY=1 -> no observability or tracker work
 SQLITE3_DISABLE_STMT_TRACE unset or !=0 -> STMT observability off, PROFILE tracker unaffected
-SQLITE3_DISABLE_STMT_TRACE=0 -> STMT observability on when observability is enabled
+SQLITE3_DISABLE_STMT_TRACE=0 -> sampled STMT observability on when observability is enabled
+SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1 -> every enabled STMT callback logs
+SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1 -> all emitted applied records omit SQL text only
 SQLITE3_DISABLE_SLOW_QUERY=1 -> PROFILE tracker off; STMT follows SQLITE3_DISABLE_STMT_TRACE
 ```
 
 The helper unconditionally calls `sqlite3_auto_extension` regardless of the
-`SQLITE3_DISABLE_AUTOPRAGMA=1` state. An alternative -- early-return from the
-helper when `SQLITE3_DISABLE_AUTOPRAGMA=1` -- was considered and rejected: it
-would have skipped `sqlite3_trace_v2(SQLITE_TRACE_STMT)` registration in
-`autopragma_init`, conflating AUTOPRAGMA disable with observability disable.
-The accepted per-open mutex + dedup-scan cost preserves orthogonality between
-the two kill switches.
+`SQLITE3_DISABLE_AUTOPRAGMA=1` state. This keeps
+`sqlite3_trace_v2(SQLITE_TRACE_STMT)` registration in `autopragma_init`
+independent of AUTOPRAGMA enablement and preserves orthogonality between the two
+kill switches.
 
 `SQLITE3_SLOW_QUERY_THRESHOLD_MS` defaults to `500`. The parser accepts only
 unsigned decimal milliseconds, allows `0` for debug-only all-sample logging,
@@ -130,13 +187,14 @@ ERANGE, or pre-conversion overflow values. PROFILE elapsed values come from
 SQLite's millisecond-quantized timing source and are scaled to nanoseconds by
 SQLite before the callback receives them.
 
-The tracker keeps a process-global 2048-entry LRU keyed by parameterized
-`sqlite3_sql()` text. It stores and displays at most 1024 SQL bytes per
+The tracker keeps a process-global 4096-entry LRU keyed by parameterized
+`sqlite3_sql()` text. It stores and displays at most 2048 SQL bytes per
 template, uses the full SQL FNV-1a hash as the probe accelerator, and uses that
-full hash as the equality proof for templates longer than 1024 bytes. Existing
-STMT logging keeps its separate 4 KiB SQL cap; `SLOW_QUERY_SQL_CAP` does not
-change `OBS_SQL_CAP`, and config/db-config decode tables stay in
-`src/observability.c`.
+full hash as the equality proof for templates longer than 2048 bytes. Existing
+STMT and rewrite-applied source/rewritten SQL logging keeps its separate 4 KiB
+`OBS_SQL_CAP`; capture-miss source SQL is uncapped on its allocated full-record
+path. `SLOW_QUERY_SQL_CAP` changes neither behavior, and config/db-config decode
+tables stay in `src/observability.c`.
 
 LRU evictions tombstone the bucket entry and trigger an amortized O(1) bucket
 rebuild when tombstones reach 25% of entries_used.
@@ -157,16 +215,18 @@ uses `pthread_mutex_trylock`; on contention it emits a one-line skip diagnostic
 instead of stalling process shutdown.
 
 The tracker is an observability satellite that depends on the hidden
-`obs_logf` / `obs_is_disabled` ABI in this MVP. A Phase 2 sink-abstraction
-layer is deferred until runtime evidence justifies persistent or alternate
-export paths.
+`obs_logf` / `obs_is_disabled` ABI. No sink-abstraction layer exists.
 
 ### Slow-Query Verification
 
 Docker build compiles + runs `slow_query_smoke`, `slow_query_atexit_smoke`,
 `slow_query_concurrency_smoke`. CI re-runs positive, disabled-mode, atexit,
 and concurrency checks, and it compiles + runs `stmt_trace_smoke` against the
-same registration path to enforce the STMT trace env contract. Bench binaries
+same registration path to enforce STMT enablement, sampling override,
+hybrid first/periodic/new correlation sampling, and full capture-miss SQL with
+bounded allocation-failure fallback. Rewrite smokes cover full
+first/periodic/new applied records, SQL-text suppression, capture-miss source
+records, and connection-local missing-index deduplication. Bench binaries
 (`slow_query_select1_bench`,
 `slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`,
 `alloc_latency_bench`, `runtime_optimize_close_bench`,

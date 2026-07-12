@@ -1,4 +1,5 @@
 #include "auto_extension_internal.h"
+#include "observability.h"
 
 #include <ctype.h>
 #include <limits.h>
@@ -8,8 +9,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
-
-__attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
 
 typedef struct auto_extension_progress_snapshot {
     unsigned nProgressOps;

@@ -1,4 +1,5 @@
 #include "sqlite3.h"
+#include "observability.h"
 
 #include <inttypes.h>
 #include <pthread.h>

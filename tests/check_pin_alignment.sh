@@ -17,6 +17,19 @@ require_line() {
   grep -Fxq -- "$line" "$file" || fail "$file missing exact line: $line"
 }
 
+require_nearby_line() {
+  file="$1"
+  anchor="$2"
+  expected="$3"
+  label="$4"
+  awk -v anchor="$anchor" -v expected="$expected" '
+    $0 == anchor { remaining = 40 }
+    remaining > 0 && $0 == expected { found = 1; exit }
+    remaining > 0 { remaining-- }
+    END { exit(found ? 0 : 1) }
+  ' "$file" || fail "$label missing from $file near: $anchor"
+}
+
 reject_line() {
   file="$1"
   line="$2"
@@ -323,6 +336,20 @@ require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EM
 require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME " "'
 require_line src/plex_fts_rewrite.c '#define PLEX_TAG_INDEX_NAME "idx_dshadow_taggings_tag_id_metadata_item_id"'
 require_line src/plex_fts_rewrite.c '#define PLEX_ONDECK_INDEX_NAME "idx_dshadow_metadata_item_views_account_grandparent_guid"'
+require_nearby_line \
+  src/observability.c \
+  '    const char *stmt_sampling = getenv("SQLITE3_DISABLE_STMT_TRACE_SAMPLING");' \
+  '        (stmt_sampling && strcmp(stmt_sampling, "1") == 0) ? 1 : 0,' \
+  'STMT trace sampling literal-1 override'
+require_nearby_line \
+  src/observability.c \
+  '    const char *applied_sql = getenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL");' \
+  '        (applied_sql && strcmp(applied_sql, "1") == 0) ? 1 : 0,' \
+  'rewrite-applied SQL literal-1 suppression'
+require_line docs/env-vars.md '| `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` | kill-switch | Omit SQL text from sampled `rewrite_applied` records. | Source and rewritten SQL text included on `sample=first`, `sample=periodic`, and `sample=new` records. | opt-out | Literal `1` omits `source_sql` and rewritten `sql` while retaining counters and correlation keys. | Unset, literal `0`, and any other value keep both SQL text fields. | generic and Plex-ICU shared libraries. | Cached once per process. Subordinate to `SQLITE3_DISABLE_OBSERVABILITY=1`; it does not gate rewrites. |'
+require_line docs/env-vars.md '| `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` | kill-switch | Disable sampling for explicitly enabled STMT trace. | Enabled STMT trace logs the first callback, each bounded first-seen `corr` shape, and every 1024th callback per connection. | opt-out | Literal `1` logs every enabled STMT callback. | Unset, literal `0`, and any other value retain `sample=first`, `sample=periodic`, and `sample=new` hybrid sampling. | generic and Plex-ICU shared libraries. | Cached once per process. Never enables STMT trace; `SQLITE3_DISABLE_STMT_TRACE=0` and observability enabled are still required. |'
+require_pattern CLAUDE.md 'SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1' 'CLAUDE rewrite-applied SQL knob'
+require_pattern CLAUDE.md 'SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1' 'CLAUDE STMT sampling knob'
 
 plex_icu_source_version="$(compat_group_pin icu69 icu_source_version)"
 plex_icu_source_sha512="$(compat_group_pin icu69 icu_source_sha512)"

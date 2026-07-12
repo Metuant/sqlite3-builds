@@ -1,5 +1,5 @@
-#include "sqlite3.h"
 #include "emby_fts_rewrite.h"
+#include "observability.h"
 
 #include <errno.h>
 #include <inttypes.h>
@@ -16,6 +16,63 @@
 
 #define OBS_SQL_CAP 4096
 #define OBS_TRUNC_TAIL "...[TRUNC]"
+#define OBS_LOG_LINE_CAP ((OBS_SQL_CAP * 2) * 4 + 4096)
+#define OBS_SAMPLE_PERIOD 1024u
+#define OBS_CLIENTDATA_KEY "sqlite3-builds-observability"
+#define OBS_CORR_CLIENTDATA_KEY "sqlite3-builds-observability-corr"
+#define OBS_CORR_SET_CAP 512u
+#define OBS_CORR_TABLE_CAP 1024u
+
+#define OBS_INDEX_MISSING_PLEX_TAGGINGS 0x01u
+#define OBS_INDEX_MISSING_PLEX_ONDECK 0x02u
+#define OBS_INDEX_MISSING_EMBY_EPISODES 0x04u
+#define OBS_INDEX_MISSING_EMBY_MOVIES 0x08u
+#define OBS_CORR_UNAVAILABLE_APPLIED 0x01u
+#define OBS_CORR_UNAVAILABLE_STMT 0x02u
+
+enum obs_applied_mode {
+    OBS_APPLIED_PLEX_FTS = 0,
+    OBS_APPLIED_PLEX_TAGGINGS,
+    OBS_APPLIED_PLEX_ONDECK,
+    OBS_APPLIED_EMBY_FTS,
+    OBS_APPLIED_EMBY_BROWSE,
+    OBS_APPLIED_EMBY_FAVORITES,
+    OBS_APPLIED_EMBY_LINKS_SEARCH,
+    OBS_APPLIED_EMBY_PEOPLE,
+    OBS_APPLIED_EMBY_RESUME,
+    OBS_APPLIED_EMBY_RESUME_SIMPLE,
+    OBS_APPLIED_EMBY_SIMILAR,
+    OBS_APPLIED_EMBY_EPISODES_LATEST,
+    OBS_APPLIED_EMBY_MOVIES_LATEST,
+    OBS_APPLIED_MODE_COUNT
+};
+
+typedef struct obs_corr_set {
+    pthread_mutex_t mutex;
+    atomic_uint count;
+    uint64_t keys[OBS_CORR_TABLE_CAP];
+    unsigned char occupied[OBS_CORR_TABLE_CAP];
+} obs_corr_set;
+
+typedef struct obs_corr_state {
+    obs_corr_set applied;
+    obs_corr_set stmt;
+} obs_corr_state;
+
+typedef struct obs_connection_state {
+    atomic_uint index_missing_bits;
+    atomic_uint corr_unavailable_bits;
+    atomic_uint_fast64_t applied_counts[OBS_APPLIED_MODE_COUNT];
+    atomic_uint_fast64_t stmt_count;
+    _Atomic(obs_corr_state *) corr_state;
+} obs_connection_state;
+
+enum obs_corr_result {
+    OBS_CORR_SEEN = 0,
+    OBS_CORR_NEW,
+    OBS_CORR_FULL,
+    OBS_CORR_UNAVAILABLE
+};
 
 typedef void (*obs_log_func)(void*, int, const char*);
 typedef void (*obs_sqllog_func)(void*, sqlite3*, const char*, int);
@@ -34,6 +91,9 @@ __attribute__((visibility("hidden"))) extern int runtime_optimize_in_progress(vo
 static pthread_once_t g_obs_once = PTHREAD_ONCE_INIT;
 static atomic_int g_obs_disabled;
 static atomic_int g_stmt_trace_disabled;
+static atomic_int g_stmt_trace_sampling_disabled;
+static atomic_int g_rewrite_applied_sql_disabled;
+static pthread_mutex_t g_obs_corr_state_mutex = PTHREAD_MUTEX_INITIALIZER;
 static __thread int s_init_depth = 0;
 
 struct obs_name {
@@ -128,6 +188,8 @@ static const struct obs_name g_open_flag_names[] = {
 static void obs_init_once(void) {
     const char *v = getenv("SQLITE3_DISABLE_OBSERVABILITY");
     const char *stmt = getenv("SQLITE3_DISABLE_STMT_TRACE");
+    const char *stmt_sampling = getenv("SQLITE3_DISABLE_STMT_TRACE_SAMPLING");
+    const char *applied_sql = getenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL");
     atomic_store_explicit(
         &g_obs_disabled,
         (v && strcmp(v, "1") == 0) ? 1 : 0,
@@ -137,6 +199,16 @@ static void obs_init_once(void) {
     atomic_store_explicit(
         &g_stmt_trace_disabled,
         (stmt && strcmp(stmt, "0") == 0) ? 0 : 1,
+        memory_order_release
+    );
+    atomic_store_explicit(
+        &g_stmt_trace_sampling_disabled,
+        (stmt_sampling && strcmp(stmt_sampling, "1") == 0) ? 1 : 0,
+        memory_order_release
+    );
+    atomic_store_explicit(
+        &g_rewrite_applied_sql_disabled,
+        (applied_sql && strcmp(applied_sql, "1") == 0) ? 1 : 0,
         memory_order_release
     );
 }
@@ -179,23 +251,151 @@ static void obs_timestamp(char *buf, size_t n) {
              tm.tm_hour, tm.tm_min, tm.tm_sec, ts.tv_nsec / 1000000L);
 }
 
+static int obs_logf_full(
+    const char *ts,
+    const char *fn,
+    const char *fmt,
+    size_t prefix_len,
+    size_t payload_len,
+    va_list ap
+) {
+    char *line;
+    size_t total;
+    size_t used;
+    int has_payload = fmt && fmt[0];
+    int rc;
+
+    if (has_payload) {
+        if (prefix_len > SIZE_MAX - payload_len ||
+            prefix_len + payload_len > SIZE_MAX - 3u) {
+            return 0;
+        }
+        total = prefix_len + payload_len + 3u;
+    } else {
+        if (prefix_len > SIZE_MAX - 2u) return 0;
+        total = prefix_len + 2u;
+    }
+    if ((sqlite3_uint64)total != total) return 0;
+    line = (char *)sqlite3_malloc64((sqlite3_uint64)total);
+    if (!line) return 0;
+    rc = snprintf(
+        line, total, "[sqlite3-builds-obs] %s %ld %ld %s",
+        ts, (long)getpid(), obs_tid(), fn ? fn : ""
+    );
+    if (rc < 0 || (size_t)rc != prefix_len) {
+        sqlite3_free(line);
+        return 0;
+    }
+    used = prefix_len;
+    if (has_payload) {
+        line[used++] = ' ';
+        rc = vsnprintf(line + used, total - used, fmt, ap);
+        if (rc < 0 || (size_t)rc != payload_len) {
+            sqlite3_free(line);
+            return 0;
+        }
+        used += payload_len;
+    }
+    line[used++] = '\n';
+    line[used] = 0;
+    flockfile(stderr);
+    (void)fwrite(line, 1, used, stderr);
+    funlockfile(stderr);
+    sqlite3_free(line);
+    return 1;
+}
+
 __attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...) {
     char ts[32];
+    char line[OBS_LOG_LINE_CAP];
+    size_t prefix_len;
+    size_t payload_len = 0;
+    size_t used;
+    size_t tail_len = sizeof(OBS_TRUNC_TAIL) - 1;
+    int rc;
+    int truncated = 0;
     va_list ap;
 
     if (obs_is_disabled()) return;
 
     obs_timestamp(ts, sizeof(ts));
-    flockfile(stderr);
-    fprintf(stderr, "[sqlite3-builds-obs] %s %ld %ld %s",
-            ts, (long)getpid(), obs_tid(), fn);
-    if (fmt && fmt[0]) {
-        fputc(' ', stderr);
-        va_start(ap, fmt);
-        vfprintf(stderr, fmt, ap);
-        va_end(ap);
+    rc = snprintf(
+        line, sizeof(line), "[sqlite3-builds-obs] %s %ld %ld %s",
+        ts, (long)getpid(), obs_tid(), fn ? fn : ""
+    );
+    if (rc < 0) return;
+    prefix_len = (size_t)rc;
+    if ((size_t)rc >= sizeof(line)) {
+        used = sizeof(line) - 1;
+        truncated = 1;
+    } else {
+        used = (size_t)rc;
     }
-    fputc('\n', stderr);
+    if (truncated) {
+        if (fmt && fmt[0]) {
+            va_start(ap, fmt);
+            rc = vsnprintf(NULL, 0, fmt, ap);
+            va_end(ap);
+            if (rc < 0) return;
+            payload_len = (size_t)rc;
+        }
+        va_start(ap, fmt);
+        if (obs_logf_full(
+                ts, fn, fmt, prefix_len, payload_len, ap
+            )) {
+            va_end(ap);
+            return;
+        }
+        va_end(ap);
+    } else if (fmt && fmt[0]) {
+        if (used + 1 >= sizeof(line)) {
+            va_start(ap, fmt);
+            rc = vsnprintf(NULL, 0, fmt, ap);
+            va_end(ap);
+            if (rc < 0) return;
+            payload_len = (size_t)rc;
+            truncated = 1;
+            va_start(ap, fmt);
+            if (obs_logf_full(
+                    ts, fn, fmt, prefix_len, payload_len, ap
+                )) {
+                va_end(ap);
+                return;
+            }
+            va_end(ap);
+        } else {
+            line[used++] = ' ';
+            va_start(ap, fmt);
+            rc = vsnprintf(line + used, sizeof(line) - used, fmt, ap);
+            va_end(ap);
+            if (rc < 0) return;
+            if ((size_t)rc >= sizeof(line) - used) {
+                payload_len = (size_t)rc;
+                used = sizeof(line) - 1;
+                truncated = 1;
+                va_start(ap, fmt);
+                if (obs_logf_full(
+                        ts, fn, fmt, prefix_len, payload_len, ap
+                    )) {
+                    va_end(ap);
+                    return;
+                }
+                va_end(ap);
+            } else {
+                used += (size_t)rc;
+            }
+        }
+    }
+    if (truncated) {
+        if (used + tail_len + 1 >= sizeof(line)) {
+            used = sizeof(line) - tail_len - 2;
+        }
+        memcpy(line + used, OBS_TRUNC_TAIL, tail_len);
+        used += tail_len;
+    }
+    line[used++] = '\n';
+    flockfile(stderr);
+    (void)fwrite(line, 1, used, stderr);
     funlockfile(stderr);
 }
 
@@ -229,18 +429,24 @@ static const char *obs_dbconfig_name(int op, char *buf, size_t n) {
     return buf;
 }
 
-static void obs_escape_string(
-    const char *src, char *dst, size_t dst_n, size_t cap, int *truncated
+static void obs_escape_span(
+    const char *src,
+    size_t src_len,
+    char *dst,
+    size_t dst_n,
+    size_t cap,
+    int *truncated
 ) {
     size_t i = 0;
     size_t o = 0;
+    size_t limit = src_len < cap ? src_len : cap;
     *truncated = 0;
     if (dst_n == 0) return;
     if (!src) {
         snprintf(dst, dst_n, "(null)");
         return;
     }
-    while (src[i] != 0 && i < cap && o + 5 < dst_n) {
+    while (i < limit && o + 5 < dst_n) {
         unsigned char c = (unsigned char)src[i++];
         switch (c) {
             case '\\':
@@ -276,23 +482,102 @@ static void obs_escape_string(
                 break;
         }
     }
-    if (src[i] != 0) *truncated = 1;
+    if (i < src_len) *truncated = 1;
     dst[o] = 0;
 }
 
 static void obs_escape_unlimited(const char *src, char *dst, size_t dst_n) {
     int truncated = 0;
-    obs_escape_string(src, dst, dst_n, SIZE_MAX, &truncated);
+    size_t src_len = src ? strlen(src) : 0;
+    obs_escape_span(src, src_len, dst, dst_n, SIZE_MAX, &truncated);
 }
 
-__attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
+static int obs_escaped_span_len(
     const char *src,
+    size_t src_len,
+    size_t *escaped_len
+) {
+    size_t i;
+    size_t total = 0;
+
+    if (!src) {
+        *escaped_len = sizeof("(null)") - 1;
+        return 1;
+    }
+    for (i = 0; i < src_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        size_t add = c < 0x20 ? 4u : 1u;
+        if (c == '\\' || c == '"' || c == '\n' || c == '\r' || c == '\t') {
+            add = 2u;
+        }
+        if (total > SIZE_MAX - add) return 0;
+        total += add;
+    }
+    *escaped_len = total;
+    return 1;
+}
+
+static size_t obs_escape_span_exact(
+    const char *src,
+    size_t src_len,
+    char *dst
+) {
+    static const char hex[] = "0123456789ABCDEF";
+    size_t i;
+    size_t o = 0;
+
+    if (!src) {
+        memcpy(dst, "(null)", sizeof("(null)") - 1);
+        return sizeof("(null)") - 1;
+    }
+    for (i = 0; i < src_len; i++) {
+        unsigned char c = (unsigned char)src[i];
+        switch (c) {
+            case '\\':
+                dst[o++] = '\\';
+                dst[o++] = '\\';
+                break;
+            case '"':
+                dst[o++] = '\\';
+                dst[o++] = '"';
+                break;
+            case '\n':
+                dst[o++] = '\\';
+                dst[o++] = 'n';
+                break;
+            case '\r':
+                dst[o++] = '\\';
+                dst[o++] = 'r';
+                break;
+            case '\t':
+                dst[o++] = '\\';
+                dst[o++] = 't';
+                break;
+            default:
+                if (c < 0x20) {
+                    dst[o++] = '\\';
+                    dst[o++] = 'x';
+                    dst[o++] = hex[c >> 4];
+                    dst[o++] = hex[c & 0x0f];
+                } else {
+                    dst[o++] = (char)c;
+                }
+                break;
+        }
+    }
+    return o;
+}
+
+static void obs_escape_sql_bounded(
+    const char *src,
+    size_t src_len,
     char *dst,
-    size_t dst_n
+    size_t dst_n,
+    size_t cap
 ) {
     int truncated = 0;
     size_t tail_len = strlen(OBS_TRUNC_TAIL);
-    obs_escape_string(src, dst, dst_n, OBS_SQL_CAP, &truncated);
+    obs_escape_span(src, src_len, dst, dst_n, cap, &truncated);
     if (truncated) {
         size_t len = strlen(dst);
         if (dst_n > tail_len + 1) {
@@ -302,6 +587,481 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
             memcpy(dst + len, OBS_TRUNC_TAIL, tail_len + 1);
         }
     }
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
+    const char *src,
+    char *dst,
+    size_t dst_n
+) {
+    obs_escape_sql_bounded(src, src ? strlen(src) : 0, dst, dst_n, OBS_SQL_CAP);
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API uint64_t obs_sql_corr_key(
+    const char *sql,
+    size_t len
+) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    size_t i;
+
+    if (!sql) return hash;
+    for (i = 0; i < len; i++) {
+        hash ^= (unsigned char)sql[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static void obs_connection_state_free(void *arg) {
+    sqlite3_free(arg);
+}
+
+static int obs_corr_set_init(obs_corr_set *set) {
+    memset(set, 0, sizeof(*set));
+    atomic_init(&set->count, 0u);
+    return pthread_mutex_init(&set->mutex, NULL) == 0;
+}
+
+static void obs_corr_state_free(void *arg) {
+    obs_corr_state *state = (obs_corr_state *)arg;
+    if (!state) return;
+    (void)pthread_mutex_destroy(&state->applied.mutex);
+    (void)pthread_mutex_destroy(&state->stmt.mutex);
+    sqlite3_free(state);
+}
+
+static obs_connection_state *obs_connection_state_get(sqlite3 *db, int create) {
+    obs_connection_state *state;
+    int rc;
+    size_t i;
+
+    if (!db) return NULL;
+    state = (obs_connection_state *)sqlite3_get_clientdata(db, OBS_CLIENTDATA_KEY);
+    if (state || !create) return state;
+    if (pthread_mutex_lock(&g_obs_corr_state_mutex) != 0) return NULL;
+    state = (obs_connection_state *)sqlite3_get_clientdata(db, OBS_CLIENTDATA_KEY);
+    if (state) {
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return state;
+    }
+    state = (obs_connection_state *)sqlite3_malloc64(sizeof(*state));
+    if (!state) {
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return NULL;
+    }
+    atomic_init(&state->index_missing_bits, 0u);
+    atomic_init(&state->corr_unavailable_bits, 0u);
+    for (i = 0; i < OBS_APPLIED_MODE_COUNT; i++) {
+        atomic_init(&state->applied_counts[i], 0u);
+    }
+    atomic_init(&state->stmt_count, 0u);
+    atomic_init(&state->corr_state, NULL);
+    rc = sqlite3_set_clientdata(
+        db, OBS_CLIENTDATA_KEY, state, obs_connection_state_free
+    );
+    if (rc != SQLITE_OK) {
+        sqlite3_free(state);
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return NULL;
+    }
+    (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+    return state;
+}
+
+static obs_corr_state *obs_corr_state_get(
+    sqlite3 *db,
+    obs_connection_state *connection,
+    int create
+) {
+    obs_corr_state *state;
+    int rc;
+
+    if (!db || !connection) return NULL;
+    state = atomic_load_explicit(&connection->corr_state, memory_order_acquire);
+    if (state || !create) return state;
+    if (pthread_mutex_lock(&g_obs_corr_state_mutex) != 0) return NULL;
+    state = atomic_load_explicit(&connection->corr_state, memory_order_acquire);
+    if (state) {
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return state;
+    }
+    state = (obs_corr_state *)sqlite3_get_clientdata(db, OBS_CORR_CLIENTDATA_KEY);
+    if (state) {
+        atomic_store_explicit(
+            &connection->corr_state, state, memory_order_release
+        );
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return state;
+    }
+    state = (obs_corr_state *)sqlite3_malloc64(sizeof(*state));
+    if (!state) {
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return NULL;
+    }
+    if (!obs_corr_set_init(&state->applied)) {
+        sqlite3_free(state);
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return NULL;
+    }
+    if (!obs_corr_set_init(&state->stmt)) {
+        (void)pthread_mutex_destroy(&state->applied.mutex);
+        sqlite3_free(state);
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return NULL;
+    }
+    rc = sqlite3_set_clientdata(
+        db, OBS_CORR_CLIENTDATA_KEY, state, obs_corr_state_free
+    );
+    if (rc != SQLITE_OK) {
+        obs_corr_state_free(state);
+        (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+        return NULL;
+    }
+    atomic_store_explicit(&connection->corr_state, state, memory_order_release);
+    (void)pthread_mutex_unlock(&g_obs_corr_state_mutex);
+    return state;
+}
+
+static size_t obs_corr_bucket(uint64_t corr) {
+    corr ^= corr >> 33;
+    corr *= UINT64_C(0xff51afd7ed558ccd);
+    corr ^= corr >> 33;
+    corr *= UINT64_C(0xc4ceb9fe1a85ec53);
+    corr ^= corr >> 33;
+    return (size_t)corr & (OBS_CORR_TABLE_CAP - 1u);
+}
+
+static enum obs_corr_result obs_corr_set_observe(
+    obs_corr_set *set,
+    uint64_t corr
+) {
+    size_t bucket;
+    size_t i;
+    unsigned int count;
+
+    if (!set || pthread_mutex_lock(&set->mutex) != 0) {
+        return OBS_CORR_UNAVAILABLE;
+    }
+    count = atomic_load_explicit(&set->count, memory_order_relaxed);
+    if (count >= OBS_CORR_SET_CAP) {
+        (void)pthread_mutex_unlock(&set->mutex);
+        return OBS_CORR_FULL;
+    }
+    bucket = obs_corr_bucket(corr);
+    for (i = 0; i < OBS_CORR_TABLE_CAP; i++) {
+        size_t slot = (bucket + i) & (OBS_CORR_TABLE_CAP - 1u);
+        if (!set->occupied[slot]) {
+            set->keys[slot] = corr;
+            set->occupied[slot] = 1u;
+            atomic_store_explicit(&set->count, count + 1u, memory_order_release);
+            (void)pthread_mutex_unlock(&set->mutex);
+            return OBS_CORR_NEW;
+        }
+        if (set->keys[slot] == corr) {
+            (void)pthread_mutex_unlock(&set->mutex);
+            return OBS_CORR_SEEN;
+        }
+    }
+    (void)pthread_mutex_unlock(&set->mutex);
+    return OBS_CORR_FULL;
+}
+
+static obs_corr_set *obs_corr_set_for_stream(
+    sqlite3 *db,
+    obs_connection_state *connection,
+    unsigned int unavailable_bit,
+    int applied
+) {
+    obs_corr_state *state;
+    obs_corr_set *set;
+    unsigned int unavailable;
+
+    if (!connection) return NULL;
+    unavailable = atomic_load_explicit(
+        &connection->corr_unavailable_bits, memory_order_acquire
+    );
+    if (unavailable & unavailable_bit) return NULL;
+    state = obs_corr_state_get(db, connection, 1);
+    if (!state) {
+        (void)atomic_fetch_or_explicit(
+            &connection->corr_unavailable_bits,
+            unavailable_bit,
+            memory_order_release
+        );
+        return NULL;
+    }
+    set = applied ? &state->applied : &state->stmt;
+    if (atomic_load_explicit(&set->count, memory_order_acquire) >=
+        OBS_CORR_SET_CAP) {
+        return NULL;
+    }
+    return set;
+}
+
+static unsigned int obs_index_missing_bit(const char *target, const char *mode) {
+    if (!target || !mode) return 0u;
+    if (strcmp(target, "plex") == 0) {
+        if (strcmp(mode, "taggings+membership") == 0) {
+            return OBS_INDEX_MISSING_PLEX_TAGGINGS;
+        }
+        if (strcmp(mode, "ondeck") == 0) return OBS_INDEX_MISSING_PLEX_ONDECK;
+        return 0u;
+    }
+    if (strcmp(target, "emby") != 0) return 0u;
+    if (strcmp(mode, "dashboard+episodes_latest") == 0) {
+        return OBS_INDEX_MISSING_EMBY_EPISODES;
+    }
+    if (strcmp(mode, "dashboard+movies_latest") == 0) {
+        return OBS_INDEX_MISSING_EMBY_MOVIES;
+    }
+    return 0u;
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API int obs_should_log_index_missing(
+    sqlite3 *db,
+    const char *target,
+    const char *mode
+) {
+    unsigned int bit;
+    obs_connection_state *state;
+    unsigned int previous;
+
+    if (obs_is_disabled()) return 0;
+    bit = obs_index_missing_bit(target, mode);
+    if (bit == 0u) return 1;
+    state = obs_connection_state_get(db, 1);
+    if (!state) return 1;
+    previous = atomic_fetch_or_explicit(
+        &state->index_missing_bits, bit, memory_order_relaxed
+    );
+    return (previous & bit) == 0u;
+}
+
+static int obs_applied_mode_index(const char *target, const char *mode) {
+    if (!target || !mode) return -1;
+    if (strcmp(target, "plex") == 0) {
+        if (strcmp(mode, "fts+tag_type") == 0) return OBS_APPLIED_PLEX_FTS;
+        if (strcmp(mode, "taggings+membership") == 0) return OBS_APPLIED_PLEX_TAGGINGS;
+        if (strcmp(mode, "ondeck") == 0) return OBS_APPLIED_PLEX_ONDECK;
+        return -1;
+    }
+    if (strcmp(target, "emby") != 0) return -1;
+    if (strcmp(mode, "fts+membership") == 0) return OBS_APPLIED_EMBY_FTS;
+    if (strcmp(mode, "fanout+browse") == 0) return OBS_APPLIED_EMBY_BROWSE;
+    if (strcmp(mode, "fanout+favorites") == 0) return OBS_APPLIED_EMBY_FAVORITES;
+    if (strcmp(mode, "fanout+links_search") == 0) return OBS_APPLIED_EMBY_LINKS_SEARCH;
+    if (strcmp(mode, "fanout+people") == 0) return OBS_APPLIED_EMBY_PEOPLE;
+    if (strcmp(mode, "fanout+resume") == 0) return OBS_APPLIED_EMBY_RESUME;
+    if (strcmp(mode, "fanout+resume_simple") == 0) return OBS_APPLIED_EMBY_RESUME_SIMPLE;
+    if (strcmp(mode, "fanout+similar") == 0) return OBS_APPLIED_EMBY_SIMILAR;
+    if (strcmp(mode, "dashboard+episodes_latest") == 0) {
+        return OBS_APPLIED_EMBY_EPISODES_LATEST;
+    }
+    if (strcmp(mode, "dashboard+movies_latest") == 0) {
+        return OBS_APPLIED_EMBY_MOVIES_LATEST;
+    }
+    return -1;
+}
+
+static int obs_log_capture_miss_full(
+    const char *target,
+    const char *mode,
+    const char *sub_reason,
+    sqlite3 *db,
+    const char *sql,
+    size_t len,
+    uint64_t corr
+) {
+    const char *fn = target && strcmp(target, "plex") == 0
+        ? "plex_fts_rewrite" : "emby_fts_rewrite";
+    char ts[32];
+    char *line;
+    size_t escaped_len;
+    size_t prefix_len;
+    size_t total;
+    size_t used;
+    int rc;
+
+    if (!obs_escaped_span_len(sql, len, &escaped_len)) return 0;
+    obs_timestamp(ts, sizeof(ts));
+    rc = snprintf(
+        NULL, 0,
+        "[sqlite3-builds-obs] %s %ld %ld %s "
+        "event=rewrite_skipped target=%s reason=capture_miss mode=%s "
+        "sub_reason=%s db=%p sql_len=%zu corr=%016" PRIx64 " sql=\"",
+        ts, (long)getpid(), obs_tid(), fn,
+        target ? target : "", mode ? mode : "", sub_reason ? sub_reason : "",
+        (void *)db, len, corr
+    );
+    if (rc < 0) return 0;
+    prefix_len = (size_t)rc;
+    if (prefix_len > SIZE_MAX - escaped_len ||
+        prefix_len + escaped_len > SIZE_MAX - 3u) {
+        return 0;
+    }
+    total = prefix_len + escaped_len + 3u;
+    line = (char *)sqlite3_malloc64((sqlite3_uint64)total);
+    if (!line) return 0;
+    rc = snprintf(
+        line, total,
+        "[sqlite3-builds-obs] %s %ld %ld %s "
+        "event=rewrite_skipped target=%s reason=capture_miss mode=%s "
+        "sub_reason=%s db=%p sql_len=%zu corr=%016" PRIx64 " sql=\"",
+        ts, (long)getpid(), obs_tid(), fn,
+        target ? target : "", mode ? mode : "", sub_reason ? sub_reason : "",
+        (void *)db, len, corr
+    );
+    if (rc < 0 || (size_t)rc != prefix_len) {
+        sqlite3_free(line);
+        return 0;
+    }
+    used = prefix_len;
+    used += obs_escape_span_exact(sql, len, line + used);
+    line[used++] = '"';
+    line[used++] = '\n';
+    line[used] = 0;
+    flockfile(stderr);
+    (void)fwrite(line, 1, used, stderr);
+    funlockfile(stderr);
+    sqlite3_free(line);
+    return 1;
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_capture_miss(
+    const char *target,
+    const char *mode,
+    const char *sub_reason,
+    sqlite3 *db,
+    const char *sql,
+    size_t len
+) {
+    char sqlbuf[OBS_SQL_CAP * 4 + sizeof(OBS_TRUNC_TAIL)];
+    uint64_t corr;
+
+    if (obs_is_disabled()) return;
+    corr = obs_sql_corr_key(sql, len);
+    if (obs_log_capture_miss_full(
+            target, mode, sub_reason, db, sql, len, corr
+        )) {
+        return;
+    }
+    obs_escape_sql_bounded(sql, len, sqlbuf, sizeof(sqlbuf), OBS_SQL_CAP);
+    obs_logf(
+        target && strcmp(target, "plex") == 0
+            ? "plex_fts_rewrite" : "emby_fts_rewrite",
+        "event=rewrite_skipped target=%s reason=capture_miss mode=%s "
+        "sub_reason=%s db=%p sql_len=%zu corr=%016" PRIx64 " sql=\"%s\"",
+        target ? target : "", mode ? mode : "", sub_reason ? sub_reason : "",
+        (void *)db, len, corr, sqlbuf
+    );
+}
+
+static void obs_emit_rewrite_applied(
+    const char *target,
+    const char *mode,
+    sqlite3 *db,
+    const char *sample,
+    uint64_t count,
+    const char *source,
+    size_t source_len,
+    const char *rewritten,
+    size_t rewritten_len,
+    uint64_t source_corr,
+    uint64_t corr
+) {
+    if (atomic_load_explicit(
+            &g_rewrite_applied_sql_disabled, memory_order_acquire
+        )) {
+        obs_logf(
+            target && strcmp(target, "plex") == 0
+                ? "plex_fts_rewrite" : "emby_fts_rewrite",
+            "event=rewrite_applied target=%s mode=%s db=%p sample=%s "
+            "count=%" PRIu64 " source_corr=%016" PRIx64 " corr=%016" PRIx64,
+            target ? target : "", mode ? mode : "", (void *)db, sample,
+            count, source_corr, corr
+        );
+        return;
+    }
+    {
+        char sourcebuf[OBS_SQL_CAP * 4 + sizeof(OBS_TRUNC_TAIL)];
+        char sqlbuf[OBS_SQL_CAP * 4 + sizeof(OBS_TRUNC_TAIL)];
+        obs_escape_sql_bounded(
+            source, source_len, sourcebuf, sizeof(sourcebuf), OBS_SQL_CAP
+        );
+        obs_escape_sql_bounded(
+            rewritten, rewritten_len, sqlbuf, sizeof(sqlbuf), OBS_SQL_CAP
+        );
+        obs_logf(
+            target && strcmp(target, "plex") == 0
+                ? "plex_fts_rewrite" : "emby_fts_rewrite",
+            "event=rewrite_applied target=%s mode=%s db=%p sample=%s "
+            "count=%" PRIu64 " source_corr=%016" PRIx64
+            " corr=%016" PRIx64 " source_sql=\"%s\" sql=\"%s\"",
+            target ? target : "", mode ? mode : "", (void *)db, sample,
+            count, source_corr, corr, sourcebuf, sqlbuf
+        );
+    }
+}
+
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_applied(
+    const char *target,
+    const char *mode,
+    sqlite3 *db,
+    const char *source,
+    size_t source_len,
+    const char *rewritten,
+    size_t rewritten_len
+) {
+    obs_connection_state *state;
+    obs_corr_set *corr_set = NULL;
+    enum obs_corr_result corr_result = OBS_CORR_UNAVAILABLE;
+    uint64_t count = 1u;
+    uint64_t source_corr;
+    uint64_t corr;
+    const char *sample = "first";
+    int mode_index;
+    int scheduled = 1;
+
+    if (obs_is_disabled()) return;
+    mode_index = obs_applied_mode_index(target, mode);
+    state = mode_index >= 0 ? obs_connection_state_get(db, 1) : NULL;
+    if (mode_index >= 0 && !state) return;
+    if (state) {
+        count = atomic_fetch_add_explicit(
+            &state->applied_counts[mode_index], 1u, memory_order_relaxed
+        ) + 1u;
+        if (count == 1u) {
+            sample = "first";
+        } else if (count % OBS_SAMPLE_PERIOD == 0u) {
+            sample = "periodic";
+        } else {
+            scheduled = 0;
+        }
+        corr_set = obs_corr_set_for_stream(
+            db, state, OBS_CORR_UNAVAILABLE_APPLIED, 1
+        );
+        if (!scheduled && !corr_set) return;
+    }
+    corr = obs_sql_corr_key(rewritten, rewritten_len);
+    if (corr_set) {
+        corr_result = obs_corr_set_observe(corr_set, corr);
+        if (corr_result == OBS_CORR_UNAVAILABLE) {
+            (void)atomic_fetch_or_explicit(
+                &state->corr_unavailable_bits,
+                OBS_CORR_UNAVAILABLE_APPLIED,
+                memory_order_release
+            );
+        }
+    }
+    if (!scheduled) {
+        if (corr_result != OBS_CORR_NEW) return;
+        sample = "new";
+    }
+    source_corr = obs_sql_corr_key(source, source_len);
+    obs_emit_rewrite_applied(
+        target, mode, db, sample, count,
+        source, source_len, rewritten, rewritten_len, source_corr, corr
+    );
 }
 
 static void obs_decode_open_flags(int flags, char *buf, size_t n) {
@@ -616,8 +1376,16 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned 
     sqlite3 *db;
     const char *sql;
     const char *file_name;
+    const char *sample;
+    uint64_t count;
+    uint64_t corr;
+    size_t sql_len;
     char file[4096];
     char sqlbuf[OBS_SQL_CAP + 256];
+    obs_connection_state *state;
+    obs_corr_set *corr_set = NULL;
+    enum obs_corr_result corr_result = OBS_CORR_UNAVAILABLE;
+    int scheduled = 1;
 
     if (runtime_optimize_in_progress()) return 0;
     (void)ctx;
@@ -628,11 +1396,59 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned 
      * threshold and can fire for every statement. */
     stmt = (sqlite3_stmt*)p;
     db = stmt ? sqlite3_db_handle(stmt) : NULL;
+    state = obs_connection_state_get(db, 1);
+    if (state) {
+        count = atomic_fetch_add_explicit(
+            &state->stmt_count, 1u, memory_order_relaxed
+        ) + 1u;
+        if (atomic_load_explicit(
+                &g_stmt_trace_sampling_disabled, memory_order_acquire
+            )) {
+            sample = "full";
+        } else if (count == 1u) {
+            sample = "first";
+        } else if (count % OBS_SAMPLE_PERIOD == 0u) {
+            sample = "periodic";
+        } else {
+            scheduled = 0;
+            sample = NULL;
+        }
+        if (!atomic_load_explicit(
+                &g_stmt_trace_sampling_disabled, memory_order_acquire
+            )) {
+            corr_set = obs_corr_set_for_stream(
+                db, state, OBS_CORR_UNAVAILABLE_STMT, 0
+            );
+            if (!scheduled && !corr_set) return 0;
+        }
+    } else {
+        return 0;
+    }
     sql = x ? (const char*)x : (stmt ? sqlite3_sql(stmt) : NULL);
+    sql_len = sql ? strlen(sql) : 0;
+    corr = obs_sql_corr_key(sql, sql_len);
+    if (corr_set) {
+        corr_result = obs_corr_set_observe(corr_set, corr);
+        if (corr_result == OBS_CORR_UNAVAILABLE) {
+            (void)atomic_fetch_or_explicit(
+                &state->corr_unavailable_bits,
+                OBS_CORR_UNAVAILABLE_STMT,
+                memory_order_release
+            );
+        }
+    }
+    if (!scheduled) {
+        if (corr_result != OBS_CORR_NEW) return 0;
+        sample = "new";
+    }
     file_name = db ? sqlite3_db_filename(db, "main") : NULL;
     obs_escape_unlimited(file_name, file, sizeof(file));
     obs_escape_sql(sql, sqlbuf, sizeof(sqlbuf));
-    obs_logf("trace_stmt", "event=SQLITE_TRACE_STMT db=%p stmt=%p file=\"%s\" sql=\"%s\"",
-             (void*)db, p, file, sqlbuf);
+    obs_logf(
+        "trace_stmt",
+        "event=SQLITE_TRACE_STMT db=%p stmt=%p sample=%s count=%" PRIu64
+        " file=\"%s\" sql_len=%zu corr=%016" PRIx64 " sql=\"%s\"",
+        (void*)db, p, sample, count, file, sql_len, corr, sqlbuf
+    );
     return 0;
 }

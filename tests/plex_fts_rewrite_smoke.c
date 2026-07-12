@@ -107,10 +107,13 @@ static const char *TAG_COLUMN_RHS_ONLY_SQL =
 #define ONDECK_HEAD \
     "select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.`index`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id="
 #define ONDECK_AFTER_SECTION " and grandparents.id in ("
+#define ONDECK_AFTER_THRESHOLD " and viewed_at > "
 #define ONDECK_AFTER_IDS " and metadata_item_settings.view_count>0  and metadata_item_views.account_id="
 #define ONDECK_AFTER_ACCOUNT " group by grandparents.id order by viewed_at desc"
 #define ONDECK_IDS "101,101,102"
+#define ONDECK_THRESHOLD "1500"
 #define ONDECK_SQL_BODY ONDECK_HEAD "2" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT
+#define ONDECK_THRESHOLD_SQL_BODY ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT
 
 static const char *ONDECK_SQL = ONDECK_SQL_BODY;
 static const char *ONDECK_SQL_REWRITTEN =
@@ -146,6 +149,66 @@ static const char *ONDECK_SQL_REWRITTEN =
     ") AS dshadow_on_deck_ranked\n"
     "WHERE dshadow_on_deck_rank=1\n"
     "ORDER BY viewed_at DESC, grandparents_id DESC;";
+static const char *ONDECK_THRESHOLD_SQL = ONDECK_THRESHOLD_SQL_BODY;
+static const char *ONDECK_THRESHOLD_SQL_REWRITTEN =
+    "SELECT grandparents_id AS id,\n"
+    "       originally_available_at AS originally_available_at,\n"
+    "       parent_index AS parent_index,\n"
+    "       metadata_item_views_index AS \"index\",\n"
+    "       viewed_at AS \"max(viewed_at)\",\n"
+    "       library_section_id AS library_section_id,\n"
+    "       grandparents_extra_data AS extra_data\n"
+    "FROM (\n"
+    "  SELECT grandparents.id AS grandparents_id,\n"
+    "         metadata_item_views.originally_available_at AS originally_available_at,\n"
+    "         metadata_item_views.parent_index AS parent_index,\n"
+    "         metadata_item_views.`index` AS metadata_item_views_index,\n"
+    "         metadata_item_views.viewed_at AS viewed_at,\n"
+    "         grandparents.library_section_id AS library_section_id,\n"
+    "         grandparentsSettings.extra_data AS grandparents_extra_data,\n"
+    "         row_number() OVER (PARTITION BY grandparents.id ORDER BY metadata_item_views.viewed_at DESC, metadata_item_views.id DESC, grandparentsSettings.id DESC, metadata_item_settings.id DESC) AS dshadow_on_deck_rank\n"
+    "  FROM metadata_items AS grandparents\n"
+    "  CROSS JOIN metadata_item_views\n"
+    "  JOIN metadata_item_settings\n"
+    "  JOIN metadata_item_settings AS grandparentsSettings\n"
+    "  WHERE grandparents.guid=metadata_item_views.grandparent_guid\n"
+    "    AND metadata_item_settings.guid=metadata_item_views.guid\n"
+    "    AND metadata_item_views.account_id=metadata_item_settings.account_id\n"
+    "    AND grandparentsSettings.guid=metadata_item_views.grandparent_guid\n"
+    "    AND metadata_item_views.account_id=grandparentsSettings.account_id\n"
+    "    AND metadata_item_views.library_section_id=2\n"
+    "    AND metadata_item_views.viewed_at > " ONDECK_THRESHOLD "\n"
+    "    AND metadata_item_settings.view_count>0\n"
+    "    AND metadata_item_views.account_id=42\n"
+    ") AS dshadow_on_deck_ranked\n"
+    "WHERE dshadow_on_deck_rank=1\n"
+    "ORDER BY viewed_at DESC, grandparents_id DESC;";
+static const char *ONDECK_THRESHOLD_PARAM_SECTION_SQL =
+    ONDECK_HEAD "?" ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_PARAM_ACCOUNT_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD ONDECK_AFTER_IDS "?" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_PARAM_BOTH_SQL =
+    ONDECK_HEAD "?" ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD ONDECK_AFTER_IDS "?" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_CROSS_PRODUCT_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_BIND_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD "?" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_NAMED_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD ":threshold" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_POSITIVE_SIGN_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD "+1500" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_NEGATIVE_SIGN_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD "-1500" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_DECIMAL_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD "1500.0" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_EXPRESSION_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD "1500+0" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_OVERFLOW_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD "9223372036854775808" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_NO_SELECTOR_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_THRESHOLD_WRONG_TAIL_SQL =
+    ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD ONDECK_AFTER_IDS "42 group by grandparents.id order by grandparents.id";
 static const char *ONDECK_LEFT_JOIN_SQL =
     "select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.`index`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid left join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id=2 and grandparents.id in (" ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_PARAM_LIST_SQL =
@@ -183,6 +246,12 @@ typedef struct auth_probe {
     int unlikely_calls;
     int deny_unlikely;
 } auth_probe;
+
+typedef struct ondeck_failure_probe {
+    int deny_row_number;
+    int deny_sqlite_master;
+    int denied_calls;
+} ondeck_failure_probe;
 
 typedef struct digest_result {
     int rows;
@@ -222,6 +291,57 @@ static void require_absent(const char *label, const char *got, const char *needl
     }
 }
 
+static void require_same_line(
+    const char *label,
+    const char *text,
+    const char *first,
+    const char *second
+) {
+    const char *line = text;
+
+    if (!text) {
+        failf("FAIL [%s]: text=(null)", label);
+    }
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        const char *first_match = strstr(line, first);
+        const char *second_match = strstr(line, second);
+        if (first_match && (!end || first_match < end) &&
+            second_match && (!end || second_match < end)) {
+            return;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    failf("FAIL [%s]: no line contains \"%s\" and \"%s\" in \"%s\"",
+          label, first, second, text ? text : "(null)");
+}
+
+static void require_no_same_line(
+    const char *label,
+    const char *text,
+    const char *first,
+    const char *second
+) {
+    const char *line = text;
+
+    if (!text) {
+        failf("FAIL [%s]: text=(null)", label);
+    }
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        const char *first_match = strstr(line, first);
+        const char *second_match = strstr(line, second);
+        if (first_match && (!end || first_match < end) &&
+            second_match && (!end || second_match < end)) {
+            failf("FAIL [%s]: line contains \"%s\" and unexpected \"%s\" in \"%s\"",
+                  label, first, second, text);
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+}
+
 static int count_occurrences(const char *haystack, const char *needle) {
     int count = 0;
     size_t needle_len = strlen(needle);
@@ -233,6 +353,17 @@ static int count_occurrences(const char *haystack, const char *needle) {
         p += needle_len;
     }
     return count;
+}
+
+static uint64_t sql_corr_key(const char *sql, size_t len) {
+    uint64_t hash = UINT64_C(14695981039346656037);
+    size_t i;
+
+    for (i = 0; i < len; i++) {
+        hash ^= (unsigned char)sql[i];
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
 }
 
 static void require_occurrences(const char *label, const char *got, const char *needle, int want) {
@@ -317,7 +448,8 @@ static int configure_obs_enabled_env(void) {
 static int configure_obs_ondeck_enabled_env(void) {
     return safe_setenv("SQLITE3_DISABLE_AUTOPRAGMA", "1") &&
            safe_setenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1") &&
-           safe_setenv("SQLITE3_DISABLE_STMT_TRACE", "1") &&
+           safe_setenv("SQLITE3_DISABLE_STMT_TRACE", "0") &&
+           safe_setenv("SQLITE3_DISABLE_STMT_TRACE_SAMPLING", "1") &&
            safe_unsetenv("SQLITE3_DISABLE_OBSERVABILITY") &&
            safe_setenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1") &&
            safe_setenv("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1") &&
@@ -605,6 +737,31 @@ static int authorizer_cb(
     return SQLITE_OK;
 }
 
+static int ondeck_failure_authorizer_cb(
+    void *ctx,
+    int action,
+    const char *p1,
+    const char *p2,
+    const char *db,
+    const char *trigger
+) {
+    ondeck_failure_probe *probe = (ondeck_failure_probe *)ctx;
+    (void)db;
+    (void)trigger;
+    if (probe->deny_row_number && action == SQLITE_FUNCTION &&
+        ((p1 && strcmp(p1, "row_number") == 0) ||
+         (p2 && strcmp(p2, "row_number") == 0))) {
+        probe->denied_calls++;
+        return SQLITE_DENY;
+    }
+    if (probe->deny_sqlite_master && action == SQLITE_READ && p1 &&
+        (strcmp(p1, "sqlite_master") == 0 || strcmp(p1, "sqlite_schema") == 0)) {
+        probe->denied_calls++;
+        return SQLITE_DENY;
+    }
+    return SQLITE_OK;
+}
+
 static sqlite3_stmt *prepare_entry(
     sqlite3 *db,
     const char *label,
@@ -656,6 +813,34 @@ static void expect_saved_sql_contains(
     sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, NULL);
     require_contains(label, sqlite3_sql(stmt), needle);
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static void expect_ondeck_static_negative(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    const char *unique_needle
+) {
+    require_occurrences(label, sql, unique_needle, 1);
+    expect_saved_sql(db, label, sql, -1, 2, sql);
+}
+
+static void expect_ondeck_authorizer_fallback(
+    sqlite3 *db,
+    const char *label,
+    int deny_row_number,
+    int deny_sqlite_master
+) {
+    ondeck_failure_probe probe = {deny_row_number, deny_sqlite_master, 0};
+
+    require_int(label,
+                sqlite3_set_authorizer(db, ondeck_failure_authorizer_cb, &probe),
+                SQLITE_OK);
+    expect_saved_sql(db, label, ONDECK_THRESHOLD_SQL, -1, 2, ONDECK_THRESHOLD_SQL);
+    require_int(label, sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
+    if (probe.denied_calls == 0) {
+        failf("FAIL [%s]: denied_calls=0 want=>0", label);
+    }
 }
 
 static void expect_rewritten_prepare_failed_skip_log(sqlite3 *db, const char *log_path) {
@@ -734,6 +919,12 @@ static void expect_ondeck_skip_log(
     close(log_fd);
 
     rc = sqlite3_prepare_v2(db, sql, -1, &stmt, &tail);
+    if (rc == SQLITE_OK) {
+        int step_rc;
+        while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        }
+        if (step_rc != SQLITE_DONE) rc = step_rc;
+    }
     fflush(stderr);
     if (dup2(saved_stderr, STDERR_FILENO) < 0) _exit(125);
     close(saved_stderr);
@@ -749,7 +940,7 @@ static void expect_ondeck_skip_log(
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
 }
 
-static void expect_tag_applied_log(sqlite3 *db, const char *log_path) {
+static void expect_tag_applied_log(sqlite3 *db, const char *log_path, int count) {
     sqlite3_stmt *stmt = NULL;
     const char *tail = NULL;
     int saved_stderr;
@@ -770,7 +961,19 @@ static void expect_tag_applied_log(sqlite3 *db, const char *log_path) {
     }
     close(log_fd);
 
-    rc = sqlite3_prepare_v2(db, TAG_BROWSE_SQL, -1, &stmt, &tail);
+    for (int i = 0; i < count; i++) {
+        const char *input_sql =
+            (i == 1 || i == 2) ? TAG_COUNT_SQL : TAG_BROWSE_SQL;
+        rc = sqlite3_prepare_v2(db, input_sql, -1, &stmt, &tail);
+        if (rc != SQLITE_OK) break;
+        require_contains("tag-applied-log/sql", sqlite3_sql(stmt), TAG_MEMBERSHIP_10);
+        if (tail != input_sql + strlen(input_sql)) {
+            failf("FAIL [tag-applied-log/tail]: tail_offset=%ld want=%ld",
+                  (long)(tail - input_sql), (long)strlen(input_sql));
+        }
+        require_int("tag-applied-log/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+        stmt = NULL;
+    }
     fflush(stderr);
     if (dup2(saved_stderr, STDERR_FILENO) < 0) _exit(125);
     close(saved_stderr);
@@ -778,12 +981,6 @@ static void expect_tag_applied_log(sqlite3 *db, const char *log_path) {
     if (rc != SQLITE_OK) {
         failf("FAIL [tag-applied-log/prepare]: rc=%d err=%s", rc, sqlite3_errmsg(db));
     }
-    require_contains("tag-applied-log/sql", sqlite3_sql(stmt), TAG_MEMBERSHIP_10);
-    if (tail != TAG_BROWSE_SQL + strlen(TAG_BROWSE_SQL)) {
-        failf("FAIL [tag-applied-log/tail]: tail_offset=%ld want=%ld",
-              (long)(tail - TAG_BROWSE_SQL), (long)strlen(TAG_BROWSE_SQL));
-    }
-    require_int("tag-applied-log/finalize", sqlite3_finalize(stmt), SQLITE_OK);
 }
 
 static void expect_legacy_authorizer(sqlite3 *db, int expect_rewrite) {
@@ -1252,6 +1449,8 @@ static int child_ondeck(void) {
     create_ondeck_index(db);
     expect_saved_sql(db, "ondeck-positive", ONDECK_SQL, -1, 2,
                      expect_rewrite ? ONDECK_SQL_REWRITTEN : ONDECK_SQL);
+    expect_saved_sql(db, "ondeck-variant-a-byte-identity", ONDECK_SQL, -1, 2,
+                     expect_rewrite ? ONDECK_SQL_REWRITTEN : ONDECK_SQL);
     if (expect_rewrite) expect_ondeck_rows(db);
     expect_saved_sql(db, "ondeck-left-join", ONDECK_LEFT_JOIN_SQL, -1, 2,
                      ONDECK_LEFT_JOIN_SQL);
@@ -1300,6 +1499,103 @@ static int child_ondeck(void) {
 
     cleanup_temp_dir();
     printf("PASS [ondeck]: expect_rewrite=%d\n", expect_rewrite);
+    return 0;
+}
+
+static int child_ondeck_threshold(void) {
+    const struct {
+        const char *label;
+        const char *sql;
+        const char *needle;
+    } negatives[] = {
+        {"ondeck-threshold-cross-product", ONDECK_THRESHOLD_CROSS_PRODUCT_SQL,
+         ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD},
+        {"ondeck-threshold-bind", ONDECK_THRESHOLD_BIND_SQL,
+         ONDECK_AFTER_THRESHOLD "?"},
+        {"ondeck-threshold-named", ONDECK_THRESHOLD_NAMED_SQL, ":threshold"},
+        {"ondeck-threshold-positive-sign", ONDECK_THRESHOLD_POSITIVE_SIGN_SQL, "+1500"},
+        {"ondeck-threshold-negative-sign", ONDECK_THRESHOLD_NEGATIVE_SIGN_SQL, "-1500"},
+        {"ondeck-threshold-decimal", ONDECK_THRESHOLD_DECIMAL_SQL, "1500.0"},
+        {"ondeck-threshold-expression", ONDECK_THRESHOLD_EXPRESSION_SQL, "1500+0"},
+        {"ondeck-threshold-overflow", ONDECK_THRESHOLD_OVERFLOW_SQL,
+         "9223372036854775808"},
+        {"ondeck-threshold-no-selector", ONDECK_NO_SELECTOR_SQL, ONDECK_AFTER_IDS},
+        {"ondeck-threshold-wrong-tail", ONDECK_THRESHOLD_WRONG_TAIL_SQL,
+         "order by grandparents.id"}
+    };
+    sqlite3 *db;
+    sqlite3 *missing_index_db;
+    int expect_rewrite;
+    size_t i;
+
+    configure_env_all("1", "1", "0");
+    make_temp_dir();
+    expect_rewrite = sqlite3_compileoption_used("ENABLE_ICU") != 0;
+    db = open_seeded_temp("com.plexapp.plugins.library.db");
+    create_ondeck_index(db);
+    expect_saved_sql(db, "ondeck-threshold-exact", ONDECK_THRESHOLD_SQL, -1, 2,
+                     expect_rewrite ? ONDECK_THRESHOLD_SQL_REWRITTEN : ONDECK_THRESHOLD_SQL);
+    expect_ondeck_bound_parity(db, "ondeck-threshold-inline", ONDECK_THRESHOLD_SQL,
+                               "metadata_item_views.viewed_at > " ONDECK_THRESHOLD,
+                               0, 0, 0, 0);
+    expect_ondeck_bound_parity(db, "ondeck-threshold-param-section",
+                               ONDECK_THRESHOLD_PARAM_SECTION_SQL,
+                               "library_section_id=?1", 1, 2, 0, 0);
+    expect_ondeck_bound_parity(db, "ondeck-threshold-param-account",
+                               ONDECK_THRESHOLD_PARAM_ACCOUNT_SQL,
+                               "account_id=?1", 1, 42, 0, 0);
+    expect_ondeck_bound_parity(db, "ondeck-threshold-param-both",
+                               ONDECK_THRESHOLD_PARAM_BOTH_SQL,
+                               "library_section_id=?1", 2, 2, 42, 0);
+    for (i = 0; i < sizeof(negatives) / sizeof(negatives[0]); i++) {
+        expect_ondeck_static_negative(
+            db, negatives[i].label, negatives[i].sql, negatives[i].needle
+        );
+    }
+    require_int("ondeck-threshold/close", sqlite3_close(db), SQLITE_OK);
+
+    missing_index_db = open_seeded_temp("com.plexapp.plugins.library.db");
+    expect_saved_sql(missing_index_db, "ondeck-threshold-missing-index",
+                     ONDECK_THRESHOLD_SQL, -1, 2, ONDECK_THRESHOLD_SQL);
+    require_int("ondeck-threshold/missing-index-close",
+                sqlite3_close(missing_index_db), SQLITE_OK);
+
+    cleanup_temp_dir();
+    printf("PASS [ondeck-threshold]: expect_rewrite=%d\n", expect_rewrite);
+    return 0;
+}
+
+static int child_ondeck_threshold_fail_open(void) {
+    sqlite3 *db;
+    int old_limit;
+    int constrained_limit;
+
+    configure_env_all("1", "1", "0");
+    make_temp_dir();
+    db = open_seeded_temp("com.plexapp.plugins.library.db");
+    create_ondeck_index(db);
+
+    if (strlen(ONDECK_THRESHOLD_SQL) >= (size_t)INT_MAX) {
+        failf("FATAL: On-Deck threshold SQL length exceeds int range");
+    }
+    constrained_limit = (int)strlen(ONDECK_THRESHOLD_SQL) + 1;
+    old_limit = sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, constrained_limit);
+    expect_saved_sql(db, "ondeck-threshold-build-fallback", ONDECK_THRESHOLD_SQL,
+                     -1, 2, ONDECK_THRESHOLD_SQL);
+    sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, old_limit);
+
+    if (sqlite3_compileoption_used("ENABLE_ICU") != 0) {
+        expect_ondeck_authorizer_fallback(
+            db, "ondeck-threshold-index-probe-fallback", 0, 1
+        );
+        expect_ondeck_authorizer_fallback(
+            db, "ondeck-threshold-rewritten-prepare-fallback", 1, 0
+        );
+    }
+
+    require_int("ondeck-threshold-fail-open/close", sqlite3_close(db), SQLITE_OK);
+    cleanup_temp_dir();
+    printf("PASS [ondeck-threshold-fail-open]\n");
     return 0;
 }
 
@@ -1364,9 +1660,17 @@ static int child_tag_applied_log(void) {
     unlink(log_path);
     db = open_seeded_temp("com.plexapp.plugins.library.db");
     create_tag_membership_index(db);
-    expect_tag_applied_log(db, log_path);
+    expect_tag_applied_log(db, log_path, 1025);
     log_text = read_text_file(log_path);
-    require_occurrences("tag-applied-log/rewrite-applied", log_text, needle, 1);
+    require_occurrences("tag-applied-log/rewrite-applied", log_text, needle, 3);
+    require_contains("tag-applied-log/first", log_text, "sample=first count=1");
+    require_contains("tag-applied-log/new", log_text, "sample=new count=2");
+    require_absent("tag-applied-log/repeated", log_text, "sample=new count=3");
+    require_contains("tag-applied-log/periodic", log_text, "sample=periodic count=1024");
+    require_contains("tag-applied-log/source", log_text, "source_sql=\"");
+    require_contains("tag-applied-log/source-corr", log_text, "source_corr=");
+    require_contains("tag-applied-log/rewritten-corr", log_text, " corr=");
+    require_occurrences("tag-applied-log/source-full", log_text, "source_sql=\"", 3);
     free(log_text);
     require_int("tag-applied-log/close", sqlite3_close(db), SQLITE_OK);
     unlink(log_path);
@@ -1375,10 +1679,132 @@ static int child_tag_applied_log(void) {
     return 0;
 }
 
-static int child_ondeck_capture_miss_log(void) {
+static int child_tag_applied_sql_suppressed(void) {
     sqlite3 *db;
     char log_path[512];
     char *log_text;
+    static const char *applied_needle =
+        "event=rewrite_applied target=plex mode=taggings+membership";
+
+    if (sqlite3_compileoption_used("ENABLE_ICU") == 0) {
+        printf("SKIP [tag-applied-sql-suppressed]: ENABLE_ICU=0\n");
+        return 0;
+    }
+    if (!configure_obs_tag_enabled_env() ||
+        !safe_setenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL", "1")) {
+        return 1;
+    }
+    make_temp_dir();
+    temp_path(log_path, sizeof(log_path), "tag-applied-suppressed.stderr");
+    unlink(log_path);
+    db = open_seeded_temp("com.plexapp.plugins.library.db");
+    create_tag_membership_index(db);
+    expect_tag_applied_log(db, log_path, 1024);
+    log_text = read_text_file(log_path);
+    require_contains("tag-applied-suppressed/first", log_text, "sample=first count=1");
+    require_contains("tag-applied-suppressed/new", log_text, "sample=new count=2");
+    require_contains(
+        "tag-applied-suppressed/periodic", log_text, "sample=periodic count=1024"
+    );
+    require_occurrences(
+        "tag-applied-suppressed/rewrite-applied", log_text,
+        applied_needle, 3
+    );
+    require_contains("tag-applied-suppressed/source-corr", log_text, "source_corr=");
+    require_contains("tag-applied-suppressed/rewritten-corr", log_text, " corr=");
+    require_absent("tag-applied-suppressed/source", log_text, " source_sql=\"");
+    require_absent("tag-applied-suppressed/rewritten", log_text, " sql=\"");
+    require_no_same_line(
+        "tag-applied-suppressed/source", log_text, applied_needle, " source_sql=\""
+    );
+    require_no_same_line(
+        "tag-applied-suppressed/rewritten", log_text, applied_needle, " sql=\""
+    );
+    free(log_text);
+    require_int("tag-applied-suppressed/close", sqlite3_close(db), SQLITE_OK);
+    unlink(log_path);
+    cleanup_temp_dir();
+    printf("PASS [tag-applied-sql-suppressed]\n");
+    return 0;
+}
+
+static int child_tag_index_log_dedup(void) {
+    sqlite3 *db;
+    ondeck_failure_probe probe = {0, 1, 0};
+    char log_path[512];
+    char *log_text;
+    static const char *missing =
+        "event=rewrite_skipped target=plex reason=index_missing mode=taggings+membership";
+    static const char *probe_error =
+        "event=rewrite_skipped target=plex reason=index_probe_error mode=taggings+membership";
+
+    if (sqlite3_compileoption_used("ENABLE_ICU") == 0) {
+        printf("SKIP [tag-index-log-dedup]: ENABLE_ICU=0\n");
+        return 0;
+    }
+    if (!configure_obs_tag_enabled_env()) return 1;
+    make_temp_dir();
+    temp_path(log_path, sizeof(log_path), "tag-index.stderr");
+    unlink(log_path);
+    db = open_seeded_temp("com.plexapp.plugins.library.db");
+    expect_ondeck_skip_log(db, log_path, "tag-index-missing-first", TAG_BROWSE_SQL);
+    log_text = read_text_file(log_path);
+    require_occurrences("tag-index-missing-first", log_text, missing, 1);
+    free(log_text);
+    expect_ondeck_skip_log(db, log_path, "tag-index-missing-repeat", TAG_BROWSE_SQL);
+    log_text = read_text_file(log_path);
+    require_occurrences("tag-index-missing-repeat", log_text, missing, 0);
+    free(log_text);
+    require_int("tag-index-missing/close-first", sqlite3_close(db), SQLITE_OK);
+    cleanup_temp_dir();
+
+    make_temp_dir();
+    db = open_seeded_temp("com.plexapp.plugins.library.db");
+    expect_ondeck_skip_log(db, log_path, "tag-index-missing-new-connection", TAG_BROWSE_SQL);
+    log_text = read_text_file(log_path);
+    require_occurrences("tag-index-missing-new-connection", log_text, missing, 1);
+    free(log_text);
+    require_int("tag-index-probe-error/authorizer",
+                sqlite3_set_authorizer(db, ondeck_failure_authorizer_cb, &probe),
+                SQLITE_OK);
+    expect_ondeck_skip_log(db, log_path, "tag-index-probe-error-first", TAG_BROWSE_SQL);
+    log_text = read_text_file(log_path);
+    require_occurrences("tag-index-probe-error-first", log_text, probe_error, 1);
+    free(log_text);
+    expect_ondeck_skip_log(db, log_path, "tag-index-probe-error-second", TAG_BROWSE_SQL);
+    log_text = read_text_file(log_path);
+    require_occurrences("tag-index-probe-error-second", log_text, probe_error, 1);
+    free(log_text);
+    require_int("tag-index-probe-error/authorizer-clear",
+                sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
+    require_int("tag-index-missing/close-second", sqlite3_close(db), SQLITE_OK);
+    unlink(log_path);
+    cleanup_temp_dir();
+    printf("PASS [tag-index-log-dedup]\n");
+    return 0;
+}
+
+static int child_ondeck_capture_miss_log(void) {
+    const struct {
+        const char *label;
+        const char *sql;
+        const char *sub_reason;
+    } threshold_misses[] = {
+        {"ondeck-threshold-cross-product-log", ONDECK_THRESHOLD_CROSS_PRODUCT_SQL, "post_id"},
+        {"ondeck-threshold-bind-log", ONDECK_THRESHOLD_BIND_SQL, "threshold"},
+        {"ondeck-threshold-named-log", ONDECK_THRESHOLD_NAMED_SQL, "threshold"},
+        {"ondeck-threshold-positive-sign-log", ONDECK_THRESHOLD_POSITIVE_SIGN_SQL, "threshold"},
+        {"ondeck-threshold-negative-sign-log", ONDECK_THRESHOLD_NEGATIVE_SIGN_SQL, "threshold"},
+        {"ondeck-threshold-decimal-log", ONDECK_THRESHOLD_DECIMAL_SQL, "post_id"},
+        {"ondeck-threshold-expression-log", ONDECK_THRESHOLD_EXPRESSION_SQL, "post_id"},
+        {"ondeck-threshold-overflow-log", ONDECK_THRESHOLD_OVERFLOW_SQL, "threshold"},
+        {"ondeck-threshold-no-selector-log", ONDECK_NO_SELECTOR_SQL, "selector"},
+        {"ondeck-threshold-wrong-tail-log", ONDECK_THRESHOLD_WRONG_TAIL_SQL, "tail"}
+    };
+    sqlite3 *db;
+    char log_path[512];
+    char *log_text;
+    size_t i;
     static const char *capture_needle =
         "event=rewrite_skipped target=plex reason=capture_miss mode=ondeck";
 
@@ -1394,16 +1820,81 @@ static int child_ondeck_capture_miss_log(void) {
     expect_ondeck_skip_log(db, log_path, "ondeck-param-list-log", ONDECK_PARAM_LIST_SQL);
     log_text = read_text_file(log_path);
     require_occurrences("ondeck-param-list-log/rewrite-skipped", log_text, capture_needle, 1);
+    require_contains("ondeck-param-list-log/sub-reason", log_text, "sub_reason=id_list");
     free(log_text);
     expect_ondeck_skip_log(db, log_path, "ondeck-param-named-log", ONDECK_PARAM_NAMED_SQL);
     log_text = read_text_file(log_path);
     require_occurrences("ondeck-param-named-log/rewrite-skipped", log_text, capture_needle, 1);
+    require_contains("ondeck-param-named-log/sub-reason", log_text, "sub_reason=section");
     free(log_text);
     expect_ondeck_skip_log(db, log_path, "ondeck-param-leading-zero-log",
                            ONDECK_PARAM_LEADING_ZERO_SQL);
     log_text = read_text_file(log_path);
     require_occurrences("ondeck-param-leading-zero-log/rewrite-skipped",
                         log_text, capture_needle, 1);
+    require_contains("ondeck-param-leading-zero-log/sub-reason", log_text, "sub_reason=section");
+    free(log_text);
+    for (i = 0; i < sizeof(threshold_misses) / sizeof(threshold_misses[0]); i++) {
+        expect_ondeck_skip_log(
+            db, log_path, threshold_misses[i].label, threshold_misses[i].sql
+        );
+        log_text = read_text_file(log_path);
+        require_occurrences(
+            threshold_misses[i].label, log_text, capture_needle, 1
+        );
+        {
+            char metadata[160];
+            int rc = snprintf(
+                metadata, sizeof(metadata),
+                "sub_reason=%s db=", threshold_misses[i].sub_reason
+            );
+            if (rc < 0 || (size_t)rc >= sizeof(metadata)) {
+                failf("FATAL: capture metadata buffer overflow");
+            }
+            require_contains(threshold_misses[i].label, log_text, metadata);
+            require_same_line(
+                threshold_misses[i].label, log_text, capture_needle, metadata
+            );
+            rc = snprintf(
+                metadata, sizeof(metadata),
+                "sql_len=%lu corr=%016llx",
+                (unsigned long)strlen(threshold_misses[i].sql),
+                (unsigned long long)sql_corr_key(
+                    threshold_misses[i].sql, strlen(threshold_misses[i].sql)
+                )
+            );
+            if (rc < 0 || (size_t)rc >= sizeof(metadata)) {
+                failf("FATAL: capture correlation buffer overflow");
+            }
+            require_contains(threshold_misses[i].label, log_text, metadata);
+            require_same_line(
+                threshold_misses[i].label, log_text, capture_needle, metadata
+            );
+            require_same_line(
+                threshold_misses[i].label, log_text,
+                "event=SQLITE_TRACE_STMT", metadata
+            );
+            require_contains(threshold_misses[i].label, log_text, threshold_misses[i].sql);
+            require_same_line(
+                threshold_misses[i].label, log_text, capture_needle, " sql=\""
+            );
+            require_same_line(
+                threshold_misses[i].label, log_text,
+                capture_needle, threshold_misses[i].sql
+            );
+        }
+        free(log_text);
+    }
+    expect_ondeck_skip_log(db, log_path, "ondeck-early-head-miss", NONMATCH_SQL);
+    log_text = read_text_file(log_path);
+    require_absent("ondeck-early-head-miss", log_text, "reason=capture_miss");
+    require_same_line(
+        "ondeck-early-head-trace", log_text, "event=SQLITE_TRACE_STMT", " sql=\"select 1\""
+    );
+    require_no_same_line(
+        "ondeck-early-head-source", log_text,
+        "event=rewrite_skipped target=plex", " sql=\""
+    );
     free(log_text);
     require_int("ondeck-capture-miss-log/close", sqlite3_close(db), SQLITE_OK);
     unlink(log_path);
@@ -1425,12 +1916,18 @@ static int run_child_body(const char *name) {
     if (strcmp(name, "tag-env-one-disabled") == 0) return child_tag_env_case("1", "tag-env-one-disabled", 0);
     if (strcmp(name, "tag-env-garbage-disabled") == 0) return child_tag_env_case("false", "tag-env-garbage-disabled", 0);
     if (strcmp(name, "ondeck") == 0) return child_ondeck();
+    if (strcmp(name, "ondeck-threshold") == 0) return child_ondeck_threshold();
+    if (strcmp(name, "ondeck-threshold-fail-open") == 0) {
+        return child_ondeck_threshold_fail_open();
+    }
     if (strcmp(name, "ondeck-env-default") == 0) return child_ondeck_env_case(NULL, "ondeck-env-default", 0);
     if (strcmp(name, "ondeck-env-one-disabled") == 0) return child_ondeck_env_case("1", "ondeck-env-one-disabled", 0);
     if (strcmp(name, "ondeck-env-garbage-disabled") == 0) return child_ondeck_env_case("false", "ondeck-env-garbage-disabled", 0);
     if (strcmp(name, "skip-log") == 0) return child_skip_log();
     if (strcmp(name, "tag-applied-log") == 0) return child_tag_applied_log();
     if (strcmp(name, "ondeck-capture-miss-log") == 0) return child_ondeck_capture_miss_log();
+    if (strcmp(name, "tag-applied-sql-suppressed") == 0) return child_tag_applied_sql_suppressed();
+    if (strcmp(name, "tag-index-log-dedup") == 0) return child_tag_index_log_dedup();
     failf("FATAL: unknown child %s", name);
     return 1;
 }
@@ -1454,7 +1951,26 @@ static void run_exec_child(const char *name) {
     pid_t pid = fork();
     if (pid < 0) failf("FATAL: fork-exec(%s) failed: %s", name, strerror(errno));
     if (pid == 0) {
-        if (!configure_obs_enabled_env()) _exit(127);
+        if (strcmp(name, "ondeck-capture-miss-log") == 0) {
+            if (!configure_obs_ondeck_enabled_env() ||
+                !safe_unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")) {
+                _exit(127);
+            }
+        } else if (strcmp(name, "tag-applied-log") == 0 ||
+                   strcmp(name, "tag-applied-sql-suppressed") == 0 ||
+                   strcmp(name, "tag-index-log-dedup") == 0) {
+            if (!configure_obs_tag_enabled_env()) _exit(127);
+            if (strcmp(name, "tag-applied-sql-suppressed") == 0 &&
+                !safe_setenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL", "1")) {
+                _exit(127);
+            }
+            if (strcmp(name, "tag-applied-sql-suppressed") != 0 &&
+                !safe_unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")) {
+                _exit(127);
+            }
+        } else if (!configure_obs_enabled_env()) {
+            _exit(127);
+        }
         execlp(g_program_path, g_program_path, "--child", name, (char *)NULL);
         fprintf(stderr, "exec(%s) failed: %s\n", g_program_path, strerror(errno));
         _exit(127);
@@ -1481,16 +1997,22 @@ int main(int argc, char **argv) {
     run_child("tag-env-one-disabled");
     run_child("tag-env-garbage-disabled");
     run_child("ondeck");
+    run_child("ondeck-threshold");
+    run_child("ondeck-threshold-fail-open");
     run_child("ondeck-env-default");
     run_child("ondeck-env-one-disabled");
     run_child("ondeck-env-garbage-disabled");
     if (sqlite3_compileoption_used("ENABLE_ICU") != 0) {
         run_exec_child("skip-log");
         run_exec_child("tag-applied-log");
+        run_exec_child("tag-applied-sql-suppressed");
+        run_exec_child("tag-index-log-dedup");
         run_exec_child("ondeck-capture-miss-log");
     } else {
         printf("SKIP [skip-log]: ENABLE_ICU=0\n");
         printf("SKIP [tag-applied-log]: ENABLE_ICU=0\n");
+        printf("SKIP [tag-applied-sql-suppressed]: ENABLE_ICU=0\n");
+        printf("SKIP [tag-index-log-dedup]: ENABLE_ICU=0\n");
         printf("SKIP [ondeck-capture-miss-log]: ENABLE_ICU=0\n");
     }
     printf("plex fts rewrite smoke passed\n");

@@ -134,7 +134,7 @@ For `library`, it builds `sqlite3.c` plus `/app/auto_extension.c`,
 `/app/runtime_optimize.c`, `/app/observability.c`,
 `/app/slow_query_tracker.c`, `/app/fts_lex.c`,
 `/app/plex_fts_rewrite.c`, and `/app/emby_fts_rewrite.c`, with
-`/app/auto_extension_internal.h`, `/app/fts_lex.h`,
+`/app/auto_extension_internal.h`, `/app/observability.h`, `/app/fts_lex.h`,
 `/app/plex_fts_rewrite.h`, and `/app/emby_fts_rewrite.h` as private headers,
 links a shared object, applies library-only feature defaults, and writes
 `dist/libsqlite3.so`.
@@ -175,7 +175,8 @@ build then compiles `sqlite3.c`, `/app/auto_extension.c`,
 `/app/slow_query_tracker.c`, `/app/fts_lex.c`,
 `/app/plex_fts_rewrite.c`, and `/app/emby_fts_rewrite.c`;
 `/app/auto_extension_internal.h` is the auto-extension/runtime-optimize seam
-header, `/app/fts_lex.h` is the shared FTS rewrite lexer header,
+header, `/app/observability.h` is the shared observability seam header,
+`/app/fts_lex.h` is the shared FTS rewrite lexer header,
 `/app/plex_fts_rewrite.h` is the Plex prepare-wrapper/rewrite seam header, and
 `/app/emby_fts_rewrite.h` is the Emby prepare-wrapper/rewrite seam header.
 `/app/auto_extension.c` keeps open-time registration, trace-mask setup,
@@ -216,7 +217,7 @@ by Buildx.
 
 It copies `build/Build.sh`,
 `src/auto_extension.c`, `src/runtime_optimize.c`,
-`src/auto_extension_internal.h`, `src/observability.c`,
+`src/auto_extension_internal.h`, `src/observability.c`, `src/observability.h`,
 `src/slow_query_tracker.c`, `src/fts_lex.c`, `src/fts_lex.h`,
 `src/plex_fts_rewrite.c`, `src/plex_fts_rewrite.h`,
 `src/emby_fts_rewrite.c`, `src/emby_fts_rewrite.h`, `tests/`,

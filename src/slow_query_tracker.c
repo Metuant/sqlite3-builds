@@ -1,4 +1,5 @@
 #include "auto_extension_internal.h"
+#include "observability.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -32,9 +33,6 @@ typedef uint64_t slow_accum_t;
 #define SLOW_QUERY_HAVE_INT128 0
 #endif
 
-__attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void);
-__attribute__((visibility("hidden"))) SQLITE_API int obs_trace_stmt_cb(unsigned trace, void *ctx, void *p, void *x);
-__attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, const char *fmt, ...);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_is_disabled_cached(void);
 

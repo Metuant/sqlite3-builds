@@ -1,5 +1,7 @@
 /* obs_* stubs for smokes that omit observability.c. */
 
+#include "observability.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
