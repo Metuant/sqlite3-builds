@@ -158,6 +158,7 @@ assert_unset GENERIC_SQLITE_BINARY
 assert_unset BACKUP_PATH
 assert_unset PLEX_OPTIMIZE_API
 assert_unset PLEX_PROCESS_BLOB_DB
+assert_unset PLEX_TRIM_FINISHED_SEASON_BLOBS
 assert_unset STATS_BANDWIDTH_RETAIN_DAYS
 
 [ "${_PAGE_SIZE:-}" = "16384" ] || {
@@ -284,6 +285,7 @@ GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
 BACKUP_PATH="$tmp/backups"
 PLEX_OPTIMIZE_API=0
 PLEX_PROCESS_BLOB_DB=0
+PLEX_TRIM_FINISHED_SEASON_BLOBS=0
 STATS_BANDWIDTH_RETAIN_DAYS=90
 return 42
 EOF_BAD_CONF
@@ -316,6 +318,7 @@ GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
 BACKUP_PATH="$tmp/backups"
 PLEX_OPTIMIZE_API=0
 PLEX_PROCESS_BLOB_DB=0
+PLEX_TRIM_FINISHED_SEASON_BLOBS=0
 STATS_BANDWIDTH_RETAIN_DAYS=90
 EOF_EARLY_FAIL_CONF
 rm -f "$tmp/docker-called" "$tmp/sqlite3-called" "$tmp/sqlite-ok-called"
@@ -385,6 +388,7 @@ GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
 BACKUP_PATH="$tmp/backups"
 PLEX_OPTIMIZE_API=0
 PLEX_PROCESS_BLOB_DB=0
+PLEX_TRIM_FINISHED_SEASON_BLOBS=0
 STATS_BANDWIDTH_RETAIN_DAYS=90
 EOF_GOOD_CONF
 rm -f "$tmp/docker-called" "$tmp/sqlite3-called" "$tmp/sqlite-ok-called"
@@ -415,6 +419,7 @@ GENERIC_SQLITE_BINARY="$tmp/bin/sqlite-ok"
 BACKUP_PATH="$tmp/backups"
 PLEX_OPTIMIZE_API=0
 PLEX_PROCESS_BLOB_DB=0
+PLEX_TRIM_FINISHED_SEASON_BLOBS=0
 STATS_BANDWIDTH_RETAIN_DAYS=90
 EOF_EMPTY_CONF
 rm -f "$tmp/docker-called" "$tmp/sqlite3-called" "$tmp/sqlite-ok-called"

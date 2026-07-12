@@ -150,8 +150,24 @@ static const char *ONDECK_LEFT_JOIN_SQL =
     "select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.`index`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid left join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id=2 and grandparents.id in (" ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_PARAM_LIST_SQL =
     ONDECK_HEAD "2" ONDECK_AFTER_SECTION "101,?" ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_SECTION_SQL =
+    ONDECK_HEAD "?" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_PARAM_ACCOUNT_SQL =
     ONDECK_HEAD "2" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "?" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_BOTH_SQL =
+    ONDECK_HEAD "?" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "?" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_REVERSED_SQL =
+    ONDECK_HEAD "?2" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "?1" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_HOLE_SQL =
+    ONDECK_HEAD "?2" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "?" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_REUSE_FORWARD_SQL =
+    ONDECK_HEAD "?1" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "?1" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_REUSE_REVERSE_SQL =
+    ONDECK_HEAD "?" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "?1" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_LEADING_ZERO_SQL =
+    ONDECK_HEAD "?01" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
+static const char *ONDECK_PARAM_NAMED_SQL =
+    ONDECK_HEAD ":section" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_DUP_ACCOUNT_SQL =
     ONDECK_HEAD "2" ONDECK_AFTER_SECTION ONDECK_IDS ")" ONDECK_AFTER_IDS "42 and metadata_item_views.account_id=43" ONDECK_AFTER_ACCOUNT;
 static const char *ONDECK_MISSING_VIEWCOUNT_SQL =
@@ -433,15 +449,18 @@ static void setup_schema(sqlite3 *db) {
         "(1001,'plex://episode/1','plex://grandparent/101',42,2,101,1,1,1000),"
         "(1002,'plex://episode/2','plex://grandparent/101',42,2,102,2,2,2000),"
         "(1003,'plex://episode/3','plex://grandparent/101',42,2,103,3,3,2000),"
-        "(1004,'plex://episode/4','plex://grandparent/102',42,2,104,4,4,1500);"
+        "(1004,'plex://episode/4','plex://grandparent/102',42,2,104,4,4,1500),"
+        "(1005,'plex://episode/5','plex://grandparent/102',2,2,105,5,5,1400);"
         "INSERT INTO metadata_item_settings(id,account_id,guid,view_count,extra_data) VALUES"
         "(201,42,'plex://episode/1',1,'episode-1'),"
         "(202,42,'plex://episode/2',1,'episode-2'),"
         "(203,42,'plex://episode/3',1,'episode-3'),"
         "(204,42,'plex://episode/4',1,'episode-4'),"
+        "(205,2,'plex://episode/5',1,'episode-5'),"
         "(301,42,'plex://grandparent/101',1,'gp101-a'),"
         "(302,42,'plex://grandparent/101',1,'gp101-b'),"
-        "(303,42,'plex://grandparent/102',1,'gp102');"
+        "(303,42,'plex://grandparent/102',1,'gp102'),"
+        "(304,2,'plex://grandparent/102',1,'gp102-account-2');"
     );
 }
 
@@ -465,6 +484,84 @@ static sqlite3_stmt *prepare_entry(
     int entry,
     const char **tail
 );
+static sqlite3 *open_seeded_temp(const char *basename);
+
+static void expect_ondeck_bound_parity(
+    sqlite3 *db,
+    const char *label,
+    const char *sql,
+    const char *rewrite_needle,
+    int expected_bind_count,
+    int bind1,
+    int bind2,
+    int bind3
+) {
+    sqlite3 *original_db = open_seeded_temp("not-target.db");
+    sqlite3_stmt *original = prepare_entry(original_db, label, sql, -1, 2, NULL);
+    sqlite3_stmt *rewritten = prepare_entry(db, label, sql, -1, 2, NULL);
+    int bind_values[] = {bind1, bind2, bind3};
+    int rows_seen = 0;
+    int i;
+
+    require_int(label, sqlite3_bind_parameter_count(original), expected_bind_count);
+    require_int(label, sqlite3_bind_parameter_count(rewritten), expected_bind_count);
+    if (sqlite3_compileoption_used("ENABLE_ICU") != 0) {
+        require_contains(label, sqlite3_sql(rewritten), rewrite_needle);
+        require_contains(label, sqlite3_sql(rewritten), "dshadow_on_deck_rank");
+    } else {
+        require_str_eq(label, sqlite3_sql(rewritten), sql);
+    }
+    for (i = 0; i < expected_bind_count; i++) {
+        require_int(label, sqlite3_bind_int(original, i + 1, bind_values[i]), SQLITE_OK);
+        require_int(label, sqlite3_bind_int(rewritten, i + 1, bind_values[i]), SQLITE_OK);
+    }
+    for (;;) {
+        int original_rc = sqlite3_step(original);
+        int rewritten_rc = sqlite3_step(rewritten);
+        int columns;
+
+        if (original_rc != rewritten_rc) {
+            failf("FAIL [%s/step]: original_rc=%d rewritten_rc=%d", label,
+                  original_rc, rewritten_rc);
+        }
+        if (original_rc == SQLITE_DONE) break;
+        if (original_rc != SQLITE_ROW) {
+            failf("FAIL [%s/step]: rc=%d want=SQLITE_ROW or SQLITE_DONE", label, original_rc);
+        }
+        rows_seen++;
+        columns = sqlite3_column_count(original);
+        require_int(label, sqlite3_column_count(rewritten), columns);
+        for (i = 0; i < columns; i++) {
+            if (i != 0 && i != 4 && i != 5) continue;
+            {
+                int original_type = sqlite3_column_type(original, i);
+                int rewritten_type = sqlite3_column_type(rewritten, i);
+                int original_bytes = sqlite3_column_bytes(original, i);
+                int rewritten_bytes = sqlite3_column_bytes(rewritten, i);
+                const void *original_value = sqlite3_column_blob(original, i);
+                const void *rewritten_value = sqlite3_column_blob(rewritten, i);
+
+                if (original_type != rewritten_type) {
+                    failf("FAIL [%s/column-type]: column=%d original=%d rewritten=%d",
+                          label, i, original_type, rewritten_type);
+                }
+                if (original_bytes != rewritten_bytes) {
+                    failf("FAIL [%s/column-bytes]: column=%d original=%d rewritten=%d",
+                          label, i, original_bytes, rewritten_bytes);
+                }
+                if (original_bytes > 0 &&
+                    memcmp(original_value, rewritten_value, (size_t)original_bytes) != 0) {
+                    failf("FAIL [%s/column-value]: column=%d byte_count=%d differs",
+                          label, i, original_bytes);
+                }
+            }
+        }
+    }
+    if (rows_seen == 0) failf("FAIL [%s/rows]: got=0 want=>0", label);
+    require_int(label, sqlite3_finalize(original), SQLITE_OK);
+    require_int(label, sqlite3_finalize(rewritten), SQLITE_OK);
+    require_int(label, sqlite3_close(original_db), SQLITE_OK);
+}
 
 static void expect_ondeck_rows(sqlite3 *db) {
     sqlite3_stmt *stmt = prepare_entry(db, "ondeck-rows", ONDECK_SQL, -1, 2, NULL);
@@ -610,7 +707,12 @@ static void expect_rewritten_prepare_failed_skip_log(sqlite3 *db, const char *lo
     require_int("skip-log/finalize", sqlite3_finalize(stmt), SQLITE_OK);
 }
 
-static void expect_ondeck_capture_miss_skip_log(sqlite3 *db, const char *log_path) {
+static void expect_ondeck_skip_log(
+    sqlite3 *db,
+    const char *log_path,
+    const char *label,
+    const char *sql
+) {
     sqlite3_stmt *stmt = NULL;
     const char *tail = NULL;
     int saved_stderr;
@@ -631,21 +733,20 @@ static void expect_ondeck_capture_miss_skip_log(sqlite3 *db, const char *log_pat
     }
     close(log_fd);
 
-    rc = sqlite3_prepare_v2(db, ONDECK_PARAM_LIST_SQL, -1, &stmt, &tail);
+    rc = sqlite3_prepare_v2(db, sql, -1, &stmt, &tail);
     fflush(stderr);
     if (dup2(saved_stderr, STDERR_FILENO) < 0) _exit(125);
     close(saved_stderr);
 
     if (rc != SQLITE_OK) {
-        failf("FAIL [ondeck-capture-miss-log/prepare]: rc=%d err=%s",
-              rc, sqlite3_errmsg(db));
+        failf("FAIL [%s/prepare]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
     }
-    require_str_eq("ondeck-capture-miss-log/sql", sqlite3_sql(stmt), ONDECK_PARAM_LIST_SQL);
-    if (tail != ONDECK_PARAM_LIST_SQL + strlen(ONDECK_PARAM_LIST_SQL)) {
-        failf("FAIL [ondeck-capture-miss-log/tail]: tail_offset=%ld want=%ld",
-              (long)(tail - ONDECK_PARAM_LIST_SQL), (long)strlen(ONDECK_PARAM_LIST_SQL));
+    require_str_eq(label, sqlite3_sql(stmt), sql);
+    if (tail != sql + strlen(sql)) {
+        failf("FAIL [%s/tail]: tail_offset=%ld want=%ld",
+              label, (long)(tail - sql), (long)strlen(sql));
     }
-    require_int("ondeck-capture-miss-log/finalize", sqlite3_finalize(stmt), SQLITE_OK);
+    require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
 }
 
 static void expect_tag_applied_log(sqlite3 *db, const char *log_path) {
@@ -1156,8 +1257,24 @@ static int child_ondeck(void) {
                      ONDECK_LEFT_JOIN_SQL);
     expect_saved_sql(db, "ondeck-param-list", ONDECK_PARAM_LIST_SQL, -1, 2,
                      ONDECK_PARAM_LIST_SQL);
-    expect_saved_sql(db, "ondeck-param-account", ONDECK_PARAM_ACCOUNT_SQL, -1, 2,
-                     ONDECK_PARAM_ACCOUNT_SQL);
+    expect_ondeck_bound_parity(db, "ondeck-param-section", ONDECK_PARAM_SECTION_SQL,
+                               "library_section_id=?1", 1, 2, 42, 0);
+    expect_ondeck_bound_parity(db, "ondeck-param-account", ONDECK_PARAM_ACCOUNT_SQL,
+                               "account_id=?1", 1, 42, 2, 0);
+    expect_ondeck_bound_parity(db, "ondeck-param-both", ONDECK_PARAM_BOTH_SQL,
+                               "library_section_id=?1", 2, 2, 42, 0);
+    expect_ondeck_bound_parity(db, "ondeck-param-reversed", ONDECK_PARAM_REVERSED_SQL,
+                               "library_section_id=?2", 2, 42, 2, 0);
+    expect_ondeck_bound_parity(db, "ondeck-param-hole", ONDECK_PARAM_HOLE_SQL,
+                               "account_id=?3", 3, 0, 2, 42);
+    expect_ondeck_bound_parity(db, "ondeck-param-reuse-forward",
+                               ONDECK_PARAM_REUSE_FORWARD_SQL,
+                               "account_id=?1", 1, 2, 2, 0);
+    expect_ondeck_bound_parity(db, "ondeck-param-reuse-reverse",
+                               ONDECK_PARAM_REUSE_REVERSE_SQL,
+                               "account_id=?1", 1, 2, 2, 0);
+    expect_saved_sql(db, "ondeck-param-leading-zero", ONDECK_PARAM_LEADING_ZERO_SQL, -1, 2,
+                     ONDECK_PARAM_LEADING_ZERO_SQL);
     expect_saved_sql(db, "ondeck-duplicate-account", ONDECK_DUP_ACCOUNT_SQL, -1, 2,
                      ONDECK_DUP_ACCOUNT_SQL);
     expect_saved_sql(db, "ondeck-missing-viewcount", ONDECK_MISSING_VIEWCOUNT_SQL, -1, 2,
@@ -1262,7 +1379,7 @@ static int child_ondeck_capture_miss_log(void) {
     sqlite3 *db;
     char log_path[512];
     char *log_text;
-    static const char *needle =
+    static const char *capture_needle =
         "event=rewrite_skipped target=plex reason=capture_miss mode=ondeck";
 
     if (sqlite3_compileoption_used("ENABLE_ICU") == 0) {
@@ -1274,9 +1391,19 @@ static int child_ondeck_capture_miss_log(void) {
     temp_path(log_path, sizeof(log_path), "ondeck-capture-miss.stderr");
     unlink(log_path);
     db = open_seeded_temp("com.plexapp.plugins.library.db");
-    expect_ondeck_capture_miss_skip_log(db, log_path);
+    expect_ondeck_skip_log(db, log_path, "ondeck-param-list-log", ONDECK_PARAM_LIST_SQL);
     log_text = read_text_file(log_path);
-    require_occurrences("ondeck-capture-miss-log/rewrite-skipped", log_text, needle, 1);
+    require_occurrences("ondeck-param-list-log/rewrite-skipped", log_text, capture_needle, 1);
+    free(log_text);
+    expect_ondeck_skip_log(db, log_path, "ondeck-param-named-log", ONDECK_PARAM_NAMED_SQL);
+    log_text = read_text_file(log_path);
+    require_occurrences("ondeck-param-named-log/rewrite-skipped", log_text, capture_needle, 1);
+    free(log_text);
+    expect_ondeck_skip_log(db, log_path, "ondeck-param-leading-zero-log",
+                           ONDECK_PARAM_LEADING_ZERO_SQL);
+    log_text = read_text_file(log_path);
+    require_occurrences("ondeck-param-leading-zero-log/rewrite-skipped",
+                        log_text, capture_needle, 1);
     free(log_text);
     require_int("ondeck-capture-miss-log/close", sqlite3_close(db), SQLITE_OK);
     unlink(log_path);

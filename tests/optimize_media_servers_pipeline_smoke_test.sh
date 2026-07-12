@@ -6,6 +6,11 @@ cd "$repo_root"
 
 . ./scripts/optimize_media_servers.sh
 
+if grep -E '^[[:space:]]*"PRAGMA temp_store=(MEMORY|2);"[[:space:]]*\\$' scripts/optimize_media_servers.sh >/dev/null; then
+  printf 'FATAL: maintenance script still forces MEMORY temp storage for VACUUM\n' >&2
+  exit 1
+fi
+
 tmp_parent="${TMPDIR:-/tmp}"
 tmp="$(mktemp -d "${tmp_parent%/}/sqlite3-optimize-pipeline.XXXXXX" 2>/dev/null || mktemp -d /tmp/sqlite3-optimize-pipeline.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT
@@ -154,10 +159,22 @@ mkdir -p "$tmp/bin"
 cat > "$tmp/bin/sqlite3" <<'EOF_SQLITE'
 #!/usr/bin/env bash
 sql_text=""
+stdin_sql=""
+if [ ! -t 0 ]; then
+  stdin_sql="$(cat)"
+fi
 for arg in "$@"; do
   sql_text="${sql_text}${arg}
 "
 done
+sql_text="${sql_text}${stdin_sql}"
+
+case "$sql_text" in
+  *"VACUUM"*)
+    printf '%s\n' "$sql_text" | tr '\n' ' ' >> "$SQLITE_VACUUM_LOG"
+    printf '\n' >> "$SQLITE_VACUUM_LOG"
+    ;;
+esac
 
 case "$sql_text" in
   *"VALUES('rebuild')"*|*"VALUES('optimize')"*)
@@ -197,6 +214,15 @@ if [ "${FAIL_REBUILD:-0}" = "1" ]; then
   done
 fi
 
+if [ -n "${TRIM_BAD_INTEGRITY_MARKER:-}" ] && [ -e "$TRIM_BAD_INTEGRITY_MARKER" ]; then
+  case "$sql_text" in
+    *"PRAGMA integrity_check;"*)
+      printf 'not ok\n'
+      exit 0
+      ;;
+  esac
+fi
+
 for arg in "$@"; do
   case "$arg" in
     *"VACUUM INTO "*)
@@ -213,6 +239,17 @@ for arg in "$@"; do
   esac
 done
 
+if [ -n "$stdin_sql" ]; then
+  printf '%s\n' "$stdin_sql" | "$REAL_SQLITE" "$@"
+  rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "${TRIM_BAD_INTEGRITY_MARKER:-}" ]; then
+    case "$stdin_sql" in
+      *"DELETE FROM blobs"*) : > "$TRIM_BAD_INTEGRITY_MARKER" ;;
+    esac
+  fi
+  exit "$rc"
+fi
+
 exec "$REAL_SQLITE" "$@"
 EOF_SQLITE
 chmod +x "$tmp/bin/sqlite3"
@@ -227,15 +264,17 @@ export PATH REAL_SQLITE="$real_sqlite"
 export SQLITE_CALL_LOG="$tmp/sqlite-calls.log"
 export SQLITE_INTEGRITY_LOG="$tmp/sqlite-integrity.log"
 export SQLITE_MAINTENANCE_LOG="$tmp/sqlite-maintenance.log"
+export SQLITE_VACUUM_LOG="$tmp/sqlite-vacuum.log"
 : > "$SQLITE_CALL_LOG"
 : > "$SQLITE_INTEGRITY_LOG"
 : > "$SQLITE_MAINTENANCE_LOG"
+: > "$SQLITE_VACUUM_LOG"
 
 backup_dir="$tmp/backups"
 mkdir -p "$backup_dir"
 
 run_rebuild_capture() {
-  local name binary db page_size auto_vacuum sanity post_sql hook
+  local name binary db page_size auto_vacuum sanity post_sql hook final_hook
   name="$1"
   binary="$2"
   db="$3"
@@ -244,11 +283,12 @@ run_rebuild_capture() {
   sanity="$6"
   post_sql="$7"
   hook="$8"
+  final_hook="${9:-}"
   set +e
   (
     cd "$repo_root"
     . ./scripts/optimize_media_servers.sh
-    rebuild_db_vacuum_into "$binary" "$db" "$backup_dir" "$page_size" "$auto_vacuum" "$sanity" "$post_sql" "$hook"
+    rebuild_db_vacuum_into "$binary" "$db" "$backup_dir" "$page_size" "$auto_vacuum" "$sanity" "$post_sql" "$hook" "" "" "$final_hook"
   ) >"$tmp/${name}.out" 2>"$tmp/${name}.err"
   rc=$?
   set -e
@@ -368,6 +408,42 @@ VALUES
   (1, 10, 100, 86400, CAST(STRFTIME('%s','now','-120 days') AS INTEGER), 0, 1000),
   (2, 10, 100, 86400, CAST(STRFTIME('%s','now','-10 days') AS INTEGER), 0, 2000),
   (3, NULL, 100, 86400, CAST(STRFTIME('%s','now','-10 days') AS INTEGER), 0, 3000);
+EOF_SQL
+}
+
+create_trim_main_db() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" <<'EOF_SQL'
+CREATE TABLE metadata_items(id INTEGER PRIMARY KEY,parent_id INTEGER,metadata_type INTEGER,originally_available_at,added_at);
+CREATE TABLE media_items(id INTEGER PRIMARY KEY,metadata_item_id INTEGER);
+CREATE TABLE media_parts(id INTEGER PRIMARY KEY,media_item_id INTEGER);
+INSERT INTO metadata_items VALUES
+  (10,NULL,3,NULL,NULL),
+  (11,10,4,CAST(strftime('%s','now','-25 months') AS INTEGER),NULL);
+INSERT INTO media_items VALUES(110,11);
+INSERT INTO media_parts VALUES(100,110);
+EOF_SQL
+}
+
+create_trim_blob_db() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" <<'EOF_SQL'
+PRAGMA user_version=4101;
+PRAGMA application_id=123456789;
+CREATE TABLE blobs(
+  id INTEGER PRIMARY KEY,
+  blob BLOB,
+  linked_type TEXT,
+  linked_id INTEGER,
+  linked_guid TEXT,
+  created_at INTEGER,
+  blob_type INTEGER,
+  UNIQUE(linked_type,linked_id,blob_type),
+  UNIQUE(linked_type,linked_guid,blob_type)
+);
+INSERT INTO blobs VALUES(1,X'01','media_part',100,'g100',1,5);
 EOF_SQL
 }
 
@@ -522,6 +598,22 @@ rc="$(cat "$tmp/plex-blob.rc")"
 assert_not_contains "$(cat "$tmp/plex-blob.out")" "Deflating Plex statistics_bandwidth" "Plex blob no deflate log"
 assert_eq "1,2,3" "$("$real_sqlite" "$plex_blob" "SELECT group_concat(id, ',') FROM (SELECT id FROM statistics_bandwidth ORDER BY id);")" "Plex blob retained stats ids"
 
+final_hook_plex_dir="$tmp/final-hook-plex"
+mkdir -p "$final_hook_plex_dir"
+plex_databases_path="$final_hook_plex_dir"
+create_trim_main_db "$plex_databases_path/$_PLEX_DB"
+final_hook_blob="$plex_databases_path/$_PLEX_BLOB_DB"
+create_trim_blob_db "$final_hook_blob"
+final_hook_live_hash_before="$(sha256_file "$final_hook_blob")"
+export TRIM_BAD_INTEGRITY_MARKER="$tmp/trim-bad-integrity.marker"
+run_rebuild_capture final-trim-integrity sqlite3 "$final_hook_blob" 4096 NONE "" "" "" "try_trim_plex_finished_season_blobs"
+unset TRIM_BAD_INTEGRITY_MARKER
+assert_eq 1 "$(cat "$tmp/final-trim-integrity.rc")" "final trim integrity pipeline rc"
+assert_contains "$(cat "$tmp/final-trim-integrity.err")" "post-trim DB failed integrity_check" "final trim integrity diagnostic"
+assert_contains "$(cat "$tmp/final-trim-integrity.err")" "final pre-publication hook failed" "final trim hook abort diagnostic"
+assert_eq "$final_hook_live_hash_before" "$(sha256_file "$final_hook_blob")" "final trim integrity live hash"
+[ ! -e "$final_hook_blob.new" ] || fail "final trim integrity staged cleanup" "no staged file" "$final_hook_blob.new exists"
+
 emby="$tmp/emby-library.db"
 create_normal_fts_db "$emby"
 add_mediaitems_fixture "$emby"
@@ -552,6 +644,15 @@ assert_movies_vendor_eqp "$emby_vendor_eqp_before" "Emby pipeline before indexes
 assert_movies_vendor_eqp "$(movies_vendor_eqp "$emby")" "Emby pipeline after indexes"
 assert_eq "$emby_vendor_rows_before" "$(movies_rows "$emby" "$(movies_vendor_sql)")" "Emby pipeline vendor rows stable"
 assert_eq "$emby_vendor_rows_before" "$(movies_rows "$emby" "$(movies_c2_sql)")" "Emby pipeline C2/vendor full-row identity"
+
+[ -s "$SQLITE_VACUUM_LOG" ] || fail "pipeline VACUUM coverage" "non-empty log" "empty log"
+vacuum_policy_violations="$(awk '
+  index($0, "VACUUM") &&
+  (!index($0, "PRAGMA threads=8;") ||
+   index($0, "PRAGMA temp_store=MEMORY") ||
+   index($0, "PRAGMA temp_store=2")) { print }
+' "$SQLITE_VACUUM_LOG")"
+assert_eq "" "$vacuum_policy_violations" "all pipeline VACUUM calls retain threads and reject MEMORY temp_store"
 
 printf 'SKIP: Docker stopped-container gate cases require a live Docker daemon and are intentionally not run by this local helper smoke test\n'
 printf 'optimize_media_servers pipeline smoke tests passed\n'

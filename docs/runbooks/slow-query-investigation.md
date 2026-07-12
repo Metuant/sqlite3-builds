@@ -320,11 +320,15 @@ hand-roll a harness that omits any of them.
       `?`-form shape but not for the inlined shape, the matcher pattern must be
       adjusted to match the raw zSql.
 
-   **Root cause of the On-Deck capture-miss (2026-07-09):** The (f) On-Deck
-   rewrite candidate was validated against `sql_expanded` (which inlines
+   **Motivating example -- the On-Deck capture-miss (2026-07-09):** The original
+   (f) On-Deck rewrite was validated against `sql_expanded` (which inlines
    `library_section_id=123`), but the production `zSql` binds it as
-   `library_section_id=?`. The matcher string did not match the raw form,
-   producing 116/116 `capture_miss` on plex-backup-1.
+   `library_section_id=?`. The exact-literal matcher did not match the raw bound
+   form, producing 116/116 `capture_miss` on plex-backup-1. The (f) matcher was
+   subsequently made bind-tolerant (it accepts an inlined decimal or a positional
+   `?`/`?N` for both `library_section_id` and `account_id`), which resolves this
+   specific capture-miss; the raw-vs-`sql_expanded` gotcha above still applies to
+   any new matcher.
 
 6. **Clean up.** Delete the whole host scratch subdir at the end, INCLUDING on
    kill/abort. If you deliberately keep the source copy for a re-run, delete
