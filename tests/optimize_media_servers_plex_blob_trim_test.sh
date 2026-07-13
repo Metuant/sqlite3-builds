@@ -73,7 +73,7 @@ for arg in "$@"; do
       fi
       ;;
     *"PRAGMA integrity_check;"*)
-      if [ "${BAD_TRIM_INTEGRITY:-0}" = "1" ]; then
+      if [ -n "${BAD_TRIM_INTEGRITY_MARKER:-}" ] && [ -e "$BAD_TRIM_INTEGRITY_MARKER" ]; then
         printf 'OUTPUT|not ok\n' >> "$TRIM_SQLITE_LOG"
         printf 'not ok\n'
         exit 0
@@ -84,6 +84,11 @@ done
 if [ -n "$stdin_sql" ]; then
   output="$(printf '%s\n' "$stdin_sql" | "$REAL_SQLITE" "$@")"
   rc=$?
+  if [ "$rc" -eq 0 ] && [ -n "${BAD_TRIM_INTEGRITY_MARKER:-}" ]; then
+    case "$stdin_sql" in
+      *"DELETE FROM blobs"*) : > "$BAD_TRIM_INTEGRITY_MARKER" ;;
+    esac
+  fi
 else
   output="$("$REAL_SQLITE" "$@")"
   rc=$?
@@ -228,18 +233,26 @@ try_trim_plex_finished_season_blobs sqlite3 "$staged_db" >"$tmp/vacuum-fail.out"
 unset FAIL_TRIM_VACUUM
 assert_contains "$(cat "$tmp/vacuum-fail.err")" "post-trim VACUUM failed" "trim VACUUM failure warning"
 assert_eq "3,4,5,6,8,9,10" "$($real_sqlite "$staged_db" "SELECT group_concat(id, ',') FROM (SELECT id FROM blobs ORDER BY id);")" "VACUUM failure keeps committed deletion"
-assert_contains "$(cat "$TRIM_SQLITE_LOG")" "PRAGMA integrity_check;" "VACUUM failure reaches integrity"
+assert_not_contains "$(cat "$TRIM_SQLITE_LOG")" "PRAGMA integrity_check;" "VACUUM failure defers integrity to pipeline"
 
 create_main_fixture
+staged_db="$plex_databases_path/$_PLEX_BLOB_DB"
 create_blob_fixture
-export BAD_TRIM_INTEGRITY=1
+live_hash_before="$(sha256sum "$staged_db" | awk '{print $1}')"
+mkdir -p "$tmp/backups"
+export BAD_TRIM_INTEGRITY_MARKER="$tmp/bad-trim-integrity.marker"
+STATS_BANDWIDTH_RETAIN_DAYS=90
 set +e
-try_trim_plex_finished_season_blobs sqlite3 "$staged_db" >"$tmp/integrity-fail.out" 2>"$tmp/integrity-fail.err"
+(
+  rebuild_db_vacuum_into sqlite3 "$staged_db" "$tmp/backups" 4096 NONE "" "" "try_trim_plex_finished_season_blobs"
+) >"$tmp/integrity-fail.out" 2>"$tmp/integrity-fail.err"
 rc=$?
 set -e
-unset BAD_TRIM_INTEGRITY
-assert_eq "1" "$rc" "bad integrity hook status"
-assert_contains "$(cat "$tmp/integrity-fail.err")" "post-trim DB failed integrity_check" "bad integrity diagnostic"
+unset BAD_TRIM_INTEGRITY_MARKER
+assert_eq "1" "$rc" "final integrity after trim pipeline status"
+assert_contains "$(cat "$tmp/integrity-fail.err")" "final staged DB failed integrity_check" "final integrity after trim diagnostic"
+assert_eq "$live_hash_before" "$(sha256sum "$staged_db" | awk '{print $1}')" "final integrity after trim live hash"
+[ ! -e "$staged_db.new" ] || fail "no staged DB" "$staged_db.new exists" "final integrity after trim staged cleanup"
 
 if ls "$tmp"/blobs.db.new.trim.* >/dev/null 2>&1; then
   fail "no scratch directory" "scratch remains" "failure scratch cleanup"

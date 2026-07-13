@@ -126,6 +126,33 @@ Plan:
 - Per-value EQP matrix for representative predicate values.
 ```
 
+Build the aggregate template census before selecting one execution to optimize:
+
+1. Capture one complete `slow_query_stats` dump from the five-minute or normal
+   process-exit path. Each line is one parameterized SQL template shape, not one
+   execution; use `count` for executions and `total_ms` for cumulative cost.
+2. Keep the emitted descending-total order. Mean-qualified templates are all
+   present. Up to 20 additional low-mean templates appear when
+   `total_ns / 20 >= threshold_ns` and `count >= 5`.
+3. Join each dumped template against the current matcher anchor inventory in
+   `src/plex_fts_rewrite.c` and `src/emby_fts_rewrite.c`. Mark applied families
+   by their owned SQL signatures, including `unlikely(`,
+   `dshadow_on_deck_rank`, and the Emby correlated `EXISTS` arms.
+4. Join remaining shapes to `rewrite_applied`, `capture_miss`, and
+   `out_of_scope` exemplars by raw template plus `sql_len` and correlation aids.
+   Do not infer rewrite coverage from execution count alone.
+5. Rank shapes with no applied-family match by `total_ms`, then capture raw
+   `zSql`, expanded values, schema, EQP, and identity evidence for the leading
+   candidates.
+
+On compilers without `__int128`, the tracker stops a template at 1048576
+observations. Its `uint64_t` `sum_ns` and `sum_sq_ns` accumulators saturate at
+their maximum rather than wrapping. Treat a field named by the emitted
+`saturated=` marker as a capped floor, not an exact figure; a saturated
+`sum_ns` always emits and is not charged to the 20-entry total-only budget.
+The observation cap also makes `count` and `total_ms` capped rather than exact
+lifetime totals.
+
 The least invasive way to extract the exact app query is to read the
 container's existing stdout/stderr log stream. Reading Docker logs, journald, or
 the configured collector is not live database access and does not touch
@@ -158,10 +185,14 @@ Capture the minimum required lines, then restore the prior setting. Prefer
 incident context allows holding expanded SQL. Expanded SQL is max-PII because it
 inlines all bound values for the statement.
 
-For matcher drift, prefer the rewrite-decision record when present. A
-post-boundary `capture_miss` includes raw source `sql`, `sub_reason`, exact
-`sql_len`, and `corr`; the allocated low-volume record includes the full,
+For matcher drift, prefer the rewrite-decision record when present. A sampled
+post-boundary `capture_miss` or positive `out_of_scope` record includes raw
+source `sql`, `sub_reason`, `sample`, process-global `count`, structural
+`shape`, exact `sql_len`, and `corr`; the allocated record includes the full,
 uncapped source SQL, with bounded fallback if the record cannot be allocated.
+The first event per reason/mode, each new structural shape, and every 1024th
+event emit. Parameter tokens remain exact structural bytes while literal
+values and same-type literal-list cardinality normalize.
 Every emitted `rewrite_applied` sample (`first`, `periodic`, or `new`) includes
 raw `source_sql`, rewritten `sql`, and both correlation keys unless literal
 `SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1` suppresses only the text fields.
@@ -340,8 +371,9 @@ hand-roll a harness that omits any of them.
       combine sampled `trace_stmt` with capture/applied source records. Normalize
       whitespace and group by shape. Candidates that appear in the census but
       show `capture_miss` indicate matcher drift on the raw form.
-   6. Cross-tab `capture_miss` entries by `(target, mode, sub_reason, db,
-      sql_len, corr)`. If misses appear for the `?`-form shape but not for the
+   6. Cross-tab `capture_miss` entries by `(target, mode, sub_reason, shape)`;
+      use `db`, `sql_len`, and `corr` to join each emitted exemplar. If misses
+      appear for the `?`-form shape but not for the
       inlined shape, the matcher pattern must be adjusted to match raw `zSql`.
 
    **On-Deck raw-shape rule:** The matcher accepts an inlined decimal or a
@@ -349,6 +381,9 @@ hand-roll a harness that omits any of them.
    id-list and literal-threshold selectors share the base On-Deck gate. After
    the exact head matches, parse drift emits `capture_miss` with a stage-specific
    `sub_reason`, including `threshold` for a threshold parse failure. The
+   recognized `true` plus per-GUID form emits
+   `out_of_scope/ondeck_per_guid`; recognizer drift falls back to
+   `capture_miss/selector`. The
    raw-vs-`sql_expanded` distinction above applies to every new matcher.
 
 6. **Clean up.** Delete the whole host scratch subdir at the end, INCLUDING on

@@ -333,7 +333,8 @@ ambiguous tag ids, existing taggings-membership conjuncts, semicolon tails,
 non-Plex basenames, and FTS shape 09 containing `fts4_metadata_titles_icu`.
 Every matched prepare probes `sqlite_master` for
 `idx_dshadow_taggings_tag_id_metadata_item_id`; absence fails open with
-`reason=index_missing`, logged once per connection for this mode.
+`reason=index_missing`, sampled process-wide for this mode on the first and
+every 1024th occurrence.
 
 On a match, the helper appends
 `AND metadata_items.id IN (SELECT metadata_item_id FROM taggings WHERE tag_id=<N>)`
@@ -368,13 +369,19 @@ The matcher also rejects slot drift, missing required settings joins, left
 joins, projection drift, semicolon tails, and non-Plex basenames. Every matched
 prepare probes `sqlite_master` for
 `idx_dshadow_metadata_item_views_account_grandparent_guid`; absence fails open
-with `reason=index_missing`, logged once per connection for this mode.
+with `reason=index_missing`, sampled process-wide for this mode on the first and
+every 1024th occurrence.
 
 An exact-head miss is silent. After the exact head matches, parse drift emits
 `reason=capture_miss mode=ondeck` with first-failure `sub_reason` from
 `section`, `selector`, `id_list`, `threshold`, `post_id`, `account`, `tail`, or
-`trailing`. Both selector arms use this same diagnostic path whenever the base
-On-Deck rewrite is enabled.
+`trailing`. The recognized `true` plus per-GUID selector form instead
+emits `reason=out_of_scope sub_reason=ondeck_per_guid`; any recognizer mismatch
+falls back to `capture_miss sub_reason=selector`. Both supported selector arms
+use the capture diagnostic path whenever the base On-Deck rewrite is enabled.
+Capture and out-of-scope records use process-global first/new/every-1024th
+sampling keyed by lexer-normalized structural shape while retaining full,
+uncapped source SQL on emitted records.
 
 On a match, the helper emits the grandparents-first ranked subquery, strips the
 vendor `INDEXED BY` hints by replacing the whole statement, and copies either
@@ -466,7 +473,10 @@ Both matchers accept exactly one ancestor CTE grammar: the list form
 `AncestorId in (<integers>) )select` or the scalar form
 `AncestorId=<integer> )select`. The scalar form has one closing parenthesis;
 the list form retains its list-closing plus CTE-closing pair. Mixed, duplicate,
-bound, nonnumeric, or mismatched anchor pairs fail open. Generated SQL renders
+bound, nonnumeric, or mismatched anchor pairs fail open. A positively detected
+bind emits `reason=out_of_scope sub_reason=bind`; a parsed limit outside
+12/16/20 emits `reason=out_of_scope sub_reason=limit_unsupported`. Limit parse
+failure remains `reason=capture_miss sub_reason=limit`. Generated SQL renders
 either validated source form as `AncestorId IN (<captured slot>)`.
 
 `emby_match_episodes_latest` first requires exact Type=8. It emits mode
@@ -496,7 +506,8 @@ original statement prepares.
 Sibling Type traffic is an unlogged clean miss, so neither family produces a
 cross-family capture miss. Missing indexes, probe errors, build/allocation
 failure, candidate prepare failure, and tail mismatch fail open to original
-SQL. Missing-index records are once per connection and dashboard mode; probe
-errors remain unsuppressed. The two exact Type=5 indexes are required only to
+SQL. Missing-index records use process-global first/every-1024th counters per
+dashboard mode; `db=` identifies the emitted exemplar rather than every handle.
+Probe errors remain unsuppressed. The two exact Type=5 indexes are required only to
 prepare C2; DateCreated storage class is not an enablement condition because C2
 uses only native comparison and ordering with no cast, arithmetic, or coercion.

@@ -180,6 +180,7 @@ milestone lands.
   Emby FTS rewrite helpers `plex_fts_rewrite_prepare` and
   `emby_fts_rewrite_prepare`, plus the shared lexer helpers `fts_lex_init`,
   `fts_lex_token_text_eq`, `fts_lex_next_token`,
+  `fts_lex_shape_key`,
   `fts_lex_match_rhs_is_complete`, and
   `fts_rewrite_db_basename_matches`, are also hidden and absent from
   `.dynsym`.
@@ -193,7 +194,7 @@ milestone lands.
   hidden-symbol deny gate in `build/Build.sh:265-288` (including
   `plex_fts_rewrite_prepare`, `emby_fts_rewrite_prepare`, `fts_lex_init`,
   `fts_lex_token_text_eq`, `fts_lex_next_token`,
-  `fts_lex_match_rhs_is_complete`, and
+  `fts_lex_shape_key`, `fts_lex_match_rhs_is_complete`, and
   `fts_rewrite_db_basename_matches`) stays adjacent to the preserved
   `build/Build.sh:255-264`
   `_real` gates as belt-and-braces.
@@ -215,9 +216,15 @@ milestone lands.
   falls back to the periodic sampler. If per-connection sampler state cannot be
   allocated or registered, known-mode `rewrite_applied` and STMT diagnostics
   are skipped; sampler failure never increases output. Capture-gated misses
+  and positive `out_of_scope` exclusions use process-global per-reason/per-mode
+  first/every-1024th counters plus one bounded process-global first-seen
+  structural-shape set. The caller gates and computes the lexer shape; this
+  file gains no lexer dependency. Every event, including count 1, is observed
+  before schedule selection. Unknown modes suppress. Emitted miss records
   allocate and carry full uncapped raw source SQL, first-failure `sub_reason`,
-  exact length, and full-span correlation; allocation or record-size failure
-  emits a bounded fallback without changing prepare behavior. Clean misses and
+  `sample`, process-global `count`, structural `shape`, exact length, and
+  full-span correlation; allocation or record-size failure emits a bounded
+  fallback without changing prepare behavior. Clean misses and
   fallback-to-original paths do not emit applied records.
 - Every `obs_forward_config` / `obs_forward_db_config` case-arm
   preserves the exact arity, types, and argument pass-through to
@@ -280,10 +287,12 @@ milestone lands.
 - `obs_logf` formats outside the stderr stream lock, allocates a full record
   when formatted output exceeds its inline buffer, and emits one `fwrite()`
   plus one terminal newline per record. Allocation or record-size failure uses
-  a bounded fallback. `index_missing` is logged
-  once per connection and mode for Plex taggings/On-Deck and Emby
-  Episodes/movies Latest; probe errors stay unsuppressed.
-- Full `capture_miss` records allocate and format outside the stderr stream
+  a bounded fallback. `index_missing` uses process-global per-mode counters for
+  Plex taggings/On-Deck and Emby Episodes/movies Latest. Count 1 and every
+  1024th occurrence emit; all others suppress across database handles. Probe
+  errors stay unsuppressed. Missing-index logging has no clientdata allocation
+  dependency.
+- Full `capture_miss` and `out_of_scope` records allocate and format outside the stderr stream
   lock, then emit one `fwrite()` plus one terminal newline; failure to build the
   full record falls back to `obs_logf` and never affects prepare behavior.
 - `SLOW_QUERY_MAX_ENTRIES=4096` is the tracker LRU entry cap.
@@ -311,9 +320,16 @@ milestone lands.
   non-hot test/registration paths; constructor(103) primes `pthread_once`
   at dlopen so the cached load sees the resolved value.
 - Slow-query stats dump gating lives outside the record hot path. A
-  `slow_query_stats` line emits only when `mean_ns >= threshold_ns` and
-  `count >= 5`; `mean_ms`, `stddev_ms`, `min_ms`, and `max_ms` render with
-  `%.6f` precision.
+  `slow_query_stats` line requires `count >= 5` and either
+  `mean_ns >= threshold_ns` or the overflow-safe total arm
+  `sum_ns / 20 >= threshold_ns`. Total-only emissions are capped at the first
+  20 entries in the existing descending-total snapshot; mean-qualified entries
+  are uncapped. `total_ms`, `mean_ms`, `stddev_ms`, `min_ms`, and `max_ms`
+  render with `%.6f` precision. On the no-`__int128` fallback, count retains
+  the existing 1048576-observation per-template cap; `sum_ns` and `sum_sq_ns`
+  saturate at `UINT64_MAX` rather than wrapping and emit an explicit
+  `saturated=` field naming the capped floor. A saturated `sum_ns` always
+  qualifies and is not charged to the total-only budget.
 - Slow-query stats key identity: full-SQL `memcmp` for templates <=2048
   bytes; 64-bit FNV-1a hash equality for templates >2048 bytes (collision
   probability negligible at <=4096 templates). FNV-1a MUST NEVER be used

@@ -213,9 +213,9 @@ set +e
 rc=$?
 set -e
 unset BAD_INTEGRITY_MARKER
-assert_eq 1 "$rc" "post-deflate integrity pipeline rc"
-assert_contains "$(cat "$tmp/integrity.err")" "post-deflate DB failed integrity_check" "post-deflate integrity diagnostic"
-assert_eq "$live_hash_before" "$(sha256_file "$integrity_live")" "post-deflate integrity abort live hash"
-[ ! -e "$integrity_live.new" ] || fail "post-deflate integrity staged cleanup" "no staged file" "$integrity_live.new exists"
+assert_eq 1 "$rc" "final integrity after deflate pipeline rc"
+assert_contains "$(cat "$tmp/integrity.err")" "final staged DB failed integrity_check" "final integrity after deflate diagnostic"
+assert_eq "$live_hash_before" "$(sha256_file "$integrity_live")" "final integrity after deflate abort live hash"
+[ ! -e "$integrity_live.new" ] || fail "final integrity after deflate staged cleanup" "no staged file" "$integrity_live.new exists"
 
 printf 'optimize_media_servers deflate tests passed\n'

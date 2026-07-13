@@ -132,9 +132,21 @@ declare -F run_plex_stat4_analyze >/dev/null || {
   printf 'missing-plex-stat4-run-helper\n'
   exit 25
 }
+declare -F rebuild_db_vacuum_into >/dev/null || {
+  printf 'missing-rebuild-helper\n'
+  exit 39
+}
+declare -F run_plex_main_post_maintenance >/dev/null || {
+  printf 'missing-plex-main-post-maintenance-helper\n'
+  exit 40
+}
 declare -F try_deflate_plex_statistics_bandwidth >/dev/null || {
   printf 'missing-deflate-helper\n'
   exit 14
+}
+declare -F try_trim_plex_finished_season_blobs >/dev/null || {
+  printf 'missing-trim-helper\n'
+  exit 41
 }
 declare -F load_optimize_config >/dev/null || {
   printf 'missing-config-loader\n'
@@ -144,6 +156,22 @@ declare -F print_usage >/dev/null || {
   printf 'missing-usage-helper\n'
   exit 30
 }
+
+rebuild_body="$(declare -f rebuild_db_vacuum_into)"
+case "$rebuild_body" in
+  *"final staged DB failed integrity_check"*) ;;
+  *) printf 'missing-final-staged-integrity-gate\n'; exit 42 ;;
+esac
+for hook_name in run_plex_main_post_maintenance try_deflate_plex_statistics_bandwidth try_trim_plex_finished_season_blobs
+do
+  hook_body="$(declare -f "$hook_name")"
+  case "$hook_body" in
+    *"PRAGMA integrity_check;"*)
+      printf 'redundant-hook-integrity-gate:%s\n' "$hook_name"
+      exit 43
+      ;;
+  esac
+done
 
 declare -p PLEX_INSTANCES >/dev/null 2>&1 && {
   printf 'plex-instances-set-by-source\n'

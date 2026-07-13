@@ -22,15 +22,20 @@
 #define SLOW_QUERY_DEFAULT_EXPANDED_SQL_THRESHOLD_MS 2500u
 #define SLOW_QUERY_DUMP_INTERVAL_NS (300ull * 1000000000ull)
 #define SLOW_QUERY_STATS_MIN_COUNT 5u
+#define SLOW_QUERY_STATS_TOTAL_FACTOR 20u
+#define SLOW_QUERY_STATS_TOTAL_BUDGET 20u
 #define SLOW_QUERY_TRUNC_TAIL "...[TRUNC]"
 #define SLOW_QUERY_FALLBACK_CAP (1u << 20)
 
-#if defined(__SIZEOF_INT128__) && __SIZEOF_INT128__ == 16
+#if !defined(SLOW_QUERY_FORCE_NO_INT128) && \
+    defined(__SIZEOF_INT128__) && __SIZEOF_INT128__ == 16
 typedef unsigned __int128 slow_accum_t;
 #define SLOW_QUERY_HAVE_INT128 1
 #else
 typedef uint64_t slow_accum_t;
 #define SLOW_QUERY_HAVE_INT128 0
+#define SLOW_QUERY_SATURATED_SUM_NS 0x01u
+#define SLOW_QUERY_SATURATED_SUM_SQ_NS 0x02u
 #endif
 
 __attribute__((visibility("hidden"))) SQLITE_API int slow_query_disabled(void);
@@ -45,6 +50,9 @@ struct slow_entry {
     uint64_t hash, min_ns, max_ns;
     uint32_t full_sql_len;
     uint32_t count;
+#if !SLOW_QUERY_HAVE_INT128
+    uint8_t saturated;
+#endif
     uint16_t lru_prev, lru_next, sql_len;
     char sql[SLOW_QUERY_SQL_CAP + 1];
 };
@@ -64,6 +72,9 @@ struct slow_entry_snapshot {
     uint64_t hash, min_ns, max_ns;
     uint32_t full_sql_len;
     uint32_t count;
+#if !SLOW_QUERY_HAVE_INT128
+    uint8_t saturated;
+#endif
     uint16_t sql_len;
     char sql[SLOW_QUERY_SQL_CAP + 1];
 };
@@ -325,14 +336,32 @@ static uint16_t slow_insert_locked(uint64_t hash, uint32_t full_len, const char 
     return idx;
 }
 
-static slow_accum_t slow_accum_square(uint64_t v) {
 #if SLOW_QUERY_HAVE_INT128
+static slow_accum_t slow_accum_square(uint64_t v) {
     return (slow_accum_t)v * (slow_accum_t)v;
-#else
-    if (v != 0 && v > UINT64_MAX / v) return UINT64_MAX;
-    return v * v;
-#endif
 }
+#else
+static slow_accum_t slow_accum_saturating_add(
+    slow_accum_t total,
+    slow_accum_t addend,
+    uint8_t *saturated,
+    uint8_t saturated_flag
+) {
+    if (addend > UINT64_MAX - total) {
+        *saturated |= saturated_flag;
+        return UINT64_MAX;
+    }
+    return total + addend;
+}
+
+static slow_accum_t slow_accum_square(uint64_t v, uint8_t *saturated) {
+    if (v != 0 && v > UINT64_MAX / v) {
+        *saturated |= SLOW_QUERY_SATURATED_SUM_SQ_NS;
+        return UINT64_MAX;
+    }
+    return v * v;
+}
+#endif
 
 static int slow_update_locked(uint16_t idx, uint64_t elapsed_ns) {
     struct slow_entry *e = &g_slow.entries[idx];
@@ -355,8 +384,23 @@ static int slow_update_locked(uint16_t idx, uint64_t elapsed_ns) {
         if (elapsed_ns > e->max_ns) e->max_ns = elapsed_ns;
     }
     e->count++;
+#if SLOW_QUERY_HAVE_INT128
     e->sum_ns += (slow_accum_t)elapsed_ns;
     e->sum_sq_ns += slow_accum_square(elapsed_ns);
+#else
+    e->sum_ns = slow_accum_saturating_add(
+        e->sum_ns,
+        (slow_accum_t)elapsed_ns,
+        &e->saturated,
+        SLOW_QUERY_SATURATED_SUM_NS
+    );
+    e->sum_sq_ns = slow_accum_saturating_add(
+        e->sum_sq_ns,
+        slow_accum_square(elapsed_ns, &e->saturated),
+        &e->saturated,
+        SLOW_QUERY_SATURATED_SUM_SQ_NS
+    );
+#endif
     slow_lru_touch_locked(idx);
     return 0;
 }
@@ -559,27 +603,68 @@ static void slow_expanded_sql_free(char *sql) {
     sqlite3_free(sql);
 }
 
-static void slow_emit_stats_snapshot(const struct slow_entry_snapshot *s) {
+static void slow_emit_stats_snapshot(
+    const struct slow_entry_snapshot *s,
+    unsigned int *total_budget
+) {
     char sqlbuf[SLOW_QUERY_SQL_CAP + 256];
     long double count;
+    long double total_ns;
     long double mean_ns;
     long double mean_sq_ns;
     long double variance_ns2;
     long double stddev_ns;
+    int mean_qualified;
+    int total_qualified;
 
     if (s->count < SLOW_QUERY_STATS_MIN_COUNT) return;
     count = (long double)s->count;
-    mean_ns = slow_accum_to_ld(s->sum_ns) / count;
-    if (mean_ns < (long double)g_threshold_ns) return;
+    total_ns = slow_accum_to_ld(s->sum_ns);
+    mean_ns = total_ns / count;
+    mean_qualified = mean_ns >= (long double)g_threshold_ns;
+    total_qualified =
+        s->sum_ns / (slow_accum_t)SLOW_QUERY_STATS_TOTAL_FACTOR >=
+        (slow_accum_t)g_threshold_ns;
+#if !SLOW_QUERY_HAVE_INT128
+    if ((s->saturated & SLOW_QUERY_SATURATED_SUM_NS) != 0u) {
+        mean_qualified = 1;
+        total_qualified = 1;
+    }
+#endif
+    if (!mean_qualified) {
+        if (!total_qualified || *total_budget == 0u) return;
+        (*total_budget)--;
+    }
     mean_sq_ns = slow_accum_to_ld(s->sum_sq_ns) / count;
     variance_ns2 = mean_sq_ns - (mean_ns * mean_ns);
     if (variance_ns2 < 0.0L) variance_ns2 = 0.0L;
     stddev_ns = sqrtl(variance_ns2);
     slow_escape_sql(s->sql, sqlbuf, sizeof(sqlbuf));
+#if !SLOW_QUERY_HAVE_INT128
+    if (s->saturated != 0u) {
+        const char *saturated =
+            s->saturated == SLOW_QUERY_SATURATED_SUM_NS ? "sum_ns" :
+            s->saturated == SLOW_QUERY_SATURATED_SUM_SQ_NS ? "sum_sq_ns" :
+            "sum_ns,sum_sq_ns";
+        obs_logf("slow_query_stats",
+                 "sql=\"%s\" count=%" PRIu32
+                 " total_ms=%.6f mean_ms=%.6f stddev_ms=%.6f min_ms=%.6f max_ms=%.6f"
+                 " saturated=%s",
+                 sqlbuf, s->count,
+                 (double)(total_ns / 1000000.0L),
+                 (double)(mean_ns / 1000000.0L),
+                 (double)(stddev_ns / 1000000.0L),
+                 (double)((long double)s->min_ns / 1000000.0L),
+                 (double)((long double)s->max_ns / 1000000.0L),
+                 saturated);
+        return;
+    }
+#endif
     obs_logf("slow_query_stats",
              "sql=\"%s\" count=%" PRIu32
-             " mean_ms=%.6f stddev_ms=%.6f min_ms=%.6f max_ms=%.6f",
+             " total_ms=%.6f mean_ms=%.6f stddev_ms=%.6f min_ms=%.6f max_ms=%.6f",
              sqlbuf, s->count,
+             (double)(total_ns / 1000000.0L),
              (double)(mean_ns / 1000000.0L),
              (double)(stddev_ns / 1000000.0L),
              (double)((long double)s->min_ns / 1000000.0L),
@@ -594,6 +679,7 @@ static void slow_query_dump(int try_lock, const char *reason) {
     uint32_t n = 0;
     uint32_t had_entries = 0;
     uint32_t i;
+    unsigned int total_budget = SLOW_QUERY_STATS_TOTAL_BUDGET;
     int lock_rc;
 
     lock_rc = try_lock ? pthread_mutex_trylock(&g_slow.mu) : pthread_mutex_lock(&g_slow.mu);
@@ -616,6 +702,9 @@ static void slow_query_dump(int try_lock, const char *reason) {
                 snap[n].max_ns = e->max_ns;
                 snap[n].full_sql_len = e->full_sql_len;
                 snap[n].count = e->count;
+#if !SLOW_QUERY_HAVE_INT128
+                snap[n].saturated = e->saturated;
+#endif
                 snap[n].sql_len = e->sql_len;
                 memcpy(snap[n].sql, e->sql, (size_t)e->sql_len + 1u);
                 n++;
@@ -631,7 +720,9 @@ static void slow_query_dump(int try_lock, const char *reason) {
         return;
     }
     qsort(snap, n, sizeof(*snap), slow_snapshot_cmp);
-    for (i = 0; i < n; i++) slow_emit_stats_snapshot(&snap[i]);
+    for (i = 0; i < n; i++) {
+        slow_emit_stats_snapshot(&snap[i], &total_budget);
+    }
     free(snap);
 }
 

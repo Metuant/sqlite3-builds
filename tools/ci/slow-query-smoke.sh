@@ -27,6 +27,29 @@ assert_marker_present "$out" '\[sqlite3-builds-obs\].* slow_query ' "FATAL: slow
 
 out=""
 set +e
+out="$(docker run --rm "${docker_library_image}" /bin/sh -c '
+  LIB_DIR=$(dirname "$(ls /app/sqlite-amalgamation-*/dist/libsqlite3.so)")
+  AMALG_DIR=$(dirname "$LIB_DIR")
+  gcc -O0 -DSLOW_QUERY_TRACKER_TEST_API -DSLOW_QUERY_FORCE_NO_INT128 \
+    -o /tmp/slow_query_smoke_fallback \
+    /app/tests/slow_query_smoke.c \
+    /app/slow_query_tracker.c \
+    /app/tests/slow_query_tracker_stubs.c \
+    /app/tests/runtime_optimize_stubs.c \
+    -I/app -I"$AMALG_DIR" -L"$LIB_DIR" -lsqlite3 -ldl -lpthread -lm
+  LD_LIBRARY_PATH="$LIB_DIR" /tmp/slow_query_smoke_fallback
+' 2>&1)"
+status=$?
+set -e
+if [ "$status" -ne 0 ]; then
+  printf "%s\n" "$out"
+  exit "$status"
+fi
+printf "%s\n" "$out"
+assert_marker_present "$out" 'slow query fallback smoke passed' "FATAL: forced-fallback slow-query smoke did not report success" || exit 1
+
+out=""
+set +e
 out="$(docker run --rm \
   -e SQLITE3_SLOW_QUERY_THRESHOLD_MS=0 \
   -e SQLITE3_DISABLE_SLOW_QUERY=1 \
@@ -56,6 +79,7 @@ out="$(docker run --rm "${docker_library_image}" /bin/sh -c '
     /app/auto_extension.c \
     /app/observability.c \
     /app/slow_query_tracker.c \
+    /app/fts_lex.c \
     /app/tests/runtime_optimize_stubs.c \
     -I/app -I"$AMALG_DIR" -lpthread -lm
   /tmp/stmt_trace_smoke

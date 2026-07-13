@@ -1,5 +1,6 @@
 #include "fts_lex.h"
 
+#include <stdint.h>
 #include <string.h>
 
 static int fts_lex_is_sqlite_id_char(unsigned char c) {
@@ -190,6 +191,116 @@ __attribute__((visibility("hidden"))) fts_lex_token fts_lex_next_token(fts_lex *
     tok.end = p + 1;
     lx->pos = p + 1;
     return tok;
+}
+
+static uint64_t fts_lex_shape_mix_byte(uint64_t hash, unsigned char value) {
+    hash ^= value;
+    return hash * UINT64_C(1099511628211);
+}
+
+static uint64_t fts_lex_shape_mix_token(
+    uint64_t hash,
+    const char *sql,
+    const fts_lex_token *tok
+) {
+    size_t i;
+
+    switch (tok->type) {
+        case FTS_LEX_TOK_IDENT:
+            for (i = tok->start; i < tok->end; i++) {
+                hash = fts_lex_shape_mix_byte(
+                    hash,
+                    (unsigned char)fts_lex_ascii_lower((unsigned char)sql[i])
+                );
+            }
+            break;
+        case FTS_LEX_TOK_NUMBER:
+            hash = fts_lex_shape_mix_byte(hash, 0x01u);
+            break;
+        case FTS_LEX_TOK_STRING:
+            hash = fts_lex_shape_mix_byte(hash, 0x02u);
+            break;
+        case FTS_LEX_TOK_PARAM:
+            for (i = tok->start; i < tok->end; i++) {
+                hash = fts_lex_shape_mix_byte(hash, (unsigned char)sql[i]);
+            }
+            break;
+        case FTS_LEX_TOK_SYMBOL:
+            hash = fts_lex_shape_mix_byte(hash, (unsigned char)tok->symbol);
+            break;
+        default:
+            break;
+    }
+    return fts_lex_shape_mix_byte(hash, 0x00u);
+}
+
+__attribute__((visibility("hidden"))) uint64_t fts_lex_shape_key(
+    const char *sql,
+    size_t len
+) {
+    fts_lex lx;
+    fts_lex_token tok;
+    fts_lex_token_type list_literal = FTS_LEX_TOK_EOF;
+    uint64_t hash = UINT64_C(14695981039346656037);
+    size_t shape_len;
+    int pending_comma = 0;
+    int list_collapsed = 0;
+
+    if (!sql) return 0;
+    shape_len = len < FTS_LEX_SHAPE_CAP ? len : FTS_LEX_SHAPE_CAP;
+    fts_lex_init(&lx, sql, shape_len, FTS_LEX_PARAM_SQLITE_VARIABLE);
+    for (;;) {
+        tok = fts_lex_next_token(&lx);
+        if (tok.type == FTS_LEX_TOK_ERROR) return 0;
+        if (tok.type == FTS_LEX_TOK_EOF) {
+            if (pending_comma) {
+                fts_lex_token comma = {
+                    FTS_LEX_TOK_SYMBOL, 0u, 0u, ','
+                };
+                hash = fts_lex_shape_mix_token(hash, sql, &comma);
+            }
+            return hash;
+        }
+
+        if (pending_comma) {
+            if (tok.type == list_literal) {
+                if (!list_collapsed) {
+                    fts_lex_token collapse = {
+                        FTS_LEX_TOK_SYMBOL, 0u, 0u, 0x04
+                    };
+                    hash = fts_lex_shape_mix_token(hash, sql, &collapse);
+                    list_collapsed = 1;
+                }
+                pending_comma = 0;
+                continue;
+            }
+            {
+                fts_lex_token comma = {
+                    FTS_LEX_TOK_SYMBOL, 0u, 0u, ','
+                };
+                hash = fts_lex_shape_mix_token(hash, sql, &comma);
+            }
+            pending_comma = 0;
+            list_literal = FTS_LEX_TOK_EOF;
+            list_collapsed = 0;
+        }
+
+        if (tok.type == FTS_LEX_TOK_SYMBOL && tok.symbol == ',' &&
+            (list_literal == FTS_LEX_TOK_NUMBER ||
+             list_literal == FTS_LEX_TOK_STRING)) {
+            pending_comma = 1;
+            continue;
+        }
+
+        hash = fts_lex_shape_mix_token(hash, sql, &tok);
+        if (tok.type == FTS_LEX_TOK_NUMBER || tok.type == FTS_LEX_TOK_STRING) {
+            list_literal = tok.type;
+            list_collapsed = 0;
+        } else {
+            list_literal = FTS_LEX_TOK_EOF;
+            list_collapsed = 0;
+        }
+    }
 }
 
 static int fts_lex_match_rhs_boundary_keyword(const char *sql, const fts_lex_token *tok) {

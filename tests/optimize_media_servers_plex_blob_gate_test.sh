@@ -95,6 +95,6 @@ ${_PLEX_BLOB_DB}|||"
 run_blob_gate_case trim-other 1 other "$main_log
 ${_PLEX_BLOB_DB}|||"
 run_blob_gate_case both-enabled 1 1 "$main_log
-${_PLEX_BLOB_DB}|||try_trim_plex_finished_season_blobs"
+${_PLEX_BLOB_DB}||try_trim_plex_finished_season_blobs|"
 
 printf 'optimize_media_servers Plex blob gate tests passed\n'
