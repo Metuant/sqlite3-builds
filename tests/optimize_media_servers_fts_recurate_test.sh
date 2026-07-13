@@ -58,6 +58,15 @@ if [ "${SKIP_RECURATE_DELETE:-0}" = "1" ]; then
   esac
 fi
 
+if [ "${FORCE_SHADOW_INTEGRITY_NONOK:-0}" = "1" ]; then
+  case "$sql_text" in
+    *'PRAGMA integrity_check("fts4_tag_titles_icu_segments");'*)
+      printf 'not ok\n'
+      exit 0
+      ;;
+  esac
+fi
+
 exec "$REAL_SQLITE" "$@"
 EOF_SQLITE
 chmod +x "$tmp/bin/sqlite3"
@@ -65,6 +74,7 @@ PATH="$tmp/bin:$PATH"
 export PATH REAL_SQLITE="$real_sqlite"
 
 declare -F run_fts_recurate >/dev/null || fail "run_fts_recurate availability" "defined shell function" "missing"
+declare -F run_fts_recurate_shadow_integrity_gate >/dev/null || fail "run_fts_recurate_shadow_integrity_gate availability" "defined shell function" "missing"
 
 create_recurate_fixture() {
   local db
@@ -111,6 +121,35 @@ assert_eq "" "$(cat "$tmp/positive.err")" "positive re-curation stderr"
 assert_eq "0" "$(bad_doc_count "$positive")" "URI and empty tag docs purged"
 assert_eq "2" "$(name_doc_count "$positive")" "name tag docs retained"
 assert_eq "2" "$(total_doc_count "$positive")" "post-recurate indexed doc count"
+run_fts_recurate_shadow_integrity_gate sqlite3 "$positive" >"$tmp/shadow-positive.out" 2>"$tmp/shadow-positive.err"
+assert_eq "" "$(cat "$tmp/shadow-positive.out")" "healthy re-curated shadow integrity stdout"
+assert_eq "" "$(cat "$tmp/shadow-positive.err")" "healthy re-curated shadow integrity stderr"
+
+export FORCE_SHADOW_INTEGRITY_NONOK=1
+set +e
+run_fts_recurate_shadow_integrity_gate sqlite3 "$positive" >"$tmp/shadow-nonok.out" 2>"$tmp/shadow-nonok.err"
+rc=$?
+set -e
+unset FORCE_SHADOW_INTEGRITY_NONOK
+assert_eq 1 "$rc" "shadow integrity rc on non-ok result"
+assert_contains "$(cat "$tmp/shadow-nonok.err")" "ERROR: post-re-curation FTS shadow table fts4_tag_titles_icu_segments failed integrity_check: not ok; live DB has NOT been touched" "shadow integrity non-ok diagnostic"
+
+structural_corrupt="$tmp/structural-corrupt.db"
+cp "$positive" "$structural_corrupt"
+shadow_rootpage="$("$real_sqlite" "$structural_corrupt" "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='fts4_tag_titles_icu_segments';")"
+shadow_page_size="$("$real_sqlite" "$structural_corrupt" "PRAGMA page_size;")"
+case "$shadow_rootpage:$shadow_page_size" in
+  *[!0-9:]*|:*|*:) fail "shadow corruption page metadata" "numeric rootpage:page_size" "$shadow_rootpage:$shadow_page_size" ;;
+esac
+dd if=/dev/zero of="$structural_corrupt" bs="$shadow_page_size" seek="$((shadow_rootpage - 1))" count=1 conv=notrunc 2>"$tmp/shadow-corrupt-dd.err"
+set +e
+run_fts_recurate_shadow_integrity_gate sqlite3 "$structural_corrupt" >"$tmp/shadow-corrupt.out" 2>"$tmp/shadow-corrupt.err"
+rc=$?
+set -e
+assert_eq 1 "$rc" "shadow integrity rc on structurally corrupt table"
+assert_contains "$(cat "$tmp/shadow-corrupt.err")" "ERROR: post-re-curation FTS shadow integrity_check failed to run for fts4_tag_titles_icu_segments; live DB has NOT been touched" "structurally corrupt shadow diagnostic"
+printf 'NON-VACUITY PROOF (expected failure):\n'
+cat "$tmp/shadow-corrupt.err"
 
 run_fts_recurate sqlite3 "$positive" >"$tmp/idempotent.out" 2>"$tmp/idempotent.err"
 assert_eq "" "$(cat "$tmp/idempotent.err")" "idempotent re-curation stderr"

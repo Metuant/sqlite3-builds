@@ -1,4 +1,5 @@
 #include "sqlite3.h"
+#include "fts_lex.h"
 #include "observability.h"
 
 #include <errno.h>
@@ -329,6 +330,111 @@ static int child_capture_miss(int fail_alloc) {
     return 0;
 }
 
+static void log_test_rewrite_miss(
+    const char *mode,
+    obs_miss_reason reason,
+    const char *sub_reason,
+    const char *sql
+) {
+    uint64_t shape = 0;
+    size_t len = strlen(sql);
+
+    if (!obs_is_disabled()) shape = fts_lex_shape_key(sql, len);
+    obs_log_rewrite_miss(
+        "emby", mode, reason, sub_reason, NULL, sql, len, shape
+    );
+}
+
+static int child_miss_sampling(void) {
+    static const char sql_a[] = "SELECT miss_a FROM source_a";
+    static const char sql_b[] = "SELECT miss_b, extra_b FROM source_b";
+    unsigned i;
+
+    for (i = 1u; i <= 1025u; i++) {
+        const char *sql = (i == 2u || i == 3u) ? sql_b : sql_a;
+        log_test_rewrite_miss(
+            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", sql
+        );
+    }
+    return 0;
+}
+
+static int child_miss_guid_dedup(void) {
+    char sql[192];
+    unsigned i;
+
+    for (i = 0u; i < 32u; i++) {
+        int rc = snprintf(
+            sql, sizeof(sql),
+            "SELECT id FROM metadata_items WHERE guid='plex://show/%024x'",
+            i
+        );
+        if (rc < 0 || (size_t)rc >= sizeof(sql)) {
+            failf("FATAL: GUID miss SQL overflow");
+        }
+        log_test_rewrite_miss(
+            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", sql
+        );
+    }
+    return 0;
+}
+
+static int child_miss_list_dedup(void) {
+    static const char list_two[] = "SELECT id FROM items WHERE id IN (1,2)";
+    static const char list_three[] = "SELECT id FROM items WHERE id IN (1,2,3)";
+
+    log_test_rewrite_miss(
+        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", list_two
+    );
+    log_test_rewrite_miss(
+        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", list_three
+    );
+    return 0;
+}
+
+static int child_miss_shape_cap(void) {
+    char sql[128];
+    unsigned i;
+
+    for (i = 0u; i < 513u; i++) {
+        int rc = snprintf(
+            sql, sizeof(sql), "SELECT column_%u FROM table_%u", i, i
+        );
+        if (rc < 0 || (size_t)rc >= sizeof(sql)) {
+            failf("FATAL: shape-cap SQL overflow");
+        }
+        log_test_rewrite_miss(
+            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection", sql
+        );
+    }
+    for (i = 513u; i < 1024u; i++) {
+        log_test_rewrite_miss(
+            "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection",
+            "SELECT column_0 FROM table_0"
+        );
+    }
+    return 0;
+}
+
+static int child_miss_lexer_error(void) {
+    log_test_rewrite_miss(
+        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection",
+        "SELECT 'unterminated_a"
+    );
+    log_test_rewrite_miss(
+        "dashboard+episodes_latest", OBS_MISS_CAPTURE, "projection",
+        "SELECT /* unterminated_b"
+    );
+    return 0;
+}
+
+static int child_miss_unknown_mode(void) {
+    log_test_rewrite_miss(
+        "unknown-mode", OBS_MISS_CAPTURE, "projection", "SELECT unknown_mode"
+    );
+    return 0;
+}
+
 static int child_applied_sampling(void) {
     static const char source_a[] = "SELECT source_a";
     static const char rewritten_a[] = "SELECT rewritten_a";
@@ -593,9 +699,12 @@ int emby_fts_rewrite_prepare(
 ) {
     if (g_prepare_capture_miss) {
         size_t scan_len = zSql ? (nByte < 0 ? strlen(zSql) : (size_t)nByte) : 0;
-        obs_log_capture_miss(
-            "emby", "dashboard+episodes_latest", "projection",
-            db, zSql, scan_len
+        uint64_t shape = 0;
+
+        if (!obs_is_disabled()) shape = fts_lex_shape_key(zSql, scan_len);
+        obs_log_rewrite_miss(
+            "emby", "dashboard+episodes_latest", OBS_MISS_CAPTURE,
+            "projection", db, zSql, scan_len, shape
         );
     }
     return plex_fts_rewrite_prepare(db, zSql, nByte, prepFlags, ppStmt, pzTail, kind);
@@ -797,6 +906,10 @@ int main(int argc, char **argv) {
         "SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1",
         NULL
     };
+    char *env_obs_disabled[] = {
+        "SQLITE3_DISABLE_OBSERVABILITY=1",
+        NULL
+    };
     char *out;
 
     if (argc == 2 && strcmp(argv[1], "child-default") == 0) return child_default();
@@ -809,6 +922,24 @@ int main(int argc, char **argv) {
     }
     if (argc == 2 && strcmp(argv[1], "child-capture-alloc-failure") == 0) {
         return child_capture_miss(1);
+    }
+    if (argc == 2 && strcmp(argv[1], "child-miss-sampling") == 0) {
+        return child_miss_sampling();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-miss-guid-dedup") == 0) {
+        return child_miss_guid_dedup();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-miss-list-dedup") == 0) {
+        return child_miss_list_dedup();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-miss-shape-cap") == 0) {
+        return child_miss_shape_cap();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-miss-lexer-error") == 0) {
+        return child_miss_lexer_error();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-miss-unknown-mode") == 0) {
+        return child_miss_unknown_mode();
     }
     if (argc == 2 && strcmp(argv[1], "child-applied-sampling") == 0) {
         return child_applied_sampling();
@@ -866,6 +997,72 @@ int main(int argc, char **argv) {
     out = run_child_capture(argv[0], "child-capture-alloc-failure", env_default);
     require_contains("capture allocation fallback", out, "...[TRUNC]");
     require_absent("capture allocation fallback tail", out, "CAPTURE_END_SENTINEL'");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-miss-sampling", env_default);
+    require_occurrences(
+        "miss sampling output", out,
+        "event=rewrite_skipped target=emby reason=capture_miss", 3
+    );
+    require_contains("miss sampling first", out, "sample=first count=1");
+    require_contains("miss sampling new", out, "sample=new count=2");
+    require_same_line(
+        "miss sampling new SQL", out, "sample=new count=2",
+        "sql=\"SELECT miss_b, extra_b FROM source_b\""
+    );
+    require_absent("miss sampling repeated new", out, "sample=new count=3");
+    require_absent("miss sampling first-shape re-emission", out, "sample=new count=4");
+    require_contains("miss sampling periodic", out, "sample=periodic count=1024");
+    require_absent("miss sampling suppressed tail", out, "count=1025");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-miss-guid-dedup", env_default);
+    require_occurrences(
+        "miss GUID shape dedup", out,
+        "event=rewrite_skipped target=emby reason=capture_miss", 1
+    );
+    require_contains(
+        "miss GUID first exemplar", out,
+        "plex://show/000000000000000000000000"
+    );
+    require_absent("miss GUID no novel literal shape", out, "sample=new");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-miss-list-dedup", env_default);
+    require_occurrences(
+        "miss list cardinality dedup", out,
+        "event=rewrite_skipped target=emby reason=capture_miss", 1
+    );
+    require_contains("miss list first exemplar", out, "id IN (1,2)");
+    require_absent("miss list cardinality not novel", out, "id IN (1,2,3)");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-miss-shape-cap", env_default);
+    require_occurrences(
+        "miss shape cap output", out,
+        "event=rewrite_skipped target=emby reason=capture_miss", 513
+    );
+    require_contains("miss shape cap last inserted", out, "column_511");
+    require_absent("miss shape cap overflow suppressed", out, "column_512");
+    require_contains("miss shape cap periodic", out, "sample=periodic count=1024");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-miss-lexer-error", env_default);
+    require_occurrences(
+        "miss lexer error fallback", out,
+        "event=rewrite_skipped target=emby reason=capture_miss", 1
+    );
+    require_contains("miss lexer error first", out, "unterminated_a");
+    require_absent("miss lexer error fewer records", out, "unterminated_b");
+    require_contains("miss lexer error shape unavailable", out, "shape=0000000000000000");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-miss-guid-dedup", env_obs_disabled);
+    require_absent("miss master disable", out, "event=rewrite_skipped");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-miss-unknown-mode", env_default);
+    require_absent("miss unknown mode suppresses", out, "event=rewrite_skipped");
     free(out);
 
     out = run_child_capture(argv[0], "child-default", env_default);

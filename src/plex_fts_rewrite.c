@@ -24,6 +24,11 @@
 #define PLEX_MODE_TAGGINGS "taggings+membership"
 #define PLEX_MODE_ONDECK "ondeck"
 
+static const char PLEX_ONDECK_AFTER_IDS[] =
+    " and metadata_item_settings.view_count>0  and metadata_item_views.account_id=";
+static const char PLEX_ONDECK_AFTER_ACCOUNT[] =
+    " group by grandparents.id order by viewed_at desc";
+
 typedef struct rewrite_target {
     const char *fts_table;
     const char *predicate_column;
@@ -984,15 +989,11 @@ static plex_match_result match_tag_membership_query(
         }
         index_state = plex_tag_index_ready(db);
         if (index_state != PLEX_INDEX_PRESENT) {
-            if (index_state != PLEX_INDEX_MISSING ||
-                obs_should_log_index_missing(
-                    db, "plex", PLEX_MODE_TAGGINGS
-                )) {
+            if (index_state == PLEX_INDEX_MISSING) {
+                obs_log_index_missing(db, "plex", PLEX_MODE_TAGGINGS);
+            } else {
                 plex_log_rewrite_skipped(
-                    db,
-                    index_state == PLEX_INDEX_MISSING
-                        ? "index_missing" : "index_probe_error",
-                    PLEX_MODE_TAGGINGS
+                    db, "index_probe_error", PLEX_MODE_TAGGINGS
                 );
             }
             return PLEX_MATCH_MISS;
@@ -1076,6 +1077,58 @@ static int plex_parse_ondeck_value_at(
     slot->assigned_index = assigned_index;
     *after = tok.end;
     return 1;
+}
+
+static void plex_log_ondeck_miss(
+    sqlite3 *db,
+    const char *sql,
+    size_t scan_len,
+    obs_miss_reason reason,
+    const char *sub_reason
+) {
+    uint64_t shape = 0;
+
+    if (!obs_is_disabled()) shape = fts_lex_shape_key(sql, scan_len);
+    obs_log_rewrite_miss(
+        "plex", PLEX_MODE_ONDECK, reason, sub_reason,
+        db, sql, scan_len, shape
+    );
+}
+
+static int plex_ondeck_is_per_guid_variant(
+    const char *sql,
+    size_t scan_len,
+    size_t pos,
+    int variable_limit
+) {
+    static const char guid_open[] = " and grandparents.guid='";
+    plex_value_slot account_id;
+    int max_index = 0;
+    size_t guid_start;
+
+    if (!plex_expect_bytes(sql, scan_len, pos, " and true", &pos)) return 0;
+    if (!plex_expect_bytes(
+            sql, scan_len, pos, PLEX_ONDECK_AFTER_IDS, &pos
+        )) {
+        return 0;
+    }
+    if (!plex_parse_ondeck_value_at(
+            sql, scan_len, pos, variable_limit, &max_index, &account_id, &pos
+        )) {
+        return 0;
+    }
+    if (!plex_expect_bytes(sql, scan_len, pos, guid_open, &pos)) return 0;
+    guid_start = pos;
+    while (pos < scan_len && sql[pos] != '\'') pos++;
+    if (pos == guid_start || pos >= scan_len) return 0;
+    pos++;
+    if (!plex_expect_bytes(sql, scan_len, pos, " ", &pos)) return 0;
+    if (!plex_expect_bytes(
+            sql, scan_len, pos, PLEX_ONDECK_AFTER_ACCOUNT, &pos
+        )) {
+        return 0;
+    }
+    return plex_trailing_space_only(sql, scan_len, pos);
 }
 
 static size_t plex_positional_render_len(int assigned_index) {
@@ -1288,9 +1341,6 @@ static plex_match_result match_ondeck_query(
     static const char after_section[] = " and grandparents.id in (";
     static const char after_threshold[] = " and viewed_at > ";
     static const char conjunction[] = " and ";
-    static const char after_ids[] =
-        " and metadata_item_settings.view_count>0  and metadata_item_views.account_id=";
-    static const char after_account[] = " group by grandparents.id order by viewed_at desc";
     plex_value_slot section_id;
     plex_ondeck_selector selector;
     plex_value_slot account_id;
@@ -1307,16 +1357,16 @@ static plex_match_result match_ondeck_query(
     if (!plex_parse_ondeck_value_at(
             sql, scan_len, pos, variable_limit, &max_index, &section_id, &pos
         )) {
-        obs_log_capture_miss(
-            "plex", PLEX_MODE_ONDECK, "section", db, sql, scan_len
+        plex_log_ondeck_miss(
+            db, sql, scan_len, OBS_MISS_CAPTURE, "section"
         );
         return PLEX_MATCH_MISS;
     }
     if (pos > scan_len || sizeof(conjunction) - 1 > scan_len - pos ||
         memcmp(sql + pos, conjunction, sizeof(conjunction) - 1) != 0 ||
         pos + sizeof(conjunction) - 1 >= scan_len) {
-        obs_log_capture_miss(
-            "plex", PLEX_MODE_ONDECK, "selector", db, sql, scan_len
+        plex_log_ondeck_miss(
+            db, sql, scan_len, OBS_MISS_CAPTURE, "selector"
         );
         return PLEX_MATCH_MISS;
     }
@@ -1324,16 +1374,16 @@ static plex_match_result match_ondeck_query(
         case 'g':
             selector.kind = PLEX_ONDECK_SELECTOR_IDS;
             if (!plex_expect_bytes(sql, scan_len, pos, after_section, &pos)) {
-                obs_log_capture_miss(
-                    "plex", PLEX_MODE_ONDECK, "selector", db, sql, scan_len
+                plex_log_ondeck_miss(
+                    db, sql, scan_len, OBS_MISS_CAPTURE, "selector"
                 );
                 return PLEX_MATCH_MISS;
             }
             if (!plex_parse_integer_list_at(
                     sql, scan_len, pos, &selector.value.id_list, &pos
                 )) {
-                obs_log_capture_miss(
-                    "plex", PLEX_MODE_ONDECK, "id_list", db, sql, scan_len
+                plex_log_ondeck_miss(
+                    db, sql, scan_len, OBS_MISS_CAPTURE, "id_list"
                 );
                 return PLEX_MATCH_MISS;
             }
@@ -1341,61 +1391,72 @@ static plex_match_result match_ondeck_query(
         case 'v':
             selector.kind = PLEX_ONDECK_SELECTOR_THRESHOLD;
             if (!plex_expect_bytes(sql, scan_len, pos, after_threshold, &pos)) {
-                obs_log_capture_miss(
-                    "plex", PLEX_MODE_ONDECK, "selector", db, sql, scan_len
+                plex_log_ondeck_miss(
+                    db, sql, scan_len, OBS_MISS_CAPTURE, "selector"
                 );
                 return PLEX_MATCH_MISS;
             }
             if (!plex_parse_ondeck_threshold_at(
                     sql, scan_len, pos, &selector.value.threshold, &pos
                 )) {
-                obs_log_capture_miss(
-                    "plex", PLEX_MODE_ONDECK, "threshold", db, sql, scan_len
+                plex_log_ondeck_miss(
+                    db, sql, scan_len, OBS_MISS_CAPTURE, "threshold"
                 );
                 return PLEX_MATCH_MISS;
             }
             break;
         default:
-            obs_log_capture_miss(
-                "plex", PLEX_MODE_ONDECK, "selector", db, sql, scan_len
-            );
+            if (plex_ondeck_is_per_guid_variant(
+                    sql, scan_len, pos, variable_limit
+                )) {
+                plex_log_ondeck_miss(
+                    db, sql, scan_len,
+                    OBS_MISS_OUT_OF_SCOPE, "ondeck_per_guid"
+                );
+            } else {
+                plex_log_ondeck_miss(
+                    db, sql, scan_len, OBS_MISS_CAPTURE, "selector"
+                );
+            }
             return PLEX_MATCH_MISS;
     }
-    if (!plex_expect_bytes(sql, scan_len, pos, after_ids, &pos)) {
-        obs_log_capture_miss(
-            "plex", PLEX_MODE_ONDECK, "post_id", db, sql, scan_len
+    if (!plex_expect_bytes(
+            sql, scan_len, pos, PLEX_ONDECK_AFTER_IDS, &pos
+        )) {
+        plex_log_ondeck_miss(
+            db, sql, scan_len, OBS_MISS_CAPTURE, "post_id"
         );
         return PLEX_MATCH_MISS;
     }
     if (!plex_parse_ondeck_value_at(
             sql, scan_len, pos, variable_limit, &max_index, &account_id, &pos
         )) {
-        obs_log_capture_miss(
-            "plex", PLEX_MODE_ONDECK, "account", db, sql, scan_len
+        plex_log_ondeck_miss(
+            db, sql, scan_len, OBS_MISS_CAPTURE, "account"
         );
         return PLEX_MATCH_MISS;
     }
-    if (!plex_expect_bytes(sql, scan_len, pos, after_account, &pos)) {
-        obs_log_capture_miss(
-            "plex", PLEX_MODE_ONDECK, "tail", db, sql, scan_len
+    if (!plex_expect_bytes(
+            sql, scan_len, pos, PLEX_ONDECK_AFTER_ACCOUNT, &pos
+        )) {
+        plex_log_ondeck_miss(
+            db, sql, scan_len, OBS_MISS_CAPTURE, "tail"
         );
         return PLEX_MATCH_MISS;
     }
     if (!plex_trailing_space_only(sql, scan_len, pos)) {
-        obs_log_capture_miss(
-            "plex", PLEX_MODE_ONDECK, "trailing", db, sql, scan_len
+        plex_log_ondeck_miss(
+            db, sql, scan_len, OBS_MISS_CAPTURE, "trailing"
         );
         return PLEX_MATCH_MISS;
     }
     index_state = plex_ondeck_index_ready(db);
     if (index_state != PLEX_INDEX_PRESENT) {
-        if (index_state != PLEX_INDEX_MISSING ||
-            obs_should_log_index_missing(db, "plex", PLEX_MODE_ONDECK)) {
+        if (index_state == PLEX_INDEX_MISSING) {
+            obs_log_index_missing(db, "plex", PLEX_MODE_ONDECK);
+        } else {
             plex_log_rewrite_skipped(
-                db,
-                index_state == PLEX_INDEX_MISSING
-                    ? "index_missing" : "index_probe_error",
-                PLEX_MODE_ONDECK
+                db, "index_probe_error", PLEX_MODE_ONDECK
             );
         }
         return PLEX_MATCH_MISS;

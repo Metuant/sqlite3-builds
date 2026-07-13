@@ -82,6 +82,10 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_logf(const char *fn, c
     (void)fmt;
 }
 
+__attribute__((visibility("hidden"))) SQLITE_API int obs_is_disabled(void) {
+    return 0;
+}
+
 __attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
     const char *src,
     char *dst,
@@ -93,23 +97,27 @@ __attribute__((visibility("hidden"))) SQLITE_API void obs_escape_sql(
     dst[i] = 0;
 }
 
-__attribute__((visibility("hidden"))) SQLITE_API void obs_log_capture_miss(
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_miss(
     const char *target,
     const char *mode,
+    obs_miss_reason reason,
     const char *sub_reason,
     sqlite3 *db,
     const char *sql,
-    size_t len
+    size_t len,
+    uint64_t shape
 ) {
     (void)target;
     (void)mode;
+    (void)reason;
     (void)sub_reason;
     (void)db;
     (void)sql;
     (void)len;
+    (void)shape;
 }
 
-__attribute__((visibility("hidden"))) SQLITE_API int obs_should_log_index_missing(
+__attribute__((visibility("hidden"))) SQLITE_API void obs_log_index_missing(
     sqlite3 *db,
     const char *target,
     const char *mode
@@ -117,7 +125,6 @@ __attribute__((visibility("hidden"))) SQLITE_API int obs_should_log_index_missin
     (void)db;
     (void)target;
     (void)mode;
-    return 1;
 }
 
 __attribute__((visibility("hidden"))) SQLITE_API void obs_log_rewrite_applied(
@@ -289,6 +296,32 @@ static void require_absent(const char *label, const char *got, const char *needl
     if (got && strstr(got, needle)) {
         failf("FAIL [%s]: got=\"%s\" unexpected=\"%s\"", label, got, needle);
     }
+}
+
+static void require_same_line(
+    const char *label,
+    const char *text,
+    const char *first,
+    const char *second
+) {
+    const char *line = text;
+
+    if (!text) failf("FAIL [%s]: text=(null)", label);
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        const char *first_match = strstr(line, first);
+        const char *second_match = strstr(line, second);
+        if (first_match && (!end || first_match < end) &&
+            second_match && (!end || second_match < end)) {
+            return;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    failf(
+        "FAIL [%s]: no line contains \"%s\" and \"%s\" in \"%s\"",
+        label, first, second, text
+    );
 }
 
 static int count_occurrences(const char *haystack, const char *needle) {
@@ -3187,10 +3220,14 @@ static int child_observability_logs(void) {
     char *latest_new_corr_sql;
     char *latest_new_corr_expected;
     char *latest_miss_sql;
+    char *latest_unsupported_sql;
+    char *latest_bind_sql;
     char *latest_series_sql;
     char *movies_sql;
     char *movies_expected;
     char *movies_miss_sql;
+    char *movies_unsupported_sql;
+    char *movies_bind_sql;
     char *movies_no_guard_sql;
     int saved_stderr_fd;
 
@@ -3241,6 +3278,16 @@ static int child_observability_logs(void) {
 
     latest_miss_sql = make_latest_sql("(A.DateCreated) ", "12");
     expect_sql(db, "obs-dashboard-capture-miss", latest_miss_sql, -1, 2, latest_miss_sql, 0);
+    latest_unsupported_sql = make_latest_sql("A.Id ", "11");
+    expect_sql(db, "obs-dashboard-limit-unsupported", latest_unsupported_sql,
+               -1, 2, latest_unsupported_sql, 0);
+    latest_bind_sql = replace_once(
+        latest_sql,
+        "select A.Id from mediaitems A",
+        "select ? AS bound,A.Id from mediaitems A"
+    );
+    expect_sql(db, "obs-dashboard-bind-out-of-scope", latest_bind_sql,
+               -1, 2, latest_bind_sql, 0);
     latest_series_sql = read_text_file(
         "tests/fixtures/emby-fts-rewrite/latest-series-browse-negative.sql"
     );
@@ -3255,6 +3302,14 @@ static int child_observability_logs(void) {
                                    " Group by A.Id");
     expect_sql(db, "obs-dashboard-movies-capture-miss", movies_miss_sql, -1, 2,
                movies_miss_sql, 0);
+    movies_unsupported_sql = make_movies_latest_sql(1, "100", "42", "21");
+    expect_sql(db, "obs-dashboard-movies-limit-unsupported",
+               movies_unsupported_sql, -1, 2, movies_unsupported_sql, 0);
+    movies_bind_sql = replace_once(
+        movies_sql, "A.Id,A.Name", "? AS bound,A.Id,A.Name"
+    );
+    expect_sql(db, "obs-dashboard-movies-bind-out-of-scope", movies_bind_sql,
+               -1, 2, movies_bind_sql, 0);
     movies_no_guard_sql = make_movies_latest_sql(0, "100", "42", "12");
     expect_sql(db, "obs-dashboard-movies-no-guard", movies_no_guard_sql, -1, 2,
                movies_no_guard_sql, 0);
@@ -3399,6 +3454,46 @@ static int child_observability_logs(void) {
         ),
         2
     );
+    require_int(
+        "observability/dashboard-out-of-scope-count",
+        count_occurrences(
+            log_output,
+            "event=rewrite_skipped target=emby reason=out_of_scope mode=dashboard+episodes_latest"
+        ),
+        2
+    );
+    require_same_line(
+        "observability/dashboard-limit-unsupported",
+        log_output,
+        "reason=out_of_scope mode=dashboard+episodes_latest sub_reason=limit_unsupported",
+        "sample=first count=1"
+    );
+    require_same_line(
+        "observability/dashboard-bind-out-of-scope",
+        log_output,
+        "reason=out_of_scope mode=dashboard+episodes_latest sub_reason=bind",
+        "sample=new count=2"
+    );
+    require_int(
+        "observability/dashboard-movies-out-of-scope-count",
+        count_occurrences(
+            log_output,
+            "event=rewrite_skipped target=emby reason=out_of_scope mode=dashboard+movies_latest"
+        ),
+        2
+    );
+    require_same_line(
+        "observability/dashboard-movies-limit-unsupported",
+        log_output,
+        "reason=out_of_scope mode=dashboard+movies_latest sub_reason=limit_unsupported",
+        "sample=first count=1"
+    );
+    require_same_line(
+        "observability/dashboard-movies-bind-out-of-scope",
+        log_output,
+        "reason=out_of_scope mode=dashboard+movies_latest sub_reason=bind",
+        "sample=new count=2"
+    );
     require_contains(
         "observability/dashboard-index-missing",
         log_output,
@@ -3410,7 +3505,13 @@ static int child_observability_logs(void) {
             log_output,
             "event=rewrite_skipped target=emby reason=index_missing mode=dashboard+episodes_latest"
         ),
-        2
+        1
+    );
+    require_same_line(
+        "observability/dashboard-index-missing-sample",
+        log_output,
+        "reason=index_missing mode=dashboard+episodes_latest",
+        "sample=first count=1"
     );
     require_contains(
         "observability/dashboard-index-probe-error",
@@ -3431,7 +3532,13 @@ static int child_observability_logs(void) {
             log_output,
             "event=rewrite_skipped target=emby reason=index_missing mode=dashboard+movies_latest"
         ),
-        2
+        1
+    );
+    require_same_line(
+        "observability/dashboard-movies-index-missing-sample",
+        log_output,
+        "reason=index_missing mode=dashboard+movies_latest",
+        "sample=first count=1"
     );
     require_int(
         "observability/dashboard-movies-index-probe-error-count",
@@ -3463,10 +3570,14 @@ static int child_observability_logs(void) {
     free(latest_new_corr_sql);
     free(latest_new_corr_expected);
     free(latest_miss_sql);
+    free(latest_unsupported_sql);
+    free(latest_bind_sql);
     free(latest_series_sql);
     free(movies_sql);
     free(movies_expected);
     free(movies_miss_sql);
+    free(movies_unsupported_sql);
+    free(movies_bind_sql);
     free(movies_no_guard_sql);
     printf("PASS [observability-logs]\n");
     return 0;

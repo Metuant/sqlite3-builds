@@ -98,6 +98,10 @@ It proves:
 - Capture-miss logging includes full uncapped source SQL on the allocated
   low-volume path and emits a bounded `...[TRUNC]` fallback when allocation
   fails.
+- Rewrite-miss sampling observes the first shape before scheduling, emits
+  first/new/every-1024th records, collapses GUID literals and same-type literal
+  list cardinality, preserves exact parameter-token forms, suppresses unknown
+  modes, and degrades to fewer records on lexer/set failure and the master gate.
 
 ### `plex_fts_rewrite_smoke`
 
@@ -121,9 +125,10 @@ It proves:
   negatives, g2 index gate, duplicate ID preservation, fail-open paths, and
   deterministic ranked-subquery output.
 - Full capture-miss source SQL, `sub_reason`, length/correlation fields,
-  early-miss silence, hybrid `sample=first|periodic|new` applied records with
-  full SQL fields, applied-SQL suppression, and connection-local taggings
-  `index_missing` deduplication.
+  early-miss silence, the verbatim 1075-byte per-GUID `out_of_scope` fixture,
+  near-miss fallback to `capture_miss`, distinct parameter-form shapes, hybrid
+  `sample=first|periodic|new` applied records with full SQL fields, applied-SQL
+  suppression, and process-global taggings `index_missing` sampling.
 - prepare-denial fail-open.
 - grouped-digest row identity.
 
@@ -159,11 +164,12 @@ It proves:
   and embedded NUL inputs.
 - Episodes index-absent/probe-error fail-open; movies outer-missing,
   inner-missing, and probe-error fail-open; native movies-index absence;
-  capture-on-miss with full source SQL, `sub_reason`, and correlation; hybrid
+  capture-on-miss with full source SQL, `sub_reason`, and correlation;
+  `out_of_scope` coverage for parsed unsupported limits and detected binds; hybrid
   first/periodic/new applied-record sampling; aggregate,
   window, bare-star, parenthesized-projection, series-browse, XB, UB, and direct
   candidate-error/partial-statement/wrong-tail coverage. Missing-index logs are
-  deduplicated per connection and mode while probe errors remain unsuppressed.
+  sampled process-wide per mode while probe errors remain unsuppressed.
   No-guard is
   matcher-non-applying: Type=5 passes, guarded-tail miss logs capture_miss, and
   original SQL prepares.

@@ -461,16 +461,16 @@ run_plex_case() {
       map_test_opt_path "/opt/$1/Library/Application Support/Plex Media Server/Preferences.xml"
     }
     run_plex_maintenance_safely() {
-      local blob_final_pre_publish_hook
+      local blob_pre_swap_hook
       (
         set -e
         optimize_plex_db "${_PLEX_DB}" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" "try_deflate_plex_statistics_bandwidth"
         if [ "${PLEX_PROCESS_BLOB_DB:-0}" = "1" ]; then
-          blob_final_pre_publish_hook=""
+          blob_pre_swap_hook=""
           if [ "${PLEX_TRIM_FINISHED_SEASON_BLOBS:-0}" = "1" ]; then
-            blob_final_pre_publish_hook="try_trim_plex_finished_season_blobs"
+            blob_pre_swap_hook="try_trim_plex_finished_season_blobs"
           fi
-          optimize_plex_db "${_PLEX_BLOB_DB}" "" "" "${blob_final_pre_publish_hook}"
+          optimize_plex_db "${_PLEX_BLOB_DB}" "" "${blob_pre_swap_hook}" ""
         fi
       )
     }

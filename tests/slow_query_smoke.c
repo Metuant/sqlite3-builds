@@ -484,6 +484,48 @@ static int child_fast_shape(void) {
     return 0;
 }
 
+static int child_high_total_low_mean(void) {
+    int i;
+    for (i = 0; i < 25; i++) {
+        slow_query_test_record_sql("SELECT high_total_low_mean", 90000000LL);
+    }
+    slow_query_test_dump();
+    slow_query_test_disable_atexit_dump();
+    return 0;
+}
+
+static int child_fallback_saturation(void) {
+    int i;
+    for (i = 0; i < 5; i++) {
+        slow_query_test_record_sql(
+            "SELECT fallback_saturation",
+            (sqlite3_int64)(INT64_MAX / 2)
+        );
+    }
+    slow_query_test_dump();
+    slow_query_test_disable_atexit_dump();
+    return 0;
+}
+
+static int child_total_budget(void) {
+    char sql[64];
+    int shape;
+    int i;
+
+    for (shape = 0; shape < 21; shape++) {
+        snprintf(sql, sizeof(sql), "SELECT total_only_%d", shape);
+        for (i = 0; i < 23; i++) {
+            slow_query_test_record_sql(sql, 90000000LL);
+        }
+    }
+    for (i = 0; i < 5; i++) {
+        slow_query_test_record_sql("SELECT mean_qualified_after_budget", 200000000LL);
+    }
+    slow_query_test_dump();
+    slow_query_test_disable_atexit_dump();
+    return 0;
+}
+
 static int child_slow_low_count(void) {
     int i;
     for (i = 0; i < 4; i++) {
@@ -623,6 +665,18 @@ int main(int argc, char **argv) {
         NULL
     };
     char *env_threshold[] = { "SQLITE3_SLOW_QUERY_THRESHOLD_MS=100", ld_lib_path, NULL };
+    char *env_overflow_threshold[] = {
+        "SQLITE3_SLOW_QUERY_THRESHOLD_MS=922337203686",
+        ld_lib_path,
+        NULL
+    };
+#ifdef SLOW_QUERY_FORCE_NO_INT128
+    char *env_fallback_saturation[] = {
+        "SQLITE3_SLOW_QUERY_THRESHOLD_MS=18446744073709",
+        ld_lib_path,
+        NULL
+    };
+#endif
     char *env_expanded[] = {
         "SQLITE3_SLOW_QUERY_THRESHOLD_MS=500",
         "SQLITE3_DISABLE_SLOW_QUERY_EXPANDED_SQL=0",
@@ -668,11 +722,54 @@ int main(int argc, char **argv) {
     if (argc == 2 && strcmp(argv[1], "child-expanded-not-retained") == 0) return child_expanded_not_retained();
     if (argc == 2 && strcmp(argv[1], "child-kill") == 0) return child_kill();
     if (argc == 2 && strcmp(argv[1], "child-fast-shape") == 0) return child_fast_shape();
+    if (argc == 2 && strcmp(argv[1], "child-high-total-low-mean") == 0) {
+        return child_high_total_low_mean();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-fallback-saturation") == 0) {
+        return child_fallback_saturation();
+    }
+    if (argc == 2 && strcmp(argv[1], "child-total-budget") == 0) {
+        return child_total_budget();
+    }
     if (argc == 2 && strcmp(argv[1], "child-slow-low-count") == 0) return child_slow_low_count();
     if (argc == 2 && strcmp(argv[1], "child-single-slow-event") == 0) return child_single_slow_event();
     if (argc == 2 && strcmp(argv[1], "child-hierarchy") == 0) return child_hierarchy();
     if (argc == 2 && strcmp(argv[1], "child-stats-frequent") == 0) return child_stats_frequent();
     if (argc == 2 && strcmp(argv[1], "child-accumulator") == 0) return child_accumulator();
+
+#ifdef SLOW_QUERY_FORCE_NO_INT128
+    out = run_child_capture(argv[0], "child-stats-frequent", env_threshold);
+    require_contains(
+        "fallback unsaturated stats", out,
+        "slow_query_stats sql=\"SELECT stats_frequent\""
+    );
+    require_absent("fallback unsaturated marker", out, "saturated=");
+    free(out);
+
+    out = run_child_capture(
+        argv[0], "child-fallback-saturation", env_fallback_saturation
+    );
+    require_absent("fallback saturation per-statement", out, " slow_query ");
+    require_contains(
+        "fallback saturation stats eligibility", out,
+        "slow_query_stats sql=\"SELECT fallback_saturation\""
+    );
+    require_contains(
+        "fallback saturation total", out,
+        "count=5 total_ms=18446744073709."
+    );
+    require_absent(
+        "fallback saturation wrapped total", out,
+        "total_ms=4611686018427."
+    );
+    require_contains(
+        "fallback saturation marker", out,
+        "saturated=sum_ns,sum_sq_ns"
+    );
+    free(out);
+    printf("slow query fallback smoke passed\n");
+    return 0;
+#endif
 
     test_parser_cases();
 
@@ -814,6 +911,31 @@ int main(int argc, char **argv) {
     require_absent("fast shape stats", out, "slow_query_stats");
     free(out);
 
+    out = run_child_capture(argv[0], "child-fast-shape", env_overflow_threshold);
+    require_absent("overflow-safe total arm", out, "slow_query_stats");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-high-total-low-mean", env_threshold);
+    require_absent("high-total low-mean per-statement", out, " slow_query ");
+    require_contains("high-total low-mean stats", out, "slow_query_stats");
+    require_contains("high-total low-mean count", out, "count=25");
+    require_contains("high-total low-mean total", out, "total_ms=2250.000000");
+    require_contains("high-total low-mean mean", out, "mean_ms=90.000000");
+    free(out);
+
+    out = run_child_capture(argv[0], "child-total-budget", env_threshold);
+    if (count_occurrences(out, "slow_query_stats sql=\"SELECT total_only_") != 20) {
+        failf(
+            "FATAL: total-only stats budget got=%d want=20 output=%s",
+            count_occurrences(out, "slow_query_stats sql=\"SELECT total_only_"), out
+        );
+    }
+    require_contains(
+        "mean-qualified survives total budget", out,
+        "slow_query_stats sql=\"SELECT mean_qualified_after_budget\""
+    );
+    free(out);
+
     out = run_child_capture(argv[0], "child-slow-low-count", env_threshold);
     require_contains("slow low-count per-statement slow_query", out, " slow_query ");
     require_absent("slow low-count stats", out, "slow_query_stats");
@@ -850,6 +972,7 @@ int main(int argc, char **argv) {
     out = run_child_capture(argv[0], "child-stats-frequent", env_threshold);
     require_contains("frequent slow stats", out, "slow_query_stats");
     require_contains("frequent slow stats count", out, "count=5");
+    require_contains("frequent slow stats total precision", out, "total_ms=5000.000000");
     require_contains("frequent slow stats mean precision", out, "mean_ms=1000.000000");
     require_contains("frequent slow stats stddev precision", out, "stddev_ms=0.000000");
     require_contains("frequent slow stats min precision", out, "min_ms=1000.000000");

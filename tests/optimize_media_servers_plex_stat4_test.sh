@@ -453,7 +453,7 @@ case "$db_arg" in
       *"UPDATE metadata_items SET"*) printf 'metadata-repair\n' >> "$ORDER_LOG" ;;
       *"PRAGMA integrity_check;"*)
         if [ -e "$STAT4_MARKER" ]; then
-          printf 'post-stat4-integrity\n' >> "$ORDER_LOG"
+          printf 'final-integrity\n' >> "$ORDER_LOG"
         fi
         ;;
       *"PRAGMA user_version;"*) printf 'user-version\n' >> "$ORDER_LOG" ;;
@@ -511,14 +511,14 @@ ordered_rc="$(cat "$tmp/ordered.rc")"
 plex_line="$(first_line_of "$ORDER_LOG" "plex-maintenance")"
 repair_line="$(first_line_of "$ORDER_LOG" "metadata-repair")"
 stat4_line="$(first_line_of "$ORDER_LOG" "stat4")"
-integrity_line="$(first_line_of "$ORDER_LOG" "post-stat4-integrity")"
+integrity_line="$(first_line_of "$ORDER_LOG" "final-integrity")"
 user_version_line="$(first_line_of "$ORDER_LOG" "user-version")"
 application_id_line="$(first_line_of "$ORDER_LOG" "application-id")"
 post_swap_fts_line="$(first_line_of "$ORDER_LOG" "post-swap-fts-optimize")"
 assert_line_lt "$plex_line" "$repair_line" "Plex staged maintenance before metadata repair"
 assert_line_lt "$repair_line" "$stat4_line" "metadata repair before STAT4"
-assert_line_lt "$stat4_line" "$integrity_line" "STAT4 before post-STAT4 integrity"
-assert_line_lt "$integrity_line" "$user_version_line" "post-STAT4 integrity before metadata preservation"
+assert_line_lt "$stat4_line" "$integrity_line" "STAT4 before final integrity"
+assert_line_lt "$integrity_line" "$user_version_line" "final integrity before metadata preservation"
 assert_line_lt "$user_version_line" "$application_id_line" "user_version before application_id preservation"
 assert_line_lt "$application_id_line" "$post_swap_fts_line" "metadata preservation before post-swap FTS optimize"
 later_plex_line="$(awk -v stat4_line="$stat4_line" 'NR > stat4_line && index($0, "plex-maintenance") { print NR; exit }' "$ORDER_LOG")"
@@ -545,9 +545,9 @@ rm -f "$STAT4_MARKER" "$POST_SWAP_SQL_GUARD_MARKER"
 export CORRUPT_AFTER_STAT4=1
 run_plex_optimize_with_stat4_capture corrupt-after-stat4 "$corrupt_dir"
 unset CORRUPT_AFTER_STAT4
-assert_eq "1" "$(cat "$tmp/corrupt-after-stat4.rc")" "post-STAT4 integrity gate rc"
-assert_contains "$(cat "$tmp/corrupt-after-stat4.err")" "post-STAT4 staged integrity_check" "post-STAT4 integrity gate diagnostic"
-assert_eq "$corrupt_hash_before" "$(sha256_file "$corrupt_db")" "post-STAT4 integrity gate live hash unchanged"
-[ ! -e "$corrupt_db.new" ] || fail "post-STAT4 integrity gate cleanup" "no staged file" "$corrupt_db.new exists"
+assert_eq "1" "$(cat "$tmp/corrupt-after-stat4.rc")" "final integrity after STAT4 gate rc"
+assert_contains "$(cat "$tmp/corrupt-after-stat4.err")" "final staged integrity_check" "final integrity after STAT4 gate diagnostic"
+assert_eq "$corrupt_hash_before" "$(sha256_file "$corrupt_db")" "final integrity after STAT4 live hash unchanged"
+[ ! -e "$corrupt_db.new" ] || fail "final integrity after STAT4 cleanup" "no staged file" "$corrupt_db.new exists"
 
 printf 'optimize_media_servers Plex STAT4 tests passed\n'

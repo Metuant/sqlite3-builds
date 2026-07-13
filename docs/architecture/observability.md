@@ -56,12 +56,24 @@ only after its own Type discriminator; valid sibling traffic is an unlogged
 clean miss. The capture-gated fan-out modes are `fanout+people`, after its
 `itemPeople2` discriminator, and `fanout+links_search`, after its
 `WithItemLinkItemIds` discriminator. Capture-gated fan-out and dashboard misses
-log `reason=capture_miss` with `sub_reason`, `db`, exact `sql_len`, a full raw
-span FNV-1a `corr` key, and the full escaped source `sql`. This capture
+log `reason=capture_miss` with `sub_reason`, `db`, `sample`, process-global
+`count`, structural `shape`, exact `sql_len`, a full raw-span FNV-1a `corr`
+key, and the full escaped source `sql`. The first miss per reason and mode emits
+as `sample=first`, every 1024th emits as `sample=periodic`, and a first-seen
+structural shape on other counts emits as `sample=new`. One process-global
+512-key set observes every event, including the first. The caller computes the
+shape with the shared lexer over at most 8192 bytes only after confirming
+observability is enabled. Identifiers are ASCII-lowercased, numeric and string
+literals are normalized, same-type literal lists collapse across cardinality,
+and parameter tokens retain their exact bytes. Lexer errors and a full or
+unavailable set fall back to first/periodic sampling and never increase output.
+This capture
 uses `pre_l1`, `select_anchor`, `ancestor_slot`, and `membership` for People;
 links-search also uses `tail_anchor` and `type_slot`; and dashboard Latest uses
 `prefix`, `select_anchor`, `ancestor_slot`, `from_anchor`, `projection`,
-`tail_anchor`, `user_slot`, `limit`, and `bind`. This capture
+`tail_anchor`, `user_slot`, and `limit`. Positively parsed unsupported dashboard
+limits and detected bind parameters instead use `reason=out_of_scope` with
+`sub_reason=limit_unsupported` or `bind`. This capture
 path allocates the uncapped record; allocation or record-size failure emits a
 bounded fallback diagnostic and never changes prepare behavior. The key is a
 diagnostic join aid, not a unique identifier or security boundary. Early clean
@@ -71,12 +83,15 @@ With the base Plex On-Deck rewrite enabled, both the id-list and
 parse drift emits `capture_miss` with first-failure `sub_reason` from `section`,
 `selector`, `id_list`, `threshold`, `post_id`, `account`, `tail`, or `trailing`.
 The threshold arm has no separate gate or disabled-silence state; a threshold
-parse failure emits `sub_reason=threshold`.
+parse failure emits `sub_reason=threshold`. The recognized per-GUID selector
+form emits `reason=out_of_scope sub_reason=ondeck_per_guid`; recognizer drift
+falls back to `capture_miss sub_reason=selector`.
 Missing required Emby dashboard or Plex
-taggings/On-Deck indexes log `reason=index_missing` only once per connection
-and mode; probe errors remain unsuppressed. Clientdata allocation or
-registration failure for missing-index deduplication preserves the diagnostic
-instead of suppressing it.
+taggings/On-Deck indexes use process-global per-mode counters. The first event
+emits `sample=first count=1`, every 1024th emits `sample=periodic count=N`, and
+all other events are suppressed across database handles. The emitted `db=` is
+the exemplar handle while `count=` is process-wide. Probe errors remain
+unsuppressed. This path has no clientdata allocation dependency.
 Other fail-open rewrite reasons are `scalar_unavailable` for Emby FTS,
 `index_probe_error`, `build_failed`, `rewritten_prepare_failed`,
 `tail_mismatch`, and `bind_count_mismatch` for Plex On-Deck. They do not carry
@@ -201,12 +216,21 @@ rebuild when tombstones reach 25% of entries_used.
 
 Stats are retained as count, sum, sum-of-squares, min, and max. Supported
 compilers use `unsigned __int128` accumulators; fallback compilers use
-`uint64_t` with a per-template sample cap and one warning per capped template.
+`uint64_t` with a per-template sample cap of 1048576 observations and one
+warning per capped template. On that fallback, `sum_ns` and `sum_sq_ns`
+saturate at `UINT64_MAX` rather than wrapping. Saturated fields are capped
+floors, not exact figures, and emitted snapshots mark them as
+`saturated=sum_ns`, `saturated=sum_sq_ns`, or
+`saturated=sum_ns,sum_sq_ns`. A saturated `sum_ns` always qualifies for stats
+emission and does not consume the 20-entry total-only budget.
 The dump path heap-allocates value snapshots, copies under the tracker mutex,
 sorts by descending total elapsed time, and emits `slow_query_stats` lines
-after releasing the mutex only when `mean_ns >= threshold_ns` and `count >= 5`.
-Stats fields `mean_ms`, `stddev_ms`, `min_ms`, and `max_ms` render with six
-digits after the decimal point.
+after releasing the mutex when `count >= 5` and either the mean reaches the
+threshold or `total_ns / 20 >= threshold_ns`. The total-only arm emits at most
+the first 20 templates per dump in the existing descending-total order;
+mean-qualified templates are not budgeted. Stats fields `total_ms`, `mean_ms`,
+`stddev_ms`, `min_ms`, and `max_ms` render with six digits after the decimal
+point.
 
 Dumps occur at normal process exit and at most every five minutes during
 PROFILE activity. The atexit path sets an atomic in-exit flag first, so later
@@ -224,9 +248,13 @@ Docker build compiles + runs `slow_query_smoke`, `slow_query_atexit_smoke`,
 and concurrency checks, and it compiles + runs `stmt_trace_smoke` against the
 same registration path to enforce STMT enablement, sampling override,
 hybrid first/periodic/new correlation sampling, and full capture-miss SQL with
-bounded allocation-failure fallback. Rewrite smokes cover full
+bounded allocation-failure fallback. It also covers rewrite-miss structural
+sampling, GUID-literal and id-list cardinality collapse, exact parameter-token
+shapes, set exhaustion, lexer-error fallback, and the master gate. Rewrite
+smokes cover full
 first/periodic/new applied records, SQL-text suppression, capture-miss source
-records, and connection-local missing-index deduplication. Bench binaries
+records, `out_of_scope` classification, and process-global missing-index
+sampling. Bench binaries
 (`slow_query_select1_bench`,
 `slow_query_metadata_bench`, `config_after_dlopen_concurrent_bench`,
 `alloc_latency_bench`, `runtime_optimize_close_bench`,

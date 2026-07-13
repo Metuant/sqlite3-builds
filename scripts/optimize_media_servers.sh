@@ -136,7 +136,6 @@ run_plex_stat4_analyze() {
     local leader_index
     local leader_rows
 
-    _PLEX_STAT4_LAST_ANALYZED=0
     if ! targets="$(discover_plex_stat4_analyze_targets "${binary}" "${db_path}")"; then
         echo "WARNING: Plex STAT4 worklist discovery failed for ${db_path}; skipping Plex STAT4 pass" >&2
         return 0
@@ -176,7 +175,6 @@ run_plex_stat4_analyze() {
         target_ident="$(quote_sql_ident "${target_name}")"
         analyze_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; PRAGMA analysis_limit=0; ANALYZE ${target_ident};"
         if "${binary}" "${db_path}" "${analyze_sql}"; then
-            _PLEX_STAT4_LAST_ANALYZED=1
             analyzed_total=$((analyzed_total + 1))
         else
             echo "WARNING: Plex STAT4 ANALYZE failed for ${target_name} in ${db_path}; continuing" >&2
@@ -753,6 +751,49 @@ run_fts_recurate() {
     return 0
 }
 
+run_fts_recurate_shadow_integrity_gate() {
+    local binary="${1}"
+    local db_path="${2}"
+    local shadow_query
+    local shadow_tables
+    local shadow_table
+    local shadow_ident
+    local shadow_integrity
+    local shadow_table_count=0
+
+    shadow_query="SELECT name FROM sqlite_master WHERE type='table' AND name GLOB 'fts4_tag_titles_icu_*' ORDER BY name;"
+    if ! shadow_tables=$("${binary}" -batch -noheader "${db_path}" "${shadow_query}"); then
+        echo "ERROR: post-re-curation FTS shadow-table discovery failed for ${db_path}; live DB has NOT been touched" >&2
+        return 1
+    fi
+
+    while IFS= read -r shadow_table
+    do
+        [ -n "${shadow_table}" ] || continue
+        if has_control_chars "${shadow_table}"; then
+            echo "ERROR: unsafe post-re-curation FTS shadow-table name discovered in ${db_path}; live DB has NOT been touched" >&2
+            return 1
+        fi
+        shadow_table_count=$((shadow_table_count + 1))
+        shadow_ident="$(quote_sql_ident "${shadow_table}")"
+        if ! shadow_integrity=$("${binary}" "${db_path}" "PRAGMA integrity_check(${shadow_ident});" < /dev/null | tr -d '\r\n'); then
+            echo "ERROR: post-re-curation FTS shadow integrity_check failed to run for ${shadow_table}; live DB has NOT been touched" >&2
+            return 1
+        fi
+        if [ "${shadow_integrity}" != "ok" ]; then
+            echo "ERROR: post-re-curation FTS shadow table ${shadow_table} failed integrity_check: ${shadow_integrity}; live DB has NOT been touched" >&2
+            return 1
+        fi
+    done <<< "${shadow_tables}"
+
+    if [ "${shadow_table_count}" = "0" ]; then
+        echo "ERROR: no post-re-curation FTS shadow tables were discovered in ${db_path}; live DB has NOT been touched" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 run_foreign_key_check_warn() {
     local binary="${1}"
     local db_path="${2}"
@@ -803,26 +844,13 @@ run_plex_metadata_date_repairs_warn() {
 run_plex_main_post_maintenance() {
     local stat4_binary="${1}"
     local staged_db="${2}"
-    local post_stat4_integrity
 
     echo "Fixing Plex metadata dates in staged DB: ${staged_db}"
     run_plex_metadata_date_repairs_warn "${PLEX_BINARY}" "${staged_db}"
 
     # WHY: reads main()'s dynamic-scoped local (sole entry is main "$@"); :-0 keeps STAT4 fail-safe off if ever out of scope.
     if [ "${plex_stat4_enabled:-0}" = "1" ]; then
-        _PLEX_STAT4_LAST_ANALYZED=0
         run_plex_stat4_analyze "${stat4_binary}" "${staged_db}"
-
-        if [ "${_PLEX_STAT4_LAST_ANALYZED:-0}" = "1" ]; then
-            if ! post_stat4_integrity=$("${PLEX_BINARY}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
-                echo "ERROR: post-STAT4 staged integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
-                return 1
-            fi
-            if [ "${post_stat4_integrity}" != "ok" ]; then
-                echo "ERROR: post-STAT4 staged DB failed integrity_check: ${post_stat4_integrity}; live DB has NOT been touched" >&2
-                return 1
-            fi
-        fi
     fi
 
     return 0
@@ -872,7 +900,6 @@ try_deflate_plex_statistics_bandwidth() {
     local retain_days="${3}"
     local table_exists
     local delete_sql
-    local post_integrity
 
     if ! table_exists=$("${binary}" "${staged_db}" "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'statistics_bandwidth' LIMIT 1;" | tr -d '\r\n'); then
         echo "WARNING: could not check for statistics_bandwidth in ${staged_db}; skipping Plex bandwidth deflate" >&2
@@ -898,15 +925,7 @@ try_deflate_plex_statistics_bandwidth() {
     if ! "${binary}" "${staged_db}" \
       "PRAGMA threads=8;" \
       "VACUUM;"; then
-        echo "WARNING: post-deflate VACUUM failed for ${staged_db}; continuing to post-deflate integrity gate" >&2
-    fi
-    if ! post_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
-        echo "ERROR: post-deflate integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
-        return 1
-    fi
-    if [ "${post_integrity}" != "ok" ]; then
-        echo "ERROR: post-deflate DB failed integrity_check: ${post_integrity}; live DB has NOT been touched" >&2
-        return 1
+        echo "WARNING: post-deflate VACUUM failed for ${staged_db}; continuing to final integrity gate" >&2
     fi
 
     return 0
@@ -922,7 +941,6 @@ try_trim_plex_finished_season_blobs() (
     local finished_ids_sql
     local trim_out
     local deleted_count=""
-    local post_integrity
 
     if ! trim_work_dir=$(mktemp -d "${staged_db}.trim.XXXXXX"); then
         echo "WARNING: could not create Plex blob trim scratch beside ${staged_db}; skipping finished-season blob trim" >&2
@@ -1051,17 +1069,8 @@ SQL
         if ! "${binary}" "${staged_db}" \
           "PRAGMA threads=8;" \
           "VACUUM;"; then
-            echo "WARNING: post-trim VACUUM failed for ${staged_db}; continuing to post-trim integrity gate" >&2
+            echo "WARNING: post-trim VACUUM failed for ${staged_db}; continuing to final integrity gate" >&2
         fi
-    fi
-
-    if ! post_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
-        echo "ERROR: post-trim integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
-        return 1
-    fi
-    if [ "${post_integrity}" != "ok" ]; then
-        echo "ERROR: post-trim DB failed integrity_check: ${post_integrity}; live DB has NOT been touched" >&2
-        return 1
     fi
 
     return 0
@@ -1090,6 +1099,7 @@ rebuild_db_vacuum_into() {
     local needs_fixup=0
     local source_integrity
     local staged_integrity
+    local final_integrity
     local source_user_version
     local staged_user_version
     local source_application_id
@@ -1103,6 +1113,7 @@ rebuild_db_vacuum_into() {
     local table_ident
     local source_count
     local staged_count
+    local has_fts_recurate_target=0
 
     case "${auto_vacuum_mode}" in
         "")
@@ -1308,6 +1319,9 @@ rebuild_db_vacuum_into() {
     while IFS= read -r table_name
     do
         [ -n "${table_name}" ] || continue
+        if [ "${table_name}" = "fts4_tag_titles_icu" ]; then
+            has_fts_recurate_target=1
+        fi
         table_ident="${table_name//\"/\"\"}"
         if ! source_count=$("${binary}" "${db_path}" "SELECT COUNT(*) FROM \"${table_ident}\";" | tr -d '\r\n'); then
             echo "ERROR: source row-count check failed for ${table_name}; live DB has NOT been touched" >&2
@@ -1345,14 +1359,6 @@ rebuild_db_vacuum_into() {
         fi
     fi
 
-    # Re-curate Plex's external-content fts4_tag_titles_icu before staged optimize.
-    # Spellfix stays carried forward because fts4aux cannot read external-content FTS4.
-    if ! run_fts_recurate "${binary}" "${staged_db}"; then
-        echo "ERROR: staged FTS re-curation failed for ${staged_db}; live DB has NOT been touched" >&2
-        cleanup_staged_db "${staged_db}"
-        exit 1
-    fi
-
     if [ -n "${optimize_sql}" ]; then
         run_staged_maintenance_sql "${binary}" "${staged_db}" "${optimize_sql}"
     fi
@@ -1370,6 +1376,32 @@ rebuild_db_vacuum_into() {
             exit 1
         fi
     fi
+    if ! final_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
+        echo "ERROR: final staged integrity_check failed to run for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+    if [ "${final_integrity}" != "ok" ]; then
+        echo "ERROR: final staged DB failed integrity_check: ${final_integrity}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+
+    # Re-curate Plex's external-content fts4_tag_titles_icu after the final integrity gate.
+    # Spellfix stays carried forward because fts4aux cannot read external-content FTS4.
+    if ! run_fts_recurate "${binary}" "${staged_db}"; then
+        echo "ERROR: staged FTS re-curation failed for ${staged_db}; live DB has NOT been touched" >&2
+        cleanup_staged_db "${staged_db}"
+        exit 1
+    fi
+    if [ "${has_fts_recurate_target}" = "1" ]; then
+        if ! run_fts_recurate_shadow_integrity_gate "${binary}" "${staged_db}"; then
+            echo "ERROR: staged post-re-curation FTS shadow structural integrity gate failed for ${staged_db}; live DB has NOT been touched" >&2
+            cleanup_staged_db "${staged_db}"
+            exit 1
+        fi
+    fi
+
     if ! staged_user_version=$("${binary}" "${staged_db}" "PRAGMA user_version;" | tr -d '\r\n'); then
         echo "ERROR: staged user_version check failed for ${staged_db}; live DB has NOT been touched" >&2
         cleanup_staged_db "${staged_db}"
@@ -1973,7 +2005,7 @@ start_container_after_maintenance() {
 run_plex_maintenance_safely() {
     local rc
     local restore_errexit=0
-    local blob_final_pre_publish_hook
+    local blob_pre_swap_hook
 
     case "$-" in
         *e*)
@@ -1997,11 +2029,11 @@ run_plex_maintenance_safely() {
           "try_deflate_plex_statistics_bandwidth"
 
         if [ "${PLEX_PROCESS_BLOB_DB:-0}" = "1" ]; then
-            blob_final_pre_publish_hook=""
+            blob_pre_swap_hook=""
             if [ "${PLEX_TRIM_FINISHED_SEASON_BLOBS:-0}" = "1" ]; then
-                blob_final_pre_publish_hook="try_trim_plex_finished_season_blobs"
+                blob_pre_swap_hook="try_trim_plex_finished_season_blobs"
             fi
-            optimize_plex_db "${_PLEX_BLOB_DB}" "" "" "${blob_final_pre_publish_hook}"
+            optimize_plex_db "${_PLEX_BLOB_DB}" "" "${blob_pre_swap_hook}" ""
         fi
     )
     rc=$?
@@ -2088,7 +2120,7 @@ and the /opt/<instance> filesystem stem. Only literal PLEX_OPTIMIZE_API=1
 triggers the post-start Plex optimize API. Only literal PLEX_PROCESS_BLOB_DB=1
 enables the Plex blob database rebuild pass. Both literal
 PLEX_PROCESS_BLOB_DB=1 and PLEX_TRIM_FINISHED_SEASON_BLOBS=1 enable the fixed
-24-month finished-season blob trim as the final staged mutation.
+24-month finished-season blob trim in the staged pre-swap hook.
 
 Stage consumed binaries before running:
   release/cli/sqlite3 -> ${HOME}/bin/sqlite3

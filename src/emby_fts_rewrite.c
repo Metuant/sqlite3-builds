@@ -1033,14 +1033,18 @@ static emby_match_result emby_build_splice_candidate(
 static emby_match_result emby_capture_miss(
     sqlite3 *db,
     int enabled,
+    obs_miss_reason reason,
     const char *mode,
     const char *sub_reason,
     const char *zSql,
     size_t scan_len
 ) {
     if (enabled) {
-        obs_log_capture_miss(
-            "emby", mode, sub_reason, db, zSql, scan_len
+        uint64_t shape = 0;
+
+        if (!obs_is_disabled()) shape = fts_lex_shape_key(zSql, scan_len);
+        obs_log_rewrite_miss(
+            "emby", mode, reason, sub_reason, db, zSql, scan_len, shape
         );
     }
     return EMBY_MATCH_MISS;
@@ -1359,12 +1363,14 @@ static emby_match_result emby_match_people(
     memset(&slots, 0, sizeof(slots));
     if (!find_unique_token_after(zSql, scan_len, 0, EMBY_ANCHOR_PRE_L1, &a1)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+people", "pre_l1", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+people", "pre_l1", zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a1.end, EMBY_ANCHOR_SELECT_AFTER_L1, &a2)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+people", "select_anchor", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+people", "select_anchor", zSql, scan_len
         );
     }
     slots.l1.start = a1.end;
@@ -1372,12 +1378,14 @@ static emby_match_result emby_match_people(
     emby_span_rtrim(zSql, &slots.l1);
     if (!validate_numeric_slot(zSql, &slots.l1)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+people", "ancestor_slot", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+people", "ancestor_slot", zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_MEMBER_PEOPLE, &a3)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+people", "membership", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+people", "membership", zSql, scan_len
         );
     }
     slots.membership = a3;
@@ -1408,12 +1416,14 @@ static emby_match_result emby_match_links_search(
     memset(&slots, 0, sizeof(slots));
     if (!find_unique_token_after(zSql, scan_len, 0, EMBY_ANCHOR_PRE_L1, &a1)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+links_search", "pre_l1", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+links_search", "pre_l1", zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a1.end, EMBY_ANCHOR_LINKS_CTE_IN, &a2)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+links_search", "select_anchor", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+links_search", "select_anchor", zSql, scan_len
         );
     }
     slots.l1.start = a1.end;
@@ -1421,12 +1431,14 @@ static emby_match_result emby_match_links_search(
     emby_span_rtrim(zSql, &slots.l1);
     if (!validate_numeric_slot(zSql, &slots.l1)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+links_search", "ancestor_slot", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+links_search", "ancestor_slot", zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_CTE_END2, &a3)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+links_search", "tail_anchor", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+links_search", "tail_anchor", zSql, scan_len
         );
     }
     slots.t1.start = a2.end;
@@ -1434,12 +1446,14 @@ static emby_match_result emby_match_links_search(
     emby_span_rtrim(zSql, &slots.t1);
     if (!validate_numeric_slot(zSql, &slots.t1)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+links_search", "type_slot", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+links_search", "type_slot", zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a3.end, EMBY_MEMBER_LINKS, &a4)) {
         return emby_capture_miss(
-            db, capture_boundary, "fanout+links_search", "membership", zSql, scan_len
+            db, capture_boundary, OBS_MISS_CAPTURE,
+            "fanout+links_search", "membership", zSql, scan_len
         );
     }
     slots.membership = a4;
@@ -1628,12 +1642,14 @@ static emby_match_result emby_match_episodes_latest(
             zSql, scan_len, &l1, &a2, &sub_reason
         )) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", sub_reason, zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+episodes_latest", sub_reason, zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_LATEST_FROM, &a3)) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", "from_anchor", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+episodes_latest", "from_anchor", zSql, scan_len
         );
     }
 
@@ -1644,12 +1660,14 @@ static emby_match_result emby_match_episodes_latest(
         emby_span_has_byte(zSql, &projection, '(') ||
         emby_projection_has_rejected_ident(zSql, &projection)) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", "projection", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+episodes_latest", "projection", zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a3.end, EMBY_ANCHOR_LATEST_TAIL, &a4)) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", "tail_anchor", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+episodes_latest", "tail_anchor", zSql, scan_len
         );
     }
     user_id.start = a3.end;
@@ -1657,35 +1675,37 @@ static emby_match_result emby_match_episodes_latest(
     emby_span_rtrim(zSql, &user_id);
     if (!emby_validate_integer_slot(zSql, &user_id)) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", "user_slot", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+episodes_latest", "user_slot", zSql, scan_len
         );
     }
     if (!emby_parse_trailing_integer(zSql, scan_len, a4.end, &limit_slot)) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", "limit", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+episodes_latest", "limit", zSql, scan_len
         );
     }
     if (!emby_latest_limit_supported(zSql, &limit_slot)) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", "limit", zSql, scan_len
+            db, 1, OBS_MISS_OUT_OF_SCOPE,
+            "dashboard+episodes_latest", "limit_unsupported", zSql, scan_len
         );
     }
     if (emby_statement_has_bind_parameter(zSql, scan_len)) {
         return emby_capture_miss(
-            db, 1, "dashboard+episodes_latest", "bind", zSql, scan_len
+            db, 1, OBS_MISS_OUT_OF_SCOPE,
+            "dashboard+episodes_latest", "bind", zSql, scan_len
         );
     }
     index_state = emby_latest_index_ready(db);
     if (index_state != EMBY_LATEST_INDEX_PRESENT) {
-        if (index_state != EMBY_LATEST_INDEX_MISSING ||
-            obs_should_log_index_missing(
+        if (index_state == EMBY_LATEST_INDEX_MISSING) {
+            obs_log_index_missing(
                 db, "emby", "dashboard+episodes_latest"
-            )) {
+            );
+        } else {
             log_rewrite_skipped(
-                db,
-                index_state == EMBY_LATEST_INDEX_MISSING
-                    ? "index_missing" : "index_probe_error",
-                "dashboard+episodes_latest"
+                db, "index_probe_error", "dashboard+episodes_latest"
             );
         }
         return EMBY_MATCH_MISS;
@@ -1749,12 +1769,14 @@ static emby_match_result emby_match_movies_latest(
             zSql, scan_len, &l1, &a2, &sub_reason
         )) {
         return emby_capture_miss(
-            db, 1, "dashboard+movies_latest", sub_reason, zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+movies_latest", sub_reason, zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_LATEST_FROM, &a3)) {
         return emby_capture_miss(
-            db, 1, "dashboard+movies_latest", "from_anchor", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+movies_latest", "from_anchor", zSql, scan_len
         );
     }
     projection.start = a2.end;
@@ -1764,13 +1786,15 @@ static emby_match_result emby_match_movies_latest(
         emby_span_has_byte(zSql, &projection, '(') ||
         emby_projection_has_rejected_ident(zSql, &projection)) {
         return emby_capture_miss(
-            db, 1, "dashboard+movies_latest", "projection", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+movies_latest", "projection", zSql, scan_len
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a3.end,
                                  EMBY_ANCHOR_MOVIES_LATEST_TAIL, &a4)) {
         return emby_capture_miss(
-            db, 1, "dashboard+movies_latest", "tail_anchor", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+movies_latest", "tail_anchor", zSql, scan_len
         );
     }
     user_id.start = a3.end;
@@ -1778,31 +1802,37 @@ static emby_match_result emby_match_movies_latest(
     emby_span_rtrim(zSql, &user_id);
     if (!emby_validate_integer_slot(zSql, &user_id)) {
         return emby_capture_miss(
-            db, 1, "dashboard+movies_latest", "user_slot", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+movies_latest", "user_slot", zSql, scan_len
         );
     }
-    if (!emby_parse_trailing_integer(zSql, scan_len, a4.end, &limit_slot) ||
-        !emby_latest_limit_supported(zSql, &limit_slot)) {
+    if (!emby_parse_trailing_integer(zSql, scan_len, a4.end, &limit_slot)) {
         return emby_capture_miss(
-            db, 1, "dashboard+movies_latest", "limit", zSql, scan_len
+            db, 1, OBS_MISS_CAPTURE,
+            "dashboard+movies_latest", "limit", zSql, scan_len
+        );
+    }
+    if (!emby_latest_limit_supported(zSql, &limit_slot)) {
+        return emby_capture_miss(
+            db, 1, OBS_MISS_OUT_OF_SCOPE,
+            "dashboard+movies_latest", "limit_unsupported", zSql, scan_len
         );
     }
     if (emby_statement_has_bind_parameter(zSql, scan_len)) {
         return emby_capture_miss(
-            db, 1, "dashboard+movies_latest", "bind", zSql, scan_len
+            db, 1, OBS_MISS_OUT_OF_SCOPE,
+            "dashboard+movies_latest", "bind", zSql, scan_len
         );
     }
     index_state = emby_latest_movies_indexes_ready(db);
     if (index_state != EMBY_LATEST_INDEX_PRESENT) {
-        if (index_state != EMBY_LATEST_INDEX_MISSING ||
-            obs_should_log_index_missing(
+        if (index_state == EMBY_LATEST_INDEX_MISSING) {
+            obs_log_index_missing(
                 db, "emby", "dashboard+movies_latest"
-            )) {
+            );
+        } else {
             log_rewrite_skipped(
-                db,
-                index_state == EMBY_LATEST_INDEX_MISSING
-                    ? "index_missing" : "index_probe_error",
-                "dashboard+movies_latest"
+                db, "index_probe_error", "dashboard+movies_latest"
             );
         }
         return EMBY_MATCH_MISS;

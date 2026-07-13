@@ -2,6 +2,9 @@
 #define FTS_LEX_H
 
 #include <stddef.h>
+#include <stdint.h>
+
+#define FTS_LEX_SHAPE_CAP 8192u
 
 typedef enum fts_lex_token_type {
     FTS_LEX_TOK_EOF = 0,
@@ -62,6 +65,11 @@ __attribute__((visibility("hidden"))) int fts_lex_token_text_eq(
     const char *want
 );
 __attribute__((visibility("hidden"))) fts_lex_token fts_lex_next_token(fts_lex *lx);
+/* Returns 0 when the token stream cannot produce a structural shape. */
+__attribute__((visibility("hidden"))) uint64_t fts_lex_shape_key(
+    const char *sql,
+    size_t len
+);
 __attribute__((visibility("hidden"))) int fts_lex_match_rhs_is_complete(
     const fts_lex *after_value,
     const fts_lex_token *value

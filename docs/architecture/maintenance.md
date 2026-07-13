@@ -119,7 +119,7 @@ Maintenance controls:
 | `PLEX_TRIM_FINISHED_SEASON_BLOBS` | `0` | Set in the config file | Together with literal `PLEX_PROCESS_BLOB_DB=1`, literal `1` enables the fixed 24-month finished-season blob trim. |
 | `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Set in the config file | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside this retention window. |
 | `_PAGE_SIZE` | `16384` | Edit the in-script `_PAGE_SIZE` constant | Rebuilt Plex and Emby databases target 16 KiB pages. |
-| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Controlled by `STATS_BANDWIDTH_RETAIN_DAYS` | Runs on the staged database before swap; DELETE or VACUUM failures warn, but a post-deflate `integrity_check` failure aborts before touching the live DB. |
+| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Controlled by `STATS_BANDWIDTH_RETAIN_DAYS` | Runs in the staged pre-swap hook; DELETE or VACUUM failures warn, and the later unconditional final staged `integrity_check` blocks publication on corruption. |
 
 ### Planned-Downtime Gate
 
@@ -144,19 +144,38 @@ dated `.original` backup.
 The rebuild runs under `PLEX_BINARY` (`Plex SQLite`) with
 `PRAGMA page_size=${_PAGE_SIZE}`, `PRAGMA auto_vacuum=NONE`, and `VACUUM INTO`
 to a same-directory staged `<db>.new` file. The staged file must pass page-size
-and auto-vacuum checks, staged `integrity_check == ok`, staged FTS integrity,
-and an exhaustive source-vs-staged per-table row-count sweep before any swap is
-attempted. If the main Plex database has `statistics_bandwidth`, the pre-swap
-hook can deflate it inside the staged file with `PRAGMA threads=8` and
-`VACUUM`, then hard-gates post-deflate `integrity_check`. Every maintenance
-`VACUUM` invoked through Plex SQLite uses its default file-backed temp storage
-and retains `PRAGMA threads=8`.
+and auto-vacuum checks and an initial staged `integrity_check == ok`, then pass
+the exhaustive source-vs-staged per-table row-count sweep. The remaining staged
+order is FTS rebuild, the staged FTS integrity gate, the per-database pre-swap
+hook, staged optimize SQL, the post-maintenance hook, the optional final
+pre-publication extension hook, the unconditional final `integrity_check ==
+ok`, FTS re-curation, the post-re-curation FTS4 shadow-table structural gate,
+and the `user_version`/`application_id` preservation gate before atomic
+replacement. The final integrity gate runs for Plex main, Plex blob, and Emby
+after all configured hooks and optimize SQL, even when no hook runs or Plex
+STAT4 is disabled or analyzes no target. FTS re-curation is the last staged
+mutation after that gate.
 
-After the rebuild and validation sweep, the staged Plex path runs FTS rebuild,
-the staged FTS integrity gate, FTS re-curation, staged optimize SQL, the staged
-metadata date-repair SQL, the Plex main-DB STAT4 pass, and, when that STAT4
-pass is enabled, a post-STAT4 `integrity_check` gate before the
-`user_version`/`application_id` preservation gate and atomic replacement.
+For the Plex main database, the pre-swap hook deflates
+`statistics_bandwidth`, when present, with `PRAGMA threads=8` and `VACUUM`.
+DELETE or VACUUM failures retain their warn-and-continue behavior; the hook has
+no local integrity gate and returns success after a completed mutation. The
+post-maintenance hook then runs metadata date repairs unconditionally and the
+Plex main-DB STAT4 pass when enabled. The final staged integrity gate runs after
+both and before FTS re-curation. Every maintenance `VACUUM` invoked through Plex
+SQLite uses its default file-backed temp storage and retains `PRAGMA threads=8`.
+
+Plex FTS re-curation deliberately removes URI and empty documents only from the
+external-content `fts4_tag_titles_icu` index while retaining their rows in
+`tags`. The resulting curated subset is intentional, so it runs after the final
+integrity gate and remains a hard-failing last mutation before publication.
+When `fts4_tag_titles_icu` exists, the script then discovers every
+`fts4_tag_titles_icu_*` shadow table from `sqlite_master` and requires literal
+`ok` from a table-scoped `PRAGMA integrity_check` for each table. This validates
+the shadow b-trees written by re-curation without running the FTS semantic arm
+that rejects the intentional curated subset. Plex blob and Emby skip this gate
+without an additional SQLite invocation because the target table is absent.
+
 Post-swap FTS maintenance is optimize-only.
 `PLEX_PROCESS_BLOB_DB=1` enables the same staged rebuild for the Plex blob
 database without the `statistics_bandwidth` hook, metadata date repair, or
@@ -168,13 +187,16 @@ selects episode rows (`metadata_type=4`) owned by season rows
 or before the fixed 24-month cutoff. A staged-only write connection imports
 that file into a TEMP table and deletes only `blob_type=5` rows with
 `linked_type='media_part'`. Candidate, deleted, total, and target counts must
-conserve before COMMIT. This trim is the final staged mutation; zero candidates
-skip its threads-only VACUUM, while nonzero or unparseable counts run it. A
-fresh integrity gate follows before the outer `user_version`, `application_id`,
-and atomic publication gates. Read, import, DELETE, and VACUUM failures keep the
-existing warn-and-continue envelope; post-trim integrity failure blocks
-publication. Plex SQLite is required because Plex data can require the
-ICU-enabled binary.
+conserve before COMMIT. The trim runs in the pre-swap hook after staged FTS
+rebuild and its integrity gate. Staged optimize SQL runs after the trim. Zero
+candidates skip its threads-only VACUUM, while nonzero or unparseable counts run
+it. Read, import, DELETE, and VACUUM failures keep the existing
+warn-and-continue envelope, and the trim hook has no local integrity gate. The
+unconditional final staged integrity gate runs later, after staged optimize SQL,
+and blocks publication before FTS re-curation, the post-re-curation FTS4
+shadow-table structural gate when the target exists, the `user_version`,
+`application_id`, and atomic publication gates. Plex SQLite is required because
+Plex data can require the ICU-enabled binary.
 
 The Plex main-database staged optimize SQL creates the runbook-validated
 `idx_dshadow_taggings_tag_id_metadata_item_id` and
@@ -204,11 +226,14 @@ FTS integrity, warns on foreign-key rows, switches the source to
 The rebuild runs under `GENERIC_SQLITE_BINARY` with
 `PRAGMA page_size=${_PAGE_SIZE}`, `PRAGMA auto_vacuum=NONE`, and
 `VACUUM INTO` to a staged `<db>.new` file. The staged file must pass page-size
-and auto-vacuum checks, staged `integrity_check == ok`, staged FTS integrity,
-an exhaustive source-vs-staged per-table row-count sweep, FTS rebuild, the
-staged FTS integrity gate, FTS re-curation, staged optimize SQL, and the
-`user_version`/`application_id` preservation gate before the script replaces the
-live database with `mv` and removes stale WAL/SHM siblings.
+and auto-vacuum checks, the initial staged `integrity_check == ok`, an
+exhaustive source-vs-staged per-table row-count sweep, FTS rebuild, the staged
+FTS integrity gate, and staged optimize SQL. The unconditional final staged
+`integrity_check == ok` then runs before FTS re-curation, which is a no-op when
+the Plex-specific table is absent. The post-re-curation FTS4 shadow-table gate
+is also a zero-invocation no-op, followed by the `user_version`/`application_id`
+preservation gate. The script then replaces the live database with `mv` and
+removes stale WAL/SHM siblings.
 The Emby staged optimize SQL creates the runbook-validated
 `idx_dshadow_mediaitems_parent_type`, `idx_dshadow_emby_latest_gk_dc`,
 `idx_dshadow_emby_latest_movies_dcn_puk`, and
@@ -226,16 +251,20 @@ Docker stop/start verification failure, Docker query failure, running
 containers after stop, source integrity failure, source FTS integrity failure,
 `journal_mode=DELETE` failure, backup publication failure, `VACUUM INTO`
 failure, staged auto-vacuum mismatch against `NONE`, staged integrity failure,
-staged FTS integrity failure, per-table row-count mismatch, pre-swap hook
-integrity failure, and post-STAT4 staged integrity failure. After a successful
-stop, these failures still fall through to the start gate before the script
-continues. The source and staged integrity gates require the literal `ok`
-result from
-`PRAGMA integrity_check`.
+staged FTS integrity failure, per-table row-count mismatch, pre-swap or
+post-maintenance hook failure, and final staged integrity failure after all
+hooks and optimize SQL. Post-re-curation FTS shadow-table discovery failure,
+unsafe discovered names, an empty shadow-table set, a table-scoped integrity
+command failure, or any result other than literal `ok` also blocks publication.
+After a successful stop, these failures still fall through to the start gate
+before the script continues. The source, initial staged, final staged, and
+post-re-curation table-scoped structural gates require the literal `ok` result
+from `PRAGMA integrity_check`.
 
 Warning-and-continue cases include source `foreign_key_check` rows, skipped
 missing instance directories, Plex `statistics_bandwidth` table absence or
-DELETE/VACUUM failure before a clean post-deflate integrity result, staged
-maintenance SQL failure, staged metadata date-repair failure, Plex STAT4
-preflight/worklist/per-target/final-count failures, and post-swap FTS
-maintenance failures.
+DELETE/VACUUM failure before the final staged integrity gate, staged maintenance
+SQL failure, staged metadata date-repair failure, Plex STAT4
+preflight/worklist/per-target/final-count failures, Plex blob-trim
+read/import/DELETE/VACUUM failures before the final staged integrity gate, and
+post-swap FTS maintenance failures.

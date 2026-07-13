@@ -116,6 +116,8 @@ static const char *TAG_COLUMN_RHS_ONLY_SQL =
 #define ONDECK_THRESHOLD_SQL_BODY ONDECK_HEAD "2" ONDECK_AFTER_THRESHOLD ONDECK_THRESHOLD ONDECK_AFTER_IDS "42" ONDECK_AFTER_ACCOUNT
 
 static const char *ONDECK_SQL = ONDECK_SQL_BODY;
+static const char *ONDECK_PER_GUID_SQL =
+    "select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.`index`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id=? and true and metadata_item_settings.view_count>0  and metadata_item_views.account_id=? and grandparents.guid='plex://show/648dd4c8004a8e8652751de2'  group by grandparents.id order by viewed_at desc";
 static const char *ONDECK_SQL_REWRITTEN =
     "SELECT grandparents_id AS id,\n"
     "       originally_available_at AS originally_available_at,\n"
@@ -372,6 +374,23 @@ static void require_occurrences(const char *label, const char *got, const char *
         failf("FAIL [%s]: occurrences=%d want=%d needle=\"%s\" text=\"%s\"",
               label, got_count, want, needle, got ? got : "(null)");
     }
+}
+
+static uint64_t require_shape_field(const char *label, const char *text) {
+    const char *field = text ? strstr(text, "shape=") : NULL;
+    const char *start;
+    char *end = NULL;
+    unsigned long long value;
+
+    if (!field) failf("FAIL [%s]: missing shape field in \"%s\"", label,
+                      text ? text : "(null)");
+    start = field + strlen("shape=");
+    errno = 0;
+    value = strtoull(start, &end, 16);
+    if (errno != 0 || end != start + 16 || *end != ' ' || value == 0u) {
+        failf("FAIL [%s]: invalid shape field in \"%s\"", label, text);
+    }
+    return (uint64_t)value;
 }
 
 static char *read_text_file(const char *path) {
@@ -938,6 +957,84 @@ static void expect_ondeck_skip_log(
               label, (long)(tail - sql), (long)strlen(sql));
     }
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+}
+
+static char *copy_ondeck_per_guid_sql(const char *guid) {
+    static const char guid_prefix[] = "plex://show/";
+    size_t sql_len = strlen(ONDECK_PER_GUID_SQL);
+    char *sql;
+    char *slot;
+
+    if (!guid || strlen(guid) != 24u) {
+        failf("FATAL: per-GUID value must contain exactly 24 bytes");
+    }
+    sql = (char *)malloc(sql_len + 1u);
+    if (!sql) failf("FATAL: per-GUID SQL allocation failed");
+    memcpy(sql, ONDECK_PER_GUID_SQL, sql_len + 1u);
+    slot = strstr(sql, guid_prefix);
+    if (!slot) failf("FATAL: per-GUID prefix missing");
+    slot += sizeof(guid_prefix) - 1u;
+    if (slot[24] != '\'') failf("FATAL: per-GUID slot width drifted");
+    memcpy(slot, guid, 24u);
+    return sql;
+}
+
+static char *make_ondeck_per_guid_near_miss(void) {
+    static const char tail[] = "order by viewed_at desc";
+    char *sql = copy_ondeck_per_guid_sql("648dd4c8004a8e8652751de2");
+    char *found = strstr(sql, tail);
+
+    if (!found) failf("FATAL: per-GUID tail missing");
+    memcpy(found + strlen("order by viewed_at "), "asc ", 4u);
+    return sql;
+}
+
+static void expect_ondeck_skip_logs(
+    sqlite3 *db,
+    const char *log_path,
+    const char *label,
+    const char *const *sqls,
+    size_t sql_count
+) {
+    sqlite3_stmt *stmt = NULL;
+    const char *tail = NULL;
+    int saved_stderr;
+    int log_fd;
+    int rc = SQLITE_OK;
+    size_t i;
+
+    saved_stderr = dup(STDERR_FILENO);
+    if (saved_stderr < 0) failf("FATAL: dup(stderr) failed: %s", strerror(errno));
+    log_fd = open(log_path, O_CREAT | O_TRUNC | O_WRONLY, 0600);
+    if (log_fd < 0) {
+        close(saved_stderr);
+        failf("FATAL: open %s failed: %s", log_path, strerror(errno));
+    }
+    if (dup2(log_fd, STDERR_FILENO) < 0) {
+        close(log_fd);
+        close(saved_stderr);
+        failf("FATAL: dup2(stderr) failed: %s", strerror(errno));
+    }
+    close(log_fd);
+
+    for (i = 0; i < sql_count; i++) {
+        rc = sqlite3_prepare_v2(db, sqls[i], -1, &stmt, &tail);
+        if (rc != SQLITE_OK) break;
+        require_str_eq(label, sqlite3_sql(stmt), sqls[i]);
+        if (tail != sqls[i] + strlen(sqls[i])) {
+            failf("FAIL [%s/tail]: index=%lu tail_offset=%ld want=%ld",
+                  label, (unsigned long)i, (long)(tail - sqls[i]),
+                  (long)strlen(sqls[i]));
+        }
+        require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+        stmt = NULL;
+    }
+    fflush(stderr);
+    if (dup2(saved_stderr, STDERR_FILENO) < 0) _exit(125);
+    close(saved_stderr);
+    if (rc != SQLITE_OK) {
+        failf("FAIL [%s/prepare]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
+    }
 }
 
 static void expect_tag_applied_log(sqlite3 *db, const char *log_path, int count) {
@@ -1750,6 +1847,10 @@ static int child_tag_index_log_dedup(void) {
     expect_ondeck_skip_log(db, log_path, "tag-index-missing-first", TAG_BROWSE_SQL);
     log_text = read_text_file(log_path);
     require_occurrences("tag-index-missing-first", log_text, missing, 1);
+    require_same_line(
+        "tag-index-missing-first/sample", log_text, missing,
+        "sample=first count=1"
+    );
     free(log_text);
     expect_ondeck_skip_log(db, log_path, "tag-index-missing-repeat", TAG_BROWSE_SQL);
     log_text = read_text_file(log_path);
@@ -1762,7 +1863,7 @@ static int child_tag_index_log_dedup(void) {
     db = open_seeded_temp("com.plexapp.plugins.library.db");
     expect_ondeck_skip_log(db, log_path, "tag-index-missing-new-connection", TAG_BROWSE_SQL);
     log_text = read_text_file(log_path);
-    require_occurrences("tag-index-missing-new-connection", log_text, missing, 1);
+    require_occurrences("tag-index-missing-new-connection", log_text, missing, 0);
     free(log_text);
     require_int("tag-index-probe-error/authorizer",
                 sqlite3_set_authorizer(db, ondeck_failure_authorizer_cb, &probe),
@@ -1785,6 +1886,12 @@ static int child_tag_index_log_dedup(void) {
 }
 
 static int child_ondeck_capture_miss_log(void) {
+    static const char *per_guid_values[] = {
+        "648dd4c8004a8e8652751de2",
+        "111111111111111111111111",
+        "aaaaaaaaaaaaaaaaaaaaaaaa",
+        "0123456789abcdef01234567"
+    };
     const struct {
         const char *label;
         const char *sql;
@@ -1802,11 +1909,21 @@ static int child_ondeck_capture_miss_log(void) {
         {"ondeck-threshold-wrong-tail-log", ONDECK_THRESHOLD_WRONG_TAIL_SQL, "tail"}
     };
     sqlite3 *db;
+    const char *per_guid_sqls[
+        sizeof(per_guid_values) / sizeof(per_guid_values[0])
+    ];
+    char *per_guid_owned[
+        sizeof(per_guid_values) / sizeof(per_guid_values[0]) - 1u
+    ];
+    char *per_guid_near_miss;
     char log_path[512];
     char *log_text;
+    uint64_t param_shapes[4] = {0};
     size_t i;
     static const char *capture_needle =
         "event=rewrite_skipped target=plex reason=capture_miss mode=ondeck";
+    static const char *out_of_scope_needle =
+        "event=rewrite_skipped target=plex reason=out_of_scope mode=ondeck";
 
     if (sqlite3_compileoption_used("ENABLE_ICU") == 0) {
         printf("SKIP [ondeck-capture-miss-log]: ENABLE_ICU=0\n");
@@ -1817,6 +1934,63 @@ static int child_ondeck_capture_miss_log(void) {
     temp_path(log_path, sizeof(log_path), "ondeck-capture-miss.stderr");
     unlink(log_path);
     db = open_seeded_temp("com.plexapp.plugins.library.db");
+
+    if (strlen(ONDECK_PER_GUID_SQL) != 1075u) {
+        failf("FAIL [ondeck-per-guid/fixture-length]: got=%lu want=1075",
+              (unsigned long)strlen(ONDECK_PER_GUID_SQL));
+    }
+    per_guid_sqls[0] = ONDECK_PER_GUID_SQL;
+    for (i = 1; i < sizeof(per_guid_values) / sizeof(per_guid_values[0]); i++) {
+        per_guid_owned[i - 1u] = copy_ondeck_per_guid_sql(per_guid_values[i]);
+        per_guid_sqls[i] = per_guid_owned[i - 1u];
+    }
+    expect_ondeck_skip_logs(
+        db, log_path, "ondeck-per-guid-originals", per_guid_sqls,
+        sizeof(per_guid_sqls) / sizeof(per_guid_sqls[0])
+    );
+    log_text = read_text_file(log_path);
+    require_occurrences(
+        "ondeck-per-guid/out-of-scope-once", log_text, out_of_scope_needle, 1
+    );
+    require_same_line(
+        "ondeck-per-guid/reason", log_text, out_of_scope_needle,
+        "sub_reason=ondeck_per_guid"
+    );
+    require_same_line(
+        "ondeck-per-guid/sample", log_text, out_of_scope_needle,
+        "sample=first count=1"
+    );
+    require_same_line(
+        "ondeck-per-guid/verbatim", log_text, out_of_scope_needle,
+        ONDECK_PER_GUID_SQL
+    );
+    require_same_line(
+        "ondeck-per-guid/length", log_text, out_of_scope_needle,
+        "sql_len=1075"
+    );
+    free(log_text);
+    for (i = 0; i < sizeof(per_guid_owned) / sizeof(per_guid_owned[0]); i++) {
+        free(per_guid_owned[i]);
+    }
+
+    per_guid_near_miss = make_ondeck_per_guid_near_miss();
+    expect_ondeck_skip_log(
+        db, log_path, "ondeck-per-guid-near-miss", per_guid_near_miss
+    );
+    log_text = read_text_file(log_path);
+    require_occurrences(
+        "ondeck-per-guid-near-miss/capture", log_text, capture_needle, 1
+    );
+    require_same_line(
+        "ondeck-per-guid-near-miss/selector", log_text, capture_needle,
+        "sub_reason=selector"
+    );
+    require_absent(
+        "ondeck-per-guid-near-miss/out-of-scope", log_text, out_of_scope_needle
+    );
+    free(log_text);
+    free(per_guid_near_miss);
+
     expect_ondeck_skip_log(db, log_path, "ondeck-param-list-log", ONDECK_PARAM_LIST_SQL);
     log_text = read_text_file(log_path);
     require_occurrences("ondeck-param-list-log/rewrite-skipped", log_text, capture_needle, 1);
@@ -1826,6 +2000,8 @@ static int child_ondeck_capture_miss_log(void) {
     log_text = read_text_file(log_path);
     require_occurrences("ondeck-param-named-log/rewrite-skipped", log_text, capture_needle, 1);
     require_contains("ondeck-param-named-log/sub-reason", log_text, "sub_reason=section");
+    require_contains("ondeck-param-named-log/sample", log_text, "sample=new");
+    param_shapes[0] = require_shape_field("ondeck-param-named-log/shape", log_text);
     free(log_text);
     expect_ondeck_skip_log(db, log_path, "ondeck-param-leading-zero-log",
                            ONDECK_PARAM_LEADING_ZERO_SQL);
@@ -1833,6 +2009,10 @@ static int child_ondeck_capture_miss_log(void) {
     require_occurrences("ondeck-param-leading-zero-log/rewrite-skipped",
                         log_text, capture_needle, 1);
     require_contains("ondeck-param-leading-zero-log/sub-reason", log_text, "sub_reason=section");
+    require_contains("ondeck-param-leading-zero-log/sample", log_text, "sample=new");
+    param_shapes[1] = require_shape_field(
+        "ondeck-param-leading-zero-log/shape", log_text
+    );
     free(log_text);
     for (i = 0; i < sizeof(threshold_misses) / sizeof(threshold_misses[0]); i++) {
         expect_ondeck_skip_log(
@@ -1842,6 +2022,12 @@ static int child_ondeck_capture_miss_log(void) {
         require_occurrences(
             threshold_misses[i].label, log_text, capture_needle, 1
         );
+        if (i == 1u || i == 2u) {
+            require_contains(threshold_misses[i].label, log_text, "sample=new");
+            param_shapes[i + 1u] = require_shape_field(
+                threshold_misses[i].label, log_text
+            );
+        }
         {
             char metadata[160];
             int rc = snprintf(
@@ -1884,6 +2070,19 @@ static int child_ondeck_capture_miss_log(void) {
             );
         }
         free(log_text);
+    }
+    for (i = 0; i < sizeof(param_shapes) / sizeof(param_shapes[0]); i++) {
+        size_t j;
+        for (j = i + 1u; j < sizeof(param_shapes) / sizeof(param_shapes[0]); j++) {
+            if (param_shapes[i] == param_shapes[j]) {
+                failf(
+                    "FAIL [ondeck-param-shapes]: index=%lu and index=%lu "
+                    "share shape=%016llx",
+                    (unsigned long)i, (unsigned long)j,
+                    (unsigned long long)param_shapes[i]
+                );
+            }
+        }
     }
     expect_ondeck_skip_log(db, log_path, "ondeck-early-head-miss", NONMATCH_SQL);
     log_text = read_text_file(log_path);

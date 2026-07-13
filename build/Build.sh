@@ -273,6 +273,7 @@ if [ "${target}" = "library" ]; then
     fts_lex_init \
     fts_lex_token_text_eq \
     fts_lex_next_token \
+    fts_lex_shape_key \
     fts_lex_match_rhs_is_complete \
     fts_rewrite_db_basename_matches \
     plex_fts_rewrite_prepare \
