@@ -1224,12 +1224,20 @@ static char *plex_build_ondeck_sql(
     const plex_value_slot *account_id,
     size_t *rewrite_len
 ) {
+    /* Unary + keeps sqlite3_column_decltype() NULL for this column, matching
+     * the vendor statement, where max(viewed_at) is an expression. A bare
+     * pass-through leaks the viewed_at decltype (integer(8)) through the
+     * subquery, and Plex types result columns by decltype: the vendor
+     * statement presents this column as untyped, so a typed rewrite column
+     * makes the PMS request handler throw std::bad_cast (HTTP 500 on
+     * /hubs/continueWatching for the affected account). Runtime value and
+     * storage class are unchanged. */
     static const char tpl0[] =
         "SELECT grandparents_id AS id,\n"
         "       originally_available_at AS originally_available_at,\n"
         "       parent_index AS parent_index,\n"
         "       metadata_item_views_index AS \"index\",\n"
-        "       viewed_at AS \"max(viewed_at)\",\n"
+        "       +viewed_at AS \"max(viewed_at)\",\n"
         "       library_section_id AS library_section_id,\n"
         "       grandparents_extra_data AS extra_data\n"
         "FROM (\n"
