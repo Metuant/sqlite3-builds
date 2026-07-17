@@ -9,7 +9,7 @@ for script in \
   lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-preflight/run \
   lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-verify/run \
   lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-swap/run \
-  lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-poolpatch/run \
+  lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run \
   lsio-mods/emby/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-preflight/run \
   lsio-mods/emby/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-verify/run \
   lsio-mods/emby/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-swap/run \
@@ -58,8 +58,8 @@ assert_oneshot emby init-mod-sqlite3-config init-mod-sqlite3-swap
 assert_oneshot plex init-mod-sqlite3-preflight init-mods
 assert_oneshot plex init-mod-sqlite3-verify init-mod-sqlite3-preflight
 assert_oneshot plex init-mod-sqlite3-swap init-mod-sqlite3-verify
-assert_oneshot plex init-mod-sqlite3-poolpatch init-mod-sqlite3-swap
-[ -f lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mods-end/dependencies.d/init-mod-sqlite3-poolpatch ] || {
+assert_oneshot plex init-mod-sqlite3-plexpatch init-mod-sqlite3-swap
+[ -f lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mods-end/dependencies.d/init-mod-sqlite3-plexpatch ] || {
   echo "FATAL: missing plex init-mods-end dependency marker" >&2
   exit 1
 }
@@ -75,9 +75,9 @@ if grep -rEn '(^|[^A-Za-z0-9_])(PLEX_POOL_PATCH_|SQLITE3_LSIO_MOD_|TMPDIR|PUID|P
 fi
 grep -Fq 'require_all_or_warn awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname' lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-preflight/run
 grep -Fq 'require_all_or_warn awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname' lsio-mods/emby/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-preflight/run
-grep -Fq 'require_all_or_warn awk chmod chown cp dd grep mktemp mv od printf rm sha256sum stat tr uname' lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-poolpatch/run
+grep -Fq 'require_all_or_warn awk chmod chown cp dd grep mktemp mv od printf rm sha256sum stat tr uname' lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run
 grep -Fq '| Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |' docs/invariants/sqlite3-builds.md
-grep -Fq '| Plex pool patch | `dd od printf` |' docs/invariants/sqlite3-builds.md
+grep -Fq '| Plex patch | `dd od printf` |' docs/invariants/sqlite3-builds.md
 if grep -rEn '(>|mv |cp |rm |dd ).*libicu.*plex\.so\.69|libicu.*plex\.so\.69.*(>|mv |cp |rm |dd )' lsio-mods; then
   echo "FATAL: mod source writes Plex ICU runtime files" >&2
   exit 1

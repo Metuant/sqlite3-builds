@@ -515,6 +515,14 @@ Complex resume emits the RES-A ancestor `EXISTS` splice and the RES-D implied
 watched/progress conjunct in one candidate. Resume-simple and Similar-items emit
 the ancestor `EXISTS` splice.
 
+Links-search accepts the one-level ItemLinks CTE and the exact two-level UNION
+shape. The one-level form replaces the membership with one correlated
+ItemLinks `EXISTS`. The two-level form requires numeric direct and indirect
+type lists plus exactly one membership reference after the CTE, then replaces
+that reference with a parenthesized OR of the one-level and two-level
+correlated `EXISTS` arms. Slot, tail, or membership drift fails open through
+the links-search capture-miss path.
+
 All fan-out families fail open. Applied logs use the shared
 first/every-1024th/new schema with `target=emby mode=fanout+<family>`.
 Capture-gated fan-out structural drift logs the shared full raw-source record with
@@ -531,14 +539,16 @@ AUTOPRAGMA. Both reject bare, numbered, and named bind tokens across the whole
 statement before readiness probes.
 
 Both matchers accept exactly one ancestor CTE grammar: the list form
-`AncestorId in (<integers>) )select` or the scalar form
+`AncestorId in (<integers>) )select` or the scalar form with either a
+nonnegative decimal integer or exact `-1` in
 `AncestorId=<integer> )select`. The scalar form has one closing parenthesis;
 the list form retains its list-closing plus CTE-closing pair. Mixed, duplicate,
-bound, nonnumeric, or mismatched anchor pairs fail open. A positively detected
-bind emits `reason=out_of_scope sub_reason=bind`; a parsed limit outside
-12/16/20 emits `reason=out_of_scope sub_reason=limit_unsupported`. Limit parse
-failure remains `reason=capture_miss sub_reason=limit`. Generated SQL renders
-either validated source form as `AncestorId IN (<captured slot>)`.
+bound, other signed, expression, whitespace-split, nonnumeric, or mismatched
+anchor pairs fail open. A positively detected bind emits
+`reason=out_of_scope sub_reason=bind`; a parsed limit outside 12/16/20 emits
+`reason=out_of_scope sub_reason=limit_unsupported`. Limit parse failure remains
+`reason=capture_miss sub_reason=limit`. Generated SQL renders either validated
+source form as `AncestorId IN (<captured slot>)`.
 
 `emby_match_episodes_latest` first requires exact Type=8. It emits mode
 `dashboard+episodes_latest` and K1: `keys(gk)` enumerates ancestor-visible,

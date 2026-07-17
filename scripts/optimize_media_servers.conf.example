@@ -14,10 +14,11 @@ PLEX_INSTANCES=("plex")
 # Emby Docker container names. Each entry is also the /opt/<name> path stem.
 EMBY_INSTANCES=("emby")
 
-# ICU-enabled Plex SQLite binary. The path contains a space; keep it quoted.
+# Operator-staged patched Plex SQLite binary. Stage the matching patched
+# libsqlite3.so and PMS source-id guard; the path contains a space, so quote it.
 PLEX_BINARY="${HOME}/plex-sql/Plex SQLite"
 
-# Tuned generic sqlite3 CLI for Emby maintenance and the Plex STAT4 pass.
+# Tuned generic sqlite3 CLI for Emby maintenance and the Plex STAT4 capability gate.
 GENERIC_SQLITE_BINARY="${HOME}/bin/sqlite3"
 
 # Backup root. If this directory exists, dated .original backups publish under

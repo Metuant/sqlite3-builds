@@ -67,6 +67,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tests/fixtures/plex-fts-rewrite/` | Raw Plex On-Deck statement fixtures and expected prepare-wrapper output for smoke checks. |
 | `tests/render_lsio_mod_baked_pins_test.sh` | Unit tests for `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: schema v3 metadata, detector, artifact, pre, Plex pool-site, unsupported rows, and malformed-input rejection. |
 | `tests/cont_init_fragments_test.sh` | Static and unit checks for LSIO mod runtime fragments, phase-script shebangs, no custom env-var surface, and Plex ICU read-only posture. |
+| `tests/plex_source_id_patch_test.sh` | Unit tests for the PMS single-replace pool-site/source-id patch, idempotence, drift and failure paths, backup preservation, and Plex ICU read-only posture. |
 | `tests/sqlite_build_workflow_mod_only_test.sh` | Static workflow check for the `preflight` / `build-cli` / `build-generic` / `build-plex` job split and producer-owned smokes, minimal release assets, rendered release-notes wiring, and split `mod-build` / `mod-publish` jobs. |
 | `tests/check_obs_counts.sh` | Pre-build lint: counts `SQLITE_CONFIG_` and `SQLITE_DBCONFIG_` decode entries in `src/observability.c` against `build/expected-sqlite-*-count.txt`. |
 | `tests/check_pin_alignment.sh` | Pre-build lint: asserts mimalloc VERSION + URL + SHA512 alignment, forbids retired scalar pin keys, checks group-owned ICU source defaults and SORTERREF/PMASZ compile/runtime alignment, enforces the 14-row mode catalogue, four-mode index eligibility, exact producer map, escaped raw-literal rejection, runbook-row and ABI-staging contracts, six `Load version pins` steps, workflow concurrency, the GHCR registry build-cache contract (`type=gha` forbidden; `CACHE_EXPORT_ENABLED`-gated event-ref-only exports), and all 19 project `COPY` lines after the ICU and mimalloc dependency layers. |
@@ -78,7 +79,7 @@ host application loads SQLite by handle rather than by symbol interposition.
 | `tools/ci/render-release-notes.sh` | Renders the oldest-first non-merge commit-subject section appended to the CalVer release body. |
 | `tools/ci/emby-fts-rewrite-dump.c` | Manual host-gate utility that prepares an Emby fixture through the wrapper and writes `sqlite3_sql(stmt)` output; it has no CI consumer. |
 | `lsio-mods/` | Source-of-truth Plex and Emby Docker mod roots, shared runtime fragments, and parent README. |
-| `lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh` | Args-only shared Plex pool-patch core staged into the Plex mod. |
+| `lsio-mods/shared/cont-init-fragments/plex-patch.sh` | Args-only shared Plex pool-site and source-id patch core staged into the Plex mod. |
 | `scripts/optimize_media_servers.sh` | Planned-downtime maintenance helper for Plex and Emby databases, including container stop/start ownership and optional post-start Plex optimize API triggering. |
 | `.github/workflows/base.yml` | Reusable workflow that resolves, builds, smokes, and publishes the generic build-base image by content hash. |
 | `.github/workflows/sqlite-build.yml` | CI build, smoke, artifact upload, release archive, and SHA manifest workflow. |
@@ -211,7 +212,7 @@ LSIO tool surface:
 - Perform no runtime archive download or extraction.
 - Common phases use `awk`, `chmod`, `chown`, `cp`, `grep`, `mkdir`, `mktemp`,
   `mv`, `rm`, `sed`, `sha256sum`, `stat`, `tr`, and `uname`.
-- Plex pool patch additionally uses `dd`, `od`, and `printf`.
+- Plex patch additionally uses `dd`, `od`, and `printf`.
 - Do not depend on `curl`, `tar`, `gunzip`, Python, `jq`, package managers, or
   network access at runtime.
 

@@ -38,7 +38,7 @@ path under investigation.
 | Target | Binary | Planner fidelity |
 |---|---|---|
 | Emby / generic | `~/bin/sqlite3` | Generic build with STAT4; faithful for Emby/generic plan choice. |
-| Plex bundled shell | `/home/darthshadow/plex-sql/Plex SQLite` | SQLite 3.39.4 with ICU and no STAT4; useful for bundled-shell behavior, not faithful for this repository's deployed Plex planner. |
+| Plex staged maintenance shell | `/home/darthshadow/plex-sql/Plex SQLite` | Patched SQLite 3.53.3 with ICU and STAT4; requires the matching staged `libsqlite3.so` and PMS source-id guard. Faithful plan-choice tests also require `icu_root` and PMS tokenizers. |
 | Plex deployed replacement | A STAT4+ICU build of the deployed Plex library, with `icu_root` and required PMS tokenizers registered | Required for faithful Plex plan-choice tests. |
 | Generic FTS mirror | `~/bin/sqlite3` against a copied `unicode61` mirror | Useful for generic FTS row-shape and rewrite experiments when Plex ICU is unavailable; not faithful for Plex ICU ranking, collation, or plan-choice claims. |
 
@@ -299,7 +299,7 @@ hand-roll a harness that omits any of them.
    timeout-wrapped runners, and enforce it with a startup self-check that greps the
    script's own source and refuses to run if any `"$SQLITE_BIN" -batch` line lacks a
    `timeout` prefix (reference: the `_ss=...grep -vF 'timeout "${'...exit 2` guard in
-   `fh1-measure.sh` / `nm10-measure.sh`). Two caps:
+   `docs/runbooks/query-measure/query-measure.sh`). Two caps:
    - Query phases (timed / identity / EQP / vendor-stability): `timeout ${TIMEOUT_S:-10}s`,
      above good-case and far below the pathological. A candidate can regress
      catastrophically -- orders of magnitude -- on a worst-case literal/user cell;

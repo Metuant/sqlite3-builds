@@ -67,9 +67,14 @@ Signing: TODO.
 
 ## Customization
 
-- Change SQLite source pins, the mimalloc tuple, `CMAKE_*` inputs for the
-  content-addressed GHCR generic base, base-image source pins,
+- Change SQLite source pins, the URL-encoded `SQLITE_SOURCE_ID`, the mimalloc
+  tuple, `CMAKE_*` inputs for the content-addressed GHCR generic base,
+  base-image source pins,
   `GENERIC_GLIBC_MAX`, and SQLite config-count pins in `pins/versions.env`.
+  On every SQLite bump, replace `SQLITE_SOURCE_ID` with the new 84-byte
+  `sqlite_source_id()` value, encoding each space as `%20`. The library build
+  decodes the pin and runs `SELECT sqlite_source_id()` through the freshly
+  built shared library; a stale pin fails the build.
   The generic library build consumes `BASE_IMAGE` dynamically from CI or the
   local wrapper; do not add a static generic base digest pin to
   `docker-library/Dockerfile`.
@@ -90,7 +95,7 @@ Signing: TODO.
 
 `scripts/optimize_media_servers.sh` is a host-side helper for stopped Plex and
 Emby containers. It consumes a generic SQLite CLI at `${HOME}/bin/sqlite3` and
-Plex runtime files under `${HOME}/plex-sql/`.
+an operator-staged patched Plex engine under `${HOME}/plex-sql/`.
 
 Stage the generic CLI directly from the local build output:
 
@@ -99,27 +104,25 @@ mkdir -p "${HOME}/bin"
 install -m 0755 release/cli/sqlite3 "${HOME}/bin/sqlite3"
 ```
 
-The Plex maintenance prerequisites are copied from a Plex container, not from
-the built `release/library-plex/libsqlite3.so` output. That built library is a
-separate library-replacement artifact for the Plex LSIO mod path.
+Copy the Plex maintenance prerequisites from a container after the Plex LSIO
+mod has swapped SQLite and patched the PMS source-id guard. The wrapper, PMS
+sibling, and `libsqlite3.so` must be a coherent patched set.
 
 ```bash
 mkdir -p "${HOME}/plex-sql"
 rm -rf "${HOME}/plex-sql/lib"
 docker cp plex:"/usr/lib/plexmediaserver/lib/" "${HOME}/plex-sql/lib/"
-
-# If lib/ came from a modded container, restore Plex's bundled SQLite in the
-# staging copy so Plex SQLite's source-id guard matches.
-cp -f "${HOME}/plex-sql/lib/libsqlite3.so.bundled.bak" \
-  "${HOME}/plex-sql/lib/libsqlite3.so"
-
 docker cp plex:"/usr/lib/plexmediaserver/Plex SQLite" "${HOME}/plex-sql/"
 docker cp plex:"/usr/lib/plexmediaserver/Plex Media Server" "${HOME}/plex-sql/"
 ```
 
-Copying the `Plex Media Server` sibling is recommended staging for Plex's
-source-id guard. The script executes only `PLEX_BINARY` (`Plex SQLite`); the
-sibling binary is not a code-proven runtime dependency of the helper.
+Do not restore `libsqlite3.so.bundled.bak` over the staged patched library.
+Before stopping any container, the script executes `PLEX_BINARY`. If its
+`sqlite_source_id()` is not the required patched id, the script skips all Plex
+maintenance without evaluating Plex instance gates, then continues independent
+Emby maintenance.
+The built `release/library-plex/libsqlite3.so` is usable here only when paired
+with the matching patched wrapper and PMS guard.
 
 Operator config is a sourced Bash file. Copy
 `scripts/optimize_media_servers.conf.example` to
@@ -144,12 +147,17 @@ Current operator controls:
 |---|---|---|---|
 | `_PAGE_SIZE` | `16384` | Edit the in-script `_PAGE_SIZE` constant in `scripts/optimize_media_servers.sh` | Target page size for staged Plex and Emby rebuilds. |
 | `BACKUP_PATH` | `/mnt/media-backup` | Set in the config file | Existing path receives instance-scoped `.original` backups; otherwise backups stay beside the database. |
-| `GENERIC_SQLITE_BINARY` | `${HOME}/bin/sqlite3` | Set in the config file | Runs Emby maintenance and the Plex main-DB STAT4 pass. |
-| `PLEX_BINARY` | `${HOME}/plex-sql/Plex SQLite` | Set in the config file | Runs Plex maintenance with Plex's ICU-enabled SQLite binary. |
+| `GENERIC_SQLITE_BINARY` | `${HOME}/bin/sqlite3` | Set in the config file | Runs Emby maintenance and gates the Plex main-DB STAT4 pass on `ENABLE_STAT4`. |
+| `PLEX_BINARY` | `${HOME}/plex-sql/Plex SQLite` | Set in the config file | Runs all Plex maintenance, including STAT4 ANALYZE with `icu_root` registered in each invocation; the patched source id is required. |
 | `PLEX_OPTIMIZE_API` | `0` | Set in the config file | Literal `1` enables the optional post-start Plex `PUT /library/optimize?async=1` trigger. |
 | `PLEX_PROCESS_BLOB_DB` | `0` | Set in the config file | Literal `1` opts into the Plex blob database rebuild pass. |
+| `PLEX_TRIM_FINISHED_SEASON_BLOBS` | `0` | Set in the config file | Literal `1`, together with `PLEX_PROCESS_BLOB_DB=1`, enables the fixed 24-month finished-season blob trim in the staged pre-swap hook. |
 | `STATS_BANDWIDTH_RETAIN_DAYS` | `90` | Set in the config file | Plex `statistics_bandwidth` deflate keeps only rows with an account id and inside the retention window. |
-| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Uses `STATS_BANDWIDTH_RETAIN_DAYS` | Deletes anonymous or older bandwidth rows on the staged database, runs `VACUUM`, and aborts before swap if post-deflate integrity is not `ok`. |
+| Plex `statistics_bandwidth` deflate | Enabled for the Plex main database when the table exists | Uses `STATS_BANDWIDTH_RETAIN_DAYS` | Deletes anonymous or older bandwidth rows on the staged database and runs `VACUUM`; the later final post-rebuild integrity gate blocks publication on corruption. |
+
+The rebuild keeps the source-vs-staged row-count sweep before FTS rebuild,
+drops the pre-copy source and pre-rebuild staged whole-DB integrity gates, and
+retains the final post-rebuild `integrity_check` as the publication barrier.
 
 ## Motivation
 

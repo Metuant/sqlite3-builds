@@ -1,4 +1,4 @@
 compat_group	mod	build_variant	artifact_stem	sqlite_source_id_guard	icu_source_version	icu_source_sha512	linked_icu_sonames	smoke_server_id
-icu69	plex	plex	plex-icu69	fixture-sqlite-source-id	69.1	d4aeb781715144ea6e3c6b98df5bbe0490bfa3175221a1d667f3e6851b7bd4a638fa4a37d4a921ccb31f02b5d15a6dded9464d98051964a86f7b1cde0ff0aab7	libicuucplex.so.69;libicui18nplex.so.69;libicudataplex.so.69	plex-fixture
+icu69	plex	plex	plex-icu69	2022-09-29 15:55:41 a29f9949895322123f7c38fbe94c649a9d6e6c9cd0c3b41c96d694552f26b309	69.1	d4aeb781715144ea6e3c6b98df5bbe0490bfa3175221a1d667f3e6851b7bd4a638fa4a37d4a921ccb31f02b5d15a6dded9464d98051964a86f7b1cde0ff0aab7	libicuucplex.so.69;libicui18nplex.so.69;libicudataplex.so.69	plex-fixture
 generic	emby	generic	generic	fixture-sqlite-source-id	-	-	-	emby-fixture
 generic2	emby	generic	generic2	fixture-sqlite-source-id	-	-	-	emby-fixture-generic2

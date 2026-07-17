@@ -26,17 +26,20 @@ stage_scratch() {
     "$scratch/docker-library" \
     "$scratch/docker-build-base" \
     "$scratch/docs" \
+    "$scratch/lsio-mods/shared/cont-init-fragments" \
     "$scratch/src" \
     "$scratch/tools/ci" \
     "$scratch/tools/lsio-mod" \
     "$scratch/tools" \
-    "$scratch/scripts"
+    "$scratch/scripts" \
+    "$scratch/lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch"
   mkdir -p "$scratch/docs/runbooks/query-measure/families"
 
   cp "$repo_root/tests/check_pin_alignment.sh" "$scratch/tests/check_pin_alignment.sh"
   cp "$repo_root/pins/versions.env" "$scratch/pins/versions.env"
   cp "$repo_root/pins/library-compat-groups.tsv" "$scratch/pins/library-compat-groups.tsv"
   cp "$repo_root/pins/runtime-support.tsv" "$scratch/pins/runtime-support.tsv"
+  cp "$repo_root/pins/runtime-baselines.tsv" "$scratch/pins/runtime-baselines.tsv"
   cp "$repo_root/.github/workflows/sqlite-build.yml" "$scratch/.github/workflows/sqlite-build.yml"
   cp "$repo_root/.github/workflows/base.yml" "$scratch/.github/workflows/base.yml"
   cp "$repo_root/build/Build.sh" "$scratch/build/Build.sh"
@@ -50,6 +53,8 @@ stage_scratch() {
   cp "$repo_root/docker-build-base/ubuntu-toolchain-r-test.asc" "$scratch/docker-build-base/ubuntu-toolchain-r-test.asc"
   cp "$repo_root/CLAUDE.md" "$scratch/CLAUDE.md"
   cp "$repo_root/docs/env-vars.md" "$scratch/docs/env-vars.md"
+  cp "$repo_root/docs/baked-pins-schema.md" "$scratch/docs/baked-pins-schema.md"
+  cp "$repo_root/docs/runtime-baseline-derivation.md" "$scratch/docs/runtime-baseline-derivation.md"
   cp "$repo_root/src/auto_extension.c" "$scratch/src/auto_extension.c"
   cp "$repo_root/src/emby_fts_rewrite.c" "$scratch/src/emby_fts_rewrite.c"
   cp "$repo_root/src/fts_lex.c" "$scratch/src/fts_lex.c"
@@ -64,9 +69,16 @@ stage_scratch() {
   cp "$repo_root/docs/runbooks/query-measure/families/emby-search.sh" "$scratch/docs/runbooks/query-measure/families/emby-search.sh"
   cp "$repo_root/docs/runbooks/query-measure/families/emby-dashboard.sh" "$scratch/docs/runbooks/query-measure/families/emby-dashboard.sh"
   cp "$repo_root/tests/abi_obsolete_config_ops_test.sh" "$scratch/tests/abi_obsolete_config_ops_test.sh"
+  cp "$repo_root/tests/stage_lsio_mod_baked_pins_test.sh" "$scratch/tests/stage_lsio_mod_baked_pins_test.sh"
   cp "$repo_root/tools/ci/mod-bake-smoke.sh" "$scratch/tools/ci/mod-bake-smoke.sh"
   cp "$repo_root/tools/lsio-mod/render-lsio-mod-baked-pins.sh" "$scratch/tools/lsio-mod/render-lsio-mod-baked-pins.sh"
+  cp "$repo_root/tools/lsio-mod/stage-lsio-mod.sh" "$scratch/tools/lsio-mod/stage-lsio-mod.sh"
+  cp "$repo_root/lsio-mods/shared/cont-init-fragments/manifest-parser.sh" "$scratch/lsio-mods/shared/cont-init-fragments/manifest-parser.sh"
+  cp "$repo_root/lsio-mods/shared/cont-init-fragments/selector.sh" "$scratch/lsio-mods/shared/cont-init-fragments/selector.sh"
+  cp "$repo_root/lsio-mods/shared/cont-init-fragments/plex-patch.sh" "$scratch/lsio-mods/shared/cont-init-fragments/plex-patch.sh"
   cp "$repo_root/scripts/optimize_media_servers.sh" "$scratch/scripts/optimize_media_servers.sh"
+  cp "$repo_root/lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run" \
+    "$scratch/lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run"
 }
 
 assert_rejected() {
@@ -482,6 +494,56 @@ PY
       ' "$scratch/CLAUDE.md" > "$scratch/CLAUDE.md.tmp"
       mv "$scratch/CLAUDE.md.tmp" "$scratch/CLAUDE.md"
       ;;
+    source-id-pin-format)
+      python3 - "$scratch/pins/versions.env" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+pattern = re.compile(r"^SQLITE_SOURCE_ID=([^\r\n]+)$", re.MULTILINE)
+matches = pattern.findall(text)
+if len(matches) != 1 or "%20" not in matches[0]:
+    raise SystemExit("SQLITE_SOURCE_ID pin fixture missing or ambiguous")
+mutated = matches[0].replace("%20", "+20", 1)
+path.write_text(pattern.sub(f"SQLITE_SOURCE_ID={mutated}", text, count=1))
+PY
+      ;;
+    source-id-build-assertion-missing)
+      python3 - "$scratch/build/Build.sh" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '  rc = prepare(db, "SELECT sqlite_source_id()", -1, &stmt, NULL);'
+new = '  rc = prepare(db, "SELECT sqlite_version()", -1, &stmt, NULL);'
+if text.count(old) != 1:
+    raise SystemExit("fresh-library source-id query fixture missing or ambiguous")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    source-id-workflow-arg-missing)
+      python3 - "$scratch/.github/workflows/sqlite-build.yml" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+line = '            --build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}" \\\n'
+if text.count(line) != 4:
+    raise SystemExit("workflow SQLITE_SOURCE_ID build-arg fixtures missing")
+path.write_text(text.replace(line, "", 1))
+PY
+      ;;
+    curated-source-id-detector)
+      printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+        detect plex plex-negative linux-arm64 plex_pms:source-id-patched - - \
+        '/usr/lib/plexmediaserver/Plex Media Server' - - - \
+        ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff \
+        >> "$scratch/pins/runtime-baselines.tsv"
+      ;;
     *)
       fail "unsupported failure case: $name"
       ;;
@@ -506,6 +568,10 @@ PY
 assert_rejected pins-source pins/versions.env
 assert_rejected scripts-source scripts/reintroduced-pin.sh
 assert_rejected retired-scalar-under-base-context docker-build-base/reintroduced-pin.sh
+assert_fails_with source-id-pin-format 'pins/versions.env SQLITE_SOURCE_ID must be an 84-byte SQLite source id with spaces encoded as %20'
+assert_fails_with source-id-build-assertion-missing 'build/Build.sh missing exact line:   rc = prepare(db, "SELECT sqlite_source_id()", -1, &stmt, NULL);'
+assert_fails_with source-id-workflow-arg-missing 'Build sqlite library SQLITE_SOURCE_ID build arg exact-line count drift: observed=0 expected=1'
+assert_fails_with curated-source-id-detector 'pins/runtime-baselines.tsv contains rejected pattern:'
 assert_fails_with missing-base-ref-script-input CMAKE_SHA256_AARCH64
 assert_fails_with inline-generic-base BASE_IMAGE
 assert_fails_with library-copy-before-dependencies 'library dependency layers before all project COPY lines invalid'

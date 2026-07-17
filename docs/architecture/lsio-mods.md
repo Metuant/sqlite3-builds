@@ -23,12 +23,15 @@ Runtime installed files:
 /opt/sqlite3-lsio-mod/lib/manifest-parser.sh
 /opt/sqlite3-lsio-mod/lib/selector.sh
 /opt/sqlite3-lsio-mod/lib/swap.sh
+/opt/sqlite3-lsio-mod/lib/atomic-write.sh
 ```
 
 Plex also installs:
 
 ```text
-/opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh
+/opt/sqlite3-lsio-mod/lib/plex-patch.sh
+/opt/sqlite3-lsio-mod/pins/library-compat-groups.tsv
+/opt/sqlite3-lsio-mod/pins/versions.env
 ```
 
 `baked-pins.txt` is the only runtime SHA source. It uses schema v3 rows:
@@ -36,6 +39,18 @@ Plex also installs:
 manifest carries detector sets for per-version detector selection, group-aware
 artifact paths, target runtime baselines, Plex ICU runtime baselines, and Plex
 pool-site byte contexts.
+Plex PMS detector identity includes exact pool-original + OLD, pool-patched +
+OLD, and pool-patched + NEW source-id states. The final state is
+`plex_pms:source-id-patched`; it remains version- and architecture-bound by its
+full SHA. Its SHA is computed while rendering: bake-smoke exports the pristine
+PMS from the pulled full Plex image, the renderer first verifies it against the
+curated `plex_pms:pristine` whole-file SHA, then produces the final bytes through
+the shared `plex_patch_populate_pms_tmp` runtime path and hashes them. The final
+role is not a `pins/runtime-baselines.tsv` curation row.
+The staged compatibility-group table is copied unchanged and supplies the OLD
+Plex `sqlite_source_id_guard`; staged `versions.env` supplies the URL-encoded
+NEW `SQLITE_SOURCE_ID`. Neither file adds a baked-pins row or runtime SHA
+source.
 
 Row-kind schema and all-arch manifest coverage are pinned in
 `docs/invariants/sqlite3-builds.md` §2 and §8. Detailed schema v3 field rules,
@@ -64,7 +79,7 @@ init-mods
   -> init-mod-sqlite3-preflight
   -> init-mod-sqlite3-verify
   -> init-mod-sqlite3-swap
-  -> init-mod-sqlite3-poolpatch     (Plex)
+  -> init-mod-sqlite3-plexpatch     (Plex)
   -> init-mods-end
 ```
 
@@ -89,11 +104,16 @@ checks `libicuucplex.so.69`, `libicui18nplex.so.69`, and
 `libicudataplex.so.69` against `pre` rows before SQLite replacement. It must
 not replace, rename, move, delete, or overwrite those files.
 
-Phase 04 pool patch runs only in the Plex mod. On amd64 and arm64, the phase
+Phase 04 Plex patch runs only in the Plex mod. On amd64 and arm64, the phase
 first verifies that the SQLite target is already current, then calls the staged
-`plex-pool-patch.sh` fragment with all paths, expected SHAs, and patch sites as
-arguments. The fragment reads no environment variables and carries no SHA
-constants.
+`plex-patch.sh` fragment with all paths, expected SHAs, patch sites, and source
+ids as arguments. The phase reads OLD from the Plex row and
+`sqlite_source_id_guard` column of the staged unchanged compatibility-group
+table. It reads NEW from the staged canonical `SQLITE_SOURCE_ID` pin and
+decodes `%20` to spaces. The OLD lookup requires exactly one Plex row and an
+84-byte guard, and NEW requires the exact encoded source-id shape; failure
+warn-skips the phase. The fragment reads no environment variables and carries
+no SHA constants.
 
 Pool-patch site tuples are
 `label|offset|write_seek|original_hex|patched_hex`. Each tuple binds the site
@@ -107,10 +127,10 @@ ConnectionPool size immediate from 20 to 16. On amd64, `original_hex` starts
 `81028052...` and `patched_hex` starts `01028052...`.
 
 Supported pool-patch sites are data rows, not runtime-derived offsets. The
-curated source rows live in `pins/plex-pool-patch-sites.tsv`; rendered runtime
+curated source rows live in `pins/plex-patch-pool-sites.tsv`; rendered runtime
 rows live as `pool-site` rows in `baked-pins.txt`.
 
-Pool-patch per-binary behavior:
+Pool-only Scanner behavior:
 
 | Site state | Baseline SHA / backup state | Action |
 |---|---|---|
@@ -120,13 +140,35 @@ Pool-patch per-binary behavior:
 | Mixed or unknown | Any | Warn and skip that binary |
 | Write, verify, or atomic replace failure | Verified backup present | Leave target unchanged, warn, and continue to the next binary |
 
+For PMS, the phase folds the pool-site and 84-byte source-id writes into one
+temp-copy operation and one atomic replace. It accepts pristine pool bytes with
+the pristine detector SHA, or pool-patched bytes with the patched detector SHA
+and the existing verified pristine backup. The all-post NEW-id state is
+idempotent only when the current whole-file SHA matches the computed
+`plex_pms:source-id-patched` detector SHA. Any other state with a NEW-id match
+fails as an unknown, conflicting, or SHA-mismatched source-id state before OLD
+matching. Only the no-NEW branch requires exactly one OLD-id match; zero or
+multiple OLD matches fail and leave PMS unchanged. The source-id write is
+length-preserving and read back from the temp copy, and the temp copy must match
+the computed source-id-patched SHA before owner/mode restoration and atomic
+replacement. The scanner retains the pool-only behavior above. The PMS
+pool-site and source-id writes use one `${PMS}.bundled.bak`. Later phase starts
+select the exact committed PMS state through `plex_pms:source-id-patched`,
+including when a prior Scanner write failed after PMS succeeded.
+
+PMS patch warnings return nonzero. Phase 04 still attempts the independent
+Scanner patch, then logs `event=failed step=pms-patch` and exits nonzero when
+the PMS operation failed. `event=complete` certifies that the required PMS
+operation either published the exact computed final bytes or verified those
+bytes were already present; Scanner outcome remains in the separate
+`pool_patch event=*` per-site namespace.
+
 Runtime command surface:
 
 | Scope | Commands |
 |---|---|
 | Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |
-| Plex pool patch | `dd od printf` |
+| Plex patch | `dd od printf` |
 
 LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
 package managers, or network access.
-

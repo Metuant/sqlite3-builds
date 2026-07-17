@@ -90,7 +90,7 @@ manifest_parser_valid_detect_role() {
   role="$2"
   case "${mod}|${role}" in
     emby\|emby_deps|emby\|emby_dll) return 0 ;;
-    plex\|plex_pms:pristine|plex\|plex_pms:patched|plex\|plex_scanner:pristine|plex\|plex_scanner:patched) return 0 ;;
+    plex\|plex_pms:pristine|plex\|plex_pms:patched|plex\|plex_pms:source-id-patched|plex\|plex_scanner:pristine|plex\|plex_scanner:patched) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -371,6 +371,55 @@ manifest_parser_selected_pristine_detector_row() {
   return 1
 }
 
+manifest_parser_selected_patched_detector_row() {
+  local mod arch manifest server_id logical_role role
+  mod="$1"
+  arch="$2"
+  manifest="$3"
+  server_id="$4"
+  logical_role="$5"
+
+  case "${mod}|${logical_role}" in
+    plex\|plex_pms) role="plex_pms:patched" ;;
+    plex\|plex_scanner) role="plex_scanner:patched" ;;
+    *) return 1 ;;
+  esac
+
+  if [ -z "$manifest" ] || [ ! -f "$manifest" ]; then
+    return 1
+  fi
+
+  local -a fields
+  local line kind row_mod row_server row_arch row_role
+
+  while IFS= read -r line || [ -n "$line" ]; do
+    line="${line%$'\r'}"
+    case "$line" in
+      ""|\#*) continue ;;
+    esac
+
+    kind="${line%%|*}"
+    [ "$kind" = "detect" ] || continue
+
+    IFS='|' read -r -a fields <<< "$line"
+    [ "${#fields[@]}" -eq 8 ] || continue
+
+    row_mod="${fields[2]}"
+    row_server="${fields[3]}"
+    row_arch="${fields[4]}"
+    row_role="${fields[5]}"
+    [ "$row_mod" = "$mod" ] || continue
+    [ "$row_server" = "$server_id" ] || continue
+    [ "$row_arch" = "$arch" ] || continue
+    [ "$row_role" = "$role" ] || continue
+
+    printf '%s|%s\n' "${fields[6]}" "${fields[7]}"
+    return 0
+  done < "$manifest"
+
+  return 1
+}
+
 validate_baked_pins_schema() {
   local manifest
   manifest="${1:-${baked_pins:-}}"
@@ -387,7 +436,7 @@ validate_baked_pins_schema() {
   local unsupported_reason tuple artifact_key unsupported_key full_path actual_sha
   local offset_num write_seek_num delta
   local detector_key canonical_key existing_server
-  local pms_pristine_path pms_patched_path scanner_pristine_path scanner_patched_path required_soname
+  local pms_pristine_path pms_patched_path pms_source_id_patched_path scanner_pristine_path scanner_patched_path required_soname
   local pool_key artifact_expected_relpath
 
   local -A seen_row_keys
@@ -753,6 +802,7 @@ validate_baked_pins_schema() {
       plex)
         if [ "${detect_count["detect|${mod}|${server_id}|${arch}|plex_pms:pristine"]:-0}" -ne 1 ] || \
           [ "${detect_count["detect|${mod}|${server_id}|${arch}|plex_pms:patched"]:-0}" -ne 1 ] || \
+          [ "${detect_count["detect|${mod}|${server_id}|${arch}|plex_pms:source-id-patched"]:-0}" -ne 1 ] || \
           [ "${detect_count["detect|${mod}|${server_id}|${arch}|plex_scanner:pristine"]:-0}" -ne 1 ] || \
           [ "${detect_count["detect|${mod}|${server_id}|${arch}|plex_scanner:patched"]:-0}" -ne 1 ]; then
           manifest_parser_reject "plex-dual-detector-requirement" "server_id=${server_id} arch=${arch}"
@@ -760,13 +810,16 @@ validate_baked_pins_schema() {
         fi
         pms_pristine_path="${detect_path["detect|${mod}|${server_id}|${arch}|plex_pms:pristine"]}"
         pms_patched_path="${detect_path["detect|${mod}|${server_id}|${arch}|plex_pms:patched"]}"
+        pms_source_id_patched_path="${detect_path["detect|${mod}|${server_id}|${arch}|plex_pms:source-id-patched"]}"
         scanner_pristine_path="${detect_path["detect|${mod}|${server_id}|${arch}|plex_scanner:pristine"]}"
         scanner_patched_path="${detect_path["detect|${mod}|${server_id}|${arch}|plex_scanner:patched"]}"
-        if [ "$pms_pristine_path" != "$pms_patched_path" ] || [ "$scanner_pristine_path" != "$scanner_patched_path" ]; then
+        if [ "$pms_pristine_path" != "$pms_patched_path" ] || \
+          [ "$pms_pristine_path" != "$pms_source_id_patched_path" ] || \
+          [ "$scanner_pristine_path" != "$scanner_patched_path" ]; then
           manifest_parser_reject "plex-detector-path-conflict" "server_id=${server_id} arch=${arch}"
           return 1
         fi
-        detector_key="plex_pms:pristine=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_pms:pristine"]}|plex_pms:patched=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_pms:patched"]}|plex_scanner:pristine=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_scanner:pristine"]}|plex_scanner:patched=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_scanner:patched"]}"
+        detector_key="plex_pms:pristine=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_pms:pristine"]}|plex_pms:patched=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_pms:patched"]}|plex_pms:source-id-patched=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_pms:source-id-patched"]}|plex_scanner:pristine=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_scanner:pristine"]}|plex_scanner:patched=${detect_sha["detect|${mod}|${server_id}|${arch}|plex_scanner:patched"]}"
         ;;
       *)
         manifest_parser_reject "invalid-field" "server_id=${server_id} arch=${arch}"

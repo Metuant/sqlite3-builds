@@ -2,7 +2,7 @@
 set -euo pipefail
 
 . ./lsio-mods/shared/cont-init-fragments/atomic-write.sh
-. ./lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh
+. ./lsio-mods/shared/cont-init-fragments/plex-patch.sh
 
 tmp_parent="${TMPDIR:-/tmp}"
 tmp="$(mktemp -d "${tmp_parent%/}/sqlite3-plex-pool.XXXXXX" 2>/dev/null || mktemp -d /tmp/sqlite3-plex-pool.XXXXXX)"

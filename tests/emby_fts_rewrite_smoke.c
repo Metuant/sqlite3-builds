@@ -766,7 +766,39 @@ static char *make_similar_expected(const char *sql) {
 }
 
 static const char *EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL =
-    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (15,16,17,18,19,20,107) ),WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6,4,3,2) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7,0,1,5,6,2)))select A.Type from mediaitems A where A.Type in (34,9,29,21) AND A.Id in WithItemLinkItemIds Group by A.Type;";
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (15,16,17,18,19,20,107) ),WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6,4,3,2) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7,0,1,5,6,2)))select A.Type from mediaitems A where A.Type in (34,9,29,21) AND A.Id in WithItemLinkItemIds Group by A.Type";
+
+static char *make_link_type_count_shape_05_expected(void) {
+    char *one = make_exists_links_one("15,16,17,18,19,20,107", "6,4,3,2");
+    char *two = make_exists_links_two("15,16,17,18,19,20,107", "7,0,1,5,6,2");
+    char *replacement = xasprintf("(%s OR %s)", one, two);
+    char *expected = replace_once(
+        EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+        "A.Id in WithItemLinkItemIds",
+        replacement
+    );
+
+    free(one);
+    free(two);
+    free(replacement);
+    return expected;
+}
+
+static void seed_link_type_count_shape_05_rows(sqlite3 *db) {
+    exec_sql(db, "links-two-level-seed",
+        "INSERT INTO MediaItems(Id,Type,Name) VALUES"
+        "(1001,34,'l1-only'),(1002,9,'l2-only'),"
+        "(1003,29,'both-and-duplicates'),(1004,21,'no-hit');"
+        "INSERT INTO AncestorIds2 VALUES"
+        "(2001,15,0),(2002,15,0),(2003,15,0),(2004,15,0);"
+        "INSERT INTO ItemLinks2 VALUES"
+        "(2001,1001,6),"
+        "(2002,2102,7),(2102,1002,99),"
+        "(2003,1003,6),(2003,1003,6),"
+        "(2003,2103,7),(2103,1003,99),(2103,1003,99),"
+        "(2004,NULL,6);"
+    );
+}
 
 static char *make_favorites_sql(void) {
     return xasprintf(
@@ -2569,12 +2601,40 @@ static int child_emby_slow_search_matrix(void) {
     links_repl = make_exists_links_one("100", "2,3");
     links_expected = replace_once(links_sql, "A.Id in WithItemLinkItemIds", links_repl);
     expect_sql(db, "similar-links-search-negative", links_sql, -1, 2, links_expected, 0);
-    /* Links/type-count family (NM-7, shape 05 be6193690e7649e0): a must-not-match
-       negative for the similar-items matcher (misses on the SimB_Ids guard). The exact
-       people/studios/type-29 similar sibling has no census specimen yet -> backlog. */
-    expect_sql(db, "similar-link-type-count-nm7-shape-05-be619369-negative",
-               EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2,
-               EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, 0);
+    /* Similar must not claim this shape on its SimB_Ids guard; links_search owns
+       the exact two-level links/type-count membership splice. */
+    {
+        char *type_count_expected = make_link_type_count_shape_05_expected();
+        char *bad_t1 = replace_once(
+            EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+            "Type in (6,4,3,2) union",
+            "Type in (6,'bad') union"
+        );
+        char *bad_t2 = replace_once(
+            EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+            "Type in (7,0,1,5,6,2)))select",
+            "Type in (7,'bad')))select"
+        );
+        char *duplicate_membership = replace_once(
+            EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+            "AND A.Id in WithItemLinkItemIds Group by",
+            "AND A.Id in WithItemLinkItemIds AND A.Id in WithItemLinkItemIds Group by"
+        );
+
+        expect_sql(db, "links-type-count-shape-05-two-level",
+                   EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2,
+                   type_count_expected, 0);
+        expect_sql(db, "links-type-count-shape-05-bad-t1",
+                   bad_t1, -1, 2, bad_t1, 0);
+        expect_sql(db, "links-type-count-shape-05-bad-t2",
+                   bad_t2, -1, 2, bad_t2, 0);
+        expect_sql(db, "links-type-count-shape-05-duplicate-membership",
+                   duplicate_membership, -1, 2, duplicate_membership, 0);
+        free(type_count_expected);
+        free(bad_t1);
+        free(bad_t2);
+        free(duplicate_membership);
+    }
 
     fts_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
     expect_sql(db, "fanout-search-fts-negative", fts_sql, -1, 2, fts_sql, 0);
@@ -2818,6 +2878,14 @@ static const char TEST_M2_PREMIERE_TAIL[] =
     "A.Id,A.EndDate,A.CommunityRating,A.Name,A.Path,A.PremiereDate,A.ProductionYear,A.OfficialRating,A.RunTimeTicks,A.guid,A.ParentId,A.CriticRating,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
     TEST_MOVIES_FROM
     "where A.Type=5 AND A.PremiereDate>=1752355308 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.ProductionYear DESC,A.PremiereDate DESC,A.SortName collate NATURALSORT DESC LIMIT 30";
+static const char TEST_EPISODES_DATE_WINDOW_OFFSET[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (15,16,17,18,19,20,3923210) )select "
+    "A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=5 "
+    "where A.Type=8 AND A.PremiereDate>=1782906237 AND A.PremiereDate <1784121997 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.ProductionYear DESC,A.PremiereDate DESC,COALESCE(A.SortParentIndexNumber,A.ParentIndexNumber) ASC,COALESCE(A.SortIndexNumber,A.IndexNumber) ASC LIMIT 12 OFFSET 12";
+static const char TEST_MOVIES_CORRELATED_RANDOM_IMAGE[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId=838031 AND ItemId=A.Id )select "
+    "A.Id from mediaitems A where A.Type=5 AND A.Images like '%Primary%' AND A.Id in WithAncestors ORDER BY RANDOM() ASC LIMIT 12";
 static const char TEST_MOVIES_AGGREGATE_PROJECTION[] =
     TEST_MOVIES_LIST_PREFIX "MAX(A.DateCreated) AS DateCreated,A.Id " TEST_MOVIES_FROM TEST_MOVIES_TAIL;
 static const char TEST_MOVIES_WINDOW_PROJECTION[] =
@@ -2933,6 +3001,10 @@ static int child_dashboard_fix_b_c(void) {
     candidate_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1);
     seed_movies_latest_rows(vendor_db);
     seed_movies_latest_rows(candidate_db);
+    exec_sql(vendor_db, "dashboard-scalar-minus-one-vendor-seed",
+             "INSERT INTO AncestorIds2 VALUES(7,-1,0),(3,-1,0);");
+    exec_sql(candidate_db, "dashboard-scalar-minus-one-candidate-seed",
+             "INSERT INTO AncestorIds2 VALUES(7,-1,0),(3,-1,0);");
     expect_movies_latest_semantics(candidate_db);
 
     {
@@ -3019,6 +3091,31 @@ static int child_dashboard_fix_b_c(void) {
     }
 
     {
+        char ids[32];
+        char *scalar = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", 1, "12"
+        );
+        char *expected = make_latest_expected_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", "12"
+        );
+
+        expect_sql(candidate_db, "dashboard-episodes-scalar-minus-one",
+                   scalar, -1, 2, expected, 0);
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-episodes-scalar-minus-one-contract",
+            scalar, scalar, expected, NULL, NULL, NULL, NULL
+        );
+        collect_int_column(
+            candidate_db, "dashboard-episodes-scalar-minus-one-ids",
+            scalar, expected, -1, 0, ids, sizeof(ids)
+        );
+        require_str_eq("dashboard-episodes-scalar-minus-one-exact-id", ids, "7,");
+        free(scalar);
+        free(expected);
+    }
+
+    {
         char *oracle = make_movies_latest_sql(1, "100", "42", "12");
         char *scalar = make_movies_latest_sql_form(
             1, "100", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
@@ -3031,6 +3128,29 @@ static int child_dashboard_fix_b_c(void) {
             NULL, NULL, NULL, NULL
         );
         free(oracle);
+        free(scalar);
+        free(expected);
+    }
+
+    {
+        char ids[32];
+        char *scalar = make_movies_latest_sql_form(
+            1, "-1", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        char *expected = make_movies_latest_expected("-1", "42", "12");
+
+        expect_sql(candidate_db, "dashboard-movies-scalar-minus-one",
+                   scalar, -1, 2, expected, 0);
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-movies-scalar-minus-one-contract",
+            scalar, scalar, expected, NULL, NULL, NULL, NULL
+        );
+        collect_int_column(
+            candidate_db, "dashboard-movies-scalar-minus-one-ids",
+            scalar, expected, -1, 0, ids, sizeof(ids)
+        );
+        require_str_eq("dashboard-movies-scalar-minus-one-exact-id", ids, "3,");
         free(scalar);
         free(expected);
     }
@@ -3066,6 +3186,36 @@ static int child_dashboard_fix_b_c(void) {
                               TEST_MOVIES_BARE_STAR_PROJECTION, "select * from", 1);
     expect_dashboard_negative(candidate_db, "dashboard-movies-parenthesized-projection",
                               TEST_MOVIES_PAREN_PROJECTION, "select (A.Id)", 1);
+
+    {
+        static const struct {
+            const char *label;
+            const char *ancestor_slot;
+            const char *boundary_needle;
+        } scalar_negative_cases[] = {
+            {"dashboard-movies-scalar-minus-two", "-2", "AncestorId=-2 )select"},
+            {"dashboard-movies-scalar-leading-space", " -1", "AncestorId= -1 )select"},
+            {"dashboard-movies-scalar-split-sign", "- 1", "AncestorId=- 1 )select"},
+            {"dashboard-movies-scalar-expression", "-1+0", "AncestorId=-1+0 )select"},
+            {"dashboard-movies-scalar-minus-one-or", "-1 OR AncestorId=200",
+             "AncestorId=-1 OR AncestorId=200 )select"},
+            {"dashboard-movies-scalar-minus-one-correlated", "-1 AND ItemId=A.Id",
+             "AncestorId=-1 AND ItemId=A.Id )select"},
+        };
+
+        for (i = 0; i < sizeof(scalar_negative_cases) / sizeof(scalar_negative_cases[0]); i++) {
+            char *sql = make_movies_latest_sql_form(
+                1, scalar_negative_cases[i].ancestor_slot, 1,
+                EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+            );
+            expect_dashboard_negative(
+                candidate_db, scalar_negative_cases[i].label, sql,
+                scalar_negative_cases[i].boundary_needle, 1
+            );
+            free(sql);
+        }
+    }
+
     expect_dashboard_negative(candidate_db, "dashboard-movies-scalar-bind",
                               TEST_MOVIES_SCALAR_BIND, "AncestorId=?", 1);
     expect_dashboard_negative(candidate_db, "dashboard-movies-bad-limit",
@@ -3082,6 +3232,17 @@ static int child_dashboard_fix_b_c(void) {
                               "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (", 2);
     expect_dashboard_negative(candidate_db, "dashboard-movies-ambiguous-select",
                               TEST_MOVIES_AMBIGUOUS_SELECT, ") )select ", 2);
+    expect_dashboard_negative(candidate_db, "dashboard-episodes-date-window-offset",
+                              TEST_EPISODES_DATE_WINDOW_OFFSET, "OFFSET 12", 1);
+    require_int("dashboard-movies-correlated-random-image/images-boundary",
+                count_occurrences(TEST_MOVIES_CORRELATED_RANDOM_IMAGE,
+                                  "A.Images like '%Primary%'"), 1);
+    require_int("dashboard-movies-correlated-random-image/order-boundary",
+                count_occurrences(TEST_MOVIES_CORRELATED_RANDOM_IMAGE,
+                                  "ORDER BY RANDOM()"), 1);
+    expect_dashboard_negative(candidate_db, "dashboard-movies-correlated-random-image",
+                              TEST_MOVIES_CORRELATED_RANDOM_IMAGE,
+                              "AncestorId=838031 AND ItemId=A.Id", 1);
 
     require_int("dashboard-fix-b-c/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
     require_int("dashboard-fix-b-c/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
@@ -3181,6 +3342,110 @@ static int query_int(sqlite3 *db, const char *label, const char *sql) {
     require_int(label, sqlite3_step(stmt), SQLITE_DONE);
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
     return value;
+}
+
+static int child_links_two_level_row_parity(void) {
+    sqlite3 *vendor_db;
+    sqlite3 *candidate_db;
+    char *expected;
+    typed_rows vendor_rows;
+    typed_rows candidate_rows;
+
+    configure_env("1", "0", NULL);
+    make_temp_dir();
+    vendor_db = open_seeded_temp("not-target.db");
+    candidate_db = open_seeded_temp("library.db");
+    seed_link_type_count_shape_05_rows(vendor_db);
+    seed_link_type_count_shape_05_rows(candidate_db);
+    expected = make_link_type_count_shape_05_expected();
+
+    require_int(
+        "links-two-level/l1-only-fixture",
+        query_int(vendor_db, "links-two-level/l1-only-fixture-sql",
+                  "SELECT count(*) FROM ItemLinks2 AS L JOIN AncestorIds2 AS X "
+                  "ON X.itemid=L.ItemId WHERE X.AncestorId=15 AND L.LinkedId=1001 "
+                  "AND L.Type IN (6,4,3,2)"),
+        1
+    );
+    require_int(
+        "links-two-level/l2-only-fixture",
+        query_int(vendor_db, "links-two-level/l2-only-fixture-sql",
+                  "SELECT count(*) FROM ItemLinks2 AS L2 WHERE L2.LinkedId=1002 "
+                  "AND EXISTS (SELECT 1 FROM ItemLinks2 AS L1 JOIN AncestorIds2 AS X "
+                  "ON X.itemid=L1.ItemId WHERE X.AncestorId=15 "
+                  "AND L1.LinkedId=L2.ItemId AND L1.Type IN (7,0,1,5,6,2))"),
+        1
+    );
+    require_int(
+        "links-two-level/both-direct-duplicates",
+        query_int(vendor_db, "links-two-level/both-direct-duplicates-sql",
+                  "SELECT count(*) FROM ItemLinks2 WHERE ItemId=2003 "
+                  "AND LinkedId=1003 AND Type=6"),
+        2
+    );
+    require_int(
+        "links-two-level/both-indirect-duplicates",
+        query_int(vendor_db, "links-two-level/both-indirect-duplicates-sql",
+                  "SELECT count(*) FROM ItemLinks2 WHERE ItemId=2103 "
+                  "AND LinkedId=1003"),
+        2
+    );
+    require_int(
+        "links-two-level/null-linked-id-fixture",
+        query_int(vendor_db, "links-two-level/null-linked-id-fixture-sql",
+                  "SELECT count(*) FROM ItemLinks2 WHERE ItemId=2004 "
+                  "AND LinkedId IS NULL AND Type=6"),
+        1
+    );
+    require_int(
+        "links-two-level/no-hit-fixture",
+        query_int(vendor_db, "links-two-level/no-hit-fixture-sql",
+                  "SELECT count(*) FROM ItemLinks2 WHERE LinkedId=1004"),
+        0
+    );
+
+    expect_sql(candidate_db, "links-two-level/rewrite-fired",
+               EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2, expected, 0);
+    contract_parity_require(
+        vendor_db, candidate_db, contract_prepare_v2,
+        "links-two-level/ordered-contract",
+        EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+        EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+        expected, NULL, NULL, NULL, NULL
+    );
+    vendor_rows = collect_typed_rows(
+        vendor_db, "links-two-level/vendor-typed-rows",
+        EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+        EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL
+    );
+    candidate_rows = collect_typed_rows(
+        candidate_db, "links-two-level/candidate-typed-rows",
+        EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+        expected
+    );
+    require_ordered_full_row_identity(
+        "links-two-level/ordered-type-tagged-identity",
+        &vendor_rows, &candidate_rows
+    );
+    require_str_eq(
+        "links-two-level/vendor-exact-output",
+        (const char *)vendor_rows.bytes,
+        "C1;N3;RI:9;RI:29;RI:34;"
+    );
+    require_str_eq(
+        "links-two-level/candidate-exact-output",
+        (const char *)candidate_rows.bytes,
+        "C1;N3;RI:9;RI:29;RI:34;"
+    );
+
+    free_typed_rows(&vendor_rows);
+    free_typed_rows(&candidate_rows);
+    free(expected);
+    require_int("links-two-level/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
+    require_int("links-two-level/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
+    cleanup_temp_dir();
+    printf("PASS [links-two-level-row-parity]\n");
+    return 0;
 }
 
 static int child_dashboard_release_matrix(void) {
@@ -3570,6 +3835,7 @@ static int child_observability_logs(void) {
     char *links_sql;
     char *links_repl;
     char *links_expected;
+    char *links_two_level_expected;
     char *links_miss_sql;
     char *resume_simple_sql;
     char *resume_simple_expected;
@@ -3602,6 +3868,10 @@ static int child_observability_logs(void) {
     links_repl = make_exists_links_one("100", "2,3");
     links_expected = replace_once(links_sql, "A.Id in WithItemLinkItemIds", links_repl);
     expect_sql(db, "obs-fanout-links-applied", links_sql, -1, 2, links_expected, 0);
+    links_two_level_expected = make_link_type_count_shape_05_expected();
+    expect_sql(db, "obs-fanout-links-two-level-applied",
+               EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2,
+               links_two_level_expected, 0);
 
     links_miss_sql = make_links_search_sql("'bad'");
     expect_sql(db, "obs-fanout-links-capture-miss", links_miss_sql, -1, 2, links_miss_sql, 0);
@@ -3734,6 +4004,14 @@ static int child_observability_logs(void) {
         "observability/fanout-applied",
         log_output,
         "event=rewrite_applied target=emby mode=fanout+links_search"
+    );
+    require_int(
+        "observability/fanout-links-applied-count",
+        count_occurrences(
+            log_output,
+            "event=rewrite_applied target=emby mode=fanout+links_search"
+        ),
+        2
     );
     require_contains(
         "observability/fanout-resume-simple-applied",
@@ -3920,6 +4198,7 @@ static int child_observability_logs(void) {
     free(links_sql);
     free(links_repl);
     free(links_expected);
+    free(links_two_level_expected);
     free(links_miss_sql);
     free(resume_simple_sql);
     free(resume_simple_expected);
@@ -4092,6 +4371,7 @@ static void run_child(const char *name) {
         if (strcmp(name, "fanout-one-disables") == 0) _exit(child_fanout_env("1", "fanout-one-disables", 0));
         if (strcmp(name, "fanout-garbage-enables") == 0) _exit(child_fanout_env("false", "fanout-garbage-enables", 1));
         if (strcmp(name, "fanout-matrix") == 0) _exit(child_fanout_matrix());
+        if (strcmp(name, "links-two-level-row-parity") == 0) _exit(child_links_two_level_row_parity());
         if (strcmp(name, "emby-slow-search-matrix") == 0) _exit(child_emby_slow_search_matrix());
         if (strcmp(name, "dashboard-default-off") == 0) _exit(child_dashboard_default_off());
         if (strcmp(name, "dashboard-one-off") == 0) _exit(child_dashboard_off_value("1", "dashboard-one-off"));
@@ -4150,6 +4430,7 @@ int main(int argc, char **argv) {
     run_child("fanout-one-disables");
     run_child("fanout-garbage-enables");
     run_child("fanout-matrix");
+    run_child("links-two-level-row-parity");
     run_child("emby-slow-search-matrix");
     run_child("dashboard-default-off");
     run_child("dashboard-one-off");

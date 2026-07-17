@@ -15,6 +15,20 @@ Use:
 - `docs/plex-pool-patch-derivation.md` for Plex ConnectionPool pool-site
   derivation and runtime patch semantics.
 
+## Bump SQLite
+
+Update the SQLite tuple in `pins/versions.env`: version, dotted version,
+amalgamation URL and SHA3-256, full-source URL and SHA3-256, and
+`SQLITE_SOURCE_ID`. Store the 84-byte `sqlite_source_id()` result in
+`SQLITE_SOURCE_ID` with each space encoded as `%20`. Do not copy the NEW id
+into the maintenance script or Plex phase; both read this pin.
+
+Then refresh the amalgamation patch and config-count pins when the new source
+requires it. Run `bash tests/check_pin_alignment.sh` before CI. The generic and
+Plex library builds decode the pin and execute `SELECT sqlite_source_id()`
+through each freshly built shared library, so CI rejects a stale or incorrect
+source-id pin.
+
 ## Add A Version
 
 Add a new supported Plex or Emby server version in this order.
@@ -38,9 +52,13 @@ Add a new supported Plex or Emby server version in this order.
 
 2. Add all required `pins/runtime-baselines.tsv` rows.
    - Use `docs/runtime-baseline-derivation.md`; do not invent SHAs.
-   - Plex requires four detector roles per `(server_id, arch)`:
+   - Plex requires four curated detector roles per `(server_id, arch)`:
      `plex_pms:pristine`, `plex_pms:patched`, `plex_scanner:pristine`, and
      `plex_scanner:patched`.
+   - Do not add `plex_pms:source-id-patched` to
+     `pins/runtime-baselines.tsv`. Manifest rendering computes that fifth
+     runtime role from the verified pristine PMS bytes, curated pool sites, and
+     canonical `SQLITE_SOURCE_ID` pin.
    - Emby requires two detector roles per `(server_id, arch)`: `emby_deps` and
      `emby_dll`.
    - Add the `pre target_sqlite` row for each `(server_id, arch)`.
@@ -56,8 +74,8 @@ Add a new supported Plex or Emby server version in this order.
      ICU sonames and matching `icu-runtime` rows for each `(compat_group, arch,
      soname)`.
 
-3. For Plex only, add pool-patch curation rows.
-   - Add `pins/plex-pool-patch-sites.tsv` rows for each supported binary and
+3. For Plex only, add Plex patch pool-site curation rows.
+   - Add `pins/plex-patch-pool-sites.tsv` rows for each supported binary and
      arch.
    - Add at least two distinct approved reviewer rows in
      `pins/plex-pool-patch-reviews.tsv` for every exact site tuple.
@@ -71,6 +89,9 @@ Add a new supported Plex or Emby server version in this order.
    - The row must name the current `compat_group`, `mod`, build variant,
      artifact stem, SQLite source guard, and a `smoke_server_id` that resolves to
      a supported row in the same group.
+   - The current Plex patch phase requires exactly one Plex row and an 84-byte
+     `sqlite_source_id_guard`; adding another Plex group also requires making
+     that runtime lookup group-aware.
    - For Plex groups, the row also owns ICU source version, source SHA-512, and
      linked ICU sonames.
 
@@ -139,8 +160,14 @@ fixtures:
 | `RENDER_LSIO_MOD_RUNTIME_SUPPORT` | `pins/runtime-support.tsv` |
 | `RENDER_LSIO_MOD_COMPAT_GROUPS` | `pins/library-compat-groups.tsv` |
 | `RENDER_LSIO_MOD_RUNTIME_BASELINES` | `pins/runtime-baselines.tsv` |
-| `RENDER_LSIO_MOD_POOL_SITES` | `pins/plex-pool-patch-sites.tsv` |
+| `RENDER_LSIO_MOD_POOL_SITES` | `pins/plex-patch-pool-sites.tsv` |
 | `RENDER_LSIO_MOD_POOL_REVIEWS` | `pins/plex-pool-patch-reviews.tsv` |
+
+Plex rendering additionally requires one
+`--plex-pms-pristine SERVER_ID:ARCH:PATH` value for every rendered server/arch
+tuple. `PATH` must contain the exact pristine PMS bytes from the supported full
+Plex image. The renderer rejects a missing file or a whole-file SHA mismatch
+before deriving or emitting the final PMS detector SHA.
 
 ## Add A Compat Group
 
@@ -154,6 +181,9 @@ Current touch points:
 - `tools/lsio-mod/render-lsio-mod-baked-pins.sh`: Plex-flavor groups require
   updating the Plex ICU soname and `plex_icu_linked:*` role allowlists when the
   linked closure changes.
+- `lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run`:
+  the staged source-id lookup currently accepts exactly one Plex compatibility
+  row and must select by group before a second Plex group can run.
 - `tests/check_multi_version_pin_alignment.sh`: required artifact-stem checks
   are hardcoded for the current groups.
 - `.github/workflows/sqlite-build.yml`: CI currently resolves
@@ -173,7 +203,7 @@ per mod.
 Use `docs/plex-pool-patch-derivation.md` for the site derivation method and
 `docs/runtime-baseline-derivation.md` for pristine, patched, and A/B SHA checks.
 
-Each `pins/plex-pool-patch-sites.tsv` row requires at least two distinct
+Each `pins/plex-patch-pool-sites.tsv` row requires at least two distinct
 approved reviewer rows in `pins/plex-pool-patch-reviews.tsv` for the exact site
 tuple. The implemented review control is count-only: `.github/CODEOWNERS` is
 single-owner, so the repository does not currently enforce two independent

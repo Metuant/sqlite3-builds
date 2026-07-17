@@ -287,6 +287,7 @@ jobs:
             --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
             --build-arg MARCH="${{ matrix.march }}" \
             --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
+            --build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}" \
             --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
             --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
             --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" \
@@ -307,6 +308,7 @@ jobs:
             --build-arg SQLITE_AMALG_URL="${SQLITE_AMALG_URL}" \
             --build-arg MARCH="${{ matrix.march }}" \
             --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
+            --build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}" \
             --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
             --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
             --build-arg MIMALLOC_SHA512="${MIMALLOC_SHA512}" \
@@ -452,6 +454,7 @@ jobs:
             --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
             --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" \
             --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" \
+            --build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}" \
             --build-arg LIBRARY_VARIANT=plex \
             --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
             --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
@@ -477,6 +480,7 @@ jobs:
             --build-arg SQLITE_AMALG_SHA3_256="${SQLITE_AMALG_SHA3_256}" \
             --build-arg SQLITE_SRC_URL="${SQLITE_SRC_URL}" \
             --build-arg SQLITE_SRC_SHA3_256="${SQLITE_SRC_SHA3_256}" \
+            --build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}" \
             --build-arg LIBRARY_VARIANT=plex \
             --build-arg MIMALLOC_VERSION="${MIMALLOC_VERSION}" \
             --build-arg MIMALLOC_URL="${MIMALLOC_URL}" \
@@ -554,6 +558,7 @@ jobs:
         run: |
           set -euo pipefail
           bash tests/plex_pool_patch_lib_test.sh
+          bash tests/plex_source_id_patch_test.sh
           bash tests/cont_init_fragments_test.sh
           bash tests/resolve_arch_test.sh
           bash tests/manifest_parser_test.sh
@@ -579,7 +584,7 @@ jobs:
           bash tests/check_pin_alignment_negative_test.sh
           bash tests/check_multi_version_pin_alignment_negative_test.sh
           bash tests/lsio_mod_phase03_install_failure_test.sh
-          bash tests/lsio_mod_plex_poolpatch_phase_test.sh
+          bash tests/lsio_mod_plex_plexpatch_phase_test.sh
           bash tests/lsio_mod_preflight_artifact_root_test.sh
           bash tests/lsio_mod_unsupported_phase_test.sh
           bash tests/optimize_media_servers_deflate_test.sh

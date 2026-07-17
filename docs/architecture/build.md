@@ -4,9 +4,9 @@ Part of the [Repository Architecture index](../architecture.md).
 
 ## Build Inputs
 
-The source of truth for SQLite, CMake, and mimalloc build pins is
-`pins/versions.env`; the local wrapper sources it and the workflow loads it into
-`$GITHUB_ENV`.
+The source of truth for SQLite, SQLite source identity, CMake, and mimalloc
+build pins is `pins/versions.env`; the local wrapper sources it and the workflow
+loads it into `$GITHUB_ENV`.
 Runtime support images live in `pins/runtime-support.tsv`. Library
 compatibility groups and Plex ICU source pins live in
 `pins/library-compat-groups.tsv`.
@@ -23,6 +23,7 @@ field contract and fail-closed validator rules, use
 | Amalgamation SHA3-256 | `d45c688a8cb23f68611a894a756a12d7eb6ab6e9e2468ca70adbeab3808b5ab9` |
 | Full source URL | `https://www.sqlite.org/2026/sqlite-src-3530300.zip` |
 | Full source SHA3-256 | `2daecfa16e3b19e058dc2e2cb717b80ade361e0315aa5376c3619f66aa81e181` |
+| SQLite source id | See `SQLITE_SOURCE_ID` in `pins/versions.env`. |
 
 The current Plex library compatibility group pins ICU 69.1:
 
@@ -73,6 +74,12 @@ The same SQLite pins must stay aligned across:
 - `docker-cli/Dockerfile`.
 - `docker-library/Dockerfile`.
 - `build/Build.sh`.
+
+`SQLITE_SOURCE_ID` follows the same path. The local wrapper and CI forward the
+URL-encoded pin to `docker-library/Dockerfile`; `build/Build.sh` decodes it,
+loads the freshly built `dist/libsqlite3.so`, executes
+`SELECT sqlite_source_id()`, and fails the library build unless the result is
+the canonical pin.
 
 The mimalloc VERSION + URL + SHA512 tuple must stay aligned across
 `build/Build.sh`, `build/build_static_sqlite.sh`, `docker-library/Dockerfile`,
@@ -197,6 +204,10 @@ After the library compile, `build/Build.sh` checks every
 `SQLITE_CONFIG_*` and `SQLITE_DBCONFIG_*` define in the pinned `sqlite3.h`
 against the decode tables in `/app/observability.c`. Missing table entries are
 build failures.
+
+The same post-compile phase uses a temporary `dlopen` checker to query
+`SELECT sqlite_source_id()` through the just-built library. This runs for both
+generic and Plex variants before Docker artifact extraction.
 
 Adjacent to the preserved `sqlite3_*_real` and lazy-helper symbol gates,
 post-link checks fail on leaked `mi_*` or malloc-family exports and require
@@ -361,8 +372,8 @@ reproduction.
 
 Mod runtime SHA data is rendered by
 `tools/lsio-mod/render-lsio-mod-baked-pins.sh` from same-run build artifacts,
-same-run runtime baseline extraction, and the Plex pool-patch pins
-(`pins/plex-pool-patch-sites.tsv` and `pins/plex-pool-patch-reviews.tsv`).
+same-run runtime baseline extraction, and the Plex patch pool-site pins
+(`pins/plex-patch-pool-sites.tsv` and `pins/plex-pool-patch-reviews.tsv`).
 
 The `mod-static-tests` job runs the repo-only LSIO mod, negative, maintenance,
 workflow, release-note rendering, and shellcheck suites, including

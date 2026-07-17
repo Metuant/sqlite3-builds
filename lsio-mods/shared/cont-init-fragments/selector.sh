@@ -7,7 +7,7 @@ selector_logical_detect_role() {
   case "${mod}|${role}" in
     emby\|emby_deps) printf '%s\n' "emby_deps" ;;
     emby\|emby_dll) printf '%s\n' "emby_dll" ;;
-    plex\|plex_pms:pristine|plex\|plex_pms:patched) printf '%s\n' "plex_pms" ;;
+    plex\|plex_pms:pristine|plex\|plex_pms:patched|plex\|plex_pms:source-id-patched) printf '%s\n' "plex_pms" ;;
     plex\|plex_scanner:pristine|plex\|plex_scanner:patched) printf '%s\n' "plex_scanner" ;;
     *) return 1 ;;
   esac
@@ -232,6 +232,10 @@ selected_pool_site_rows() {
 
 selected_pristine_detector_row() {
   manifest_parser_selected_pristine_detector_row "$@"
+}
+
+selected_patched_detector_row() {
+  manifest_parser_selected_patched_detector_row "$@"
 }
 
 selected_artifact_is_current() {

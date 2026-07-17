@@ -306,7 +306,7 @@ unset INDEX_TEST_CORRUPT_STAGED_ON_INTEGRITY INDEX_TEST_CORRUPT_STAGED_DB
 assert_eq 1 "$(cat "$tmp/staged-gate.rc")" "staged integrity gate rc"
 assert_eq "$gate_hash_before" "$(sha256_file "$gate_db")" "staged integrity gate live hash"
 [ ! -e "$gate_db.new" ] || fail "staged integrity gate cleanup" "no staged file" "$gate_db.new exists"
-assert_contains "$(cat "$tmp/staged-gate.err")" "integrity check failed" "staged integrity gate diagnostic"
+assert_contains "$(cat "$tmp/staged-gate.err")" "final staged integrity_check failed to run" "final staged integrity gate diagnostic"
 
 eqp_db="$tmp/plex-eqp.db"
 create_plex_index_db "$eqp_db"

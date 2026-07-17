@@ -224,11 +224,15 @@ assert_plex_run() {
   assert_common_run "$slice" "$run_label" "$expected_arch_re" "$bad_signal_re"
   assert_swap_run "$slice" "$run_label" "$expected_swap"
   case "$matrix_arch_suffix" in amd64|arm64) ;; *) echo "FATAL: unsupported Plex arch suffix: $matrix_arch_suffix" >&2; exit 1 ;; esac
+  require_grep 'phase=04-plex-patch event=complete' "$slice" "FATAL: ${run_label} missing successful Plex patch phase terminal marker"
   if [ "$expected_swap" = "installed" ]; then
-    require_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} missing Plex pool patch apply marker"
+    require_grep 'plex_patch event=source-id-patched binary=/usr/lib/plexmediaserver/Plex Media Server' "$slice" "FATAL: ${run_label} missing PMS patch apply marker"
+    require_grep 'pool_patch event=patched binary=/usr/lib/plexmediaserver/Plex Media Scanner' "$slice" "FATAL: ${run_label} missing Scanner pool patch apply marker"
   else
-    require_grep 'pool_patch event=already-patched' "$slice" "FATAL: ${run_label} missing Plex pool already-patched marker"
-    reject_grep 'pool_patch event=patched' "$slice" "FATAL: ${run_label} unexpectedly re-applied Plex pool patch"
+    require_grep 'plex_patch event=already-patched binary=/usr/lib/plexmediaserver/Plex Media Server' "$slice" "FATAL: ${run_label} missing PMS already-patched marker"
+    require_grep 'pool_patch event=already-patched binary=/usr/lib/plexmediaserver/Plex Media Scanner' "$slice" "FATAL: ${run_label} missing Scanner pool already-patched marker"
+    reject_grep 'plex_patch event=source-id-patched binary=/usr/lib/plexmediaserver/Plex Media Server' "$slice" "FATAL: ${run_label} unexpectedly re-applied PMS patch"
+    reject_grep 'pool_patch event=patched binary=/usr/lib/plexmediaserver/Plex Media Scanner' "$slice" "FATAL: ${run_label} unexpectedly re-applied Scanner pool patch"
   fi
 }
 

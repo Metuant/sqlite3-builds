@@ -4,6 +4,11 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
 cd "$repo_root"
 
+# shellcheck source=pins/versions.env
+. pins/versions.env
+PLEX_PATCHED_SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID//%20/ }"
+export PLEX_PATCHED_SQLITE_SOURCE_ID
+
 tmp_parent="${TMPDIR:-/tmp}"
 tmp="$(mktemp -d "${tmp_parent%/}/sqlite3-optimize-sourcing.XXXXXX" 2>/dev/null || mktemp -d /tmp/sqlite3-optimize-sourcing.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT
@@ -71,7 +76,12 @@ chmod +x "$tmp/bin/sqlite3"
 cat > "$tmp/bin/sqlite-ok" <<'EOF_SQLITE_OK'
 #!/usr/bin/env bash
 printf 'sqlite-ok called\n' >> "${OPTIMIZE_SOURCE_PROBE_DIR}/sqlite-ok-called"
-printf '1\n'
+case "$*" in
+  *"sqlite_source_id()"*)
+    printf '%s\n' "$PLEX_PATCHED_SQLITE_SOURCE_ID"
+    ;;
+  *) printf '1\n' ;;
+esac
 exit 0
 EOF_SQLITE_OK
 chmod +x "$tmp/bin/sqlite-ok"
@@ -295,7 +305,7 @@ set +e
 ) >"$tmp/bogus.out" 2>"$tmp/bogus.err"
 rc=$?
 set -e
-assert_eq 2 "$rc" "unknown argument rc"
+assert_eq 64 "$rc" "unknown argument rc"
 bogus_err="$(cat "$tmp/bogus.err")"
 assert_contains "$bogus_err" "Usage:" "unknown argument usage"
 assert_contains "$bogus_err" "--help" "unknown argument help pointer"

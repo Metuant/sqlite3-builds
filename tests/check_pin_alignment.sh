@@ -185,6 +185,7 @@ SQLITE_AMALG_URL
 SQLITE_AMALG_SHA3_256
 SQLITE_SRC_URL
 SQLITE_SRC_SHA3_256
+SQLITE_SOURCE_ID
 MIMALLOC_VERSION
 MIMALLOC_URL
 MIMALLOC_SHA512
@@ -206,6 +207,13 @@ done
 
 printf '%s\n' "$UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT" | grep -Eq '^[0-9A-F]{40}$' || \
   fail "$pin_file UBUNTU_TOOLCHAIN_R_TEST_KEY_FINGERPRINT must be 40 uppercase hex characters"
+
+printf '%s\n' "$SQLITE_SOURCE_ID" | \
+  grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}%20[0-9]{2}:[0-9]{2}:[0-9]{2}%20[0-9a-f]{64}$' || \
+  fail "$pin_file SQLITE_SOURCE_ID must be an 84-byte SQLite source id with spaces encoded as %20"
+sqlite_source_id_decoded="$(printf '%s\n' "$SQLITE_SOURCE_ID" | sed 's/%20/ /g')"
+[ "${#sqlite_source_id_decoded}" -eq 84 ] || \
+  fail "$pin_file decoded SQLITE_SOURCE_ID must be exactly 84 bytes"
 
 assert_eq() {
   label="$1"
@@ -245,6 +253,17 @@ extract_single_int() {
   [ "$count" = "1" ] || fail "$label matched $count lines in $file"
   value="$(grep -E -- "$pattern" "$file" | sed -E "s/$pattern/\\1/")"
   [ -n "$value" ] || fail "$label missing integer in $file"
+  printf '%s\n' "$value"
+}
+
+extract_single_value() {
+  file="$1"
+  pattern="$2"
+  label="$3"
+  count="$(grep -Ec -- "$pattern" "$file" || true)"
+  [ "$count" = "1" ] || fail "$label matched $count lines in $file"
+  value="$(grep -E -- "$pattern" "$file" | sed -E "s|$pattern|\\1|")"
+  [ -n "$value" ] || fail "$label missing value in $file"
   printf '%s\n' "$value"
 }
 
@@ -416,6 +435,7 @@ for key in \
   SQLITE_AMALG_SHA3_256 \
   SQLITE_SRC_URL \
   SQLITE_SRC_SHA3_256 \
+  SQLITE_SOURCE_ID \
   MIMALLOC_VERSION \
   MIMALLOC_URL \
   MIMALLOC_SHA512
@@ -470,6 +490,23 @@ rt_pmasz="$(extract_single_int \
 
 assert_eq 'SORTERREF compile<->runtime alignment' "$build_sorterref" "$rt_sorterref"
 assert_eq 'PMASZ compile<->runtime alignment' "$build_pmasz" "$rt_pmasz"
+
+require_line scripts/optimize_media_servers.sh '    pin_file="${script_dir}/../pins/versions.env"'
+require_line scripts/optimize_media_servers.sh '    if ! expected_source_id="$(sqlite_source_id_pin_value)"; then'
+require_line lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run 'versions_env="/opt/sqlite3-lsio-mod/pins/versions.env"'
+require_line lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run 'source_id_new="${source_id_new_encoded//%20/ }"'
+require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh 'versions_env="${RENDER_LSIO_MOD_VERSIONS_ENV:-pins/versions.env}"'
+require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh '  plex_source_id_new="${encoded_source_id//%20/ }"'
+reject_pattern scripts/optimize_media_servers.sh 'expected_source_id="[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]][0-9a-f]{64}"'
+reject_pattern lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run "source_id_new='[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]][0-9a-f]{64}'"
+
+source_id_wrapper_arg_count="$(grep -Fc -- '--build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}"' build/build_static_sqlite.sh || true)"
+assert_eq 'build/build_static_sqlite.sh SQLITE_SOURCE_ID build-arg count' '2' "$source_id_wrapper_arg_count"
+require_line build/Build.sh 'SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID:-}"'
+require_line build/Build.sh '  rc = prepare(db, "SELECT sqlite_source_id()", -1, &stmt, NULL);'
+require_pattern build/Build.sh 'strcmp[(]actual_source_id, expected_source_id[)]' 'fresh-library source-id pin comparison'
+require_line docker-library/Dockerfile 'ARG SQLITE_SOURCE_ID'
+require_line docker-library/Dockerfile '    SQLITE_SOURCE_ID="$SQLITE_SOURCE_ID" \'
 
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type = 8;"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"'
@@ -582,7 +619,7 @@ require_range_token_count src/emby_fts_rewrite.c \
   'Emby people producer manifest'
 require_range_token_count src/emby_fts_rewrite.c \
   'static emby_match_result emby_match_links_search(' \
-  'static emby_match_result emby_match_resume_simple(' OBS_MODE_EMBY_LINKS_SEARCH 7 \
+  'static emby_match_result emby_match_resume_simple(' OBS_MODE_EMBY_LINKS_SEARCH 13 \
   'Emby links-search producer manifest'
 require_range_token_count src/emby_fts_rewrite.c \
   'static emby_match_result emby_match_resume_simple(' \
@@ -608,7 +645,7 @@ require_range_token_count src/emby_fts_rewrite.c \
 plex_mode_token_count="$(grep -Eo 'OBS_MODE_PLEX_[A-Z_]+' src/plex_fts_rewrite.c | wc -l | tr -d ' ')"
 emby_mode_token_count="$(grep -Eo 'OBS_MODE_EMBY_[A-Z_]+' src/emby_fts_rewrite.c | wc -l | tr -d ' ')"
 assert_eq 'Plex producer token total' 13 "$plex_mode_token_count"
-assert_eq 'Emby producer token total' 44 "$emby_mode_token_count"
+assert_eq 'Emby producer token total' 50 "$emby_mode_token_count"
 
 raw_mode_wire_ere='"(fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest)"'
 for file in \
@@ -828,6 +865,18 @@ require_cache_family_topology \
   'Build sqlite Plex library' \
   'Export sqlite Plex library build cache' \
   'Plex'
+for step in \
+  'Build sqlite library' \
+  'Export sqlite generic library build cache' \
+  'Build sqlite Plex library' \
+  'Export sqlite Plex library build cache'
+do
+  require_workflow_step_line \
+    .github/workflows/sqlite-build.yml \
+    "$step" \
+    '            --build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}" \' \
+    "$step SQLITE_SOURCE_ID build arg"
+done
 require_pattern .github/workflows/sqlite-build.yml '--build-arg BASE_IMAGE="\$\{BASE_IMAGE\}"' 'library BASE_IMAGE build arg'
 require_pattern .github/workflows/sqlite-build.yml '--build-arg BASEIMAGE_ALPINE="\$\{BASEIMAGE_ALPINE\}"' 'library BASEIMAGE_ALPINE build arg'
 reject_pattern .github/workflows/sqlite-build.yml 'sudo docker build|--platform'
@@ -843,6 +892,22 @@ reject_pattern .github/workflows/sqlite-build.yml '\$(PLEX|EMBY)_.*TAG'
 reject_pattern tools/ci/mod-bake-smoke.sh '(PLEX|EMBY)_.*TAG'
 require_pattern tools/lsio-mod/render-lsio-mod-baked-pins.sh "printf '# baked-pins schema=3\\\\n'" 'schema-v3 render comment'
 require_pattern tools/lsio-mod/render-lsio-mod-baked-pins.sh "printf 'meta[|]3[|]release_tag[|]%s[|]generated_at[|]%s\\\\n'" 'schema-v3 meta render'
+require_line lsio-mods/shared/cont-init-fragments/manifest-parser.sh '    plex\|plex_pms:pristine|plex\|plex_pms:patched|plex\|plex_pms:source-id-patched|plex\|plex_scanner:pristine|plex\|plex_scanner:patched) return 0 ;;'
+require_line lsio-mods/shared/cont-init-fragments/selector.sh '    plex\|plex_pms:pristine|plex\|plex_pms:patched|plex\|plex_pms:source-id-patched) printf '\''%s\n'\'' "plex_pms" ;;'
+require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh '    plex\|plex_pms:pristine|plex\|plex_pms:patched|plex\|plex_scanner:pristine|plex\|plex_scanner:patched) return 0 ;;'
+require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh '      for role in plex_pms:pristine plex_pms:patched plex_scanner:pristine plex_scanner:patched; do'
+require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh '  if ! plex_patch_populate_pms_tmp "$derived_pms_tmp" "$input_path" "$source_id_offset" "$plex_source_id_new" "${pms_sites[@]}"; then'
+require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh '          printf '\''%s\n'\'' "${detect_line[$server_id|$arch|plex_pms:source-id-patched]}"'
+require_line tools/ci/mod-bake-smoke.sh '  if ! docker run --rm --entrypoint cat "$image" "$path" > "$output"; then'
+require_line tools/ci/mod-bake-smoke.sh '      plex_pms_render_args+=(--plex-pms-pristine "${server_id}:${arch}:${pms_input}")'
+reject_pattern pins/runtime-baselines.tsv '^detect[[:space:]]+plex[[:space:]]+[^[:space:]]+[[:space:]]+[^[:space:]]+[[:space:]]+plex_pms:source-id-patched[[:space:]]'
+require_line tools/lsio-mod/stage-lsio-mod.sh 'cp lsio-mods/shared/cont-init-fragments/*.sh "$output_dir/root-fs/opt/sqlite3-lsio-mod/lib/"'
+require_line tools/lsio-mod/stage-lsio-mod.sh 'cp "$baked_pins" "$output_dir/root-fs/opt/sqlite3-lsio-mod/baked-pins.txt"'
+require_line tools/lsio-mod/stage-lsio-mod.sh '  cp pins/versions.env "$output_dir/root-fs/opt/sqlite3-lsio-mod/pins/versions.env"'
+require_line tests/stage_lsio_mod_baked_pins_test.sh 'grep -Fq '\''|plex_pms:source-id-patched|'\'' "$plex_staged/root-fs/opt/sqlite3-lsio-mod/baked-pins.txt" ||'
+require_line tests/stage_lsio_mod_baked_pins_test.sh 'cmp -s pins/versions.env "$plex_staged/root-fs/opt/sqlite3-lsio-mod/pins/versions.env" ||'
+require_pattern docs/baked-pins-schema.md 'exactly one `plex_pms:pristine`, `plex_pms:patched`, `plex_pms:source-id-patched`, `plex_scanner:pristine`, and `plex_scanner:patched`' 'five-role Plex detector schema'
+require_pattern docs/runtime-baseline-derivation.md '`plex_pms:source-id-patched` is computed during manifest rendering' 'PMS source-id-patched render-time derivation contract'
 
 awk -F '\t' '
   function die(message) {

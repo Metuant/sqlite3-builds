@@ -2,6 +2,7 @@
 meta|3|release_tag|2026.05.28-r1|generated_at|2026-05-28T00:00:00Z
 detect|1|plex|plex-1.43.2|@ARCH@|plex_pms:pristine|@PLEX_PMS_PATH@|@PLEX_PMS_PRISTINE_SHA@
 detect|1|plex|plex-1.43.2|@ARCH@|plex_pms:patched|@PLEX_PMS_PATH@|@PLEX_PMS_PATCHED_SHA@
+detect|1|plex|plex-1.43.2|@ARCH@|plex_pms:source-id-patched|@PLEX_PMS_PATH@|@PLEX_PMS_SOURCE_ID_PATCHED_SHA@
 detect|1|plex|plex-1.43.2|@ARCH@|plex_scanner:pristine|@PLEX_SCANNER_PATH@|@PLEX_SCANNER_PRISTINE_SHA@
 detect|1|plex|plex-1.43.2|@ARCH@|plex_scanner:patched|@PLEX_SCANNER_PATH@|@PLEX_SCANNER_PATCHED_SHA@
 artifact|1|plex|plex-1.43.2|@ARCH@|icu69|artifacts/@ARCH@/icu69/libsqlite3.so|/usr/lib/plexmediaserver/lib/libsqlite3.so|@PLEX_ARTIFACT_SHA@

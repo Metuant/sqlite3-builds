@@ -193,7 +193,8 @@ for relpath in artifact_relpaths:
     require_member(f"opt/sqlite3-lsio-mod/{relpath}")
 
 if mod == "plex":
-    require_member("opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh")
+    require_member("opt/sqlite3-lsio-mod/lib/plex-patch.sh")
+    require_member("opt/sqlite3-lsio-mod/pins/library-compat-groups.tsv")
 
 if any(name.startswith("root-fs/") for name in members):
     fail("layer contains root-fs prefix instead of root filesystem paths")

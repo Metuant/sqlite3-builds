@@ -168,6 +168,7 @@ real_sqlite="$(command -v sqlite3 || true)"
 mkdir -p "$tmp/bin"
 cat > "$tmp/bin/sqlite3" <<'EOF_SQLITE'
 #!/usr/bin/env bash
+db_arg="${1:-}"
 sql_text=""
 stdin_sql=""
 if [ ! -t 0 ]; then
@@ -201,7 +202,15 @@ case "$sql_text" in
 esac
 
 case "$sql_text" in
-  *"PRAGMA integrity_check;"*) printf 'integrity\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
+  *"PRAGMA integrity_check;"*)
+    case "$db_arg" in
+      *.new) printf 'final-integrity\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
+      *) printf 'source-integrity\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
+    esac
+    ;;
+  *'SELECT COUNT(*) FROM "'*) printf 'row-count\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
+  *"VALUES('rebuild')"*) printf 'rebuild\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
+  *"PRAGMA user_version;"*) printf 'user-version\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
   *'DELETE FROM "fts4_tag_titles_icu"'*) printf 'recurate\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
   *"name GLOB 'fts4_tag_titles_icu_"*) printf 'shadow-discovery\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
   *'PRAGMA integrity_check("fts4_tag_titles_icu_'*) printf 'shadow-integrity\n' >> "$SQLITE_PIPELINE_ORDER_LOG" ;;
@@ -487,6 +496,11 @@ INSERT INTO tags(id, tag) VALUES
   (6, NULL);
 CREATE VIRTUAL TABLE fts4_tag_titles_icu USING fts4(tag, content='tags');
 INSERT INTO fts4_tag_titles_icu(fts4_tag_titles_icu) VALUES('rebuild');
+DELETE FROM fts4_tag_titles_icu
+WHERE docid IN (
+  SELECT rowid FROM tags
+  WHERE tag GLOB '*://*' OR tag IS NULL OR trim(tag)=''
+);
 EOF_SQL
 }
 
@@ -516,6 +530,7 @@ assert_eq "1" "$healthy_backup_count" "healthy pipeline backup count"
 [ ! -e "$healthy.new" ] || fail "healthy pipeline staged cleanup" "no staged file" "$healthy.new exists"
 assert_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check;" "healthy full integrity_check"
 assert_not_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check(1);" "healthy no bounded integrity_check"
+assert_eq "2" "$(wc -l < "$SQLITE_INTEGRITY_LOG" | tr -d ' ')" "healthy source and final integrity_check"
 assert_contains "$(cat "$SQLITE_MAINTENANCE_LOG")" "ANALYZE; PRAGMA optimize=0x10002;" "healthy staged ANALYZE before optimize"
 
 source_corrupt="$tmp/source-corrupt.db"
@@ -608,25 +623,33 @@ create_stats_db "$plex_main"
 : > "$SQLITE_PIPELINE_ORDER_LOG"
 : > "$SQLITE_SHADOW_GATE_LOG"
 add_plex_tag_titles_icu_fixture "$plex_main"
+assert_eq "0" "$(bad_plex_tag_doc_count "$plex_main")" "Plex main curated source URI and empty FTS doc count"
+assert_eq "2" "$(name_plex_tag_doc_count "$plex_main")" "Plex main curated source name FTS doc count"
+assert_eq "malformed inverted index for FTS4 table main.fts4_tag_titles_icu" "$("$real_sqlite" "$plex_main" "PRAGMA integrity_check;" | tr -d '\r')" "Plex main curated source whole-DB xIntegrity result"
 run_pipeline_plex_optimize_capture plex-main "$_PLEX_DB" "try_deflate_plex_statistics_bandwidth"
 rc="$(cat "$tmp/plex-main.rc")"
 [ "$rc" = "0" ] || fail "Plex main optimize rc" "0" "rc=$rc stderr=$(cat "$tmp/plex-main.err")"
-final_integrity_line="$(awk '$0 == "integrity" { line=NR } END { if (line) print line }' "$SQLITE_PIPELINE_ORDER_LOG")"
-recurate_line="$(awk '$0 == "recurate" { print NR; exit }' "$SQLITE_PIPELINE_ORDER_LOG")"
-shadow_discovery_line="$(awk '$0 == "shadow-discovery" { print NR; exit }' "$SQLITE_PIPELINE_ORDER_LOG")"
-shadow_integrity_line="$(awk '$0 == "shadow-integrity" { print NR; exit }' "$SQLITE_PIPELINE_ORDER_LOG")"
-assert_line_lt "$final_integrity_line" "$recurate_line" "Plex final staged integrity before FTS re-curation"
-assert_line_lt "$recurate_line" "$shadow_discovery_line" "Plex FTS re-curation before shadow discovery"
-assert_line_lt "$shadow_discovery_line" "$shadow_integrity_line" "Plex shadow discovery before table-scoped integrity checks"
+source_integrity_line="$(awk '$0 == "source-integrity" { print NR; exit }' "$SQLITE_PIPELINE_ORDER_LOG")"
+final_integrity_line="$(awk '$0 == "final-integrity" { line=NR } END { if (line) print line }' "$SQLITE_PIPELINE_ORDER_LOG")"
+row_count_line="$(awk '$0 == "row-count" { print NR; exit }' "$SQLITE_PIPELINE_ORDER_LOG")"
+rebuild_line="$(awk '$0 == "rebuild" { print NR; exit }' "$SQLITE_PIPELINE_ORDER_LOG")"
+staged_user_version_line="$(awk '$0 == "user-version" { line=NR } END { if (line) print line }' "$SQLITE_PIPELINE_ORDER_LOG")"
+assert_eq "1" "$(count_log_occurrences 'source-integrity' "$SQLITE_PIPELINE_ORDER_LOG")" "Plex source integrity gate count"
+assert_eq "1" "$(count_log_occurrences 'final-integrity' "$SQLITE_PIPELINE_ORDER_LOG")" "Plex final integrity gate count"
+assert_line_lt "$source_integrity_line" "$row_count_line" "Plex source integrity before row-count sweep"
+assert_line_lt "$row_count_line" "$rebuild_line" "Plex row-count sweep before FTS rebuild"
+assert_line_lt "$rebuild_line" "$final_integrity_line" "Plex FTS rebuild before final integrity gate"
+assert_line_lt "$final_integrity_line" "$staged_user_version_line" "Plex final staged integrity before preservation gates"
+assert_eq "0" "$(count_log_occurrences 'recurate' "$SQLITE_PIPELINE_ORDER_LOG")" "Plex main no FTS re-curation invocation"
+assert_eq "0" "$(count_log_occurrences 'shadow-discovery' "$SQLITE_PIPELINE_ORDER_LOG")" "Plex main no post-recuration shadow discovery"
+assert_eq "0" "$(count_log_occurrences 'shadow-integrity' "$SQLITE_PIPELINE_ORDER_LOG")" "Plex main no post-recuration shadow integrity checks"
 assert_contains "$(cat "$tmp/plex-main.out")" "Deflating Plex statistics_bandwidth" "Plex main deflate log"
 assert_eq "2" "$("$real_sqlite" "$plex_main" "SELECT group_concat(id, ',') FROM (SELECT id FROM statistics_bandwidth ORDER BY id);")" "Plex main deflated ids"
-assert_eq "0" "$(bad_plex_tag_doc_count "$plex_main")" "Plex main recurate bad tag docs"
-assert_eq "2" "$(name_plex_tag_doc_count "$plex_main")" "Plex main recurate name docs"
+assert_eq "4" "$(bad_plex_tag_doc_count "$plex_main")" "Plex main staged rebuild restores URI and empty FTS documents"
+assert_eq "2" "$(name_plex_tag_doc_count "$plex_main")" "Plex main retains name FTS documents"
 assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts4_tag_titles_icu"("fts4_tag_titles_icu") VALUES('\''rebuild'\'');' "$SQLITE_CALL_LOG")" "Plex main staged-only FTS rebuild count"
 assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts4_tag_titles_icu"("fts4_tag_titles_icu") VALUES('\''optimize'\'');' "$SQLITE_CALL_LOG")" "Plex main post-swap FTS optimize count"
-plex_shadow_table_count="$("$real_sqlite" "$plex_main" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name GLOB 'fts4_tag_titles_icu_*';")"
-assert_eq "1" "$(count_log_occurrences 'shadow-discovery' "$SQLITE_SHADOW_GATE_LOG")" "Plex main shadow discovery invocation count"
-assert_eq "$plex_shadow_table_count" "$(count_log_occurrences 'shadow-integrity' "$SQLITE_SHADOW_GATE_LOG")" "Plex main table-scoped shadow integrity invocation count"
+assert_eq "0" "$(wc -l < "$SQLITE_SHADOW_GATE_LOG" | tr -d ' ')" "Plex main no post-recuration shadow-gate SQLite invocations"
 
 plex_blob="$plex_dir/$_PLEX_BLOB_DB"
 create_stats_db "$plex_blob"
@@ -671,6 +694,7 @@ assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts_search9"("fts_search9")
 assert_eq "1" "$(count_log_occurrences 'INSERT INTO "fts_search9"("fts_search9") VALUES('\''optimize'\'');' "$SQLITE_CALL_LOG")" "Emby post-swap FTS optimize count"
 assert_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check;" "Emby full integrity_check"
 assert_not_contains "$(cat "$SQLITE_INTEGRITY_LOG")" "PRAGMA integrity_check(1);" "Emby no bounded integrity_check"
+assert_eq "2" "$(wc -l < "$SQLITE_INTEGRITY_LOG" | tr -d ' ')" "Emby source and final integrity_check"
 assert_contains "$(cat "$SQLITE_MAINTENANCE_LOG")" "ANALYZE; PRAGMA optimize=0x10002;" "Emby staged ANALYZE before optimize"
 assert_eq "0" "$(wc -l < "$SQLITE_SHADOW_GATE_LOG" | tr -d ' ')" "Emby no post-recuration shadow-gate SQLite invocations"
 assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_mediaitems_parent_type';")" "Emby pipeline index count"

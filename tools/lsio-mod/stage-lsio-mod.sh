@@ -42,6 +42,13 @@ cp -R "lsio-mods/${mod}/." "$output_dir/"
 mkdir -p "$output_dir/root-fs/opt/sqlite3-lsio-mod/lib"
 cp lsio-mods/shared/cont-init-fragments/*.sh "$output_dir/root-fs/opt/sqlite3-lsio-mod/lib/"
 cp "$baked_pins" "$output_dir/root-fs/opt/sqlite3-lsio-mod/baked-pins.txt"
+if [ "$mod" = "plex" ]; then
+  [ -f pins/library-compat-groups.tsv ] || { echo "FATAL: missing Plex compatibility groups" >&2; exit 1; }
+  [ -f pins/versions.env ] || { echo "FATAL: missing version pins" >&2; exit 1; }
+  mkdir -p "$output_dir/root-fs/opt/sqlite3-lsio-mod/pins"
+  cp pins/library-compat-groups.tsv "$output_dir/root-fs/opt/sqlite3-lsio-mod/pins/library-compat-groups.tsv"
+  cp pins/versions.env "$output_dir/root-fs/opt/sqlite3-lsio-mod/pins/versions.env"
+fi
 
 for artifact in "${artifacts[@]}"; do
   IFS=':' read -r arch compat_group source_path extra <<EOF_ART

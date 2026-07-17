@@ -14,17 +14,40 @@ family_configure() {
   DASHBOARD_ANCESTORS=
 }
 
-family_all_cases() { printf '%s\n' movies-latest episodes-latest; }
+family_all_cases() {
+  printf '%s\n' \
+    movies-latest \
+    episodes-latest \
+    episodes-latest-single-index \
+    episodes-latest-two-index
+}
 family_cases() {
   local -a selected
   if [ -n "${CASES:-}" ]; then read -r -a selected <<< "$CASES"; printf '%s\n' "${selected[@]}"; else family_all_cases; fi
 }
 
+# The shared engine owns fixed vendor/candidate labels. Comparison cases put
+# shipped K1 in the vendor slot so timing remains a direct K1-to-candidate A-B.
+family_case_role() {
+  case "$1" in
+    movies-latest|episodes-latest) printf 'SHIPPED\n' ;;
+    episodes-latest-single-index|episodes-latest-two-index) printf 'COMPARISON\n' ;;
+    *) die "unknown Emby dashboard case role: $1" ;;
+  esac
+}
+
 family_contract_check() {
+  local _role
   grep -Fx '    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby Episodes Latest mode catalogue contract drifted'
   grep -Fx '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby movies Latest mode catalogue contract drifted'
-  for _case in movies-latest episodes-latest; do
+  [ "$(family_all_cases | wc -l | tr -d ' ')" -eq 4 ] || die 'Emby dashboard arm matrix incomplete'
+  for _case in movies-latest episodes-latest episodes-latest-single-index episodes-latest-two-index; do
     family_all_cases | grep -Fx "$_case" >/dev/null || die "missing Emby dashboard measurement arm: $_case"
+    _role=$(family_case_role "$_case")
+    case "$_case:$_role" in
+      movies-latest:SHIPPED|episodes-latest:SHIPPED|episodes-latest-single-index:COMPARISON|episodes-latest-two-index:COMPARISON) ;;
+      *) die "Emby dashboard arm role drifted: case=$_case role=$_role" ;;
+    esac
   done
   while IFS= read -r _case; do family_all_cases | grep -Fx "$_case" >/dev/null || die "unknown CASES entry for emby-dashboard: $_case"; done < <(family_cases)
 }
@@ -62,6 +85,7 @@ family_prepare_sql() {
   cat <<'SQL'
 .bail on
 CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type = 8;
+CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_episodes_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8;
 CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_dcn_puk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5;
 CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_puk_dc_cover ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5;
 SQL
@@ -70,7 +94,7 @@ SQL
 dashboard_projection() {
   case "$1" in
     movies-latest) printf '%s' 'A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
-    episodes-latest) printf '%s' 'A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
+    episodes-latest|episodes-latest-single-index|episodes-latest-two-index) printf '%s' 'A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
     *) die "unknown Emby dashboard case: $1" ;;
   esac
 }
@@ -107,7 +131,7 @@ SQL
     episodes-latest:vendor)
       printf 'with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (%s) )select %sfrom mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=%s where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 12;\n' "$DASHBOARD_ANCESTORS" "$projection" "$DASHBOARD_USER_ID"
       ;;
-    episodes-latest:candidate)
+    episodes-latest:candidate|episodes-latest-single-index:vendor|episodes-latest-two-index:vendor)
       cat <<SQL
 WITH keys(gk) AS MATERIALIZED (
   SELECT DISTINCT coalesce(A0.SeriesPresentationUniqueKey,A0.PresentationUniqueKey)
@@ -129,20 +153,67 @@ LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.Use
 ORDER BY R.maxdc DESC LIMIT 12;
 SQL
       ;;
+    episodes-latest-single-index:candidate)
+      cat <<SQL
+WITH exact_groups(gk,id,maxdc) AS MATERIALIZED (
+  SELECT coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey),A.Id,A.DateCreated
+  FROM MediaItems AS A
+  WHERE A.Type=8
+    AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId=A.Id AND X.AncestorId IN ($DASHBOARD_ANCESTORS))
+    AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId=A.UserDataKeyId AND U0.UserId=$DASHBOARD_USER_ID AND U0.played<>0)
+    AND NOT EXISTS (
+      SELECT 1 FROM MediaItems AS B INDEXED BY idx_dshadow_emby_latest_gk_dc
+      WHERE B.Type=8
+        AND coalesce(B.SeriesPresentationUniqueKey,B.PresentationUniqueKey) IS coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey)
+        AND ((B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated>A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id<A.Id))
+        AND EXISTS (SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId=B.Id AND XB.AncestorId IN ($DASHBOARD_ANCESTORS))
+        AND NOT EXISTS (SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId=B.UserDataKeyId AND UB.UserId=$DASHBOARD_USER_ID AND UB.played<>0)
+    )
+), ranked AS MATERIALIZED (
+  SELECT gk,id,maxdc FROM exact_groups ORDER BY maxdc DESC LIMIT 12
+)
+SELECT ${projection}FROM ranked AS R JOIN MediaItems AS A ON A.Id=R.id
+LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.UserId=$DASHBOARD_USER_ID
+ORDER BY R.maxdc DESC LIMIT 12;
+SQL
+      ;;
+    episodes-latest-two-index:candidate)
+      cat <<SQL
+WITH ranked(id,dc,gk) AS MATERIALIZED (
+  SELECT A.Id,A.DateCreated,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey)
+  FROM MediaItems AS A INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk
+  WHERE A.Type=8
+    AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId=A.Id AND X.AncestorId IN ($DASHBOARD_ANCESTORS))
+    AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId=A.UserDataKeyId AND U0.UserId=$DASHBOARD_USER_ID AND U0.played<>0)
+    AND NOT EXISTS (
+      SELECT 1 FROM MediaItems AS B INDEXED BY idx_dshadow_emby_latest_gk_dc
+      WHERE B.Type=8
+        AND coalesce(B.SeriesPresentationUniqueKey,B.PresentationUniqueKey) IS coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey)
+        AND ((B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated>A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id<A.Id))
+        AND EXISTS (SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId=B.Id AND XB.AncestorId IN ($DASHBOARD_ANCESTORS))
+        AND NOT EXISTS (SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId=B.UserDataKeyId AND UB.UserId=$DASHBOARD_USER_ID AND UB.played<>0)
+    )
+  ORDER BY (A.DateCreated IS NULL) ASC,A.DateCreated DESC,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey) ASC LIMIT 12
+)
+SELECT ${projection}FROM ranked AS R JOIN MediaItems AS A ON A.Id=R.id
+LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.UserId=$DASHBOARD_USER_ID
+ORDER BY (R.dc IS NULL) ASC,R.dc DESC,R.gk ASC LIMIT 12;
+SQL
+      ;;
     *) die "unknown Emby dashboard arm: $case_id/$arm" ;;
   esac
 }
 
 dashboard_query_core() { sed '$s/;[[:space:]]*$//' "$1"; }
+dashboard_render_core() { family_render "$1" "$2" | sed '$s/;[[:space:]]*$//'; }
 
-# This strict canary can false-fail when max-DateCreated ties cross LIMIT 12:
-# neither arm has a deterministic group tiebreaker, so tied subsets can differ.
-# It can also pass on all-singleton groups without exercising representative
-# selection; tests/fixtures/emby-fts-rewrite/ is authoritative for that drift.
 family_identity_sql() {
-  local _case_id=$1 vendor_file=$2 candidate_file=$3
-  write_readonly_preamble
-  cat <<SQL
+  local case_id=$1 vendor_file=$2 candidate_file=$3
+  local comparison candidate_kind require_canonical vendor_core reference_core candidate_core
+
+  if [ "$case_id" = movies-latest ]; then
+    write_readonly_preamble
+    cat <<SQL
 WITH vendor_identity AS MATERIALIZED ($(dashboard_query_core "$vendor_file")),
 candidate_identity AS MATERIALIZED ($(dashboard_query_core "$candidate_file")),
 metrics AS (
@@ -153,6 +224,199 @@ metrics AS (
 )
 SELECT 'IDENTITY',CASE WHEN vendor_rows>0 AND vendor_rows=candidate_rows AND missing_candidate=0 AND extra_candidate=0 THEN 'PASS' ELSE 'FAIL' END,
        vendor_rows,candidate_rows,missing_candidate,extra_candidate FROM metrics;
+SQL
+    return 0
+  fi
+
+  case "$case_id" in
+    episodes-latest)
+      comparison=vendor_vs_shipped_k1
+      candidate_kind=shipped_k1
+      require_canonical=0
+      vendor_core=$(dashboard_query_core "$vendor_file")
+      reference_core=$vendor_core
+      ;;
+    episodes-latest-single-index)
+      comparison=shipped_k1_vs_single_index_antijoin
+      candidate_kind=single_index_antijoin
+      require_canonical=1
+      vendor_core=$(dashboard_render_core episodes-latest vendor)
+      reference_core=$(dashboard_query_core "$vendor_file")
+      ;;
+    episodes-latest-two-index)
+      comparison=shipped_k1_vs_two_index_antijoin
+      candidate_kind=two_index_antijoin
+      require_canonical=1
+      vendor_core=$(dashboard_render_core episodes-latest vendor)
+      reference_core=$(dashboard_query_core "$vendor_file")
+      ;;
+    *) die "unknown Emby dashboard identity case: $case_id" ;;
+  esac
+  candidate_core=$(dashboard_query_core "$candidate_file")
+
+  write_readonly_preamble
+  cat <<SQL
+WITH eligible(id,gk,dc) AS MATERIALIZED (
+  SELECT A.Id,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey),A.DateCreated
+  FROM MediaItems AS A
+  WHERE A.Type=8
+    AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId=A.Id AND X.AncestorId IN ($DASHBOARD_ANCESTORS))
+    AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId=A.UserDataKeyId AND U0.UserId=$DASHBOARD_USER_ID AND U0.played<>0)
+), eligible_groups(gk,maxdc) AS MATERIALIZED (
+  SELECT gk,MAX(dc) FROM eligible GROUP BY gk
+), eligible_maxima(gk,maxdc,canonical_id,tie_count) AS MATERIALIZED (
+  SELECT G.gk,G.maxdc,MIN(E.id),count(*)
+  FROM eligible_groups AS G JOIN eligible AS E ON E.gk IS G.gk AND E.dc IS G.maxdc
+  GROUP BY G.gk,G.maxdc
+), universe(group_count,expected_rows) AS (
+  SELECT count(*),CASE WHEN count(*)<12 THEN count(*) ELSE 12 END FROM eligible_maxima
+), canonical_boundary(has_cut,maxdc) AS (
+  SELECT group_count>12,
+         (SELECT maxdc FROM eligible_maxima ORDER BY (maxdc IS NULL) ASC,maxdc DESC LIMIT 1 OFFSET 11)
+  FROM universe
+), vendor_output AS MATERIALIZED ($vendor_core),
+reference_output AS MATERIALIZED ($reference_core),
+candidate_output AS MATERIALIZED ($candidate_core),
+vendor_rows(id,gk,maxdc) AS MATERIALIZED (
+  SELECT A.Id,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey),A.DateCreated
+  FROM vendor_output AS O JOIN MediaItems AS A ON A.Id=O.Id
+), reference_rows(id,gk,maxdc) AS MATERIALIZED (
+  SELECT A.Id,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey),A.DateCreated
+  FROM reference_output AS O JOIN MediaItems AS A ON A.Id=O.Id
+), candidate_rows(id,gk,maxdc) AS MATERIALIZED (
+  SELECT A.Id,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey),A.DateCreated
+  FROM candidate_output AS O JOIN MediaItems AS A ON A.Id=O.Id
+), arm_names(arm) AS (VALUES('vendor'),('reference'),('candidate')),
+arm_rows(arm,id,gk,maxdc) AS (
+  SELECT 'vendor',id,gk,maxdc FROM vendor_rows
+  UNION ALL SELECT 'reference',id,gk,maxdc FROM reference_rows
+  UNION ALL SELECT 'candidate',id,gk,maxdc FROM candidate_rows
+), arm_quality(arm,row_count,group_count,invalid_max,missing_above_boundary,below_boundary) AS (
+  SELECT N.arm,
+         (SELECT count(*) FROM arm_rows AS R WHERE R.arm=N.arm),
+         (SELECT count(*) FROM (SELECT R.gk FROM arm_rows AS R WHERE R.arm=N.arm GROUP BY R.gk)),
+         (SELECT count(*) FROM arm_rows AS R
+          WHERE R.arm=N.arm AND NOT EXISTS (
+            SELECT 1 FROM eligible_maxima AS G
+            WHERE G.gk IS R.gk AND G.maxdc IS R.maxdc
+              AND EXISTS (SELECT 1 FROM eligible AS E WHERE E.id=R.id AND E.gk IS R.gk AND E.dc IS R.maxdc)
+          )),
+         (SELECT count(*) FROM eligible_maxima AS G CROSS JOIN canonical_boundary AS B
+          WHERE B.has_cut=1
+            AND ((B.maxdc IS NULL AND G.maxdc IS NOT NULL) OR (B.maxdc IS NOT NULL AND G.maxdc>B.maxdc))
+            AND NOT EXISTS (SELECT 1 FROM arm_rows AS R WHERE R.arm=N.arm AND R.gk IS G.gk)),
+         (SELECT count(*) FROM arm_rows AS R CROSS JOIN canonical_boundary AS B
+          WHERE R.arm=N.arm AND B.has_cut=1 AND B.maxdc IS NOT NULL
+            AND (R.maxdc IS NULL OR R.maxdc<B.maxdc))
+  FROM arm_names AS N
+), pair_metrics AS (
+  SELECT
+    (SELECT count(*) FROM reference_rows AS R CROSS JOIN canonical_boundary AS B
+     WHERE NOT EXISTS (SELECT 1 FROM candidate_rows AS C WHERE C.gk IS R.gk)
+       AND (B.has_cut=0 OR NOT (R.maxdc IS B.maxdc))) AS missing_candidate_group,
+    (SELECT count(*) FROM candidate_rows AS C CROSS JOIN canonical_boundary AS B
+     WHERE NOT EXISTS (SELECT 1 FROM reference_rows AS R WHERE R.gk IS C.gk)
+       AND (B.has_cut=0 OR NOT (C.maxdc IS B.maxdc))) AS extra_candidate_group,
+    (SELECT count(*) FROM reference_rows AS R CROSS JOIN canonical_boundary AS B
+     WHERE B.has_cut=1 AND R.maxdc IS B.maxdc
+       AND NOT EXISTS (SELECT 1 FROM candidate_rows AS C WHERE C.gk IS R.gk)) AS boundary_missing_candidate_group,
+    (SELECT count(*) FROM candidate_rows AS C CROSS JOIN canonical_boundary AS B
+     WHERE B.has_cut=1 AND C.maxdc IS B.maxdc
+       AND NOT EXISTS (SELECT 1 FROM reference_rows AS R WHERE R.gk IS C.gk)) AS boundary_extra_candidate_group,
+    (SELECT count(*) FROM reference_rows AS R JOIN candidate_rows AS C ON C.gk IS R.gk
+     WHERE NOT (C.maxdc IS R.maxdc)) AS common_maxdc_mismatch,
+    (SELECT count(*) FROM reference_rows AS R
+       JOIN candidate_rows AS C ON C.gk IS R.gk
+       JOIN eligible_maxima AS G ON G.gk IS R.gk
+     WHERE G.tie_count=1 AND C.id<>R.id) AS non_tied_id_mismatch,
+    (SELECT count(*) FROM reference_rows AS R
+       JOIN candidate_rows AS C ON C.gk IS R.gk
+       JOIN eligible_maxima AS G ON G.gk IS R.gk
+     WHERE G.tie_count>1 AND C.id<>R.id) AS tied_id_divergence,
+    (SELECT count(*) FROM candidate_rows AS C
+     WHERE NOT EXISTS (SELECT 1 FROM eligible_maxima AS G WHERE G.gk IS C.gk AND G.canonical_id=C.id)) AS candidate_not_lower_id
+), vendor_metrics AS (
+  SELECT
+    (SELECT count(*) FROM vendor_rows AS V CROSS JOIN canonical_boundary AS B
+     WHERE NOT EXISTS (SELECT 1 FROM candidate_rows AS C WHERE C.gk IS V.gk)
+       AND (B.has_cut=0 OR NOT (V.maxdc IS B.maxdc))) AS vendor_missing_candidate_group,
+    (SELECT count(*) FROM candidate_rows AS C CROSS JOIN canonical_boundary AS B
+     WHERE NOT EXISTS (SELECT 1 FROM vendor_rows AS V WHERE V.gk IS C.gk)
+       AND (B.has_cut=0 OR NOT (C.maxdc IS B.maxdc))) AS vendor_extra_candidate_group,
+    (SELECT count(*) FROM vendor_rows AS V CROSS JOIN canonical_boundary AS B
+     WHERE B.has_cut=1 AND V.maxdc IS B.maxdc
+       AND NOT EXISTS (SELECT 1 FROM candidate_rows AS C WHERE C.gk IS V.gk)) AS vendor_boundary_missing_candidate_group,
+    (SELECT count(*) FROM candidate_rows AS C CROSS JOIN canonical_boundary AS B
+     WHERE B.has_cut=1 AND C.maxdc IS B.maxdc
+       AND NOT EXISTS (SELECT 1 FROM vendor_rows AS V WHERE V.gk IS C.gk)) AS vendor_boundary_extra_candidate_group,
+    (SELECT count(*) FROM vendor_rows AS V JOIN candidate_rows AS C ON C.gk IS V.gk
+     WHERE NOT (C.maxdc IS V.maxdc)) AS vendor_common_maxdc_mismatch,
+    (SELECT count(*) FROM vendor_rows AS V
+       JOIN candidate_rows AS C ON C.gk IS V.gk
+       JOIN eligible_maxima AS G ON G.gk IS V.gk
+     WHERE G.tie_count=1 AND C.id<>V.id) AS vendor_non_tied_id_mismatch,
+    (SELECT count(*) FROM vendor_rows AS V
+       JOIN candidate_rows AS C ON C.gk IS V.gk
+       JOIN eligible_maxima AS G ON G.gk IS V.gk
+     WHERE G.tie_count>1 AND C.id<>V.id) AS vendor_tied_id_divergence
+), metrics AS (
+  SELECT U.expected_rows,
+         R.row_count AS reference_row_count,R.group_count AS reference_group_count,
+         R.invalid_max AS reference_invalid_max,
+         R.missing_above_boundary AS reference_missing_above,R.below_boundary AS reference_below_boundary,
+         C.row_count AS candidate_row_count,C.group_count AS candidate_group_count,
+         C.invalid_max AS candidate_invalid_max,
+         C.missing_above_boundary AS candidate_missing_above,C.below_boundary AS candidate_below_boundary,
+         V.row_count AS vendor_row_count,V.group_count AS vendor_group_count,V.invalid_max AS vendor_invalid_max,
+         V.missing_above_boundary AS vendor_missing_above,V.below_boundary AS vendor_below_boundary,
+         P.*,VM.*
+  FROM universe AS U
+  JOIN arm_quality AS R ON R.arm='reference'
+  JOIN arm_quality AS C ON C.arm='candidate'
+  JOIN arm_quality AS V ON V.arm='vendor'
+  CROSS JOIN pair_metrics AS P CROSS JOIN vendor_metrics AS VM
+)
+SELECT 'IDENTITY',
+       CASE WHEN expected_rows>0
+                  AND reference_row_count=expected_rows AND candidate_row_count=expected_rows
+                  AND reference_group_count=reference_row_count AND candidate_group_count=candidate_row_count
+                  AND reference_invalid_max=0 AND candidate_invalid_max=0
+                  AND reference_missing_above=0 AND candidate_missing_above=0
+                  AND reference_below_boundary=0 AND candidate_below_boundary=0
+                  AND missing_candidate_group=0 AND extra_candidate_group=0
+                  AND common_maxdc_mismatch=0 AND non_tied_id_mismatch=0
+                  AND ($require_canonical=0 OR candidate_not_lower_id=0)
+            THEN 'PASS' ELSE 'FAIL' END,
+       'comparison=$comparison','expected_rows='||expected_rows,
+       'reference_rows='||reference_row_count,'candidate_rows='||candidate_row_count,
+       'reference_groups='||reference_group_count,'candidate_groups='||candidate_group_count,
+       'reference_invalid_max='||reference_invalid_max,'candidate_invalid_max='||candidate_invalid_max,
+       'reference_rank_errors='||(reference_missing_above+reference_below_boundary),
+       'candidate_rank_errors='||(candidate_missing_above+candidate_below_boundary),
+       'normalized_missing='||missing_candidate_group,'normalized_extra='||extra_candidate_group,
+       'boundary_missing='||boundary_missing_candidate_group,'boundary_extra='||boundary_extra_candidate_group,
+       'common_maxdc_mismatch='||common_maxdc_mismatch,
+       'non_tied_id_mismatch='||non_tied_id_mismatch,
+       'tied_id_divergence='||tied_id_divergence,
+       'candidate_not_lower_id='||candidate_not_lower_id
+FROM metrics
+UNION ALL
+SELECT 'VENDOR_INFO','INFO','comparison=${candidate_kind}_vs_vendor',
+       'expected_rows='||expected_rows,
+       'vendor_rows='||vendor_row_count,'candidate_rows='||candidate_row_count,
+       'vendor_groups='||vendor_group_count,'candidate_groups='||candidate_group_count,
+       'vendor_invalid_max='||vendor_invalid_max,'candidate_invalid_max='||candidate_invalid_max,
+       'vendor_rank_errors='||(vendor_missing_above+vendor_below_boundary),
+       'candidate_rank_errors='||(candidate_missing_above+candidate_below_boundary),
+       'normalized_missing='||vendor_missing_candidate_group,
+       'normalized_extra='||vendor_extra_candidate_group,
+       'boundary_missing='||vendor_boundary_missing_candidate_group,
+       'boundary_extra='||vendor_boundary_extra_candidate_group,
+       'common_maxdc_mismatch='||vendor_common_maxdc_mismatch,
+       'non_tied_id_mismatch='||vendor_non_tied_id_mismatch,
+       'tied_id_divergence='||vendor_tied_id_divergence,
+       'candidate_not_lower_id='||candidate_not_lower_id
+FROM metrics;
 SQL
 }
 

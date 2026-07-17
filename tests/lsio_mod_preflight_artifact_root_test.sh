@@ -87,17 +87,20 @@ prepare_plex_case() {
   write_file "$artifact" "plex replacement sqlite"
   write_file "$pms_path" "plex pms pristine"
   write_file "$case_root/pms-patched" "plex pms patched"
+  write_file "$case_root/pms-source-id-patched" "plex pms source-id patched"
   write_file "$scanner_path" "plex scanner pristine"
   write_file "$case_root/scanner-patched" "plex scanner patched"
   artifact_sha="$(sha_file "$artifact")"
   pms_sha="$(sha_file "$pms_path")"
   pms_patched_sha="$(sha_file "$case_root/pms-patched")"
+  pms_source_id_patched_sha="$(sha_file "$case_root/pms-source-id-patched")"
   scanner_sha="$(sha_file "$scanner_path")"
   scanner_patched_sha="$(sha_file "$case_root/scanner-patched")"
   cat > "$fixture/opt/sqlite3-lsio-mod/baked-pins.txt" <<EOF_PLEX_PINS
 meta|3|release_tag|2026.05.28-r1|generated_at|2026-05-28T00:00:00Z
 detect|1|plex|plex-root-test|linux-arm64|plex_pms:pristine|$pms_path|$pms_sha
 detect|1|plex|plex-root-test|linux-arm64|plex_pms:patched|$pms_path|$pms_patched_sha
+detect|1|plex|plex-root-test|linux-arm64|plex_pms:source-id-patched|$pms_path|$pms_source_id_patched_sha
 detect|1|plex|plex-root-test|linux-arm64|plex_scanner:pristine|$scanner_path|$scanner_sha
 detect|1|plex|plex-root-test|linux-arm64|plex_scanner:patched|$scanner_path|$scanner_patched_sha
 artifact|1|plex|plex-root-test|linux-arm64|icu69|artifacts/linux-arm64/icu69/libsqlite3.so|/usr/lib/plexmediaserver/lib/libsqlite3.so|$artifact_sha

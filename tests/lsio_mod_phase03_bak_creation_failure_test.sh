@@ -42,6 +42,9 @@ EOF_SCANNER
 cat > "$detector_sha_root/plex-pms-patched" <<'EOF_PMS_PATCHED'
 plex pms patched
 EOF_PMS_PATCHED
+cat > "$detector_sha_root/plex-pms-source-id-patched" <<'EOF_PMS_SOURCE_ID_PATCHED'
+plex pms source-id patched
+EOF_PMS_SOURCE_ID_PATCHED
 cat > "$detector_sha_root/plex-scanner-patched" <<'EOF_SCANNER_PATCHED'
 plex scanner patched
 EOF_SCANNER_PATCHED
@@ -54,6 +57,7 @@ baseline_sha="$(sha256sum "$runtime_lib_dir/libsqlite3.so" | awk '{print $1}')"
 pms_pristine_sha="$(sha256sum "$pms_path" | awk '{print $1}')"
 scanner_pristine_sha="$(sha256sum "$scanner_path" | awk '{print $1}')"
 pms_patched_sha="$(sha256sum "$detector_sha_root/plex-pms-patched" | awk '{print $1}')"
+pms_source_id_patched_sha="$(sha256sum "$detector_sha_root/plex-pms-source-id-patched" | awk '{print $1}')"
 scanner_patched_sha="$(sha256sum "$detector_sha_root/plex-scanner-patched" | awk '{print $1}')"
 icu_uc_sha="$(sha256sum "$runtime_lib_dir/libicuucplex.so.69" | awk '{print $1}')"
 icu_i18n_sha="$(sha256sum "$runtime_lib_dir/libicui18nplex.so.69" | awk '{print $1}')"
@@ -63,6 +67,7 @@ cat > "$fixture/opt/sqlite3-lsio-mod/baked-pins.txt" <<EOF_PINS
 meta|3|release_tag|2026.05.28-r1|generated_at|2026-05-28T00:00:00Z
 detect|1|plex|plex-fixture|linux-arm64|plex_pms:pristine|$pms_path|$pms_pristine_sha
 detect|1|plex|plex-fixture|linux-arm64|plex_pms:patched|$pms_path|$pms_patched_sha
+detect|1|plex|plex-fixture|linux-arm64|plex_pms:source-id-patched|$pms_path|$pms_source_id_patched_sha
 detect|1|plex|plex-fixture|linux-arm64|plex_scanner:pristine|$scanner_path|$scanner_pristine_sha
 detect|1|plex|plex-fixture|linux-arm64|plex_scanner:patched|$scanner_path|$scanner_patched_sha
 artifact|1|plex|plex-fixture|linux-arm64|icu69|artifacts/linux-arm64/icu69/libsqlite3.so|${fixture}/usr/lib/plexmediaserver/lib/libsqlite3.so|$current_sha

@@ -59,7 +59,7 @@ for file in \
   pins/library-compat-groups.tsv \
   pins/runtime-baselines.tsv \
   pins/emby-detector-evidence.tsv \
-  pins/plex-pool-patch-sites.tsv \
+  pins/plex-patch-pool-sites.tsv \
   pins/plex-pool-patch-reviews.tsv \
   .github/workflows/sqlite-build.yml \
   tools/ci/mod-bake-smoke.sh
@@ -72,7 +72,7 @@ awk -F '\t' \
   -v support_file="pins/runtime-support.tsv" \
   -v baseline_file="pins/runtime-baselines.tsv" \
   -v emby_evidence_file="pins/emby-detector-evidence.tsv" \
-  -v pool_sites_file="pins/plex-pool-patch-sites.tsv" \
+  -v pool_sites_file="pins/plex-patch-pool-sites.tsv" \
   -v pool_reviews_file="pins/plex-pool-patch-reviews.tsv" '
   function die(message) {
     printf "FATAL: %s\n", message > "/dev/stderr"
@@ -176,6 +176,24 @@ awk -F '\t' \
       }
       if ($1 == "detect" && $5 ~ /:pristine$/) {
         pristine_sha[$3 SUBSEP $4 SUBSEP $8] = $12
+      }
+      if ($1 == "detect" && $2 == "plex") {
+        if ($5 != "plex_pms:pristine" &&
+            $5 != "plex_pms:patched" &&
+            $5 != "plex_scanner:pristine" &&
+            $5 != "plex_scanner:patched") {
+          if ($5 == "plex_pms:source-id-patched") {
+            die("derived Plex source-id-patched detector must not be curated at line " FNR)
+          }
+          die("invalid Plex detector role at line " FNR ": " $5)
+        }
+        plex_tuple = $3 SUBSEP $4
+        plex_role_key = plex_tuple SUBSEP $5
+        if (plex_role_count[plex_role_key]++) {
+          die("duplicate Plex detector role at line " FNR ": " $3 " " $4 " " $5)
+        }
+        plex_tuple_seen[plex_tuple] = 1
+        plex_tuple_desc[plex_tuple] = $3 " " $4
       }
       if ($2 == "emby") {
         evidence_key = $2 SUBSEP $3 SUBSEP $4 SUBSEP $1 SUBSEP $5
@@ -299,6 +317,14 @@ awk -F '\t' \
     next
   }
   END {
+    for (plex_tuple in plex_tuple_seen) {
+      if (plex_role_count[plex_tuple SUBSEP "plex_pms:pristine"] != 1 ||
+          plex_role_count[plex_tuple SUBSEP "plex_pms:patched"] != 1 ||
+          plex_role_count[plex_tuple SUBSEP "plex_scanner:pristine"] != 1 ||
+          plex_role_count[plex_tuple SUBSEP "plex_scanner:patched"] != 1) {
+        die("incomplete required Plex detector coverage: " plex_tuple_desc[plex_tuple])
+      }
+    }
     for (evidence_key in baseline_evidence_path) {
       if (!(evidence_key in evidence_seen)) {
         die("Emby runtime baseline tuple has no detector evidence row: " evidence_key)
@@ -335,7 +361,7 @@ awk -F '\t' \
   pins/runtime-support.tsv \
   pins/runtime-baselines.tsv \
   pins/emby-detector-evidence.tsv \
-  pins/plex-pool-patch-sites.tsv \
+  pins/plex-patch-pool-sites.tsv \
   pins/plex-pool-patch-reviews.tsv
 
 plex_stems="$(artifact_stems_for_mod plex)"
@@ -354,6 +380,8 @@ reject_pattern .github/workflows/sqlite-build.yml 'destination: library-plex$'
 
 require_line tools/ci/mod-bake-smoke.sh '    render_args+=(--artifact "${arch}:${compat_group}:${artifact_name}:${artifact_path}:${target_path}")'
 require_line tools/ci/mod-bake-smoke.sh '    stage_args+=(--artifact "${arch}:${compat_group}:${artifact_path}")'
+require_line tools/ci/mod-bake-smoke.sh '      plex_pms_render_args+=(--plex-pms-pristine "${server_id}:${arch}:${pms_input}")'
+require_line tools/ci/mod-bake-smoke.sh '    "${plex_pms_render_args[@]}" \'
 reject_pattern tools/ci/mod-bake-smoke.sh 'artifact_kind="library-(plex|generic|plex-icu69)"'
 
 require_line .github/workflows/sqlite-build.yml '      - name: Record support image digests'

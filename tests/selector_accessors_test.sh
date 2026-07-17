@@ -59,6 +59,7 @@ setup_fixture_files() {
 
   write_file "$sha_root/plex-pms-pristine" "plex pms pristine detector"
   write_file "$sha_root/plex-pms-patched" "plex pms known patched detector"
+  write_file "$sha_root/plex-pms-source-id-patched" "plex pms source-id patched detector"
   write_file "$sha_root/plex-scanner-pristine" "plex scanner pristine detector"
   write_file "$sha_root/plex-scanner-patched" "plex scanner known patched detector"
   write_file "$sha_root/emby-deps" "emby deps detector"
@@ -73,6 +74,7 @@ setup_fixture_files() {
 
   plex_pms_pristine_sha="$(sha256_of "$sha_root/plex-pms-pristine")"
   plex_pms_patched_sha="$(sha256_of "$sha_root/plex-pms-patched")"
+  plex_pms_source_id_patched_sha="$(sha256_of "$sha_root/plex-pms-source-id-patched")"
   plex_scanner_pristine_sha="$(sha256_of "$sha_root/plex-scanner-pristine")"
   plex_scanner_patched_sha="$(sha256_of "$sha_root/plex-scanner-patched")"
   emby_deps_sha="$(sha256_of "$sha_root/emby-deps")"
@@ -97,6 +99,7 @@ render_manifest() {
     -e "s|@EMBY_DLL_PATH@|$emby_dll_path|g" \
     -e "s|@PLEX_PMS_PRISTINE_SHA@|$plex_pms_pristine_sha|g" \
     -e "s|@PLEX_PMS_PATCHED_SHA@|$plex_pms_patched_sha|g" \
+    -e "s|@PLEX_PMS_SOURCE_ID_PATCHED_SHA@|$plex_pms_source_id_patched_sha|g" \
     -e "s|@PLEX_SCANNER_PRISTINE_SHA@|$plex_scanner_pristine_sha|g" \
     -e "s|@PLEX_SCANNER_PATCHED_SHA@|$plex_scanner_patched_sha|g" \
     -e "s|@EMBY_DEPS_SHA@|$emby_deps_sha|g" \

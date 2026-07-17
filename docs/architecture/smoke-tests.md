@@ -172,12 +172,16 @@ It proves:
   enable; literal `1` disables.
 - FANOUT default-on behavior, literal-`1` opt-out, and enabled Browse-by-name,
   Favorites-first, RES-A/RES-D, resume-simple, Similar-items, People, Studios,
-  Type-29, and links-search rewrites.
+  Type-29, and links-search rewrites. Links-search covers both the one-level and
+  exact two-level ItemLinks forms, malformed type slots, duplicate membership,
+  duplicate-link/NULL/no-hit fixtures, and ordered type-tagged row parity.
 - DASHBOARD default-off behavior and literal-0 Episodes-Latest K1 plus guarded
-  movies-Latest C2 behavior, list and one-parenthesis scalar ancestor forms,
-  structural wide/compact projection preservation, movies `over` and
-  `LastWatchedEpisodes` guards, LIMIT variation, bind/grammar/projection
-  negatives, family Type clean misses, and zero cross-family capture misses.
+  movies-Latest C2 behavior, list and one-parenthesis nonnegative/exact-`-1`
+  scalar ancestor forms, structural wide/compact projection preservation,
+  movies `over` and `LastWatchedEpisodes` guards, LIMIT variation,
+  bind/grammar/projection negatives, date-window/OFFSET and correlated
+  random-image negatives, family Type clean misses, and zero cross-family
+  capture misses.
 - exact `library.db` target basename and non-target negatives.
 - three UTF-8 prepare entries with `nByte`/NUL and tail handling.
 - MATCH scalar insertion plus membership `EXISTS` rewrite for type and

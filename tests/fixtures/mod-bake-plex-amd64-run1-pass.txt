@@ -1,5 +1,6 @@
 component=sqlite3-lsio-mod phase=03-swap event=installed arch=linux-x86_64-v3
-component=sqlite3-lsio-mod phase=04-pool-patch event=complete
-pool_patch event=patched
+component=sqlite3-lsio-mod phase=04-plex-patch event=complete
+info plex_patch event=source-id-patched binary=/usr/lib/plexmediaserver/Plex Media Server offset=123456
+info pool_patch event=patched binary=/usr/lib/plexmediaserver/Plex Media Scanner site=scanner-site
 [sqlite3-builds-obs] 2026-05-31 sqlite3_open filename=/config/Library/Application Support/Plex Media Server/Plug-in Support/Databases/com.plexapp.plugins.library.db rc=0
 [sqlite3-builds-obs] 2026-05-31 trace SQLITE_TRACE_STMT sql=select 1

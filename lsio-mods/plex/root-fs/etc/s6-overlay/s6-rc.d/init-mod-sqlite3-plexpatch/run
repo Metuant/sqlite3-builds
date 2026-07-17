@@ -2,14 +2,14 @@
 # shellcheck shell=bash
 # shellcheck source=/dev/null
 set -u
-phase_name="04-pool-patch"
+phase_name="04-plex-patch"
 . /opt/sqlite3-lsio-mod/lib/logging.sh
 . /opt/sqlite3-lsio-mod/lib/sha.sh
 . /opt/sqlite3-lsio-mod/lib/arch.sh
 . /opt/sqlite3-lsio-mod/lib/manifest-parser.sh
 . /opt/sqlite3-lsio-mod/lib/selector.sh
 . /opt/sqlite3-lsio-mod/lib/atomic-write.sh
-. /opt/sqlite3-lsio-mod/lib/plex-pool-patch.sh
+. /opt/sqlite3-lsio-mod/lib/plex-patch.sh
 sqlite3_mod_init_logging
 if ! require_all_or_warn awk chmod chown cp dd grep mktemp mv od printf rm sha256sum stat tr uname; then exit 0; fi
 baked_pins="/opt/sqlite3-lsio-mod/baked-pins.txt"
@@ -31,6 +31,28 @@ if [ -z "$pms_detector_path" ] || [ -z "$pms_sha" ]; then
   log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms"
   exit 0
 fi
+pms_patched_detector_row="$(selected_patched_detector_row "plex" "$selected_arch" "$baked_pins" "$server_id" "plex_pms")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms-patched"; exit 0; }
+IFS='|' read -r pms_patched_detector_path pms_patched_sha <<< "$pms_patched_detector_row"
+if [ -z "$pms_patched_detector_path" ] || [ -z "$pms_patched_sha" ] || [ "$pms_patched_detector_path" != "$pms_detector_path" ]; then
+  log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms-patched"
+  exit 0
+fi
+pms_source_id_patched_detector_row="$(awk -F '|' -v want_server="$server_id" -v want_arch="$selected_arch" '
+  $1 == "detect" && $3 == "plex" && $4 == want_server && $5 == want_arch && $6 == "plex_pms:source-id-patched" {
+    path = $7
+    sha = $8
+    count++
+  }
+  END {
+    if (count == 1) print path "|" sha
+    else exit 1
+  }
+' "$baked_pins")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms-source-id-patched"; exit 0; }
+IFS='|' read -r pms_source_id_patched_detector_path pms_source_id_patched_sha <<< "$pms_source_id_patched_detector_row"
+if [ -z "$pms_source_id_patched_detector_path" ] || [ -z "$pms_source_id_patched_sha" ] || [ "$pms_source_id_patched_detector_path" != "$pms_detector_path" ]; then
+  log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms-source-id-patched"
+  exit 0
+fi
 scanner_detector_row="$(selected_pristine_detector_row "plex" "$selected_arch" "$baked_pins" "$server_id" "plex_scanner")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=scanner"; exit 0; }
 IFS='|' read -r scanner_detector_path scanner_sha <<< "$scanner_detector_row"
 if [ -z "$scanner_detector_path" ] || [ -z "$scanner_sha" ]; then
@@ -39,6 +61,34 @@ if [ -z "$scanner_detector_path" ] || [ -z "$scanner_sha" ]; then
 fi
 pms_site_rows="$(selected_pool_site_rows "plex" "$selected_arch" "$baked_pins" "$server_id" "$pms_detector_path")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=pms"; exit 0; }
 scanner_site_rows="$(selected_pool_site_rows "plex" "$selected_arch" "$baked_pins" "$server_id" "$scanner_detector_path")" || { log_warn "mod=plex phase=${phase_name} event=missing-pool-row binary=scanner"; exit 0; }
+compat_groups="/opt/sqlite3-lsio-mod/pins/library-compat-groups.tsv"
+versions_env="/opt/sqlite3-lsio-mod/pins/versions.env"
+source_id_old="$(awk -F '\t' '
+  NR == 1 {
+    for (i = 1; i <= NF; i++) if ($i == "sqlite_source_id_guard") guard_col = i
+    next
+  }
+  $2 == "plex" { source_id = $guard_col; plex_rows++ }
+  END {
+    if (guard_col > 0 && plex_rows == 1 && length(source_id) == 84) print source_id
+    else exit 1
+  }
+' "$compat_groups")" || { log_warn "mod=plex phase=${phase_name} event=missing-source-id-guard"; exit 0; }
+source_id_new_encoded="$(awk -F= '
+  $1 == "SQLITE_SOURCE_ID" {
+    value = substr($0, index($0, "=") + 1)
+    count++
+  }
+  END {
+    if (count == 1 && value != "") print value
+    else exit 1
+  }
+' "$versions_env" 2>/dev/null)" || { log_warn "mod=plex phase=${phase_name} event=missing-source-id-pin"; exit 0; }
+if [[ ! "$source_id_new_encoded" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}%20[0-9]{2}:[0-9]{2}:[0-9]{2}%20[0-9a-f]{64}$ ]]; then
+  log_warn "mod=plex phase=${phase_name} event=invalid-source-id-pin"
+  exit 0
+fi
+source_id_new="${source_id_new_encoded//%20/ }"
 pms_sites=()
 while IFS= read -r site_row || [ -n "$site_row" ]; do
   [ -n "$site_row" ] || continue
@@ -53,6 +103,11 @@ while IFS= read -r site_row || [ -n "$site_row" ]; do
 done <<EOF_SCANNER_SITES
 $scanner_site_rows
 EOF_SCANNER_SITES
-plex_pool_patch_apply_binary "$pms_detector_path" "$pms_sha" "${pms_sites[@]}" || true
+pms_patch_status=0
+plex_patch_apply_pms "$pms_detector_path" "$pms_sha" "$pms_patched_sha" "$pms_source_id_patched_sha" "$source_id_old" "$source_id_new" "${pms_sites[@]}" || pms_patch_status=$?
 plex_pool_patch_apply_binary "$scanner_detector_path" "$scanner_sha" "${scanner_sites[@]}" || true
+if [ "$pms_patch_status" -ne 0 ]; then
+  log_warn "mod=plex phase=${phase_name} event=failed step=pms-patch status=${pms_patch_status}"
+  exit 1
+fi
 log_info "mod=plex phase=${phase_name} event=complete"

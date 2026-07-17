@@ -88,6 +88,29 @@ target_path_for_server_arch() {
   printf '%s\n' "$target_path"
 }
 
+pristine_pms_path_for_server_arch() {
+  local server_id="$1" arch="$2" pms_path
+  pms_path="$(awk -F '\t' -v want_server="$server_id" -v want_arch="$arch" '
+    $0 ~ /^[[:space:]]*($|#)/ { next }
+    $1 == "kind" { next }
+    $1 == "detect" && $2 == "plex" && $3 == want_server && $4 == want_arch && $5 == "plex_pms:pristine" {
+      if (value != "") {
+        printf "FATAL: duplicate pristine PMS baseline: %s %s\n", want_server, want_arch > "/dev/stderr"
+        exit 2
+      }
+      value = $8
+    }
+    END {
+      if (value == "") {
+        printf "FATAL: missing pristine PMS baseline: %s %s\n", want_server, want_arch > "/dev/stderr"
+        exit 1
+      }
+      print value
+    }
+  ' pins/runtime-baselines.tsv)"
+  printf '%s\n' "$pms_path"
+}
+
 case "$MATRIX_MOD" in
   plex|emby) ;;
   *)
@@ -139,6 +162,21 @@ emit_pre_row() {
   printf 'pre|1|%s|%s|%s|%s|%s|runtime|%s\n' \
     "$target" "$arch" "$image" "$digest" "$path" "$pre_sha" >> "$pre_fragment"
 }
+
+extract_image_file() {
+  local image="$1" path="$2" output="$3"
+  mkdir -p "$(dirname "$output")"
+  if ! docker run --rm --entrypoint cat "$image" "$path" > "$output"; then
+    echo "FATAL: failed to extract $path from $image" >&2
+    exit 1
+  fi
+  [ -s "$output" ] || {
+    echo "FATAL: extracted empty file for $path from $image" >&2
+    exit 1
+  }
+}
+
+plex_pms_render_args=()
 while IFS=$'\t' read -r server_id lsio_image compat_group; do
   [ -n "$server_id" ] || continue
   remember_support_group "$compat_group"
@@ -161,6 +199,10 @@ while IFS=$'\t' read -r server_id lsio_image compat_group; do
       emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicuucplex.so.69
       emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicui18nplex.so.69
       emit_pre_row plex "$arch" "$lsio_image" "$image_digest" /usr/lib/plexmediaserver/lib/libicudataplex.so.69
+      pms_path="$(pristine_pms_path_for_server_arch "$server_id" "$arch")"
+      pms_input="${tmpdir}/plex-pms/${server_id}/${arch}/Plex Media Server"
+      extract_image_file "$lsio_image" "$pms_path" "$pms_input"
+      plex_pms_render_args+=(--plex-pms-pristine "${server_id}:${arch}:${pms_input}")
     fi
   done
 done < "$support_rows"
@@ -197,6 +239,7 @@ if [ "$MATRIX_MOD" = "plex" ]; then
     --generated-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
     --sha256sums "$sha256sums" \
     --pre-fragment "$pre_fragment" \
+    "${plex_pms_render_args[@]}" \
     --output "$baked_pins" \
     "${render_args[@]}"
   bash tools/lsio-mod/stage-lsio-mod.sh \
@@ -271,12 +314,12 @@ wait_for_slice_marker() {
 }
 
 wait_for_plex_slice() {
-  local cursor="$1" slice="$2" run_label="$3" pool_marker="$4"
+  local cursor="$1" slice="$2" run_label="$3" pms_marker="$4" scanner_marker="$5"
   local ready=0
   for _ in $(seq 1 30); do
     write_log_slice "$cursor" "$slice"
-    if grep -Fq "$pool_marker" "$slice"; then
-      if grep -Fq 'mod=plex phase=04-pool-patch event=complete' "$slice"; then
+    if grep -Fq "$pms_marker" "$slice"; then
+      if grep -Fq "$scanner_marker" "$slice" && grep -Fq 'mod=plex phase=04-plex-patch event=complete' "$slice"; then
         ready=1
         break
       fi
@@ -285,7 +328,7 @@ wait_for_plex_slice() {
   done
   if [ "$ready" -ne 1 ]; then
     cat "$slice"
-    echo "FATAL: LSIO mod bake-in smoke did not reach ${run_label} terminal marker: ${pool_marker}" >&2
+    echo "FATAL: LSIO mod bake-in smoke did not reach ${run_label} Plex markers: PMS=${pms_marker} Scanner=${scanner_marker}" >&2
     exit 1
   fi
 }
@@ -350,7 +393,7 @@ run_support_smoke() {
     -e SQLITE3_DISABLE_STMT_TRACE=0 \
     "$smoke_ref"
   if [ "$MATRIX_MOD" = "plex" ]; then
-    wait_for_plex_slice "$log_cursor" "$run1_logs" "run 1" 'pool_patch event=patched'
+    wait_for_plex_slice "$log_cursor" "$run1_logs" "run 1" 'plex_patch event=source-id-patched binary=/usr/lib/plexmediaserver/Plex Media Server' 'pool_patch event=patched binary=/usr/lib/plexmediaserver/Plex Media Scanner'
     wait_for_slice_marker "$log_cursor" "$run1_logs" '[ls.io-init] done.' "run 1"
     wait_for_tcp_port 32400 "run 1"
     write_log_slice "$log_cursor" "$run1_logs"
@@ -374,7 +417,7 @@ run_support_smoke() {
   docker stop -t 60 "$smoke_container" >/dev/null
   docker start "$smoke_container" >/dev/null
   if [ "$MATRIX_MOD" = "plex" ]; then
-    wait_for_plex_slice "$log_cursor" "$run2_logs" "run 2" 'pool_patch event=already-patched'
+    wait_for_plex_slice "$log_cursor" "$run2_logs" "run 2" 'plex_patch event=already-patched binary=/usr/lib/plexmediaserver/Plex Media Server' 'pool_patch event=already-patched binary=/usr/lib/plexmediaserver/Plex Media Scanner'
     wait_for_slice_marker "$log_cursor" "$run2_logs" '[ls.io-init] done.' "run 2"
     wait_for_tcp_port 32400 "run 2"
     write_log_slice "$log_cursor" "$run2_logs"
@@ -398,7 +441,7 @@ run_support_smoke() {
   docker stop -t 60 "$smoke_container" >/dev/null
   docker start "$smoke_container" >/dev/null
   if [ "$MATRIX_MOD" = "plex" ]; then
-    wait_for_plex_slice "$log_cursor" "$run3_logs" "run 3" 'pool_patch event=already-patched'
+    wait_for_plex_slice "$log_cursor" "$run3_logs" "run 3" 'plex_patch event=already-patched binary=/usr/lib/plexmediaserver/Plex Media Server' 'pool_patch event=already-patched binary=/usr/lib/plexmediaserver/Plex Media Scanner'
     wait_for_slice_marker "$log_cursor" "$run3_logs" '[ls.io-init] done.' "run 3"
     wait_for_tcp_port 32400 "run 3"
     write_log_slice "$log_cursor" "$run3_logs"

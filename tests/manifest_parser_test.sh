@@ -48,6 +48,7 @@ setup_fixture_files() {
 
   write_file "$sha_root/plex-pms-pristine" "plex pms pristine detector"
   write_file "$sha_root/plex-pms-patched" "plex pms known patched detector"
+  write_file "$sha_root/plex-pms-source-id-patched" "plex pms source-id patched detector"
   write_file "$sha_root/plex-scanner-pristine" "plex scanner pristine detector"
   write_file "$sha_root/plex-scanner-patched" "plex scanner known patched detector"
   write_file "$sha_root/emby-deps" "emby deps detector"
@@ -63,6 +64,7 @@ setup_fixture_files() {
 
   plex_pms_pristine_sha="$(sha256_of "$sha_root/plex-pms-pristine")"
   plex_pms_patched_sha="$(sha256_of "$sha_root/plex-pms-patched")"
+  plex_pms_source_id_patched_sha="$(sha256_of "$sha_root/plex-pms-source-id-patched")"
   plex_scanner_pristine_sha="$(sha256_of "$sha_root/plex-scanner-pristine")"
   plex_scanner_patched_sha="$(sha256_of "$sha_root/plex-scanner-patched")"
   emby_deps_sha="$(sha256_of "$sha_root/emby-deps")"
@@ -86,6 +88,7 @@ render_manifest() {
     -e "s|@EMBY_DLL_PATH@|$emby_dll_path|g" \
     -e "s|@PLEX_PMS_PRISTINE_SHA@|$plex_pms_pristine_sha|g" \
     -e "s|@PLEX_PMS_PATCHED_SHA@|$plex_pms_patched_sha|g" \
+    -e "s|@PLEX_PMS_SOURCE_ID_PATCHED_SHA@|$plex_pms_source_id_patched_sha|g" \
     -e "s|@PLEX_SCANNER_PRISTINE_SHA@|$plex_scanner_pristine_sha|g" \
     -e "s|@PLEX_SCANNER_PATCHED_SHA@|$plex_scanner_patched_sha|g" \
     -e "s|@EMBY_DEPS_SHA@|$emby_deps_sha|g" \
@@ -168,6 +171,15 @@ render_manifest "$valid_manifest"
 normalize_valid_pool_site_contexts "$valid_manifest"
 
 assert_valid "$valid_manifest" "valid-v3"
+assert_eq "$plex_pms_path|$plex_pms_pristine_sha" \
+  "$(manifest_parser_selected_pristine_detector_row plex "$arch" "$valid_manifest" plex-1.43.2 plex_pms)" \
+  "selected pristine Plex PMS detector"
+assert_eq "$plex_pms_path|$plex_pms_patched_sha" \
+  "$(manifest_parser_selected_patched_detector_row plex "$arch" "$valid_manifest" plex-1.43.2 plex_pms)" \
+  "selected patched Plex PMS detector"
+if manifest_parser_selected_patched_detector_row emby "$arch" "$valid_manifest" emby-4.9.3 emby_dll >/dev/null; then
+  fail "patched detector selector accepted an Emby role"
+fi
 
 copy_bad pre-image-digest-opaque
 awk 'BEGIN { FS=OFS="|" } $1=="pre" && $3=="emby" && $6=="target_sqlite" { $8="not-a-digest" } { print }' "$valid_manifest" > "$bad"
@@ -247,13 +259,17 @@ copy_bad emby-detector-count
 awk 'BEGIN { FS=OFS="|" } !($1=="detect" && $3=="emby" && $6=="emby_dll") { print }' "$valid_manifest" > "$bad"
 assert_invalid "$bad" "emby-detector-count"
 
-copy_bad plex-dual-detector-requirement
-awk 'BEGIN { FS=OFS="|" } !($1=="detect" && $3=="plex" && $6=="plex_pms:patched") { print }' "$valid_manifest" > "$bad"
-assert_invalid "$bad" "plex-dual-detector-requirement"
+copy_bad plex-detector-requirement
+awk 'BEGIN { FS=OFS="|" } !($1=="detect" && $3=="plex" && $6=="plex_pms:source-id-patched") { print }' "$valid_manifest" > "$bad"
+assert_invalid_reason "$bad" "plex-detector-requirement" "reason=plex-dual-detector-requirement"
 
 copy_bad plex-detector-path-conflict
 awk 'BEGIN { FS=OFS="|" } $1=="detect" && $3=="plex" && $6=="plex_pms:patched" { $7=$7 ".patched" } { print }' "$valid_manifest" > "$bad"
 assert_invalid_reason "$bad" "plex-detector-path-conflict" "reason=plex-detector-path-conflict"
+
+copy_bad plex-source-id-detector-path-conflict
+awk 'BEGIN { FS=OFS="|" } $1=="detect" && $3=="plex" && $6=="plex_pms:source-id-patched" { $7=$7 ".source-id-patched" } { print }' "$valid_manifest" > "$bad"
+assert_invalid_reason "$bad" "plex-source-id-detector-path-conflict" "reason=plex-detector-path-conflict"
 
 copy_bad duplicate-canonical-detector-set
 awk 'BEGIN { FS=OFS="|" } $1!="meta" && $3=="plex" { $4="plex-duplicate"; print }' "$valid_manifest" >> "$bad"

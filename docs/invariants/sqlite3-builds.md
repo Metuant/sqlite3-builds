@@ -60,13 +60,16 @@ milestone lands.
   `auto_vacuum=NONE` during planned-downtime `VACUUM INTO` rebuilds and gates
   the staged `PRAGMA auto_vacuum` result on `0`.
 - Planned-downtime Plex maintenance keeps `PLEX_BINARY` for ICU-sensitive
-  rebuild, FTS, `REINDEX`, and staged Plex SQL. `GENERIC_SQLITE_BINARY` is the
-  single host generic SQLite setting for Emby maintenance and the Plex main-DB
-  STAT4 pass. For configured Plex instances, `main()` derives internal STAT4
-  capability state from `GENERIC_SQLITE_BINARY` preflight. The Plex main-DB
-  STAT4 pass runs only when that state is `1`. Plex STAT4 preflight or
-  per-target failures warn and skip only STAT4; they do not weaken existing hard
-  integrity gates.
+  rebuild, FTS, `REINDEX`, staged Plex SQL, and the Plex main-DB STAT4 pass.
+  Before any Plex instance gate, `PLEX_BINARY` must report the patched
+  `sqlite_source_id()` pinned by the Plex patch phase; mismatch skips all Plex
+  maintenance. `tests/check_pin_alignment.sh` enforces that cross-site source-id
+  equality. `GENERIC_SQLITE_BINARY` is the single host generic SQLite setting
+  for Emby maintenance and the Plex STAT4 capability preflight. For configured
+  Plex instances, `main()` derives internal STAT4 capability state from that
+  preflight, but executes the Plex main-DB STAT4 pass through `PLEX_BINARY` only
+  when the state is `1`. Plex STAT4 preflight or per-target failures warn and
+  skip only STAT4; they do not weaken existing hard integrity gates.
 - `SQLITE_DEFAULT_MMAP_SIZE=34359738368` (32 GiB) is the compile-default
   mmap-size pin in `build/Build.sh`; CI compile-option assertions keep it
   aligned with the runtime auto-PRAGMA target.
@@ -128,25 +131,32 @@ milestone lands.
   `#!/usr/bin/with-contenv bash`.
 - SQLite mod oneshots are chained after `init-mods` and before
   `init-mods-end`: preflight -> verify -> swap -> config (Emby) or
-  poolpatch (Plex). `init-mods-end` depends on the final SQLite oneshot, so
+  plexpatch (Plex). `init-mods-end` depends on the final SQLite oneshot, so
   the chain completes before `init-services` and `svc-*` startup.
 - LSIO runtime command surface:
   | Scope | Commands |
   |---|---|
   | Common phases | `awk chmod chown cp grep mkdir mktemp mv rm sed sha256sum stat tr uname` |
-  | Plex pool patch | `dd od printf` |
+  | Plex patch | `dd od printf` |
 - LSIO runtime has no dependency on `curl`, `tar`, `gunzip`, Python, `jq`,
   package managers, or network access.
 - Phase posture: malformed or missing `baked-pins.txt`, baked artifact
-  mismatch, and selected baked artifact absence are fatal. Unsupported arch,
-  missing target path, runtime Plex ICU mismatch, unknown current target SHA,
-  backup failure, temp-copy failure, and pool-patch drift warn and exit 0.
+  mismatch, selected baked artifact absence, and an install-recovery failure
+  that leaves the target unverified are fatal. Unsupported arch, missing target
+  path, runtime Plex ICU mismatch, unknown current target SHA, backup failure,
+  pre-publication temp-copy failure, pool-patch drift, and source-id drift warn
+  and exit 0.
 - Phase 03 swap skips an unrecognized current target even when a
   `.bundled.bak` exists; it restores a verified backup only after a failed
-  install attempt.
-- Pool patch is args-only: callers pass every path, SHA, and site tuple.
-  The staged `plex-pool-patch.sh` fragment reads no environment variables and
-  carries no SHA constants.
+  install attempt. Recovery copies and verifies the backup in a same-filesystem
+  temp file before atomic rename. After recovery failure, phase 03 continues
+  only when a fresh SHA classifies the target as the selected artifact or the
+  bundled baseline; every other state exits nonzero before service startup.
+- Plex patch is args-only: callers pass every path, SHA, pool-site tuple, and
+  source-id value. The staged `plex-patch.sh` fragment reads no environment
+  variables and carries no SHA constants. The phase reads the OLD 84-byte Plex
+  source id from the staged unchanged `pins/library-compat-groups.tsv` and
+  carries the NEW 84-byte source id required by the replacement library.
 - Pool-patch site tuples are
   `label|offset|write_seek|original_hex|patched_hex`. The writer derives one
   byte from `patched_hex` at `write_seek - offset`, applies it to a same-fs
@@ -156,10 +166,20 @@ milestone lands.
 - Pool-site to pristine detector baseline-SHA agreement is a render/CI gate.
   Runtime pool-site rows bind to pristine detector rows by binary path, not by
   an embedded pool-site baseline SHA.
-- Pool patch skips a binary when any site is mixed or unknown. It patches only
-  when all sites are original and the binary SHA matches the selected pristine
-  detector SHA; it skips when all sites are already patched.
-- Plex amd64 and arm64 swap SQLite and patch PMS / Scanner pool size.
+- The pool-only Scanner patch skips the binary when any site is mixed or
+  unknown. It patches only when all sites are original and the binary SHA
+  matches the selected pristine detector SHA; it skips when all sites are
+  already patched.
+- The PMS Plex patch first requires the selected SQLite artifact to be current.
+  It accepts either all-original pool sites with the pristine detector SHA or
+  all-patched pool sites with the patched detector SHA and a verified pristine
+  backup. It checks the all-patched NEW source-id state before locating OLD,
+  otherwise requires exactly one OLD match, applies pool-site writes followed
+  by the length-preserving source-id write to one same-filesystem temp copy,
+  verifies the temp bytes, preserves owner/mode, and atomically replaces PMS
+  once. Both writes use one `${PMS}.bundled.bak`.
+- Plex amd64 and arm64 swap SQLite, patch PMS / Scanner pool size, and patch
+  the PMS source-id guard. Plex ICU runtime files remain read-only.
 
 ## 3. Source
 

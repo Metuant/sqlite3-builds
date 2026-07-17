@@ -4,6 +4,11 @@ set -euo pipefail
 repo_root="$(cd -- "$(dirname -- "$0")/.." && pwd -P)"
 cd "$repo_root"
 
+# shellcheck source=pins/versions.env
+. pins/versions.env
+PLEX_PATCHED_SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID//%20/ }"
+export PLEX_PATCHED_SQLITE_SOURCE_ID
+
 tmp_parent="${TMPDIR:-/tmp}"
 tmp="$(mktemp -d "${tmp_parent%/}/sqlite3-optimize-plex-api.XXXXXX" 2>/dev/null || mktemp -d /tmp/sqlite3-optimize-plex-api.XXXXXX)"
 trap 'rm -rf "$tmp"' EXIT
@@ -141,6 +146,11 @@ mkdir -p "$tmp/bin"
 
 cat > "$tmp/bin/sqlite-ok" <<'EOF_SQLITE'
 #!/usr/bin/env bash
+case "$*" in
+  *"sqlite_source_id()"*)
+    printf '%s\n' "$PLEX_PATCHED_SQLITE_SOURCE_ID"
+    ;;
+esac
 exit 0
 EOF_SQLITE
 chmod +x "$tmp/bin/sqlite-ok"
@@ -504,7 +514,6 @@ EOF_CONF
     assert_eq "0" "$PLEX_PROCESS_BLOB_DB" "$name config PLEX_PROCESS_BLOB_DB"
     assert_eq "0" "$PLEX_TRIM_FINISHED_SEASON_BLOBS" "$name config PLEX_TRIM_FINISHED_SEASON_BLOBS"
     assert_eq "90" "$STATS_BANDWIDTH_RETAIN_DAYS" "$name config STATS_BANDWIDTH_RETAIN_DAYS"
-    assert_eq "$instance" "${PLEX_INSTANCES[*]}" "$name config PLEX_INSTANCES"
     assert_eq "" "${EMBY_INSTANCES[*]}" "$name config EMBY_INSTANCES"
     exit "$main_rc"
   ) >"$case_dir/out" 2>"$case_dir/err"

@@ -1407,12 +1407,16 @@ static emby_match_result emby_match_links_search(
     emby_rewrite_candidate *candidate
 ) {
     static const emby_exists_arm_id arms[] = {EMBY_EXISTS_ARM_LINKS_ONE_LEVEL};
+    static const emby_exists_arm_id two_level_arms[] = {
+        EMBY_EXISTS_ARM_LINKS_ONE_LEVEL, EMBY_EXISTS_ARM_LINKS_TWO_LEVEL
+    };
     int capture_boundary;
     emby_slots slots;
     emby_span a1;
     emby_span a2;
     emby_span a3;
     emby_span a4;
+    emby_span a5;
 
     if (emby_token_present(zSql, scan_len, EMBY_GUARD_PLAYLISTS)) return EMBY_MATCH_MISS;
     if (emby_sql_has_bytes(zSql, scan_len, EMBY_MEMBER_ANCESTORS)) return EMBY_MATCH_MISS;
@@ -1437,6 +1441,53 @@ static emby_match_result emby_match_links_search(
         return emby_capture_miss(
             db, capture_boundary, OBS_MISS_CAPTURE,
             OBS_MODE_EMBY_LINKS_SEARCH, "ancestor_slot", zSql, scan_len
+        );
+    }
+    if (find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_TWOLEVEL_BARE, &a3)) {
+        slots.t1.start = a2.end;
+        slots.t1.end = a3.start;
+        emby_span_rtrim(zSql, &slots.t1);
+        if (slots.t1.end <= slots.t1.start || zSql[slots.t1.end - 1] != ')') {
+            return emby_capture_miss(
+                db, capture_boundary, OBS_MISS_CAPTURE,
+                OBS_MODE_EMBY_LINKS_SEARCH, "type_slot", zSql, scan_len
+            );
+        }
+        slots.t1.end--;
+        emby_span_rtrim(zSql, &slots.t1);
+        if (!validate_numeric_slot(zSql, &slots.t1)) {
+            return emby_capture_miss(
+                db, capture_boundary, OBS_MISS_CAPTURE,
+                OBS_MODE_EMBY_LINKS_SEARCH, "type_slot", zSql, scan_len
+            );
+        }
+        if (!find_unique_token_after(zSql, scan_len, a3.end, EMBY_ANCHOR_CTE_END3, &a4)) {
+            return emby_capture_miss(
+                db, capture_boundary, OBS_MISS_CAPTURE,
+                OBS_MODE_EMBY_LINKS_SEARCH, "tail_anchor", zSql, scan_len
+            );
+        }
+        slots.t2.start = a3.end;
+        slots.t2.end = a4.start;
+        emby_span_rtrim(zSql, &slots.t2);
+        if (!validate_numeric_slot(zSql, &slots.t2)) {
+            return emby_capture_miss(
+                db, capture_boundary, OBS_MISS_CAPTURE,
+                OBS_MODE_EMBY_LINKS_SEARCH, "type_slot", zSql, scan_len
+            );
+        }
+        if (count_tokens_after(zSql, scan_len, 0, EMBY_MEMBER_LINKS, &a5) != 1 ||
+            a5.start < a4.end) {
+            return emby_capture_miss(
+                db, capture_boundary, OBS_MISS_CAPTURE,
+                OBS_MODE_EMBY_LINKS_SEARCH, "membership", zSql, scan_len
+            );
+        }
+        slots.membership = a5;
+        return emby_build_splice_candidate(
+            db, zSql, bounded_len, scan_len, slots.membership, &slots,
+            two_level_arms, sizeof(two_level_arms) / sizeof(two_level_arms[0]),
+            1, OBS_MODE_EMBY_LINKS_SEARCH, candidate
         );
     }
     if (!find_unique_token_after(zSql, scan_len, a2.end, EMBY_ANCHOR_CTE_END2, &a3)) {
@@ -1612,7 +1663,9 @@ static int emby_find_latest_ancestor_slot(
     slot->end = select_anchor->start;
     emby_span_rtrim(zSql, slot);
     *sub_reason = "ancestor_slot";
-    return scalar ? emby_validate_integer_slot(zSql, slot)
+    return scalar ? (emby_validate_integer_slot(zSql, slot) ||
+                     (slot->end - slot->start == 2 &&
+                      memcmp(zSql + slot->start, "-1", 2) == 0))
                   : validate_numeric_slot(zSql, slot);
 }
 

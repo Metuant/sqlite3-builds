@@ -12,6 +12,7 @@ arch="${src##*/}"
 workdir="${arch%.*}"
 sqlite_amalg_sha3="${SQLITE_AMALG_SHA3_256}"
 sqlite_src_sha3="${SQLITE_SRC_SHA3_256:-}"
+SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID:-}"
 LIBRARY_VARIANT="${LIBRARY_VARIANT:-generic}"
 MARCH="${MARCH:-x86-64-v3}"
 MIMALLOC_VERSION="${MIMALLOC_VERSION:-3.3.2}"
@@ -239,6 +240,119 @@ if ! ${CC:-gcc} \
   -o "${output}"; then
   echo "================================ FAILED to compile ============================="
   exit 1
+fi
+
+if [ "${target}" = "library" ]; then
+  if ! printf '%s\n' "${SQLITE_SOURCE_ID}" | \
+    grep -Eq '^[0-9]{4}-[0-9]{2}-[0-9]{2}%20[0-9]{2}:[0-9]{2}:[0-9]{2}%20[0-9a-f]{64}$'; then
+    printf 'FATAL: SQLITE_SOURCE_ID must be the canonical URL-encoded source-id pin\n' >&2
+    exit 1
+  fi
+  expected_source_id="$(printf '%s\n' "${SQLITE_SOURCE_ID}" | sed 's/%20/ /g')"
+
+  if ! ${CC:-gcc} -O0 -I. -x c - -o /tmp/sqlite-source-id-check -ldl <<'EOF_SOURCE_ID_CHECK'
+#include <dlfcn.h>
+#include <sqlite3.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#define LOAD_SYMBOL(target, name)                                              \
+  do {                                                                         \
+    *(void **)(&(target)) = dlsym(handle, (name));                              \
+    if (!(target)) {                                                           \
+      fprintf(stderr, "FATAL: missing %s in freshly built library: %s\n",      \
+              (name), dlerror());                                               \
+      dlclose(handle);                                                         \
+      return 1;                                                                \
+    }                                                                          \
+  } while (0)
+
+int main(int argc, char **argv) {
+  void *handle;
+  sqlite3 *db = NULL;
+  sqlite3_stmt *stmt = NULL;
+  int (*open_db)(const char *, sqlite3 **);
+  int (*prepare)(sqlite3 *, const char *, int, sqlite3_stmt **, const char **);
+  int (*step)(sqlite3_stmt *);
+  const unsigned char *(*column_text)(sqlite3_stmt *, int);
+  int (*finalize)(sqlite3_stmt *);
+  int (*close_db)(sqlite3 *);
+  const char *(*errmsg)(sqlite3 *);
+  const char *actual_source_id;
+  const char *expected_source_id;
+  int rc;
+
+  if (argc != 3) {
+    fprintf(stderr, "usage: %s LIB EXPECTED_SOURCE_ID\n", argv[0]);
+    return 2;
+  }
+  expected_source_id = argv[2];
+  handle = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+  if (!handle) {
+    fprintf(stderr, "FATAL: cannot load freshly built library %s: %s\n",
+            argv[1], dlerror());
+    return 1;
+  }
+
+  LOAD_SYMBOL(open_db, "sqlite3_open");
+  LOAD_SYMBOL(prepare, "sqlite3_prepare_v2");
+  LOAD_SYMBOL(step, "sqlite3_step");
+  LOAD_SYMBOL(column_text, "sqlite3_column_text");
+  LOAD_SYMBOL(finalize, "sqlite3_finalize");
+  LOAD_SYMBOL(close_db, "sqlite3_close");
+  LOAD_SYMBOL(errmsg, "sqlite3_errmsg");
+
+  rc = open_db(":memory:", &db);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "FATAL: sqlite3_open through freshly built library failed: rc=%d error=%s\n",
+            rc, db ? errmsg(db) : "unavailable");
+    if (db) close_db(db);
+    dlclose(handle);
+    return 1;
+  }
+  rc = prepare(db, "SELECT sqlite_source_id()", -1, &stmt, NULL);
+  if (rc != SQLITE_OK) {
+    fprintf(stderr, "FATAL: SELECT sqlite_source_id() prepare failed: rc=%d error=%s\n",
+            rc, errmsg(db));
+    close_db(db);
+    dlclose(handle);
+    return 1;
+  }
+  rc = step(stmt);
+  if (rc != SQLITE_ROW) {
+    fprintf(stderr, "FATAL: SELECT sqlite_source_id() returned rc=%d instead of SQLITE_ROW\n", rc);
+    finalize(stmt);
+    close_db(db);
+    dlclose(handle);
+    return 1;
+  }
+  actual_source_id = (const char *)column_text(stmt, 0);
+  if (!actual_source_id || strcmp(actual_source_id, expected_source_id) != 0) {
+    fprintf(stderr, "FATAL: freshly built sqlite_source_id mismatch: expected=[%s] actual=[%s]\n",
+            expected_source_id, actual_source_id ? actual_source_id : "<null>");
+    finalize(stmt);
+    close_db(db);
+    dlclose(handle);
+    return 1;
+  }
+  printf("freshly built sqlite_source_id verified: %s\n", actual_source_id);
+  finalize(stmt);
+  close_db(db);
+  dlclose(handle);
+  return 0;
+}
+EOF_SOURCE_ID_CHECK
+  then
+    printf 'FATAL: failed to compile fresh-library source-id checker\n' >&2
+    exit 1
+  fi
+
+  if ! LD_LIBRARY_PATH="${PLEX_ICU_LIB:-}" \
+    /tmp/sqlite-source-id-check "${output}" "${expected_source_id}"; then
+    printf 'FATAL: freshly built library does not match SQLITE_SOURCE_ID\n' >&2
+    exit 1
+  fi
 fi
 
 if [ "${target}" = "cli" ]; then

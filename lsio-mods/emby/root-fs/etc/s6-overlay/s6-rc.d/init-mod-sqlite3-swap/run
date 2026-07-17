@@ -45,15 +45,8 @@ elif [ ! -f "$bak" ]; then
 fi
 artifact="/opt/sqlite3-lsio-mod/${artifact_relpath}"
 if ! install_sqlite_artifact "$artifact" "$target_path" "$current_sha"; then
-  if [ -f "$bak" ] && [ "$(sha256_of "$bak")" = "$baseline_sha" ]; then
-    if cp -f "$bak" "$target_path"; then
-      restored_sha="$(sha256_of "$target_path")"
-      [ "$restored_sha" = "$baseline_sha" ] || log_warn "mod=emby phase=${phase_name} event=restore-reclassify-mismatch target_path=${target_path} expected=${baseline_sha} actual=${restored_sha}"
-    else
-      log_warn "mod=emby phase=${phase_name} event=restore-failed target_path=${target_path}"
-    fi
-  else
-    log_warn "mod=emby phase=${phase_name} event=install-failed-target-preserved target_path=${target_path} reason=no-trusted-backup"
+  if ! recover_failed_sqlite_install "emby" "$bak" "$target_path" "$baseline_sha" "$current_sha"; then
+    exit 1
   fi
   exit 0
 fi

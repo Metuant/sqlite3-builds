@@ -18,7 +18,7 @@ stage_scratch() {
   cp "$repo_root/pins/library-compat-groups.tsv" "$scratch/pins/"
   cp "$repo_root/pins/runtime-baselines.tsv" "$scratch/pins/"
   cp "$repo_root/pins/emby-detector-evidence.tsv" "$scratch/pins/"
-  cp "$repo_root/pins/plex-pool-patch-sites.tsv" "$scratch/pins/"
+  cp "$repo_root/pins/plex-patch-pool-sites.tsv" "$scratch/pins/"
   cp "$repo_root/pins/plex-pool-patch-reviews.tsv" "$scratch/pins/"
   cp "$repo_root/.github/workflows/sqlite-build.yml" "$scratch/.github/workflows/"
   cp "$repo_root/tools/ci/mod-bake-smoke.sh" "$scratch/tools/ci/"
@@ -102,6 +102,31 @@ assert_evidence_rejected() {
   }
 }
 
+assert_curated_source_id_role_rejected() {
+  local scratch output rc
+  scratch="$tmp_root/curated-source-id-role"
+  stage_scratch "$scratch"
+  awk 'BEGIN { FS=OFS="\t" }
+    { print }
+    !added && $1 == "detect" && $2 == "plex" && $5 == "plex_pms:patched" {
+      $5 = "plex_pms:source-id-patched"
+      $12 = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+      print
+      added = 1
+    }
+  ' "$scratch/pins/runtime-baselines.tsv" > "$scratch/pins/runtime-baselines.tsv.tmp"
+  mv "$scratch/pins/runtime-baselines.tsv.tmp" "$scratch/pins/runtime-baselines.tsv"
+  set +e
+  output="$(cd "$scratch" && bash tests/check_multi_version_pin_alignment.sh 2>&1)"
+  rc=$?
+  set -e
+  [ "$rc" -ne 0 ] || fail "curated-source-id-role: derived detector curation was accepted"
+  printf '%s\n' "$output" | grep -Fq 'derived Plex source-id-patched detector must not be curated' || {
+    printf '%s\n' "$output" >&2
+    fail "curated-source-id-role: missing derived-role curation failure"
+  }
+}
+
 positive="$tmp_root/positive"
 stage_scratch "$positive"
 (cd "$positive" && bash tests/check_multi_version_pin_alignment.sh >/dev/null)
@@ -111,5 +136,6 @@ assert_rejected support-registry-regression supported \
 assert_rejected baseline-registry-regression unsupported \
   'runtime baseline image_ref must use canonical GHCR repository'
 assert_evidence_rejected emby-evidence-registry-regression
+assert_curated_source_id_role_rejected
 
-printf 'multi-version registry negative checks passed\n'
+printf 'multi-version negative checks passed\n'

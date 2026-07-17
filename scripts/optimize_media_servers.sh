@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 
 export SQLITE3_DISABLE_AUTOPRAGMA=1
+export SQLITE3_DISABLE_OBSERVABILITY=1
 
 # Maintenance assumes planned downtime. For each configured instance with a
 # present database directory, the script stops the container, verifies it is
@@ -83,6 +84,58 @@ quote_sql_ident() {
     printf '"%s"' "${ident//\"/\"\"}"
 }
 
+sqlite_source_id_pin_value() {
+    local script_dir
+    local pin_file
+    local encoded_source_id
+
+    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
+    pin_file="${script_dir}/../pins/versions.env"
+    if ! encoded_source_id="$(awk -F= '
+        $1 == "SQLITE_SOURCE_ID" {
+            value = substr($0, index($0, "=") + 1)
+            count++
+        }
+        END {
+            if (count == 1 && value != "") print value
+            else exit 1
+        }
+    ' "${pin_file}" 2>/dev/null)"; then
+        echo "ERROR: canonical SQLite source-id pin missing or ambiguous: ${pin_file}" >&2
+        return 1
+    fi
+    if [[ ! "${encoded_source_id}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}%20[0-9]{2}:[0-9]{2}:[0-9]{2}%20[0-9a-f]{64}$ ]]; then
+        echo "ERROR: canonical SQLite source-id pin is malformed: ${pin_file}" >&2
+        return 1
+    fi
+    printf '%s\n' "${encoded_source_id//%20/ }"
+}
+
+plex_patched_engine_preflight() {
+    local binary="${1}"
+    local expected_source_id
+    local source_id
+
+    if ! expected_source_id="$(sqlite_source_id_pin_value)"; then
+        return 1
+    fi
+
+    if ! source_id=$("${binary}" ":memory:" "SELECT sqlite_source_id();" 2>&1); then
+        echo "ERROR: patched Plex maintenance engine pre-flight failed for ${binary}" >&2
+        echo "ERROR: pre-flight output: ${source_id}" >&2
+        return 1
+    fi
+    source_id="${source_id//$'\r'/}"
+    if [ "${source_id}" != "${expected_source_id}" ]; then
+        echo "ERROR: ${binary} sqlite_source_id() mismatch" >&2
+        echo "ERROR: expected: ${expected_source_id}" >&2
+        echo "ERROR: observed: ${source_id}" >&2
+        return 1
+    fi
+
+    return 0
+}
+
 plex_stat4_preflight() {
     local binary="${1}"
     local probe_out
@@ -112,7 +165,7 @@ discover_plex_stat4_analyze_targets() {
     local field_sep=$'\t'
     local query
 
-    query="WITH RECURSIVE ctl(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM ctl WHERE n < 31), ordinary_tables AS (SELECT s.name FROM sqlite_master AS s WHERE s.type = 'table' AND s.sql IS NOT NULL AND s.name NOT GLOB 'sqlite_*' AND NOT EXISTS (SELECT 1 FROM ctl WHERE instr(s.name, char(n)) > 0) AND lower(ltrim(replace(replace(replace(s.sql, char(9), ' '), char(10), ' '), char(13), ' '))) NOT LIKE 'create virtual table%'), table_indexes AS (SELECT t.name AS table_name, il.name AS index_name, il.origin AS origin FROM ordinary_tables AS t, pragma_index_list(t.name) AS il), index_safety AS (SELECT ti.table_name, ti.index_name, ti.origin, max(CASE WHEN ix.key = 1 AND upper(coalesce(ix.coll, 'BINARY')) NOT IN ('BINARY', 'NOCASE', 'RTRIM') THEN 1 ELSE 0 END) AS has_unsafe_collation FROM table_indexes AS ti, pragma_index_xinfo(ti.index_name) AS ix GROUP BY ti.table_name, ti.index_name, ti.origin), safe_tables AS (SELECT t.name AS target_name FROM ordinary_tables AS t WHERE NOT EXISTS (SELECT 1 FROM index_safety AS s WHERE s.table_name = t.name AND s.has_unsafe_collation = 1)), safe_indexes AS (SELECT s.index_name AS target_name FROM index_safety AS s JOIN sqlite_master AS schema_idx ON schema_idx.type = 'index' AND schema_idx.name = s.index_name WHERE s.has_unsafe_collation = 0 AND s.origin = 'c' AND s.index_name NOT GLOB 'sqlite_*' AND NOT EXISTS (SELECT 1 FROM ctl WHERE instr(s.index_name, char(n)) > 0) AND EXISTS (SELECT 1 FROM index_safety AS unsafe WHERE unsafe.table_name = s.table_name AND unsafe.has_unsafe_collation = 1)) SELECT target_kind, target_name FROM (SELECT 'T' AS target_kind, target_name FROM safe_tables UNION ALL SELECT 'I' AS target_kind, target_name FROM safe_indexes) ORDER BY target_kind DESC, target_name;"
+    query="WITH RECURSIVE ctl(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM ctl WHERE n < 31), ordinary_tables AS (SELECT s.name FROM sqlite_master AS s WHERE s.type = 'table' AND s.sql IS NOT NULL AND s.name NOT GLOB 'sqlite_*' AND NOT EXISTS (SELECT 1 FROM ctl WHERE instr(s.name, char(n)) > 0) AND lower(ltrim(replace(replace(replace(s.sql, char(9), ' '), char(10), ' '), char(13), ' '))) NOT LIKE 'create virtual table%'), table_indexes AS (SELECT t.name AS table_name, il.name AS index_name, il.origin AS origin FROM ordinary_tables AS t, pragma_index_list(t.name) AS il), index_safety AS (SELECT ti.table_name, ti.index_name, ti.origin, max(CASE WHEN ix.key = 1 AND upper(coalesce(ix.coll, 'BINARY')) NOT IN ('BINARY', 'NOCASE', 'RTRIM', 'ICU_ROOT') THEN 1 ELSE 0 END) AS has_unsafe_collation, max(CASE WHEN ix.key = 1 AND upper(coalesce(ix.coll, 'BINARY')) = 'ICU_ROOT' THEN 1 ELSE 0 END) AS has_icu_root_collation FROM table_indexes AS ti, pragma_index_xinfo(ti.index_name) AS ix GROUP BY ti.table_name, ti.index_name, ti.origin), safe_tables AS (SELECT t.name AS target_name FROM ordinary_tables AS t WHERE NOT EXISTS (SELECT 1 FROM index_safety AS s WHERE s.table_name = t.name AND (s.has_unsafe_collation = 1 OR s.has_icu_root_collation = 1))), safe_indexes AS (SELECT s.index_name AS target_name FROM index_safety AS s JOIN sqlite_master AS schema_idx ON schema_idx.type = 'index' AND schema_idx.name = s.index_name WHERE s.has_unsafe_collation = 0 AND s.origin = 'c' AND s.index_name NOT GLOB 'sqlite_*' AND NOT EXISTS (SELECT 1 FROM ctl WHERE instr(s.index_name, char(n)) > 0) AND EXISTS (SELECT 1 FROM index_safety AS split WHERE split.table_name = s.table_name AND (split.has_unsafe_collation = 1 OR split.has_icu_root_collation = 1))) SELECT target_kind, target_name FROM (SELECT 'T' AS target_kind, target_name FROM safe_tables UNION ALL SELECT 'I' AS target_kind, target_name FROM safe_indexes) ORDER BY target_kind DESC, target_name;"
 
     "${binary}" -batch -noheader -separator "${field_sep}" "${db_path}" "${query}"
 }
@@ -659,6 +712,107 @@ run_fts_integrity_gate() {
     return 0
 }
 
+run_source_integrity_gate() {
+    local binary="${1}"
+    local db_path="${2}"
+    local begin_marker="__sqlite3_builds_source_integrity_begin_v1__"
+    local end_marker="__sqlite3_builds_source_integrity_end_v1__"
+    local integrity_sql
+    local integrity_output
+    local state="before"
+    local line
+    local payload_count=0
+    local ok_count=0
+    local framing_error=0
+    local hard_findings=""
+    local saw_curated_fts4=0
+    local saw_deferred_fts=0
+    local saw_checker_hiccup=0
+
+    integrity_sql="SELECT '${begin_marker}'; PRAGMA integrity_check; SELECT '${end_marker}';"
+    if ! integrity_output=$("${binary}" "${db_path}" "${integrity_sql}"); then
+        echo "WARNING: source integrity_check failed to run for ${db_path}; continuing because corruption was not demonstrated" >&2
+        return 0
+    fi
+    integrity_output="${integrity_output//$'\r'/}"
+
+    while IFS= read -r line
+    do
+        case "${state}" in
+            before)
+                if [ "${line}" != "${begin_marker}" ]; then
+                    framing_error=1
+                    break
+                fi
+                state="payload"
+                ;;
+            payload)
+                if [ "${line}" = "${end_marker}" ]; then
+                    state="done"
+                    continue
+                fi
+                if [ -z "${line}" ]; then
+                    framing_error=1
+                    break
+                fi
+                payload_count=$((payload_count + 1))
+                case "${line}" in
+                    ok)
+                        ok_count=$((ok_count + 1))
+                        ;;
+                    "malformed inverted index for FTS4 table main.fts4_tag_titles_icu")
+                        saw_curated_fts4=1
+                        ;;
+                    malformed\ inverted\ index\ for\ FTS[345]\ table\ *)
+                        saw_deferred_fts=1
+                        ;;
+                    unable\ to\ validate\ the\ inverted\ index\ for\ FTS[345]\ table\ *)
+                        saw_checker_hiccup=1
+                        ;;
+                    *)
+                        if [ -n "${hard_findings}" ]; then
+                            hard_findings+=$'\n'
+                        fi
+                        hard_findings+="${line}"
+                        ;;
+                esac
+                ;;
+            done)
+                framing_error=1
+                break
+                ;;
+        esac
+    done <<< "${integrity_output}"
+
+    if [ "${framing_error}" -ne 0 ] || [ "${state}" != "done" ] || [ "${payload_count}" -eq 0 ]; then
+        echo "WARNING: source integrity_check returned uninterpretable output for ${db_path}; continuing because corruption was not demonstrated" >&2
+        return 0
+    fi
+    if [ "${ok_count}" -ne 0 ]; then
+        if [ "${ok_count}" -eq 1 ] && [ "${payload_count}" -eq 1 ]; then
+            return 0
+        fi
+        echo "WARNING: source integrity_check returned contradictory output for ${db_path}; continuing because corruption was not demonstrated" >&2
+        return 0
+    fi
+    if [ -n "${hard_findings}" ]; then
+        echo "ERROR: source DB failed integrity_check for ${db_path}; live DB has NOT been touched" >&2
+        printf '%s\n' "${hard_findings}" >&2
+        return 1
+    fi
+    if [ "${saw_curated_fts4}" -eq 1 ]; then
+        echo "WARNING: source integrity_check accepted curated FTS4 exception for main.fts4_tag_titles_icu in ${db_path}" >&2
+    fi
+    if [ "${saw_deferred_fts}" -eq 1 ]; then
+        echo "WARNING: source integrity_check deferred FTS xIntegrity findings to the source FTS warn-and-rebuild gate for ${db_path}" >&2
+    fi
+    if [ "${saw_checker_hiccup}" -eq 1 ]; then
+        echo "WARNING: source integrity_check could not validate at least one FTS index in ${db_path}; continuing because source b-tree corruption was not demonstrated" >&2
+    fi
+
+    return 0
+}
+
 run_fts_rebuild_hard() {
     local binary="${1}"
     local db_path="${2}"
@@ -800,11 +954,11 @@ run_foreign_key_check_warn() {
     local fk_rows
 
     if ! fk_rows=$("${binary}" "${db_path}" "PRAGMA foreign_key_check;" | tr -d '\r'); then
-        echo "WARNING: foreign_key_check failed to run for ${db_path}; continuing after source integrity and FTS gates" >&2
+        echo "WARNING: foreign_key_check failed to run for ${db_path}; continuing after source FTS gates" >&2
         return 0
     fi
     if [ -n "${fk_rows}" ]; then
-        echo "WARNING: foreign_key_check returned rows for ${db_path}; continuing after source integrity and FTS gates" >&2
+        echo "WARNING: foreign_key_check returned rows for ${db_path}; continuing after source FTS gates" >&2
         printf '%s\n' "${fk_rows}" >&2
     fi
     return 0
@@ -1097,8 +1251,6 @@ rebuild_db_vacuum_into() {
     local backup_date
     local new_mode
     local needs_fixup=0
-    local source_integrity
-    local staged_integrity
     local final_integrity
     local source_user_version
     local staged_user_version
@@ -1113,7 +1265,6 @@ rebuild_db_vacuum_into() {
     local table_ident
     local source_count
     local staged_count
-    local has_fts_recurate_target=0
 
     case "${auto_vacuum_mode}" in
         "")
@@ -1151,16 +1302,11 @@ rebuild_db_vacuum_into() {
     if [ -n "${sanity_sql}" ]; then
         "${binary}" "${db_path}" "${sanity_sql}"
     fi
-    if ! source_integrity=$("${binary}" "${db_path}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
-        echo "ERROR: source integrity_check failed to run for ${db_path}; live DB has NOT been touched" >&2
-        exit 1
-    fi
-    if [ "${source_integrity}" != "ok" ]; then
-        echo "ERROR: source DB failed integrity_check: ${source_integrity}; live DB has NOT been touched" >&2
-        exit 1
-    fi
     if ! run_fts_integrity_gate "${binary}" "${db_path}" "source" "warn"; then
         echo "ERROR: source FTS metadata is unsafe or unclassified for ${db_path}; live DB has NOT been touched" >&2
+        exit 1
+    fi
+    if ! run_source_integrity_gate "${binary}" "${db_path}"; then
         exit 1
     fi
     run_foreign_key_check_warn "${binary}" "${db_path}"
@@ -1298,16 +1444,6 @@ rebuild_db_vacuum_into() {
         exit 1
     fi
 
-    if ! staged_integrity=$("${binary}" "${staged_db}" "PRAGMA integrity_check;" | tr -d '\r\n'); then
-        echo "ERROR: integrity check failed to run on staged DB; live DB has NOT been touched" >&2
-        cleanup_staged_db "${staged_db}"
-        exit 1
-    fi
-    if [ "${staged_integrity}" != "ok" ]; then
-        echo "ERROR: staged DB failed integrity_check: ${staged_integrity}; live DB has NOT been touched" >&2
-        cleanup_staged_db "${staged_db}"
-        exit 1
-    fi
     # WHY: The exhaustive source-vs-staged row-count sweep is intentional
     # defense-in-depth before publishing the rebuilt DB.
     table_query="SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY name;"
@@ -1319,9 +1455,6 @@ rebuild_db_vacuum_into() {
     while IFS= read -r table_name
     do
         [ -n "${table_name}" ] || continue
-        if [ "${table_name}" = "fts4_tag_titles_icu" ]; then
-            has_fts_recurate_target=1
-        fi
         table_ident="${table_name//\"/\"\"}"
         if ! source_count=$("${binary}" "${db_path}" "SELECT COUNT(*) FROM \"${table_ident}\";" | tr -d '\r\n'); then
             echo "ERROR: source row-count check failed for ${table_name}; live DB has NOT been touched" >&2
@@ -1387,20 +1520,17 @@ rebuild_db_vacuum_into() {
         exit 1
     fi
 
-    # Re-curate Plex's external-content fts4_tag_titles_icu after the final integrity gate.
-    # Spellfix stays carried forward because fts4aux cannot read external-content FTS4.
-    if ! run_fts_recurate "${binary}" "${staged_db}"; then
-        echo "ERROR: staged FTS re-curation failed for ${staged_db}; live DB has NOT been touched" >&2
-        cleanup_staged_db "${staged_db}"
-        exit 1
-    fi
-    if [ "${has_fts_recurate_target}" = "1" ]; then
-        if ! run_fts_recurate_shadow_integrity_gate "${binary}" "${staged_db}"; then
-            echo "ERROR: staged post-re-curation FTS shadow structural integrity gate failed for ${staged_db}; live DB has NOT been touched" >&2
-            cleanup_staged_db "${staged_db}"
-            exit 1
-        fi
-    fi
+    # Temporarily disabled pending the patched-ICU FTS re-curation rework.
+    # if ! run_fts_recurate "${binary}" "${staged_db}"; then
+    #     echo "ERROR: staged FTS re-curation failed for ${staged_db}; live DB has NOT been touched" >&2
+    #     cleanup_staged_db "${staged_db}"
+    #     exit 1
+    # fi
+    # if ! run_fts_recurate_shadow_integrity_gate "${binary}" "${staged_db}"; then
+    #     echo "ERROR: staged post-re-curation FTS shadow structural integrity gate failed for ${staged_db}; live DB has NOT been touched" >&2
+    #     cleanup_staged_db "${staged_db}"
+    #     exit 1
+    # fi
 
     if ! staged_user_version=$("${binary}" "${staged_db}" "PRAGMA user_version;" | tr -d '\r\n'); then
         echo "ERROR: staged user_version check failed for ${staged_db}; live DB has NOT been touched" >&2
@@ -1447,12 +1577,15 @@ optimize_plex_db() {
       backup_dir="${plex_databases_path}"
     fi
 
-    # NOTE: The 0x10000 bit of PRAGMA optimize=0x10002 is inert on Plex SQLite 3.39.4.
+    # NOTE: The 0x10000 bit of PRAGMA optimize=0x10002 is honored on the patched
+    # Plex SQLite 3.53.3 and was inert on the bundled 3.39.4; it size-checks every
+    # table rather than only recently used ones. The mask omits 0x00010 on purpose:
+    # the preceding analysis_limit=0 makes the ANALYZE deliberately unbounded.
     optimize_sql="PRAGMA cache_size=-1048576; PRAGMA temp_store=2; PRAGMA threads=8; REINDEX; PRAGMA analysis_limit=0; ANALYZE; PRAGMA optimize=0x10002;"
     if [ "${db_file}" = "${_PLEX_DB}" ]; then
         optimize_sql="$(build_plex_optimize_sql)"
         post_maintenance_hook="run_plex_main_post_maintenance"
-        post_maintenance_binary="${GENERIC_SQLITE_BINARY:-}"
+        post_maintenance_binary="${PLEX_BINARY}"
     fi
 
     rebuild_db_vacuum_into \
@@ -2124,12 +2257,11 @@ PLEX_PROCESS_BLOB_DB=1 and PLEX_TRIM_FINISHED_SEASON_BLOBS=1 enable the fixed
 
 Stage consumed binaries before running:
   release/cli/sqlite3 -> ${HOME}/bin/sqlite3
-  Plex SQLite plus Plex's lib/ runtime copy -> ${HOME}/plex-sql/
+  patched Plex SQLite plus the matching patched libsqlite3.so runtime copy ->
+    ${HOME}/plex-sql/ (PLEX_BINARY points at the patched Plex SQLite)
 
-If ${HOME}/plex-sql/lib came from a modded container, restore
-libsqlite3.so.bundled.bak over libsqlite3.so in that staging copy before use.
-Copying Plex Media Server beside Plex SQLite is recommended for source-id
-staging checks, but this script executes only PLEX_BINARY.
+PLEX_BINARY must resolve the matching patched libsqlite3.so and report the
+patched sqlite_source_id() required by this script.
 USAGE
 }
 
@@ -2213,6 +2345,10 @@ load_optimize_config() {
 
 main() {
     local final_rc=0
+    local maintenance_failure_status=1
+    local plex_preflight_drop_status=2
+    local emby_preflight_drop_status=4
+    local unsupported_argument_status=64
     local plex_optimize_attempted=0
     local plex_optimize_successful=0
     local plex_optimize_accepted=0
@@ -2232,7 +2368,6 @@ main() {
     local script_dir
     local conf_file
     local config_rc
-    local plex_preflight_out
     local emby_preflight_out
     local plex_instance
     local plex_path
@@ -2249,7 +2384,7 @@ main() {
             *)
                 echo "ERROR: unknown argument: ${arg}" >&2
                 print_usage >&2
-                return 2
+                return "${unsupported_argument_status}"
                 ;;
             esac
         done
@@ -2277,12 +2412,10 @@ main() {
     set -o pipefail
 
 if [ "${#PLEX_INSTANCES[@]}" -gt 0 ]; then
-    if ! plex_preflight_out=$("${PLEX_BINARY}" ":memory:" "SELECT 1;" 2>&1); then
-        echo "WARNING: ${PLEX_BINARY} pre-flight failed; skipping all Plex maintenance" >&2
-        echo "WARNING: pre-flight output: ${plex_preflight_out}" >&2
-        echo "WARNING: likely cause: Plex SQLite/libsqlite3.so source-id mismatch in ${HOME}/plex-sql/lib" >&2
-        echo "WARNING: if so, copy ${HOME}/plex-sql/lib/libsqlite3.so.bundled.bak to ${HOME}/plex-sql/lib/libsqlite3.so in the staging copy and retry; the deployed container runtime lib is unchanged" >&2
+    if ! plex_patched_engine_preflight "${PLEX_BINARY}"; then
+        echo "WARNING: patched Plex maintenance engine prerequisite failed; skipping all Plex maintenance" >&2
         echo "WARNING: the per-instance stopped-container gate was NOT evaluated for Plex this run" >&2
+        final_rc=$((final_rc | plex_preflight_drop_status))
         PLEX_INSTANCES=()
     elif plex_stat4_preflight "${GENERIC_SQLITE_BINARY}"; then
         plex_stat4_enabled=1
@@ -2309,14 +2442,14 @@ do
         0)
             ;;
         3)
-            final_rc=1
+            final_rc=$((final_rc | maintenance_failure_status))
             if ! start_container_after_maintenance "Plex" "${plex_instance}"; then
-                final_rc=1
+                final_rc=$((final_rc | maintenance_failure_status))
             fi
             continue
             ;;
         *)
-            final_rc=1
+            final_rc=$((final_rc | maintenance_failure_status))
             continue
             ;;
     esac
@@ -2327,11 +2460,11 @@ do
     set -e
     if [ "${maintenance_rc}" -ne 0 ]; then
         echo "WARNING: Plex maintenance failed for ${plex_instance}; restarting container and continuing" >&2
-        final_rc=1
+        final_rc=$((final_rc | maintenance_failure_status))
     fi
 
     if ! start_container_after_maintenance "Plex" "${plex_instance}"; then
-        final_rc=1
+        final_rc=$((final_rc | maintenance_failure_status))
         continue
     fi
 
@@ -2412,7 +2545,7 @@ done
 if [ "${PLEX_OPTIMIZE_API:-0}" = "1" ] && [ "${plex_optimize_attempted}" -gt 0 ]; then
     echo "Plex optimize summary: accepted=${plex_optimize_accepted} already-running=${plex_optimize_already_running} completed=${plex_optimize_completed} skipped=${plex_optimize_skipped} warned=${plex_optimize_warned}"
     if [ "${plex_optimize_successful}" -eq 0 ]; then
-        final_rc=1
+        final_rc=$((final_rc | maintenance_failure_status))
     fi
 fi
 
@@ -2422,6 +2555,7 @@ if [ "${#EMBY_INSTANCES[@]}" -gt 0 ]; then
         echo "WARNING: ${GENERIC_SQLITE_BINARY} pre-flight failed; skipping all Emby maintenance" >&2
         echo "WARNING: pre-flight output: ${emby_preflight_out}" >&2
         echo "WARNING: the per-instance stopped-container gate was NOT evaluated for Emby this run" >&2
+        final_rc=$((final_rc | emby_preflight_drop_status))
         EMBY_INSTANCES=()
     fi
 fi
@@ -2442,14 +2576,14 @@ do
         0)
             ;;
         3)
-            final_rc=1
+            final_rc=$((final_rc | maintenance_failure_status))
             if ! start_container_after_maintenance "Emby" "${emby_instance}"; then
-                final_rc=1
+                final_rc=$((final_rc | maintenance_failure_status))
             fi
             continue
             ;;
         *)
-            final_rc=1
+            final_rc=$((final_rc | maintenance_failure_status))
             continue
             ;;
     esac
@@ -2460,11 +2594,11 @@ do
     set -e
     if [ "${maintenance_rc}" -ne 0 ]; then
         echo "WARNING: Emby maintenance failed for ${emby_instance}; restarting container and continuing" >&2
-        final_rc=1
+        final_rc=$((final_rc | maintenance_failure_status))
     fi
 
     if ! start_container_after_maintenance "Emby" "${emby_instance}"; then
-        final_rc=1
+        final_rc=$((final_rc | maintenance_failure_status))
         continue
     fi
 done

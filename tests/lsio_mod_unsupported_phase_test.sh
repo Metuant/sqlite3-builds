@@ -68,7 +68,7 @@ setup_lib_root() {
   cp lsio-mods/shared/cont-init-fragments/selector.sh "$lib_root/selector.sh"
   cp lsio-mods/shared/cont-init-fragments/atomic-write.sh "$lib_root/atomic-write.sh"
   cp lsio-mods/shared/cont-init-fragments/swap.sh "$lib_root/swap.sh"
-  cp lsio-mods/shared/cont-init-fragments/plex-pool-patch.sh "$lib_root/plex-pool-patch.sh"
+  cp lsio-mods/shared/cont-init-fragments/plex-patch.sh "$lib_root/plex-patch.sh"
 }
 
 prepare_plex_case() {
@@ -87,11 +87,13 @@ prepare_plex_case() {
   scanner_patched="ef2132435465768798a9bacbdcedfe0f"
   write_hex_file "$pms_path" "$pms_orig"
   write_hex_file "$case_root/pms-patched" "$pms_patched"
+  printf 'plex pms source-id patched fixture\n' > "$case_root/pms-source-id-patched"
   write_hex_file "$scanner_path" "$scanner_orig"
   write_hex_file "$case_root/scanner-patched" "$scanner_patched"
 
   pms_sha="$(sha_file "$pms_path")"
   pms_patched_sha="$(sha_file "$case_root/pms-patched")"
+  pms_source_id_patched_sha="$(sha_file "$case_root/pms-source-id-patched")"
   scanner_sha="$(sha_file "$scanner_path")"
   scanner_patched_sha="$(sha_file "$case_root/scanner-patched")"
 
@@ -99,6 +101,7 @@ prepare_plex_case() {
 meta|3|release_tag|2026.05.28-r1|generated_at|2026-05-28T00:00:00Z
 detect|1|plex|plex-unsupported|linux-arm64|plex_pms:pristine|$pms_path|$pms_sha
 detect|1|plex|plex-unsupported|linux-arm64|plex_pms:patched|$pms_path|$pms_patched_sha
+detect|1|plex|plex-unsupported|linux-arm64|plex_pms:source-id-patched|$pms_path|$pms_source_id_patched_sha
 detect|1|plex|plex-unsupported|linux-arm64|plex_scanner:pristine|$scanner_path|$scanner_sha
 detect|1|plex|plex-unsupported|linux-arm64|plex_scanner:patched|$scanner_path|$scanner_patched_sha
 pre|2|plex|plex-unsupported|linux-arm64|plex_icu_linked:libicuucplex.so.69|lscr.io/linuxserver/plex:fixture|sha256:fixture|/usr/lib/plexmediaserver/lib/libicuucplex.so.69|$pms_sha
@@ -187,7 +190,7 @@ wanted_phase="${2:-}"
 ran=0
 for case_mod in plex emby; do
   case "$case_mod" in
-    plex) case_phases="preflight verify swap poolpatch" ;;
+    plex) case_phases="preflight verify swap plexpatch" ;;
     emby) case_phases="preflight verify swap config" ;;
     *) fail "unsupported test mod: $case_mod" ;;
   esac

@@ -6,6 +6,7 @@ usage() {
 Usage:
   render-lsio-mod-baked-pins.sh --mod plex|emby --release-tag TAG --generated-at ISO \
     --sha256sums SHA256SUMS --pre-fragment FILE --output FILE \
+    [--plex-pms-pristine SERVER_ID:ARCH:PATH ...] \
     --artifact ARCH:COMPAT_GROUP:NAME:PATH:TARGET_PATH [--artifact ...]
 
 Input pin files default to pins/*. Override with RENDER_LSIO_MOD_* paths for
@@ -85,7 +86,7 @@ valid_status() {
   esac
 }
 
-valid_detect_role() {
+valid_curated_detect_role() {
   local row_mod role
   row_mod="$1"
   role="$2"
@@ -136,12 +137,15 @@ sha256sums=""
 output=""
 pre_fragments=()
 artifacts=()
+plex_pms_pristine_inputs=()
 
 runtime_support="${RENDER_LSIO_MOD_RUNTIME_SUPPORT:-pins/runtime-support.tsv}"
 compat_groups="${RENDER_LSIO_MOD_COMPAT_GROUPS:-pins/library-compat-groups.tsv}"
 runtime_baselines="${RENDER_LSIO_MOD_RUNTIME_BASELINES:-pins/runtime-baselines.tsv}"
-pool_sites_file="${RENDER_LSIO_MOD_POOL_SITES:-pins/plex-pool-patch-sites.tsv}"
+pool_sites_file="${RENDER_LSIO_MOD_POOL_SITES:-pins/plex-patch-pool-sites.tsv}"
 pool_reviews_file="${RENDER_LSIO_MOD_POOL_REVIEWS:-pins/plex-pool-patch-reviews.tsv}"
+versions_env="${RENDER_LSIO_MOD_VERSIONS_ENV:-pins/versions.env}"
+plex_patch_lib="${RENDER_LSIO_MOD_PLEX_PATCH_LIB:-lsio-mods/shared/cont-init-fragments/plex-patch.sh}"
 
 while [ "$#" -gt 0 ]; do
   case "$1" in
@@ -150,6 +154,7 @@ while [ "$#" -gt 0 ]; do
     --generated-at) require_value "$1" "${2:-}"; generated_at="$2"; shift 2 ;;
     --sha256sums) require_value "$1" "${2:-}"; sha256sums="$2"; shift 2 ;;
     --pre-fragment) require_value "$1" "${2:-}"; pre_fragments+=("$2"); shift 2 ;;
+    --plex-pms-pristine) require_value "$1" "${2:-}"; plex_pms_pristine_inputs+=("$2"); shift 2 ;;
     --pool-baselines) require_value "$1" "${2:-}"; shift 2 ;;
     --output) require_value "$1" "${2:-}"; output="$2"; shift 2 ;;
     --artifact) require_value "$1" "${2:-}"; artifacts+=("$2"); shift 2 ;;
@@ -169,14 +174,20 @@ for required_pin in "$runtime_support" "$compat_groups" "$runtime_baselines" "$p
   [ -f "$required_pin" ] || fatal "missing M3 prerequisite: $required_pin"
 done
 
+tmp="${output}.tmp.$$"
+derived_pms_tmp="${output}.pms-derived.$$"
+trap 'rm -f "$tmp" "$derived_pms_tmp"' EXIT
+
 declare -a support_ids support_groups artifact_arches pool_records
-declare -A group_mod group_artifact_stem
+declare -A group_mod group_artifact_stem group_sqlite_guard
 declare -A support_image_ref support_compat support_review supported_server support_group_seen
 declare -A artifact_name artifact_path artifact_target artifact_sha
 declare -A artifact_arch_seen artifact_group_has_v2 artifact_group_has_v3
 declare -A detect_line detect_sha detect_path pre_path pre_sha pre_digest pre_image_ref
 declare -A baseline_pre_sha_by_fragment_key pre_digest_override icu_runtime_sha review_approved review_count
 declare -A pool_count group_arch_target_path group_arch_target_warned group_arch_artifact_sha
+declare -A plex_pms_pristine_path
+plex_source_id_new=""
 
 load_compat_groups() {
   local line_no compat row_mod build_variant artifact_stem sqlite_guard icu_version icu_sha linked smoke extra
@@ -194,10 +205,33 @@ load_compat_groups() {
     [ -z "${group_mod[$compat]:-}" ] || fatal "duplicate compat group: $compat"
     group_mod[$compat]="$row_mod"
     group_artifact_stem[$compat]="$artifact_stem"
+    group_sqlite_guard[$compat]="$sqlite_guard"
     if [ "$row_mod" = "plex" ]; then
       [ "$linked" = "libicuucplex.so.69;libicui18nplex.so.69;libicudataplex.so.69" ] || fatal "unsupported Plex ICU soname set for $compat: $linked"
     fi
   done < "$compat_groups"
+}
+
+parse_plex_pms_pristine_inputs() {
+  local input server_id arch path extra key
+  if [ "$mod" != "plex" ]; then
+    [ "${#plex_pms_pristine_inputs[@]}" -eq 0 ] || fatal "--plex-pms-pristine is Plex-only"
+    return 0
+  fi
+  for input in "${plex_pms_pristine_inputs[@]}"; do
+    IFS=':' read -r server_id arch path extra <<EOF_PMS_INPUT
+$input
+EOF_PMS_INPUT
+    [ -z "${extra:-}" ] || fatal "malformed --plex-pms-pristine: $input"
+    require_nonempty_fields "--plex-pms-pristine" "$server_id" "$arch" "$path"
+    [ -n "${supported_server[$server_id]:-}" ] || fatal "Plex PMS input references unsupported server_id: $server_id"
+    valid_arch "$arch" || fatal "unsupported Plex PMS input arch: $arch"
+    [ -n "${artifact_arch_seen[$arch]:-}" ] || fatal "Plex PMS input arch is not rendered: $arch"
+    [ -f "$path" ] || fatal "missing Plex PMS pristine input file: $path"
+    key="$server_id|$arch"
+    [ -z "${plex_pms_pristine_path[$key]:-}" ] || fatal "duplicate --plex-pms-pristine for server_id=$server_id arch=$arch"
+    plex_pms_pristine_path[$key]="$path"
+  done
 }
 
 load_support() {
@@ -340,7 +374,7 @@ load_runtime_baselines() {
       detect)
         [ "$row_mod" = "$mod" ] || continue
         [ -n "${supported_server[$server_id]:-}" ] || continue
-        valid_detect_role "$row_mod" "$role" || fatal "invalid detect role at line $line_no: $role"
+        valid_curated_detect_role "$row_mod" "$role" || fatal "invalid detect role at line $line_no: $role"
         key="$server_id|$arch|$role"
         [ -z "${detect_line[$key]:-}" ] || fatal "duplicate detect baseline: $key"
         detect_line[$key]="detect|1|$row_mod|$server_id|$arch|$role|$file_path|$sha"
@@ -528,6 +562,104 @@ load_pool_sites() {
   done < "$pool_sites_file"
 }
 
+load_plex_derivation_contract() {
+  local encoded_source_id
+  [ "$mod" = "plex" ] || return 0
+  [ -f "$plex_patch_lib" ] || fatal "missing Plex patch library: $plex_patch_lib"
+  [ -f "$versions_env" ] || fatal "missing version pins: $versions_env"
+  # shellcheck source=lsio-mods/shared/cont-init-fragments/plex-patch.sh
+  . "$plex_patch_lib"
+  declare -F plex_patch_populate_pms_tmp >/dev/null || fatal "Plex patch library missing plex_patch_populate_pms_tmp"
+  declare -F plex_patch_source_id_matches >/dev/null || fatal "Plex patch library missing plex_patch_source_id_matches"
+  declare -F plex_patch_match_count >/dev/null || fatal "Plex patch library missing plex_patch_match_count"
+  declare -F plex_pool_patch_sha256_of >/dev/null || fatal "Plex patch library missing plex_pool_patch_sha256_of"
+  encoded_source_id="$(awk -F= '
+    $1 == "SQLITE_SOURCE_ID" {
+      value = substr($0, index($0, "=") + 1)
+      count++
+    }
+    END {
+      if (count == 1 && value != "") print value
+      else exit 1
+    }
+  ' "$versions_env")" || fatal "SQLITE_SOURCE_ID is missing or ambiguous in $versions_env"
+  [[ "$encoded_source_id" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}%20[0-9]{2}:[0-9]{2}:[0-9]{2}%20[0-9a-f]{64}$ ]] ||
+    fatal "SQLITE_SOURCE_ID is malformed in $versions_env"
+  plex_source_id_new="${encoded_source_id//%20/ }"
+}
+
+derive_plex_pms_detector_sha() {
+  local server_id arch compat input_path expected_pristine_sha actual_pristine_sha pms_path source_id_old
+  local old_matches old_count new_matches new_count source_id_offset record rec_server rec_arch binary_path
+  local label offset write_seek original_hex patched_hex derived_old_matches derived_old_count derived_new_matches derived_new_count derived_sha
+  local -a pms_sites
+  server_id="$1"
+  arch="$2"
+  compat="${support_compat[$server_id]}"
+  input_path="${plex_pms_pristine_path[$server_id|$arch]:-}"
+  [ -n "$input_path" ] || fatal "missing Plex PMS pristine input: server_id=$server_id arch=$arch"
+  expected_pristine_sha="${detect_sha[$server_id|$arch|plex_pms:pristine]:-}"
+  pms_path="${detect_path[$server_id|$arch|plex_pms:pristine]:-}"
+  [ -n "$expected_pristine_sha" ] && [ -n "$pms_path" ] || fatal "missing detector baseline: server_id=$server_id arch=$arch role=plex_pms:pristine"
+  actual_pristine_sha="$(plex_pool_patch_sha256_of "$input_path")"
+  valid_sha256 "$actual_pristine_sha" || fatal "invalid Plex pristine PMS SHA for $server_id $arch: $actual_pristine_sha"
+  [ "$actual_pristine_sha" = "$expected_pristine_sha" ] || fatal "Plex pristine PMS SHA mismatch for $server_id $arch: expected $expected_pristine_sha got $actual_pristine_sha"
+
+  source_id_old="${group_sqlite_guard[$compat]:-}"
+  [ "${#source_id_old}" -eq 84 ] || fatal "Plex OLD source id is not 84 bytes for compat_group=$compat"
+  [ "$source_id_old" != "$plex_source_id_new" ] || fatal "Plex OLD and NEW source ids are identical for compat_group=$compat"
+  old_matches="$(plex_patch_source_id_matches "$input_path" "$source_id_old")"
+  old_count="$(printf '%s\n' "$old_matches" | plex_patch_match_count)"
+  [ "$old_count" -eq 1 ] || fatal "Plex pristine PMS OLD source-id match count for $server_id $arch: expected 1 got $old_count"
+  new_matches="$(plex_patch_source_id_matches "$input_path" "$plex_source_id_new")"
+  new_count="$(printf '%s\n' "$new_matches" | plex_patch_match_count)"
+  [ "$new_count" -eq 0 ] || fatal "Plex pristine PMS NEW source-id match count for $server_id $arch: expected 0 got $new_count"
+  source_id_offset="$(printf '%s\n' "$old_matches" | awk -F: 'NF { print $1; exit }')"
+  case "$source_id_offset" in
+    ''|*[!0-9]*) fatal "invalid Plex pristine PMS source-id offset for $server_id $arch" ;;
+  esac
+
+  pms_sites=()
+  for record in "${pool_records[@]}"; do
+    IFS='|' read -r rec_server rec_arch binary_path label offset write_seek original_hex patched_hex <<EOF_PMS_SITE
+$record
+EOF_PMS_SITE
+    [ "$rec_server" = "$server_id" ] || continue
+    [ "$rec_arch" = "$arch" ] || continue
+    [ "$binary_path" = "$pms_path" ] || continue
+    pms_sites+=("$label|$offset|$write_seek|$original_hex|$patched_hex")
+  done
+  [ "${#pms_sites[@]}" -gt 0 ] || fatal "missing Plex pool-site rows: server_id=$server_id arch=$arch path=$pms_path"
+
+  plex_patch_failure_event=""
+  plex_patch_failure_site=""
+  plex_pool_patch_failure_event=""
+  plex_pool_patch_failure_site=""
+  if ! plex_patch_populate_pms_tmp "$derived_pms_tmp" "$input_path" "$source_id_offset" "$plex_source_id_new" "${pms_sites[@]}"; then
+    fatal "Plex PMS derivation failed for $server_id $arch: event=${plex_patch_failure_event:-${plex_pool_patch_failure_event:-unknown}} site=${plex_patch_failure_site:-${plex_pool_patch_failure_site:-unknown}}"
+  fi
+  derived_old_matches="$(plex_patch_source_id_matches "$derived_pms_tmp" "$source_id_old")"
+  derived_old_count="$(printf '%s\n' "$derived_old_matches" | plex_patch_match_count)"
+  derived_new_matches="$(plex_patch_source_id_matches "$derived_pms_tmp" "$plex_source_id_new")"
+  derived_new_count="$(printf '%s\n' "$derived_new_matches" | plex_patch_match_count)"
+  [ "$derived_old_count" -eq 0 ] && [ "$derived_new_count" -eq 1 ] || fatal "derived Plex PMS source-id postcondition failed for $server_id $arch: old_count=$derived_old_count new_count=$derived_new_count"
+  derived_sha="$(plex_pool_patch_sha256_of "$derived_pms_tmp")"
+  valid_sha256 "$derived_sha" || fatal "invalid derived Plex PMS SHA for $server_id $arch: $derived_sha"
+  detect_path["$server_id|$arch|plex_pms:source-id-patched"]="$pms_path"
+  detect_sha["$server_id|$arch|plex_pms:source-id-patched"]="$derived_sha"
+  detect_line["$server_id|$arch|plex_pms:source-id-patched"]="detect|1|plex|$server_id|$arch|plex_pms:source-id-patched|$pms_path|$derived_sha"
+}
+
+derive_plex_pms_detector_shas() {
+  local server_id arch
+  [ "$mod" = "plex" ] || return 0
+  for server_id in "${support_ids[@]}"; do
+    for arch in "${artifact_arches[@]}"; do
+      derive_plex_pms_detector_sha "$server_id" "$arch"
+    done
+  done
+}
+
 require_tuple() {
   local server_id arch compat role key target_key target_path soname pms_path scanner_path
   local artifact_key artifact_target_path artifact_group_sha first_target first_sha
@@ -546,6 +678,8 @@ require_tuple() {
         key="$server_id|$arch|$role"
         [ -n "${detect_line[$key]:-}" ] || fatal "missing detector baseline: server_id=$server_id arch=$arch role=$role"
       done
+      key="$server_id|$arch|plex_pms:source-id-patched"
+      [ -n "${detect_line[$key]:-}" ] || fatal "missing computed detector: server_id=$server_id arch=$arch role=plex_pms:source-id-patched"
       ;;
   esac
 
@@ -621,14 +755,14 @@ EOF_POOL
 load_compat_groups
 load_support
 parse_artifacts
+parse_plex_pms_pristine_inputs
 load_runtime_baselines
 load_pre_fragments
 load_pool_reviews
 load_pool_sites
 validate_artifacts
-
-tmp="${output}.tmp.$$"
-trap 'rm -f "$tmp"' EXIT
+load_plex_derivation_contract
+derive_plex_pms_detector_shas
 
 {
   printf '# baked-pins schema=3\n'
@@ -642,6 +776,7 @@ trap 'rm -f "$tmp"' EXIT
         plex)
           printf '%s\n' "${detect_line[$server_id|$arch|plex_pms:pristine]}"
           printf '%s\n' "${detect_line[$server_id|$arch|plex_pms:patched]}"
+          printf '%s\n' "${detect_line[$server_id|$arch|plex_pms:source-id-patched]}"
           printf '%s\n' "${detect_line[$server_id|$arch|plex_scanner:pristine]}"
           printf '%s\n' "${detect_line[$server_id|$arch|plex_scanner:patched]}"
           ;;
@@ -666,4 +801,5 @@ trap 'rm -f "$tmp"' EXIT
 } > "$tmp"
 
 mv -f "$tmp" "$output"
+rm -f "$derived_pms_tmp"
 trap - EXIT
