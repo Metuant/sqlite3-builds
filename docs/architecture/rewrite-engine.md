@@ -334,28 +334,31 @@ The Plex GUID LIKE rewrite is opt-in:
 every other value disable it. It is independent of
 `SQLITE3_DISABLE_PLEX_FTS_REWRITE` and `SQLITE3_DISABLE_AUTOPRAGMA`.
 
-The matcher compares raw `zSql` bytes and accepts only this complete statement:
+The matcher reads raw `zSql` and requires this fixed statement skeleton, with
+one variable token at each placeholder:
 
 ```sql
-SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :1) LIMIT :2
+SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE <pattern-token>) LIMIT <limit-token>
 ```
 
-Case, whitespace, quoting, aliases, bind tokens, parentheses, projection,
-clauses, semicolons, embedded NULs, and multi-statement tails must match
-exactly. Every other shape prepares the original SQL.
+Each placeholder accepts any non-anonymous SQLite variable token: `:name`,
+`:N`, `?N`, `@name`, or `$name`. A bare anonymous `?` is rejected at either
+slot. Case, whitespace, quoting, aliases, parentheses, projection, clauses,
+semicolons, embedded NULs, and multi-statement tails remain byte-exact; every
+other shape prepares the original SQL.
 
-On a match, the helper prepares:
+On a match, the helper duplicates the actual pattern token into the NULL guard
+and preserves both original tokens:
 
 ```sql
-SELECT mt.`id` FROM metadata_items mt WHERE :1 IS NOT NULL AND (mt.`guid` LIKE :1) LIMIT :2
+SELECT mt.`id` FROM metadata_items mt WHERE <pattern-token> IS NOT NULL AND (mt.`guid` LIKE <pattern-token>) LIMIT <limit-token>
 ```
 
-The repeated named `:1` token retains one bind slot, so bind count and names
-remain `:1` and `:2`. The projection and `LIMIT` stay unchanged. The prepared
-rewrite must expose two binds and one result column; mismatch, allocation
-failure, rewritten-prepare failure, or tail mismatch finalizes any rewritten
-statement and prepares the original SQL. Successful preparation maps `pzTail`
-to the end of the caller's original SQL buffer.
+Reusing a non-anonymous token preserves its SQLite parameter slot. The
+prepared rewrite must expose exactly two binds and one result column. A count
+mismatch, allocation failure, rewritten-prepare failure, or tail mismatch
+finalizes any rewritten statement and prepares the original SQL. Successful
+preparation maps `pzTail` to the end of the caller's original SQL buffer.
 
 For a NULL pattern, `LIKE` is NULL and cannot satisfy `WHERE`; the added guard
 allows SQLite to stop before scanning. For a non-NULL pattern, the guard is
@@ -551,11 +554,17 @@ anchor pairs fail open. A positively detected bind emits
 source form as `AncestorId IN (<captured slot>)`.
 
 `emby_match_episodes_latest` first requires exact Type=8. It emits mode
-`dashboard+episodes_latest` and K1: `keys(gk)` enumerates ancestor-visible,
-unplayed groups, while the existing picked/ranked tail and
-`idx_dshadow_emby_latest_gk_dc` readiness contract remain. The readiness gate
-is advisory: absence or probe failure falls open, while an unexpected same-name
-index shape is a performance-only risk because K1 contains no `INDEXED BY`.
+`dashboard+episodes_latest` and a date-ordered anti-join using
+`idx_dshadow_emby_latest_episodes_dcn_gk` for the outer scan and
+`idx_dshadow_emby_latest_gk_dc` for the group-ordered inner probe. The paired
+readiness gate requires both named `MediaItems` indexes to have the exact
+`sqlite_master.sql` definitions published by maintenance. The anti-join keeps
+the maximum non-NULL `DateCreated` per
+`coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey)`, uses `IS` for
+the NULL group key, and chooses the lower `Id` for equal dates. NULL wins only
+when every eligible date in the group is NULL. A missing or same-name
+definition-mismatched index fails open before candidate preparation and prepares
+the original SQL through the sampled `reason=index_missing` path.
 It rejects `over`, `LastWatchedEpisodes`, series-browse ordering/collation, and
 unsafe projections before copying the validated projection verbatim into the
 owned outer SELECT.
@@ -580,10 +589,13 @@ guarded tail misses, `capture_miss` logs when observability is enabled, and the
 original statement prepares.
 
 Sibling Type traffic is an unlogged clean miss, so neither family produces a
-cross-family capture miss. Missing indexes, probe errors, build/allocation
-failure, candidate prepare failure, and tail mismatch fail open to original
-SQL. Missing-index records use process-global first/every-1024th counters per
-dashboard mode; `db=` identifies the emitted exemplar rather than every handle.
-Probe errors remain unsuppressed. The two exact Type=5 indexes are required only to
-prepare C2; DateCreated storage class is not an enablement condition because C2
-uses only native comparison and ordering with no cast, arithmetic, or coercion.
+cross-family capture miss. Missing indexes, same-name definition mismatches,
+probe errors, build/allocation failure, candidate prepare failure, and tail
+mismatch fail open to original SQL. Missing-index and definition-mismatch
+records use `reason=index_missing` with process-global first/every-1024th
+counters per dashboard mode; `db=` identifies the emitted exemplar rather than
+every handle. Probe errors remain unsuppressed. Episodes requires its exact
+Type=8 index pair, and movies requires its exact Type=5 index pair, to prepare
+the corresponding anti-join. DateCreated storage class is not an enablement
+condition because the templates use only native comparison and ordering with no
+cast, arithmetic, or coercion.

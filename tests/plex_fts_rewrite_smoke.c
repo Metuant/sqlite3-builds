@@ -63,6 +63,28 @@ static const char *GUID_LIKE_SQL =
     "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :1) LIMIT :2";
 static const char *GUID_LIKE_SQL_REWRITTEN =
     "SELECT mt.`id` FROM metadata_items mt WHERE :1 IS NOT NULL AND (mt.`guid` LIKE :1) LIMIT :2";
+static const char *GUID_LIKE_COLON_NAMED_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :C1) LIMIT :C2";
+static const char *GUID_LIKE_COLON_NAMED_SQL_REWRITTEN =
+    "SELECT mt.`id` FROM metadata_items mt WHERE :C1 IS NOT NULL AND (mt.`guid` LIKE :C1) LIMIT :C2";
+static const char *GUID_LIKE_QMARK_NUMBERED_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE ?1) LIMIT ?2";
+static const char *GUID_LIKE_QMARK_NUMBERED_SQL_REWRITTEN =
+    "SELECT mt.`id` FROM metadata_items mt WHERE ?1 IS NOT NULL AND (mt.`guid` LIKE ?1) LIMIT ?2";
+static const char *GUID_LIKE_AT_NAMED_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE @pattern) LIMIT @limit";
+static const char *GUID_LIKE_AT_NAMED_SQL_REWRITTEN =
+    "SELECT mt.`id` FROM metadata_items mt WHERE @pattern IS NOT NULL AND (mt.`guid` LIKE @pattern) LIMIT @limit";
+static const char *GUID_LIKE_DOLLAR_NAMED_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE $pattern) LIMIT $limit";
+static const char *GUID_LIKE_DOLLAR_NAMED_SQL_REWRITTEN =
+    "SELECT mt.`id` FROM metadata_items mt WHERE $pattern IS NOT NULL AND (mt.`guid` LIKE $pattern) LIMIT $limit";
+static const char *GUID_LIKE_ANONYMOUS_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE ?) LIMIT ?";
+static const char *GUID_LIKE_ANONYMOUS_PATTERN_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE ?) LIMIT ?2";
+static const char *GUID_LIKE_ANONYMOUS_LIMIT_SQL =
+    "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :C1) LIMIT ?";
 static const char *GUID_LIKE_NEGATIVE_SQL =
     "SELECT mt.`id` FROM metadata_items mt WHERE mt.`guid` LIKE :1 LIMIT :2";
 
@@ -1934,10 +1956,25 @@ static int child_nonmatch(void) {
 }
 
 static int child_guid_like(void) {
+    const struct {
+        const char *label;
+        const char *sql;
+        const char *rewritten;
+    } reusable_bind_cases[] = {
+        {"guid-like-colon-named", GUID_LIKE_COLON_NAMED_SQL,
+         GUID_LIKE_COLON_NAMED_SQL_REWRITTEN},
+        {"guid-like-qmark-numbered", GUID_LIKE_QMARK_NUMBERED_SQL,
+         GUID_LIKE_QMARK_NUMBERED_SQL_REWRITTEN},
+        {"guid-like-at-named", GUID_LIKE_AT_NAMED_SQL,
+         GUID_LIKE_AT_NAMED_SQL_REWRITTEN},
+        {"guid-like-dollar-named", GUID_LIKE_DOLLAR_NAMED_SQL,
+         GUID_LIKE_DOLLAR_NAMED_SQL_REWRITTEN}
+    };
     guid_like_bind_values null_binds = {NULL, 3};
     guid_like_bind_values prefix_binds = {"plex://item/%", 3};
     sqlite3 *vendor_db;
     sqlite3 *candidate_db;
+    size_t i;
 
     configure_guid_like_env("0");
     make_temp_dir();
@@ -1962,6 +1999,33 @@ static int child_guid_like(void) {
         require_guid_like_legal_rows(
             candidate_db, "guid-like-prefix-contract", "candidate", GUID_LIKE_SQL,
             GUID_LIKE_SQL_REWRITTEN, &prefix_binds
+        );
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "guid-like-colon-named-contract", GUID_LIKE_COLON_NAMED_SQL,
+            GUID_LIKE_COLON_NAMED_SQL, GUID_LIKE_COLON_NAMED_SQL_REWRITTEN,
+            bind_guid_like_values, &prefix_binds,
+            accept_guid_like_legal_difference, NULL
+        );
+        for (i = 0; i < sizeof(reusable_bind_cases) / sizeof(reusable_bind_cases[0]); i++) {
+            expect_saved_sql(
+                candidate_db, reusable_bind_cases[i].label, reusable_bind_cases[i].sql,
+                -1, 2, reusable_bind_cases[i].rewritten
+            );
+        }
+        expect_saved_sql(
+            candidate_db, "guid-like-anonymous-bind-negative", GUID_LIKE_ANONYMOUS_SQL,
+            -1, 2, GUID_LIKE_ANONYMOUS_SQL
+        );
+        expect_saved_sql(
+            candidate_db, "guid-like-anonymous-pattern-negative",
+            GUID_LIKE_ANONYMOUS_PATTERN_SQL, -1, 2,
+            GUID_LIKE_ANONYMOUS_PATTERN_SQL
+        );
+        expect_saved_sql(
+            candidate_db, "guid-like-anonymous-limit-negative",
+            GUID_LIKE_ANONYMOUS_LIMIT_SQL, -1, 2,
+            GUID_LIKE_ANONYMOUS_LIMIT_SQL
         );
         expect_saved_sql(
             candidate_db, "guid-like-shape-negative", GUID_LIKE_NEGATIVE_SQL,

@@ -18,20 +18,19 @@ family_all_cases() {
   printf '%s\n' \
     movies-latest \
     episodes-latest \
-    episodes-latest-single-index \
-    episodes-latest-two-index
+    episodes-latest-single-index
 }
 family_cases() {
   local -a selected
   if [ -n "${CASES:-}" ]; then read -r -a selected <<< "$CASES"; printf '%s\n' "${selected[@]}"; else family_all_cases; fi
 }
 
-# The shared engine owns fixed vendor/candidate labels. Comparison cases put
-# shipped K1 in the vendor slot so timing remains a direct K1-to-candidate A-B.
+# The shared engine owns fixed vendor/candidate labels. The comparison case puts
+# the shipped two-index arm in the vendor slot for a direct paired-to-single A-B.
 family_case_role() {
   case "$1" in
     movies-latest|episodes-latest) printf 'SHIPPED\n' ;;
-    episodes-latest-single-index|episodes-latest-two-index) printf 'COMPARISON\n' ;;
+    episodes-latest-single-index) printf 'COMPARISON\n' ;;
     *) die "unknown Emby dashboard case role: $1" ;;
   esac
 }
@@ -40,12 +39,12 @@ family_contract_check() {
   local _role
   grep -Fx '    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby Episodes Latest mode catalogue contract drifted'
   grep -Fx '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby movies Latest mode catalogue contract drifted'
-  [ "$(family_all_cases | wc -l | tr -d ' ')" -eq 4 ] || die 'Emby dashboard arm matrix incomplete'
-  for _case in movies-latest episodes-latest episodes-latest-single-index episodes-latest-two-index; do
+  [ "$(family_all_cases | wc -l | tr -d ' ')" -eq 3 ] || die 'Emby dashboard arm matrix incomplete'
+  for _case in movies-latest episodes-latest episodes-latest-single-index; do
     family_all_cases | grep -Fx "$_case" >/dev/null || die "missing Emby dashboard measurement arm: $_case"
     _role=$(family_case_role "$_case")
     case "$_case:$_role" in
-      movies-latest:SHIPPED|episodes-latest:SHIPPED|episodes-latest-single-index:COMPARISON|episodes-latest-two-index:COMPARISON) ;;
+      movies-latest:SHIPPED|episodes-latest:SHIPPED|episodes-latest-single-index:COMPARISON) ;;
       *) die "Emby dashboard arm role drifted: case=$_case role=$_role" ;;
     esac
   done
@@ -94,7 +93,7 @@ SQL
 dashboard_projection() {
   case "$1" in
     movies-latest) printf '%s' 'A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
-    episodes-latest|episodes-latest-single-index|episodes-latest-two-index) printf '%s' 'A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
+    episodes-latest|episodes-latest-single-index) printf '%s' 'A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
     *) die "unknown Emby dashboard case: $1" ;;
   esac
 }
@@ -131,28 +130,6 @@ SQL
     episodes-latest:vendor)
       printf 'with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (%s) )select %sfrom mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=%s where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 12;\n' "$DASHBOARD_ANCESTORS" "$projection" "$DASHBOARD_USER_ID"
       ;;
-    episodes-latest:candidate|episodes-latest-single-index:vendor|episodes-latest-two-index:vendor)
-      cat <<SQL
-WITH keys(gk) AS MATERIALIZED (
-  SELECT DISTINCT coalesce(A0.SeriesPresentationUniqueKey,A0.PresentationUniqueKey)
-  FROM (SELECT DISTINCT itemid FROM AncestorIds2 WHERE AncestorId IN ($DASHBOARD_ANCESTORS)) AS W
-  CROSS JOIN MediaItems AS A0
-  WHERE A0.Id=W.itemid AND A0.Type=8
-    AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId=A0.UserDataKeyId AND U0.UserId=$DASHBOARD_USER_ID AND U0.played<>0)
-), picked AS MATERIALIZED (
-  SELECT K.gk,(SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type=8
-    AND coalesce(A2.SeriesPresentationUniqueKey,A2.PresentationUniqueKey) IS K.gk
-    AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId=A2.Id AND X.AncestorId IN ($DASHBOARD_ANCESTORS))
-    AND NOT EXISTS (SELECT 1 FROM UserDatas AS U2 WHERE U2.UserDataKeyId=A2.UserDataKeyId AND U2.UserId=$DASHBOARD_USER_ID AND U2.played<>0)
-    ORDER BY A2.DateCreated DESC LIMIT 1) AS id FROM keys AS K
-), exact_groups AS MATERIALIZED (
-  SELECT P.gk,P.id,Amax.DateCreated AS maxdc FROM picked AS P JOIN MediaItems AS Amax ON Amax.Id=P.id WHERE P.id IS NOT NULL
-), ranked AS MATERIALIZED (SELECT gk,id,maxdc FROM exact_groups ORDER BY maxdc DESC LIMIT 12)
-SELECT ${projection}FROM ranked AS R JOIN MediaItems AS A ON A.Id=R.id
-LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.UserId=$DASHBOARD_USER_ID
-ORDER BY R.maxdc DESC LIMIT 12;
-SQL
-      ;;
     episodes-latest-single-index:candidate)
       cat <<SQL
 WITH exact_groups(gk,id,maxdc) AS MATERIALIZED (
@@ -177,7 +154,7 @@ LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.Use
 ORDER BY R.maxdc DESC LIMIT 12;
 SQL
       ;;
-    episodes-latest-two-index:candidate)
+    episodes-latest:candidate|episodes-latest-single-index:vendor)
       cat <<SQL
 WITH ranked(id,dc,gk) AS MATERIALIZED (
   SELECT A.Id,A.DateCreated,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey)
@@ -230,22 +207,15 @@ SQL
 
   case "$case_id" in
     episodes-latest)
-      comparison=vendor_vs_shipped_k1
-      candidate_kind=shipped_k1
-      require_canonical=0
+      comparison=vendor_vs_shipped_two_index
+      candidate_kind=shipped_two_index
+      require_canonical=1
       vendor_core=$(dashboard_query_core "$vendor_file")
       reference_core=$vendor_core
       ;;
     episodes-latest-single-index)
-      comparison=shipped_k1_vs_single_index_antijoin
+      comparison=shipped_two_index_vs_single_index_antijoin
       candidate_kind=single_index_antijoin
-      require_canonical=1
-      vendor_core=$(dashboard_render_core episodes-latest vendor)
-      reference_core=$(dashboard_query_core "$vendor_file")
-      ;;
-    episodes-latest-two-index)
-      comparison=shipped_k1_vs_two_index_antijoin
-      candidate_kind=two_index_antijoin
       require_canonical=1
       vendor_core=$(dashboard_render_core episodes-latest vendor)
       reference_core=$(dashboard_query_core "$vendor_file")

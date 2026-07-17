@@ -125,8 +125,14 @@ It proves:
 - ICU-only FTS rewrite enablement.
 - FTS opt-out env behavior: default-enabled, literal `1` disabled, non-`1`
   enabled, and exact-path negatives.
-- GUID-LIKE and On-Deck opt-in env behavior: literal `0` enabled, unset,
-  literal `1`, and non-`0` disabled.
+- GUID-LIKE opt-in env behavior: literal `0` enabled, unset, literal `1`, and
+  non-`0` disabled. The fixed skeleton rewrites canonical `:1`/`:2`, production
+  `:C1`/`:C2`, numbered `?1`/`?2`, `@pattern`/`@limit`, and
+  `$pattern`/`$limit` forms by reusing the pattern token; a bare anonymous `?`
+  at either slot prepares the original SQL, and accepted forms retain the
+  two-bind/one-column contract.
+- On-Deck opt-in env behavior: literal `0` enabled, unset, literal `1`, and
+  non-`0` disabled.
 - taggings opt-out env behavior: unset, literal `0`, and non-`1` enabled;
   literal `1` disabled.
 - On-Deck Variant B threshold rewriting with the common On-Deck opt-in enabled.
@@ -175,8 +181,9 @@ It proves:
   Type-29, and links-search rewrites. Links-search covers both the one-level and
   exact two-level ItemLinks forms, malformed type slots, duplicate membership,
   duplicate-link/NULL/no-hit fixtures, and ordered type-tagged row parity.
-- DASHBOARD default-off behavior and literal-0 Episodes-Latest K1 plus guarded
-  movies-Latest C2 behavior, list and one-parenthesis nonnegative/exact-`-1`
+- DASHBOARD default-off behavior and literal-0 Episodes-Latest paired-index
+  anti-join plus guarded movies-Latest C2 behavior, list and one-parenthesis
+  nonnegative/exact-`-1`
   scalar ancestor forms, structural wide/compact projection preservation,
   movies `over` and `LastWatchedEpisodes` guards, LIMIT variation,
   bind/grammar/projection negatives, date-window/OFFSET and correlated
@@ -193,21 +200,30 @@ It proves:
 - structural misses for fast-form input, duplicate MATCH sites, literal RHS
   outside direct-test mode, over-cap slots, ambiguous anchors, semicolon tails,
   and embedded NUL inputs.
-- Episodes index-absent/probe-error fail-open; movies outer-missing,
-  inner-missing, and probe-error fail-open; native movies-index absence;
-  capture-on-miss with full source SQL, `sub_reason`, and correlation;
-  `out_of_scope` coverage for parsed unsupported limits and detected binds; hybrid
-  first/periodic/new applied-record sampling; aggregate,
+- Episodes outer-missing, inner-missing, both-missing, malformed same-name
+  outer/inner definitions, and probe-error fail-open; movies outer-missing,
+  inner-missing, malformed same-name outer/inner definitions, and probe-error
+  fail-open; canonical definitions apply and log `rewrite_applied`; native
+  movies-index absence; capture-on-miss with full source SQL, `sub_reason`, and
+  correlation; `out_of_scope` coverage for parsed unsupported limits and
+  detected binds; hybrid first/periodic/new applied-record sampling; aggregate,
   window, bare-star, parenthesized-projection, series-browse, XB, UB, and direct
-  candidate-error/partial-statement/wrong-tail coverage. Missing-index logs are
-  sampled process-wide per mode while probe errors remain unsuppressed.
+  candidate-error/partial-statement/wrong-tail coverage. Missing-index and
+  definition-mismatch logs are sampled process-wide per mode while probe errors
+  remain unsuppressed.
   No-guard is
   matcher-non-applying: Type=5 passes, guarded-tail miss logs capture_miss, and
   original SQL prepares.
 - fixture canaries under `tests/fixtures/emby-fts-rewrite/`.
+- exact paired-index Episodes SQL for LIMIT 12/16/20 plus an Episodes semantic
+  fixture before and after full `ANALYZE`: singleton, distinct-date duplicate,
+  equal-date lower-`Id` tie, mixed NULL/non-NULL dates, all-NULL dates, NULL
+  group key, missing UserDatas, played zero/one, ancestor-invisible newer, and
+  played newer cells. It checks one row per group, deterministic candidate ID
+  order, full projected-row provenance, and vendor group/max-date grain.
 - ordered all-column type-tagged byte identity between separate non-target
-  vendor and indexed `library.db` candidate databases for K1 LIMIT 12/16/20
-  and guarded C2 36/36 literal cells, plus separate 36/36 no-guard
+  vendor and indexed `library.db` candidate databases for guarded C2 36/36
+  literal cells, plus separate 36/36 no-guard
   original-SQL/tail passthrough. For guarded C2 expanded regimes in both stat
   states, the vendor query executes and must return 20 rows; the candidate must
   return the exact ID sequence `9001,9002,9003,9004,9005,9006,9007,9008,9009,9010,9119,9101,9104,9107,9111,9112,9113,9118,9116,9108`,

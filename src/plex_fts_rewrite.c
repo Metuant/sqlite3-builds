@@ -22,10 +22,17 @@
 #define PLEX_TAG_MEMBERSHIP_CLOSE ")"
 #define PLEX_ONDECK_COLUMN_COUNT 7
 
+/* The measurement runbook extracts these canonical reusable-token forms. */
 static const char PLEX_GUID_LIKE_SQL[] =
     "SELECT mt.`id` FROM metadata_items mt WHERE (mt.`guid` LIKE :1) LIMIT :2";
 static const char PLEX_GUID_LIKE_REWRITTEN_SQL[] =
     "SELECT mt.`id` FROM metadata_items mt WHERE :1 IS NOT NULL AND (mt.`guid` LIKE :1) LIMIT :2";
+
+static const char PLEX_GUID_LIKE_HEAD[] =
+    "SELECT mt.`id` FROM metadata_items mt WHERE ";
+static const char PLEX_GUID_LIKE_PREDICATE[] = "(mt.`guid` LIKE ";
+static const char PLEX_GUID_LIKE_LIMIT[] = ") LIMIT ";
+static const char PLEX_GUID_LIKE_GUARD[] = " IS NOT NULL AND ";
 
 static const char PLEX_ONDECK_AFTER_IDS[] =
     " and metadata_item_settings.view_count>0  and metadata_item_views.account_id=";
@@ -1473,36 +1480,88 @@ static int plex_prepare_input_lengths(
     return 1;
 }
 
+static int plex_parse_reusable_bind_at(
+    const char *sql,
+    size_t len,
+    size_t pos,
+    plex_span *bind,
+    size_t *after
+) {
+    fts_lex lx;
+    fts_lex_token tok;
+
+    if (pos > len) return 0;
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_SQLITE_VARIABLE);
+    lx.pos = pos;
+    tok = fts_lex_next_token(&lx);
+    if (tok.start != pos || tok.type != FTS_LEX_TOK_PARAM) return 0;
+    if (tok.end == tok.start + 1 && sql[tok.start] == '?') return 0;
+
+    bind->start = tok.start;
+    bind->end = tok.end;
+    *after = tok.end;
+    return 1;
+}
+
 static plex_match_result match_guid_like_query(
     const char *sql,
     size_t bounded_len,
     size_t scan_len,
     plex_rewrite_candidate *candidate
 ) {
-    const size_t source_len = sizeof(PLEX_GUID_LIKE_SQL) - 1;
-    const size_t rewritten_len = sizeof(PLEX_GUID_LIKE_REWRITTEN_SQL) - 1;
+    plex_span pattern_bind;
+    plex_span limit_bind;
+    char *p;
+    size_t guard_off;
+    size_t pos = 0;
     size_t suffix_len;
 
-    if (scan_len != source_len ||
-        memcmp(sql, PLEX_GUID_LIKE_SQL, source_len) != 0) {
+    if (bounded_len < scan_len || bounded_len - scan_len > 1) {
         return PLEX_MATCH_MISS;
     }
-    if (bounded_len < scan_len || bounded_len - scan_len > 1) {
+    if (!plex_expect_bytes(
+            sql, scan_len, pos, PLEX_GUID_LIKE_HEAD, &pos
+        )) {
+        return PLEX_MATCH_MISS;
+    }
+    guard_off = pos;
+    if (!plex_expect_bytes(
+            sql, scan_len, pos, PLEX_GUID_LIKE_PREDICATE, &pos
+        ) ||
+        !plex_parse_reusable_bind_at(
+            sql, scan_len, pos, &pattern_bind, &pos
+        ) ||
+        !plex_expect_bytes(
+            sql, scan_len, pos, PLEX_GUID_LIKE_LIMIT, &pos
+        ) ||
+        !plex_parse_reusable_bind_at(
+            sql, scan_len, pos, &limit_bind, &pos
+        ) ||
+        pos != scan_len) {
         return PLEX_MATCH_MISS;
     }
 
     suffix_len = bounded_len - scan_len;
-    if (rewritten_len > SIZE_MAX - suffix_len - 1) {
+    candidate->rewrite_len = bounded_len;
+    if (!plex_add_size(
+            &candidate->rewrite_len, pattern_bind.end - pattern_bind.start
+        ) ||
+        !plex_add_size(
+            &candidate->rewrite_len, sizeof(PLEX_GUID_LIKE_GUARD) - 1
+        ) ||
+        candidate->rewrite_len == SIZE_MAX) {
         return PLEX_MATCH_BUILD_FAILED;
     }
-    candidate->rewrite_len = rewritten_len + suffix_len;
     candidate->sql = (char *)malloc(candidate->rewrite_len + 1);
     if (!candidate->sql) return PLEX_MATCH_BUILD_FAILED;
 
-    memcpy(candidate->sql, PLEX_GUID_LIKE_REWRITTEN_SQL, rewritten_len);
-    memcpy(candidate->sql + rewritten_len, sql + scan_len, suffix_len);
+    p = candidate->sql;
+    plex_append_bytes(&p, sql, guard_off);
+    plex_append_span(&p, sql, &pattern_bind);
+    plex_append_bytes(&p, PLEX_GUID_LIKE_GUARD, sizeof(PLEX_GUID_LIKE_GUARD) - 1);
+    plex_append_bytes(&p, sql + guard_off, bounded_len - guard_off);
     candidate->sql[candidate->rewrite_len] = 0;
-    candidate->scan_out_len = rewritten_len;
+    candidate->scan_out_len = candidate->rewrite_len - suffix_len;
     candidate->expected_bind_count = 2;
     candidate->verify_bind_count = 1;
     candidate->expected_column_count = 1;

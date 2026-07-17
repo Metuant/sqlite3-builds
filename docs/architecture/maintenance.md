@@ -310,9 +310,25 @@ preservation gate. The script then replaces the live database with `mv` and
 removes stale WAL/SHM siblings.
 The Emby staged optimize SQL creates the runbook-validated
 `idx_dshadow_mediaitems_parent_type`, `idx_dshadow_emby_latest_gk_dc`,
+`idx_dshadow_emby_latest_episodes_dcn_gk`,
 `idx_dshadow_emby_latest_movies_dcn_puk`, and
 `idx_dshadow_emby_latest_movies_puk_dc_cover` indexes before `REINDEX`,
-`ANALYZE`, and `PRAGMA optimize`.
+`ANALYZE`, and `PRAGMA optimize`. Both Episodes-Latest indexes therefore have
+statistics before staged publication. The dashboard readiness probes compare
+all four Latest index definitions with the exact `sqlite_master.sql` text
+produced by the `_EMBY_INDEXES` DDL. Because `CREATE INDEX IF NOT EXISTS` does
+not replace a same-name index, a noncanonical existing definition leaves the
+corresponding rewrite fail-open with sampled `reason=index_missing`. The
+date-first Episodes index measured approximately 66.3 MB; the worst-case
+indexed-column update canary measured 1.28x write amplification and
+approximately 1.9 microseconds per row.
+
+Release note: an updated library deployed before this maintenance step sees
+only the older `idx_dshadow_emby_latest_gk_dc`, declines the Episodes-Latest
+rewrite, and runs original Emby SQL. The accepted interim window can move the
+query from the former approximately 1.36-second K1 result to the approximately
+2.66-second vendor result until planned-downtime maintenance creates and
+analyzes `idx_dshadow_emby_latest_episodes_dcn_gk`.
 
 Post-swap FTS maintenance is optimize-only because the database has already
 traversed the source gate under the limits above and passed the staged

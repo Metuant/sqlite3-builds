@@ -20,8 +20,21 @@
 #define EMBY_CLIENTDATA_KEY "sqlite3-builds-emby-fts-rewrite"
 #define EMBY_OWNER_PROBE "__dshadow_emby_owner_probe__"
 #define EMBY_LATEST_INDEX_NAME "idx_dshadow_emby_latest_gk_dc"
+#define EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME "idx_dshadow_emby_latest_episodes_dcn_gk"
 #define EMBY_LATEST_MOVIES_INDEX_NAME "idx_dshadow_emby_latest_movies_dcn_puk"
 #define EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME "idx_dshadow_emby_latest_movies_puk_dc_cover"
+#define EMBY_LATEST_INDEX_DEFINITION \
+    "CREATE INDEX " EMBY_LATEST_INDEX_NAME \
+    " ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type = 8"
+#define EMBY_LATEST_EPISODES_DCN_GK_INDEX_DEFINITION \
+    "CREATE INDEX " EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME \
+    " ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8"
+#define EMBY_LATEST_MOVIES_INDEX_DEFINITION \
+    "CREATE INDEX " EMBY_LATEST_MOVIES_INDEX_NAME \
+    " ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5"
+#define EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION \
+    "CREATE INDEX " EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME \
+    " ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5"
 typedef struct emby_span {
     size_t start;
     size_t end;
@@ -434,11 +447,17 @@ typedef enum emby_latest_index_state {
 
 static emby_latest_index_state emby_latest_index_ready(sqlite3 *db) {
     static const char probe_sql[] =
-        "SELECT 1 FROM sqlite_master "
+        "SELECT 1 WHERE "
+        "EXISTS (SELECT 1 FROM sqlite_master "
         "WHERE type='index' "
         "AND name='" EMBY_LATEST_INDEX_NAME "' "
         "AND tbl_name='MediaItems' COLLATE NOCASE "
-        "LIMIT 1";
+        "AND sql='" EMBY_LATEST_INDEX_DEFINITION "') "
+        "AND EXISTS (SELECT 1 FROM sqlite_master "
+        "WHERE type='index' "
+        "AND name='" EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME "' "
+        "AND tbl_name='MediaItems' COLLATE NOCASE "
+        "AND sql='" EMBY_LATEST_EPISODES_DCN_GK_INDEX_DEFINITION "')";
     sqlite3_stmt *stmt = NULL;
     const char *tail = NULL;
     int rc;
@@ -473,11 +492,13 @@ static emby_latest_index_state emby_latest_movies_indexes_ready(sqlite3 *db) {
         "EXISTS (SELECT 1 FROM sqlite_master "
         "WHERE type='index' "
         "AND name='" EMBY_LATEST_MOVIES_INDEX_NAME "' "
-        "AND tbl_name='MediaItems' COLLATE NOCASE) "
+        "AND tbl_name='MediaItems' COLLATE NOCASE "
+        "AND sql='" EMBY_LATEST_MOVIES_INDEX_DEFINITION "') "
         "AND EXISTS (SELECT 1 FROM sqlite_master "
         "WHERE type='index' "
         "AND name='" EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME "' "
-        "AND tbl_name='MediaItems' COLLATE NOCASE)";
+        "AND tbl_name='MediaItems' COLLATE NOCASE "
+        "AND sql='" EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION "')";
     sqlite3_stmt *stmt = NULL;
     const char *tail = NULL;
     int rc;
@@ -820,19 +841,26 @@ static const char EMBY_ANCHOR_MOVIES_LATEST_TAIL[] =
     "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT";
 /* Correctness relies on Emby's UserDatas PK uniqueness on (UserDataKeyId, UserId). */
 static const char EMBY_LATEST_TPL_0[] =
-    "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(A0.SeriesPresentationUniqueKey, A0.PresentationUniqueKey) FROM (SELECT DISTINCT itemid FROM AncestorIds2 WHERE AncestorId IN (";
+    "WITH ranked(id, dc, gk) AS MATERIALIZED ("
+    "  SELECT A.Id, A.DateCreated, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) "
+    "  FROM MediaItems AS A INDEXED BY " EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME " "
+    "  WHERE A.Type = 8 AND EXISTS ( SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A.Id AND X.AncestorId IN (";
 static const char EMBY_LATEST_TPL_1[] =
-    ")) AS W CROSS JOIN MediaItems AS A0 WHERE A0.Id = W.itemid AND A0.Type = 8 AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId = A0.UserDataKeyId AND U0.UserId = ";
+    ") ) AND NOT EXISTS ( SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId = A.UserDataKeyId AND U0.UserId = ";
 static const char EMBY_LATEST_TPL_2[] =
-    " AND U0.played <> 0)), picked AS MATERIALIZED (SELECT K.gk, (SELECT A2.Id FROM MediaItems AS A2 WHERE A2.Type = 8 AND coalesce(A2.SeriesPresentationUniqueKey, A2.PresentationUniqueKey) IS K.gk AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A2.Id AND X.AncestorId IN (";
+    " AND U0.played <> 0 ) AND NOT EXISTS ("
+    "      SELECT 1 "
+    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_INDEX_NAME " "
+    "      WHERE B.Type = 8 AND coalesce(B.SeriesPresentationUniqueKey, B.PresentationUniqueKey) IS coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) AND ( (B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated > A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id < A.Id) ) AND EXISTS ( SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId = B.Id AND XB.AncestorId IN (";
 static const char EMBY_LATEST_TPL_3[] =
-    ")) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U2 WHERE U2.UserDataKeyId = A2.UserDataKeyId AND U2.UserId = ";
+    ") ) AND NOT EXISTS ( SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId = B.UserDataKeyId AND UB.UserId = ";
 static const char EMBY_LATEST_TPL_4[] =
-    " AND U2.played <> 0) ORDER BY A2.DateCreated DESC LIMIT 1) AS id FROM keys AS K), exact_groups AS MATERIALIZED (SELECT P.gk, P.id, Amax.DateCreated AS maxdc FROM picked AS P JOIN MediaItems AS Amax ON Amax.Id = P.id WHERE P.id IS NOT NULL), ranked AS MATERIALIZED (SELECT gk, id, maxdc FROM exact_groups ORDER BY maxdc DESC LIMIT ";
-static const char EMBY_LATEST_TPL_5[] = ") SELECT ";
+    " AND UB.played <> 0 ) ) ORDER BY (A.DateCreated IS NULL) ASC, A.DateCreated DESC, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ASC LIMIT ";
+static const char EMBY_LATEST_TPL_5[] = " ) SELECT ";
 static const char EMBY_LATEST_TPL_6[] =
-    " FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = ";
-static const char EMBY_LATEST_TPL_7[] = " ORDER BY R.maxdc DESC LIMIT ";
+    "FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = ";
+static const char EMBY_LATEST_TPL_7[] =
+    " ORDER BY (R.dc IS NULL) ASC, R.dc DESC, R.gk ASC LIMIT ";
 
 /* SQLite leaves the vendor GROUP BY's bare dashboard columns undefined on ties.
    Newest-non-NULL-date/lower-Id ranking picks one row deterministically; different

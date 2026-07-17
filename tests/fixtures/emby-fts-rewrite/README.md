@@ -22,8 +22,11 @@ it. The utility prepares one raw input template and writes the resulting
 - Fan-out coverage includes RES-A, People, links-search, Browse-by-name,
   Favorites-first, resume-simple, Similar-items, and RES-D membership rewrites;
   only canary-backed families keep fixture pairs here.
-- Episodes-Latest K1 fixtures cover LIMIT 12/16/20 and projection variation;
-  the LIMIT 12/16 expected files are active fixture canaries.
+- Episodes-Latest paired-index anti-join fixtures cover LIMIT 12/16/20 and
+  projection variation; the LIMIT 12/16 expected files are active byte
+  canaries. The C smoke separately exercises equal-date lower-`Id`, all-NULL,
+  NULL-group, played, ancestor-visibility, row-provenance, and both-stat-state
+  semantics.
 - Guarded movies-Latest C2 has an exact LIMIT12 raw/expected fixture pair;
   complete bind-token and matcher-shape negatives run in the C smoke.
 - No-guard movies SQL is matcher-non-applying and has no fixture pair pending an

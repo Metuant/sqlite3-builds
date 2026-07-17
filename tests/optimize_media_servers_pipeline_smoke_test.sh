@@ -86,6 +86,16 @@ latest_eqp() {
   "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT Id FROM MediaItems WHERE Type=8 AND coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey)='series-6' ORDER BY DateCreated DESC LIMIT 1;" | tr '\r\n' ' '
 }
 
+episodes_two_index_sql() {
+  printf '%s' "WITH ranked(id,dc,gk) AS MATERIALIZED (SELECT A.Id,A.DateCreated,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey) FROM MediaItems AS A INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk WHERE A.Type=8 AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId=A.Id AND X.AncestorId IN (300)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId=A.UserDataKeyId AND U0.UserId=42 AND U0.played<>0) AND NOT EXISTS (SELECT 1 FROM MediaItems AS B INDEXED BY idx_dshadow_emby_latest_gk_dc WHERE B.Type=8 AND coalesce(B.SeriesPresentationUniqueKey,B.PresentationUniqueKey) IS coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey) AND ((B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated>A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id<A.Id)) AND EXISTS (SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId=B.Id AND XB.AncestorId IN (300)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId=B.UserDataKeyId AND UB.UserId=42 AND UB.played<>0)) ORDER BY (A.DateCreated IS NULL),A.DateCreated DESC,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey) ASC LIMIT 12) SELECT A.Id FROM ranked AS R JOIN MediaItems AS A ON A.Id=R.id ORDER BY (R.dc IS NULL),R.dc DESC,R.gk ASC LIMIT 12"
+}
+
+episodes_two_index_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN $(episodes_two_index_sql)" | tr '\r\n' ' '
+}
+
 movies_vendor_sql() {
   printf '%s' "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12"
 }
@@ -159,7 +169,25 @@ assert_eqp_uses_latest_index() {
   phase="$2"
   assert_contains "$eqp" "SEARCH" "$phase latest EQP search"
   assert_contains "$eqp" "idx_dshadow_emby_latest_gk_dc" "$phase latest EQP index"
+  assert_not_contains "$eqp" "idx_dshadow_emby_latest_episodes_dcn_gk" "$phase latest EQP keeps group-first role"
   assert_not_contains "$eqp" "USE TEMP B-TREE" "$phase latest EQP no temp sort"
+}
+
+assert_episodes_two_index_eqp() {
+  local eqp phase ranked_eqp
+  eqp="$1"
+  phase="$2"
+  case "$eqp" in
+    *"SCAN A USING COVERING INDEX idx_dshadow_emby_latest_episodes_dcn_gk"*|*"SCAN A USING INDEX idx_dshadow_emby_latest_episodes_dcn_gk"*) ;;
+    *) fail "$phase Episodes outer index" "A uses [idx_dshadow_emby_latest_episodes_dcn_gk]" "$eqp" ;;
+  esac
+  case "$eqp" in
+    *"SEARCH B USING COVERING INDEX idx_dshadow_emby_latest_gk_dc"*|*"SEARCH B USING INDEX idx_dshadow_emby_latest_gk_dc"*) ;;
+    *) fail "$phase Episodes inner index" "B uses [idx_dshadow_emby_latest_gk_dc]" "$eqp" ;;
+  esac
+  assert_contains "$eqp" "SCAN R" "$phase Episodes ranked output scan"
+  ranked_eqp="${eqp%%SCAN R*}"
+  assert_not_contains "$ranked_eqp" "USE TEMP B-TREE" "$phase Episodes ranked EQP no temp sort"
 }
 
 real_sqlite="$(command -v sqlite3 || true)"
@@ -394,6 +422,9 @@ INSERT INTO AncestorIds2 VALUES(6115,999,0);
 INSERT INTO UserDatas(UserDataKeyId,UserId,IsFavorite,Played,PlaybackPositionTicks,AudioStreamIndex,SubtitleStreamIndex)
 SELECT UserDataKeyId,42,Id%2,CASE WHEN Id=6114 OR Id=6117 THEN 1 ELSE 0 END,Id*10,Id%3,Id%4
 FROM MediaItems WHERE Type=5 AND Id<>6112;
+INSERT INTO AncestorIds2 SELECT Id,300,0 FROM MediaItems WHERE Type=8;
+INSERT INTO UserDatas(UserDataKeyId,UserId,IsFavorite,Played,PlaybackPositionTicks,AudioStreamIndex,SubtitleStreamIndex)
+SELECT UserDataKeyId,42,Id%2,0,Id*10,Id%3,Id%4 FROM MediaItems WHERE Type=8;
 EOF_SQL
 }
 
@@ -699,11 +730,13 @@ assert_contains "$(cat "$SQLITE_MAINTENANCE_LOG")" "ANALYZE; PRAGMA optimize=0x1
 assert_eq "0" "$(wc -l < "$SQLITE_SHADOW_GATE_LOG" | tr -d ' ')" "Emby no post-recuration shadow-gate SQLite invocations"
 assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_mediaitems_parent_type';")" "Emby pipeline index count"
 assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_emby_latest_gk_dc';")" "Emby pipeline latest index count"
+assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_emby_latest_episodes_dcn_gk';")" "Emby pipeline Episodes date-first index count"
 assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_emby_latest_movies_dcn_puk';")" "Emby pipeline movies outer index count"
 assert_eq "1" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_dshadow_emby_latest_movies_puk_dc_cover';")" "Emby pipeline movies inner index count"
 assert_eq "0" "$("$real_sqlite" "$emby" "SELECT COUNT(*) FROM sqlite_master WHERE type='index' AND name='idx_MediaItems47b2';")" "Emby pipeline native movies index absent"
 assert_eqp_uses_emby_index "$(mediaitems_eqp "$emby")" "Emby pipeline"
 assert_eqp_uses_latest_index "$(latest_eqp "$emby")" "Emby pipeline"
+assert_episodes_two_index_eqp "$(episodes_two_index_eqp "$emby")" "Emby pipeline"
 assert_movies_c2_eqp "$(movies_c2_eqp "$emby")" "Emby pipeline"
 assert_movies_vendor_eqp "$emby_vendor_eqp_before" "Emby pipeline before indexes"
 assert_movies_vendor_eqp "$(movies_vendor_eqp "$emby")" "Emby pipeline after indexes"

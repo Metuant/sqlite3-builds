@@ -98,10 +98,13 @@ The strict Emby dashboard identity gate has two canary limitations:
   nondeterminism in the vendor query, not a rewrite divergence.
 - Unexercised-divergence pass: a derived cell can contain only singleton groups.
   An identity pass then does not exercise representative selection, including
-  the movies MIN-to-MAX Latest semantic divergence. The authoritative gate for
-  that divergence is the CI smoke fixtures under
-  `tests/fixtures/emby-fts-rewrite/`, including
-  `latest-movies-played-limit12.expected.sql`.
+  Episodes equal-date lower-`Id` selection or the movies MIN-to-MAX Latest
+  semantic divergence. Episodes and movies can also choose a different group
+  subset when maximum dates tie at the LIMIT boundary. The authoritative gate
+  is `tests/emby_fts_rewrite_smoke.c`: its Episodes semantic fixture exercises
+  equal-date and all-NULL ties at both statistics states, while the movies
+  fixture and `tests/fixtures/emby-fts-rewrite/latest-movies-played-limit12.expected.sql`
+  cover the sibling candidate.
 
 ## Bound Parameters And RAW Prepare Form
 

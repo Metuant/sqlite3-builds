@@ -153,6 +153,204 @@ require_range_order() {
   ' "$file" || fail "$label gate order invalid in $file"
 }
 
+c_string_define_value() {
+  emby_contract_define_symbol="$1"
+  awk -v symbol="$emby_contract_define_symbol" '
+    $1 == "#define" && $2 == symbol {
+      if (match($0, /"[^"]*"$/)) {
+        print substr($0, RSTART + 1, RLENGTH - 2)
+        found++
+      }
+    }
+    END { exit(found == 1 ? 0 : 1) }
+  ' src/emby_fts_rewrite.c
+}
+
+c_index_definition_value() {
+  emby_readiness_definition_symbol="$1"
+  emby_readiness_name_symbol="$2"
+  emby_readiness_index_name="$3"
+  awk -v definition_symbol="$emby_readiness_definition_symbol" \
+      -v name_symbol="$emby_readiness_name_symbol" \
+      -v index_name="$emby_readiness_index_name" '
+    $1 == "#define" && $2 == definition_symbol {
+      active = 1
+      found++
+      next
+    }
+    active {
+      line = $0
+      gsub(name_symbol, "\"" index_name "\"", line)
+      while (match(line, /"[^"]*"/)) {
+        printf "%s", substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+      if ($0 !~ /\\[[:space:]]*$/) active = 0
+    }
+    END { exit(found == 1 && !active ? 0 : 1) }
+  ' src/emby_fts_rewrite.c
+}
+
+emby_production_index_ddl() {
+  emby_readiness_index_name="$1"
+  awk -v index_name="$emby_readiness_index_name" '
+    $0 == "    _EMBY_INDEXES=(" {
+      active = 1
+      array_count++
+      next
+    }
+    active && /^[[:space:]]*\)/ {
+      active = 0
+      next
+    }
+    active && /^[[:space:]]*"CREATE (UNIQUE )?INDEX / {
+      line = $0
+      sub(/^[[:space:]]*"/, "", line)
+      sub(/"[[:space:]]*$/, "", line)
+      if (index(line, " " index_name " ") != 0) {
+        print line
+        found++
+      }
+    }
+    END { exit(array_count == 1 && found == 1 ? 0 : 1) }
+  ' scripts/optimize_media_servers.sh
+}
+
+emby_sqlite_master_index_definition() {
+  emby_readiness_production_ddl="$1"
+  printf '%s\n%s\n%s\n' \
+    'CREATE TABLE MediaItems (SeriesPresentationUniqueKey, PresentationUniqueKey, DateCreated, Id, UserDataKeyId, Type);' \
+    "$emby_readiness_production_ddl" \
+    "SELECT sql FROM sqlite_master WHERE type='index';" \
+    | sqlite3 -batch -noheader :memory:
+}
+
+canonicalize_emby_production_index_ddl() {
+  sed -E \
+    -e 's/^CREATE ((UNIQUE )?INDEX) IF NOT EXISTS /CREATE \1 /' \
+    -e 's/;$//'
+}
+
+check_emby_readiness_index_definition() {
+  emby_readiness_name_symbol="$1"
+  emby_readiness_definition_symbol="$2"
+
+  if ! emby_readiness_index_name="$(c_string_define_value "$emby_readiness_name_symbol")"; then
+    fail "Emby readiness index name macro missing or ambiguous: $emby_readiness_name_symbol"
+  fi
+  if ! emby_readiness_expected="$(c_index_definition_value \
+    "$emby_readiness_definition_symbol" \
+    "$emby_readiness_name_symbol" \
+    "$emby_readiness_index_name")"; then
+    fail "Emby readiness index definition macro missing or ambiguous for $emby_readiness_index_name: $emby_readiness_definition_symbol"
+  fi
+  if ! emby_readiness_production_ddl="$(emby_production_index_ddl "$emby_readiness_index_name")"; then
+    fail "Emby readiness production DDL missing or ambiguous for index: $emby_readiness_index_name"
+  fi
+
+  if [ "$emby_readiness_sqlite_available" -eq 1 ]; then
+    if ! emby_readiness_actual="$(emby_sqlite_master_index_definition \
+      "$emby_readiness_production_ddl" 2>&1)"; then
+      printf 'production DDL: %s\n' "$emby_readiness_production_ddl" >&2
+      printf 'sqlite3 output: %s\n' "$emby_readiness_actual" >&2
+      fail "Emby readiness production DDL failed SQLite round-trip: $emby_readiness_index_name"
+    fi
+  else
+    emby_readiness_actual="$(printf '%s\n' "$emby_readiness_production_ddl" \
+      | canonicalize_emby_production_index_ddl)"
+  fi
+
+  if [ "$emby_readiness_expected" != "$emby_readiness_actual" ]; then
+    printf 'readiness macro %s: %s\n' \
+      "$emby_readiness_definition_symbol" "$emby_readiness_expected" >&2
+    printf 'production sqlite_master.sql for %s: %s\n' \
+      "$emby_readiness_index_name" "$emby_readiness_actual" >&2
+    fail "Emby readiness index definition drift: $emby_readiness_index_name"
+  fi
+}
+
+check_emby_readiness_index_definitions() {
+  if command -v sqlite3 >/dev/null 2>&1; then
+    emby_readiness_sqlite_available=1
+  else
+    emby_readiness_sqlite_available=0
+    printf '%s\n' \
+      'WARNING: sqlite3 unavailable; checking Emby readiness definitions with strict production-DDL canonicalization' >&2
+  fi
+
+  check_emby_readiness_index_definition \
+    EMBY_LATEST_INDEX_NAME \
+    EMBY_LATEST_INDEX_DEFINITION
+  check_emby_readiness_index_definition \
+    EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME \
+    EMBY_LATEST_EPISODES_DCN_GK_INDEX_DEFINITION
+  check_emby_readiness_index_definition \
+    EMBY_LATEST_MOVIES_INDEX_NAME \
+    EMBY_LATEST_MOVIES_INDEX_DEFINITION
+  check_emby_readiness_index_definition \
+    EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME \
+    EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION
+}
+
+emby_latest_template_value() {
+  emby_contract_template_symbol="$1"
+  emby_contract_gk_name="$2"
+  emby_contract_dcn_name="$3"
+  awk -v symbol="$emby_contract_template_symbol" \
+      -v gk_name="$emby_contract_gk_name" \
+      -v dcn_name="$emby_contract_dcn_name" '
+    $0 ~ "^static const char " symbol "\\[\\] =" {
+      active = 1
+      found++
+    }
+    active {
+      line = $0
+      gsub(/EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME/, "\"" dcn_name "\"", line)
+      gsub(/EMBY_LATEST_INDEX_NAME/, "\"" gk_name "\"", line)
+      while (match(line, /"[^"]*"/)) {
+        printf "%s", substr(line, RSTART + 1, RLENGTH - 2)
+        line = substr(line, RSTART + RLENGTH)
+      }
+      if ($0 ~ /;[[:space:]]*$/) active = 0
+    }
+    END { exit(found == 1 && !active ? 0 : 1) }
+  ' src/emby_fts_rewrite.c
+}
+
+normalize_emby_latest_sql() {
+  tr '\r\n\t' '   ' | sed -E \
+    -e 's/[[:space:]]+/ /g' \
+    -e 's/[[:space:]]*([(),=<>])[[:space:]]*/\1/g' \
+    -e 's/^ //; s/[[:space:]]*;$//; s/ $//'
+}
+
+check_emby_dashboard_latest_sql_contract() {
+  emby_contract_runbook='docs/runbooks/query-measure/families/emby-dashboard.sh'
+  emby_contract_ancestors='100,200'
+  emby_contract_user='42'
+  emby_contract_limit='12'
+  emby_contract_gk_name="$(c_string_define_value EMBY_LATEST_INDEX_NAME)"
+  emby_contract_dcn_name="$(c_string_define_value EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME)"
+  emby_contract_tpl_0="$(emby_latest_template_value EMBY_LATEST_TPL_0 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_tpl_1="$(emby_latest_template_value EMBY_LATEST_TPL_1 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_tpl_2="$(emby_latest_template_value EMBY_LATEST_TPL_2 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_tpl_3="$(emby_latest_template_value EMBY_LATEST_TPL_3 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_tpl_4="$(emby_latest_template_value EMBY_LATEST_TPL_4 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_tpl_5="$(emby_latest_template_value EMBY_LATEST_TPL_5 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_tpl_6="$(emby_latest_template_value EMBY_LATEST_TPL_6 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_tpl_7="$(emby_latest_template_value EMBY_LATEST_TPL_7 "$emby_contract_gk_name" "$emby_contract_dcn_name")"
+  emby_contract_projection="$(bash -c '. "$1"; dashboard_projection episodes-latest' bash "$emby_contract_runbook")"
+  emby_contract_runtime="${emby_contract_tpl_0}${emby_contract_ancestors}${emby_contract_tpl_1}${emby_contract_user}${emby_contract_tpl_2}${emby_contract_ancestors}${emby_contract_tpl_3}${emby_contract_user}${emby_contract_tpl_4}${emby_contract_limit}${emby_contract_tpl_5}${emby_contract_projection}${emby_contract_tpl_6}${emby_contract_user}${emby_contract_tpl_7}${emby_contract_limit}"
+  emby_contract_runbook_sql="$(bash -c '. "$1"; DASHBOARD_ANCESTORS=$2; DASHBOARD_USER_ID=$3; family_render episodes-latest candidate' bash "$emby_contract_runbook" "$emby_contract_ancestors" "$emby_contract_user")"
+  emby_contract_runtime_normalized="$(printf '%s' "$emby_contract_runtime" | normalize_emby_latest_sql)"
+  emby_contract_runbook_normalized="$(printf '%s' "$emby_contract_runbook_sql" | normalize_emby_latest_sql)"
+  if [ "$emby_contract_runtime_normalized" != "$emby_contract_runbook_normalized" ]; then
+    printf 'runtime Latest SQL: %s\n' "$emby_contract_runtime_normalized" >&2
+    printf 'runbook Latest SQL: %s\n' "$emby_contract_runbook_normalized" >&2
+    fail 'Emby Episodes Latest runbook SQL diverged from runtime templates'
+  fi
+}
+
 legacy_scalar_keys() {
   printf '%s_%s_%s\n' PLEX IMAGE TAG
   printf '%s_%s_%s\n' EMBY IMAGE TAG
@@ -509,6 +707,7 @@ require_line docker-library/Dockerfile 'ARG SQLITE_SOURCE_ID'
 require_line docker-library/Dockerfile '    SQLITE_SOURCE_ID="$SQLITE_SOURCE_ID" \'
 
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type = 8;"'
+require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_episodes_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8;"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_guid_nocase ON metadata_items (guid COLLATE NOCASE);"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_item_views_account_grandparent_guid ON metadata_item_views (account_id, grandparent_guid);"'
@@ -516,16 +715,33 @@ require_line scripts/optimize_media_servers.sh '        "idx_dshadow_taggings_ta
 require_line scripts/optimize_media_servers.sh '        "idx_dshadow_metadata_items_guid_nocase"'
 require_line scripts/optimize_media_servers.sh '        "idx_dshadow_metadata_item_views_account_grandparent_guid"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_INDEX_NAME "idx_dshadow_emby_latest_gk_dc"'
+require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME "idx_dshadow_emby_latest_episodes_dcn_gk"'
+require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_INDEX_DEFINITION \\"
+require_line src/emby_fts_rewrite.c '    " ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type = 8"'
+require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_EPISODES_DCN_GK_INDEX_DEFINITION \\"
+require_line src/emby_fts_rewrite.c '    " ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8"'
 require_line src/emby_fts_rewrite.c "        \"AND name='\" EMBY_LATEST_INDEX_NAME \"' \""
-require_line src/emby_fts_rewrite.c '    "WITH keys(gk) AS MATERIALIZED (SELECT DISTINCT coalesce(A0.SeriesPresentationUniqueKey, A0.PresentationUniqueKey) FROM (SELECT DISTINCT itemid FROM AncestorIds2 WHERE AncestorId IN (";'
+require_line src/emby_fts_rewrite.c "        \"AND name='\" EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME \"' \""
+require_line src/emby_fts_rewrite.c '        "AND sql='\''" EMBY_LATEST_INDEX_DEFINITION "'\'') "'
+require_line src/emby_fts_rewrite.c '        "AND sql='\''" EMBY_LATEST_EPISODES_DCN_GK_INDEX_DEFINITION "'\'')";'
+require_line src/emby_fts_rewrite.c '    "WITH ranked(id, dc, gk) AS MATERIALIZED ("'
+require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME " "'
+require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_INDEX_NAME " "'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_dcn_puk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5;"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_puk_dc_cover ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5;"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MOVIES_INDEX_NAME "idx_dshadow_emby_latest_movies_dcn_puk"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME "idx_dshadow_emby_latest_movies_puk_dc_cover"'
+require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_MOVIES_INDEX_DEFINITION \\"
+require_line src/emby_fts_rewrite.c '    " ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5"'
+require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION \\"
+require_line src/emby_fts_rewrite.c '    " ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5"'
 require_line src/emby_fts_rewrite.c "        \"AND name='\" EMBY_LATEST_MOVIES_INDEX_NAME \"' \""
 require_line src/emby_fts_rewrite.c "        \"AND name='\" EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME \"' \""
+require_line src/emby_fts_rewrite.c '        "AND sql='\''" EMBY_LATEST_MOVIES_INDEX_DEFINITION "'\'') "'
+require_line src/emby_fts_rewrite.c '        "AND sql='\''" EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION "'\'')";'
 require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EMBY_LATEST_MOVIES_INDEX_NAME " "'
 require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME " "'
+check_emby_readiness_index_definitions
 require_line src/plex_fts_rewrite.c '#define PLEX_TAG_INDEX_NAME "idx_dshadow_taggings_tag_id_metadata_item_id"'
 require_line src/plex_fts_rewrite.c '#define PLEX_ONDECK_INDEX_NAME "idx_dshadow_metadata_item_views_account_grandparent_guid"'
 require_line src/rewrite_modes.h '#define OBS_REWRITE_MODE_CATALOG(X) \'
@@ -635,6 +851,30 @@ require_range_token_count src/emby_fts_rewrite.c \
   'static emby_match_result emby_match_movies_latest(' \
   OBS_MODE_EMBY_EPISODES_LATEST 11 \
   'Emby Episodes Latest producer manifest'
+require_range_order src/emby_fts_rewrite.c \
+  '    pieces[0].lit = EMBY_LATEST_TPL_0;' \
+  '    pieces[4].lit = EMBY_LATEST_TPL_4;' \
+  'Emby Episodes Latest runtime assembly first half' \
+  '    pieces[0].lit = EMBY_LATEST_TPL_0;' \
+  '    pieces[0].slot = &l1;' \
+  '    pieces[1].lit = EMBY_LATEST_TPL_1;' \
+  '    pieces[1].slot = &user_id;' \
+  '    pieces[2].lit = EMBY_LATEST_TPL_2;' \
+  '    pieces[2].slot = &l1;' \
+  '    pieces[3].lit = EMBY_LATEST_TPL_3;' \
+  '    pieces[3].slot = &user_id;'
+require_range_order src/emby_fts_rewrite.c \
+  '    pieces[4].lit = EMBY_LATEST_TPL_4;' \
+  '    candidate->mode = OBS_MODE_EMBY_EPISODES_LATEST;' \
+  'Emby Episodes Latest runtime assembly second half' \
+  '    pieces[4].lit = EMBY_LATEST_TPL_4;' \
+  '    pieces[4].slot = &limit_slot;' \
+  '    pieces[5].lit = EMBY_LATEST_TPL_5;' \
+  '    pieces[5].slot = &projection;' \
+  '    pieces[6].lit = EMBY_LATEST_TPL_6;' \
+  '    pieces[6].slot = &user_id;' \
+  '    pieces[7].lit = EMBY_LATEST_TPL_7;' \
+  '    pieces[7].slot = &limit_slot;'
 require_range_token_count src/emby_fts_rewrite.c \
   'static emby_match_result emby_match_movies_latest(' \
   'static char *emby_build_rewritten_sql(' OBS_MODE_EMBY_MOVIES_LATEST 11 \
@@ -716,6 +956,7 @@ require_line docs/runbooks/query-measure/families/emby-search.sh '  grep -Fx '\'
 require_line docs/runbooks/query-measure/families/emby-search.sh '  grep -Fx '\''    X(EMBY_LINKS_SEARCH, "emby", "fanout+links_search", "emby_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby links-search mode catalogue contract drifted'\'''
 require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby Episodes Latest mode catalogue contract drifted'\'''
 require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby movies Latest mode catalogue contract drifted'\'''
+check_emby_dashboard_latest_sql_contract
 reject_line docs/runbooks/query-measure/families/plex-guid-like.sh '  grep -F '\''#define PLEX_MODE_GUID_LIKE "guid+like-null"'\'' "$source" >/dev/null || die '\''Plex GUID LIKE mode source contract drifted'\'''
 reject_pattern docs/runbooks/query-measure/families/emby-fanout.sh 'for _mode in.*fanout[+]resume'
 reject_pattern docs/runbooks/query-measure/families/emby-search.sh 'for _mode in.*fanout[+]people'

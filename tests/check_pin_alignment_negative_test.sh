@@ -494,6 +494,37 @@ PY
       ' "$scratch/CLAUDE.md" > "$scratch/CLAUDE.md.tmp"
       mv "$scratch/CLAUDE.md.tmp" "$scratch/CLAUDE.md"
       ;;
+    emby-readiness-definition-prefix-drift)
+      python3 - "$scratch/src/emby_fts_rewrite.c" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '    "CREATE INDEX " EMBY_LATEST_MOVIES_INDEX_NAME \\\n'
+new = '    "CREATE UNIQUE INDEX " EMBY_LATEST_MOVIES_INDEX_NAME \\\n'
+if text.count(old) != 1:
+    raise SystemExit("Emby movies readiness definition prefix fixture missing")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    emby-readiness-production-ddl-drift)
+      python3 - \
+        "$scratch/scripts/optimize_media_servers.sh" \
+        "$scratch/tests/check_pin_alignment.sh" <<'PY'
+from pathlib import Path
+import sys
+
+old = "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_episodes_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8;"
+new = "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_episodes_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated ASC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8;"
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    text = path.read_text()
+    if text.count(old) != 1:
+        raise SystemExit(f"Emby Episodes production DDL fixture missing from {path}")
+    path.write_text(text.replace(old, new, 1))
+PY
+      ;;
     source-id-pin-format)
       python3 - "$scratch/pins/versions.env" <<'PY'
 from pathlib import Path
@@ -614,5 +645,9 @@ assert_fails_with rewrite-abi-mode-header-missing \
 assert_fails_with stmt-sampling-source-literal 'STMT trace sampling literal-1 override missing'
 assert_fails_with stmt-sampling-doc-literal 'docs/env-vars.md missing exact line'
 assert_fails_with stmt-sampling-claude-literal 'CLAUDE STMT sampling knob missing from CLAUDE.md'
+assert_fails_with emby-readiness-definition-prefix-drift \
+  'Emby readiness index definition drift: idx_dshadow_emby_latest_movies_dcn_puk'
+assert_fails_with emby-readiness-production-ddl-drift \
+  'Emby readiness index definition drift: idx_dshadow_emby_latest_episodes_dcn_gk'
 
 printf 'negative pin-alignment checks passed\n'
