@@ -3,6 +3,8 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <limits.h>
 
 /* WHY: SQLITE_OMIT_SHARED_CACHE strips sqlite3_enable_shared_cache from the
  * library, but PMS's libpython27.so links against this symbol at load time.
@@ -95,6 +97,39 @@ int auto_extension_path_is_target(const char *raw_fn) {
     return is_target;
 }
 
+/* WHY: Bound the per-connection ANALYZE / PRAGMA optimize sample so an app-side
+ * ANALYZE (for example Plex's post-scan stats refresh) does not hold the write
+ * lock for tens of seconds on a large database. Default 0 preserves the
+ * historical unbounded, full-accuracy behavior. SQLITE3_ANALYSIS_LIMIT set to a
+ * positive unsigned decimal (for example 400, the SQLite-recommended cap) makes
+ * ANALYZE sample rather than full-scan; planning quality stays near-identical
+ * while the pass completes in milliseconds. Unset, empty, signed, non-decimal,
+ * trailing-junk, and overflow values fall back to 0. Planned-downtime
+ * maintenance still runs the full STAT4 ANALYZE at analysis_limit=0. */
+static int auto_extension_analysis_limit(void) {
+    const char *value = getenv("SQLITE3_ANALYSIS_LIMIT");
+    unsigned long long acc = 0;
+    const char *p;
+
+    if (value == NULL || value[0] < '0' || value[0] > '9') {
+        return 0;
+    }
+    for (p = value; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            return 0;
+        }
+        if (acc > ((unsigned long long)INT_MAX / 10ULL)) {
+            return 0;
+        }
+        acc *= 10ULL;
+        if (acc > (unsigned long long)INT_MAX - (unsigned long long)(*p - '0')) {
+            return 0;
+        }
+        acc += (unsigned long long)(*p - '0');
+    }
+    return (int)acc;
+}
+
 static int autopragma_init(
     sqlite3 *db, char **pzErr, const sqlite3_api_routines *pApi
 ) {
@@ -173,8 +208,10 @@ static int autopragma_init(
      * failure path. Runtime optimize is off unless
      * SQLITE3_DISABLE_RUNTIME_OPTIMIZE is explicitly set to "0"; when enabled,
      * it runs only on later safe-idle hooks. Planned downtime maintenance
-     * remains the explicit full ANALYZE lifecycle. analysis_limit=0 stays
-     * explicit so app-side ANALYZE on this connection remains accurate. */
+     * remains the explicit full ANALYZE lifecycle. analysis_limit is applied
+     * below from SQLITE3_ANALYSIS_LIMIT (default 0 = unbounded/full accuracy);
+     * a positive value bounds app-side ANALYZE so a post-scan ANALYZE on a
+     * large database does not hold the write lock for tens of seconds. */
     char *err = NULL;
     int rc;
     g_autopragma_depth++;
@@ -185,14 +222,37 @@ static int autopragma_init(
         "PRAGMA threads=8;"
         "PRAGMA wal_autocheckpoint=16000;"
         "PRAGMA journal_size_limit=67108864;"
-        "PRAGMA busy_timeout=10000;"
-        "PRAGMA analysis_limit=0;",
+        "PRAGMA busy_timeout=10000;",
         NULL, NULL, &err);
     g_autopragma_depth--;
     if (rc != SQLITE_OK) {
         sqlite3_log(rc, "auto_extension: pragma block failed on %s: %s",
                     raw_fn, err ? err : "(no message)");
         sqlite3_free(err);
+    }
+
+    /* analysis_limit: configurable per-connection ANALYZE sample bound. Default
+     * 0 preserves the historical unbounded, full-accuracy behavior; a positive
+     * SQLITE3_ANALYSIS_LIMIT (for example 400) makes an app-side ANALYZE /
+     * PRAGMA optimize sample instead of full-scan, so a post-scan ANALYZE on a
+     * large database does not hold the write lock for tens of seconds. Executed
+     * as its own statement so the effective value is visible in the open-time
+     * trace. */
+    {
+        char analysis_pragma[48];
+        char *analysis_err = NULL;
+        int analysis_rc;
+        (void)snprintf(analysis_pragma, sizeof(analysis_pragma),
+                       "PRAGMA analysis_limit=%d;", auto_extension_analysis_limit());
+        g_autopragma_depth++;
+        analysis_rc = sqlite3_exec(db, analysis_pragma, NULL, NULL, &analysis_err);
+        g_autopragma_depth--;
+        if (analysis_rc != SQLITE_OK) {
+            sqlite3_log(analysis_rc,
+                        "auto_extension: analysis_limit pragma failed on %s: %s",
+                        raw_fn, analysis_err ? analysis_err : "(no message)");
+            sqlite3_free(analysis_err);
+        }
     }
 
     /* WHY: sqlite3_auto_extension propagates non-OK returns into sqlite3_open*;

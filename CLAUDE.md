@@ -70,6 +70,14 @@ Project-specific guidance:
   defaults exact: `PLEX_OPTIMIZE_API=0`. For configured Plex instances,
   `main()` derives internal STAT4 capability state from `GENERIC_SQLITE_BINARY`
   preflight; the Plex main-DB STAT4 pass runs only when that state is `1`.
+- Keep `SQLITE3_ANALYSIS_LIMIT` a numeric tunable: default `0` preserves
+  unbounded/full-accuracy app-side ANALYZE; a positive unsigned decimal (for
+  example `400`) bounds the per-connection `PRAGMA analysis_limit` so app-side
+  ANALYZE / PRAGMA optimize samples instead of full-scanning. Unset, empty,
+  signed, non-decimal, trailing junk, and overflow fall back to `0`. Applied in
+  `src/auto_extension.c` on each target-DB read-write open unless
+  `SQLITE3_DISABLE_AUTOPRAGMA` is literal `1`; planned-downtime maintenance is
+  unaffected and still runs the full STAT4 ANALYZE at `analysis_limit=0`.
 - Keep Plex FTS rewrite opt-out (default-on in the Plex/ICU build): literal
   `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
   other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
