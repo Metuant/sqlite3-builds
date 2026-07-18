@@ -23,6 +23,8 @@
 #define EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME "idx_dshadow_emby_latest_episodes_dcn_gk"
 #define EMBY_LATEST_MOVIES_INDEX_NAME "idx_dshadow_emby_latest_movies_dcn_puk"
 #define EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME "idx_dshadow_emby_latest_movies_puk_dc_cover"
+#define EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME "idx_dshadow_emby_latest_mixed_dcn_gk"
+#define EMBY_LATEST_MIXED_GK_DC_INDEX_NAME "idx_dshadow_emby_latest_mixed_gk_dc"
 #define EMBY_LATEST_INDEX_DEFINITION \
     "CREATE INDEX " EMBY_LATEST_INDEX_NAME \
     " ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type = 8"
@@ -35,6 +37,12 @@
 #define EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION \
     "CREATE INDEX " EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME \
     " ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5"
+#define EMBY_LATEST_MIXED_DCN_GK_INDEX_DEFINITION \
+    "CREATE INDEX " EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME \
+    " ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type IN (8,5)"
+#define EMBY_LATEST_MIXED_GK_DC_INDEX_DEFINITION \
+    "CREATE INDEX " EMBY_LATEST_MIXED_GK_DC_INDEX_NAME \
+    " ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type IN (8,5)"
 typedef struct emby_span {
     size_t start;
     size_t end;
@@ -527,6 +535,47 @@ static emby_latest_index_state emby_latest_movies_indexes_ready(sqlite3 *db) {
     return ready ? EMBY_LATEST_INDEX_PRESENT : EMBY_LATEST_INDEX_MISSING;
 }
 
+static emby_latest_index_state emby_latest_mixed_indexes_ready(sqlite3 *db) {
+    static const char probe_sql[] =
+        "SELECT 1 WHERE "
+        "EXISTS (SELECT 1 FROM sqlite_master "
+        "WHERE type='index' "
+        "AND name='" EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME "' "
+        "AND tbl_name='MediaItems' COLLATE NOCASE "
+        "AND sql='" EMBY_LATEST_MIXED_DCN_GK_INDEX_DEFINITION "') "
+        "AND EXISTS (SELECT 1 FROM sqlite_master "
+        "WHERE type='index' "
+        "AND name='" EMBY_LATEST_MIXED_GK_DC_INDEX_NAME "' "
+        "AND tbl_name='MediaItems' COLLATE NOCASE "
+        "AND sql='" EMBY_LATEST_MIXED_GK_DC_INDEX_DEFINITION "')";
+    sqlite3_stmt *stmt = NULL;
+    const char *tail = NULL;
+    int rc;
+    int step_rc;
+    int final_rc;
+    int ready = 0;
+
+    rc = sqlite3_prepare_v2_real(db, probe_sql, -1, &stmt, &tail);
+    if (rc != SQLITE_OK) {
+        if (stmt) sqlite3_finalize(stmt);
+        return EMBY_LATEST_INDEX_PROBE_ERROR;
+    }
+    if (!tail || tail != probe_sql + strlen(probe_sql)) {
+        sqlite3_finalize(stmt);
+        return EMBY_LATEST_INDEX_PROBE_ERROR;
+    }
+    step_rc = sqlite3_step(stmt);
+    if (step_rc == SQLITE_ROW) {
+        ready = 1;
+    } else if (step_rc != SQLITE_DONE) {
+        sqlite3_finalize(stmt);
+        return EMBY_LATEST_INDEX_PROBE_ERROR;
+    }
+    final_rc = sqlite3_finalize(stmt);
+    if (final_rc != SQLITE_OK) return EMBY_LATEST_INDEX_PROBE_ERROR;
+    return ready ? EMBY_LATEST_INDEX_PRESENT : EMBY_LATEST_INDEX_MISSING;
+}
+
 static int capture_membership_slots(const char *sql, size_t len, emby_slots *slots) {
     static const char pre_l1[] =
         "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (";
@@ -831,6 +880,7 @@ static const char EMBY_GUARD_PLAYLISTS[] = "ListItemsExemptionForPlaylists";
 
 static const char EMBY_TYPE_EPISODES_LATEST[] = "where A.Type=8 ";
 static const char EMBY_TYPE_MOVIES_LATEST[] = "where A.Type=5 ";
+static const char EMBY_TYPE_MIXED_LATEST[] = "where A.Type in (8,5) ";
 static const char EMBY_ANCHOR_LATEST_SELECT[] = ") )select ";
 static const char EMBY_ANCHOR_LATEST_SELECT_SCALAR[] = ")select ";
 static const char EMBY_ANCHOR_LATEST_FROM[] =
@@ -839,6 +889,10 @@ static const char EMBY_ANCHOR_LATEST_TAIL[] =
     "where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT";
 static const char EMBY_ANCHOR_MOVIES_LATEST_TAIL[] =
     "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT";
+static const char EMBY_ANCHOR_MIXED_LATEST_TAIL[] =
+    "where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT";
+static const char EMBY_MIXED_LATEST_PROJECTION[] =
+    "A.type,A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ";
 /* Correctness relies on Emby's UserDatas PK uniqueness on (UserDataKeyId, UserId). */
 static const char EMBY_LATEST_TPL_0[] =
     "WITH ranked(id, dc, gk) AS MATERIALIZED ("
@@ -888,6 +942,26 @@ static const char EMBY_MOVIES_LATEST_TPL_6[] =
 static const char EMBY_MOVIES_LATEST_TPL_7[] =
     " ORDER BY (R.dc IS NULL) ASC, R.dc DESC, R.puk ASC LIMIT ";
 
+static const char EMBY_MIXED_LATEST_TPL_0[] =
+    "WITH mixed_latest_args(user_id, row_limit) AS MATERIALIZED ( VALUES (";
+static const char EMBY_MIXED_LATEST_TPL_1[] =
+    ", ";
+static const char EMBY_MIXED_LATEST_TPL_2[] =
+    ") ), ranked(id, dc, gk) AS MATERIALIZED ("
+    "  SELECT A.Id, A.DateCreated, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) "
+    "  FROM MediaItems AS A INDEXED BY " EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME " "
+    "  CROSS JOIN mixed_latest_args AS Args "
+    "  WHERE A.Type IN (8,5) AND EXISTS ( SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A.Id AND X.AncestorId IN (";
+static const char EMBY_MIXED_LATEST_TPL_3[] =
+    ") ) AND NOT EXISTS ( SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId = A.UserDataKeyId AND U0.UserId = Args.user_id AND U0.played <> 0 ) AND NOT EXISTS ("
+    "      SELECT 1 "
+    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_MIXED_GK_DC_INDEX_NAME " "
+    "      WHERE B.Type IN (8,5) AND coalesce(B.SeriesPresentationUniqueKey, B.PresentationUniqueKey) IS coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) AND ( (B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated > A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id < A.Id) ) AND EXISTS ( SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId = B.Id AND XB.AncestorId IN (";
+static const char EMBY_MIXED_LATEST_TPL_4[] =
+    ") ) AND NOT EXISTS ( SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId = B.UserDataKeyId AND UB.UserId = Args.user_id AND UB.played <> 0 ) ) ORDER BY (A.DateCreated IS NULL) ASC, A.DateCreated DESC, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ASC LIMIT (SELECT row_limit FROM mixed_latest_args) ) SELECT ";
+static const char EMBY_MIXED_LATEST_TPL_5[] =
+    "FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id CROSS JOIN mixed_latest_args AS Args LEFT JOIN UserDatas ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = Args.user_id ORDER BY (R.dc IS NULL) ASC, R.dc DESC, R.gk ASC LIMIT (SELECT row_limit FROM mixed_latest_args)";
+
 typedef enum emby_match_result {
     EMBY_MATCH_MISS = 0,
     EMBY_MATCH_BUILT,
@@ -899,6 +973,8 @@ typedef struct emby_rewrite_candidate {
     size_t scan_out_len;
     size_t rewrite_len;
     obs_rewrite_mode mode;
+    int expected_bind_count;
+    int require_mixed_acceptance;
 } emby_rewrite_candidate;
 
 static int emby_find_bytes_after(
@@ -991,6 +1067,79 @@ static int emby_parse_trailing_integer(
     slot->start = tok.start;
     slot->end = tok.end;
     return emby_validate_integer_slot(sql, slot);
+}
+
+static int emby_span_is_parameter_token(
+    const char *sql,
+    size_t len,
+    const emby_span *span
+) {
+    fts_lex lx;
+    fts_lex_token tok;
+    fts_lex_token eof_tok;
+
+    if (span->start >= span->end || span->end > len) return 0;
+    fts_lex_init(&lx, sql, span->end, FTS_LEX_PARAM_SQLITE_VARIABLE);
+    lx.pos = span->start;
+    tok = fts_lex_next_token(&lx);
+    if (tok.type != FTS_LEX_TOK_PARAM || tok.start != span->start ||
+        tok.end != span->end) {
+        return 0;
+    }
+    eof_tok = fts_lex_next_token(&lx);
+    return eof_tok.type == FTS_LEX_TOK_EOF;
+}
+
+static int emby_parse_trailing_integer_or_parameter(
+    const char *sql,
+    size_t len,
+    size_t start,
+    emby_span *slot
+) {
+    fts_lex lx;
+    fts_lex_token tok;
+    fts_lex_token eof_tok;
+
+    if (start > len) return 0;
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_SQLITE_VARIABLE);
+    lx.pos = start;
+    tok = fts_lex_next_token(&lx);
+    if (tok.type != FTS_LEX_TOK_NUMBER && tok.type != FTS_LEX_TOK_PARAM) return 0;
+    eof_tok = fts_lex_next_token(&lx);
+    if (eof_tok.type != FTS_LEX_TOK_EOF) return 0;
+    slot->start = tok.start;
+    slot->end = tok.end;
+    return tok.type == FTS_LEX_TOK_PARAM || emby_validate_integer_slot(sql, slot);
+}
+
+static int emby_mixed_bind_slots_valid(
+    const char *sql,
+    size_t len,
+    const emby_span *user_slot,
+    const emby_span *limit_slot,
+    int *bind_count
+) {
+    fts_lex lx;
+    int count = 0;
+
+    fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_SQLITE_VARIABLE);
+    for (;;) {
+        fts_lex_token tok = fts_lex_next_token(&lx);
+        int user_match;
+        int limit_match;
+        if (tok.type == FTS_LEX_TOK_ERROR) return 0;
+        if (tok.type == FTS_LEX_TOK_EOF) break;
+        if (tok.type != FTS_LEX_TOK_PARAM) continue;
+        user_match = tok.start == user_slot->start && tok.end == user_slot->end;
+        limit_match = tok.start == limit_slot->start && tok.end == limit_slot->end;
+        if ((!user_match && !limit_match) || tok.end != tok.start + 1 ||
+            sql[tok.start] != '?') {
+            return 0;
+        }
+        count++;
+    }
+    *bind_count = count;
+    return 1;
 }
 
 static int emby_span_has_byte(const char *sql, const emby_span *span, char c) {
@@ -1144,7 +1293,7 @@ static int emby_capture_literal_user_id_after(
     return emby_validate_integer_slot(sql, slot);
 }
 
-static char *emby_build_resume_conjunct(
+static char *emby_build_complex_resume_watched_progress_conjunct(
     const char *sql,
     const emby_span *user_id,
     size_t *out_len
@@ -1176,13 +1325,13 @@ static emby_match_result emby_build_resume_candidate(
     const emby_span *user_id,
     emby_rewrite_candidate *candidate
 ) {
-    size_t repl_len = 0;
-    size_t conjunct_len = 0;
+    size_t ancestor_exists_splice_len = 0;
+    size_t watched_progress_conjunct_len = 0;
     size_t old_len;
     size_t out_len;
     size_t limit;
-    char *repl = NULL;
-    char *conjunct = NULL;
+    char *ancestor_exists_splice = NULL;
+    char *watched_progress_conjunct = NULL;
     char *buf = NULL;
     char *p;
 
@@ -1191,14 +1340,20 @@ static emby_match_result emby_build_resume_candidate(
         insert_before.start > scan_len || target.end > insert_before.start) {
         return EMBY_MATCH_BUILD_FAILED;
     }
-    repl = build_exists_arms_for_family(zSql, slots, arms, arm_count, 0, &repl_len);
-    conjunct = emby_build_resume_conjunct(zSql, user_id, &conjunct_len);
-    if (!repl || !conjunct) goto fail;
+    ancestor_exists_splice = build_exists_arms_for_family(
+        zSql, slots, arms, arm_count, 0, &ancestor_exists_splice_len
+    );
+    watched_progress_conjunct =
+        emby_build_complex_resume_watched_progress_conjunct(
+            zSql, user_id, &watched_progress_conjunct_len
+        );
+    if (!ancestor_exists_splice || !watched_progress_conjunct) goto fail;
 
     old_len = target.end - target.start;
     if (bounded_len < old_len) goto fail;
     out_len = bounded_len - old_len;
-    if (!add_size(&out_len, repl_len) || !add_size(&out_len, conjunct_len)) goto fail;
+    if (!add_size(&out_len, ancestor_exists_splice_len) ||
+        !add_size(&out_len, watched_progress_conjunct_len)) goto fail;
     limit = (size_t)sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1);
     if (out_len > limit || out_len > (size_t)INT_MAX) goto fail;
 
@@ -1206,22 +1361,23 @@ static emby_match_result emby_build_resume_candidate(
     if (!buf) goto fail;
     p = buf;
     append_bytes(&p, zSql, target.start);
-    append_bytes(&p, repl, repl_len);
+    append_bytes(&p, ancestor_exists_splice, ancestor_exists_splice_len);
     append_bytes(&p, zSql + target.end, insert_before.start - target.end);
-    append_bytes(&p, conjunct, conjunct_len);
+    append_bytes(&p, watched_progress_conjunct, watched_progress_conjunct_len);
     append_bytes(&p, zSql + insert_before.start, bounded_len - insert_before.start);
     buf[out_len] = 0;
 
     candidate->sql = buf;
-    candidate->scan_out_len = scan_len - old_len + repl_len + conjunct_len;
+    candidate->scan_out_len = scan_len - old_len + ancestor_exists_splice_len +
+                              watched_progress_conjunct_len;
     candidate->rewrite_len = out_len;
-    free(repl);
-    free(conjunct);
+    free(ancestor_exists_splice);
+    free(watched_progress_conjunct);
     return EMBY_MATCH_BUILT;
 
 fail:
-    free(repl);
-    free(conjunct);
+    free(ancestor_exists_splice);
+    free(watched_progress_conjunct);
     free(buf);
     return EMBY_MATCH_BUILD_FAILED;
 }
@@ -1949,6 +2105,172 @@ static emby_match_result emby_match_movies_latest(
     return EMBY_MATCH_BUILT;
 }
 
+static emby_match_result emby_match_mixed_latest(
+    sqlite3 *db,
+    const char *zSql,
+    size_t scan_len,
+    emby_rewrite_candidate *candidate
+) {
+    emby_span type_gate;
+    emby_span list_anchor;
+    emby_span select_anchor;
+    emby_span from_anchor;
+    emby_span tail_anchor;
+    emby_span ancestors;
+    emby_span projection;
+    emby_span user_id;
+    emby_span limit_slot;
+    emby_piece pieces[6];
+    emby_latest_index_state index_state;
+    const char *sub_reason;
+    size_t limit;
+    size_t projection_len;
+    int bind_count = 0;
+    int user_is_parameter;
+    int limit_is_parameter;
+
+    if (!find_unique_token_after(zSql, scan_len, 0, EMBY_TYPE_MIXED_LATEST, &type_gate)) {
+        return EMBY_MATCH_MISS;
+    }
+    if (emby_token_present(zSql, scan_len, "over") ||
+        emby_sql_has_bytes(zSql, scan_len, "LastWatchedEpisodes") ||
+        emby_sql_has_bytes(zSql, scan_len, "IsFavorite=1") ||
+        emby_sql_has_bytes(zSql, scan_len, "PremiereDate>=") ||
+        emby_sql_has_bytes(zSql, scan_len, "COLLATE NATURALSORT") ||
+        emby_sql_has_bytes(zSql, scan_len, "ORDER BY RANDOM()") ||
+        emby_token_present(zSql, scan_len, "OFFSET")) {
+        return EMBY_MATCH_MISS;
+    }
+    sub_reason = "prefix";
+    if (count_tokens_after(zSql, scan_len, 0, EMBY_ANCHOR_PRE_L1, &list_anchor) != 1 ||
+        !emby_find_latest_ancestor_slot(
+            zSql, scan_len, &ancestors, &select_anchor, &sub_reason
+        )) {
+        obs_miss_reason reason = OBS_MISS_CAPTURE;
+        if (strcmp(sub_reason, "ancestor_slot") == 0 &&
+            emby_statement_has_bind_parameter(zSql, scan_len)) {
+            reason = OBS_MISS_OUT_OF_SCOPE;
+            sub_reason = "bind";
+        }
+        return emby_capture_miss(
+            db, 1, reason,
+            OBS_MODE_EMBY_MIXED_LATEST, sub_reason, zSql, scan_len
+        );
+    }
+    if (!find_unique_token_after(
+            zSql, scan_len, select_anchor.end, EMBY_ANCHOR_LATEST_FROM, &from_anchor
+        )) {
+        return emby_capture_miss(
+            db, 1, OBS_MISS_CAPTURE,
+            OBS_MODE_EMBY_MIXED_LATEST, "from_anchor", zSql, scan_len
+        );
+    }
+    projection.start = select_anchor.end;
+    projection.end = from_anchor.start;
+    projection_len = projection.end - projection.start;
+    if (projection.end <= projection.start ||
+        projection_len != sizeof(EMBY_MIXED_LATEST_PROJECTION) - 1 ||
+        memcmp(zSql + projection.start, EMBY_MIXED_LATEST_PROJECTION,
+               sizeof(EMBY_MIXED_LATEST_PROJECTION) - 1) != 0) {
+        obs_miss_reason reason = OBS_MISS_CAPTURE;
+        const char *projection_reason = "projection";
+        if (projection.end > projection.start &&
+            emby_statement_has_bind_parameter(
+                zSql + projection.start, projection_len
+            )) {
+            reason = OBS_MISS_OUT_OF_SCOPE;
+            projection_reason = "bind";
+        }
+        return emby_capture_miss(
+            db, 1, reason,
+            OBS_MODE_EMBY_MIXED_LATEST, projection_reason, zSql, scan_len
+        );
+    }
+    if (!find_unique_token_after(
+            zSql, scan_len, from_anchor.end, EMBY_ANCHOR_MIXED_LATEST_TAIL,
+            &tail_anchor
+        )) {
+        return emby_capture_miss(
+            db, 1, OBS_MISS_CAPTURE,
+            OBS_MODE_EMBY_MIXED_LATEST, "tail_anchor", zSql, scan_len
+        );
+    }
+    user_id.start = from_anchor.end;
+    user_id.end = tail_anchor.start;
+    emby_span_rtrim(zSql, &user_id);
+    user_is_parameter = emby_span_is_parameter_token(zSql, scan_len, &user_id);
+    if (!emby_validate_integer_slot(zSql, &user_id) && !user_is_parameter) {
+        return emby_capture_miss(
+            db, 1, OBS_MISS_CAPTURE,
+            OBS_MODE_EMBY_MIXED_LATEST, "user_slot", zSql, scan_len
+        );
+    }
+    if (!emby_parse_trailing_integer_or_parameter(
+            zSql, scan_len, tail_anchor.end, &limit_slot
+        )) {
+        return emby_capture_miss(
+            db, 1, OBS_MISS_CAPTURE,
+            OBS_MODE_EMBY_MIXED_LATEST, "limit", zSql, scan_len
+        );
+    }
+    limit_is_parameter = emby_span_is_parameter_token(zSql, scan_len, &limit_slot);
+    if (!limit_is_parameter &&
+        (limit_slot.end - limit_slot.start != 1 || zSql[limit_slot.start] != '3')) {
+        return emby_capture_miss(
+            db, 1, OBS_MISS_OUT_OF_SCOPE,
+            OBS_MODE_EMBY_MIXED_LATEST, "limit_unsupported", zSql, scan_len
+        );
+    }
+    if (!emby_mixed_bind_slots_valid(
+            zSql, scan_len, &user_id, &limit_slot, &bind_count
+        )) {
+        return emby_capture_miss(
+            db, 1, OBS_MISS_OUT_OF_SCOPE,
+            OBS_MODE_EMBY_MIXED_LATEST, "bind", zSql, scan_len
+        );
+    }
+    index_state = emby_latest_mixed_indexes_ready(db);
+    if (index_state != EMBY_LATEST_INDEX_PRESENT) {
+        if (index_state == EMBY_LATEST_INDEX_MISSING) {
+            obs_log_index_missing(db, OBS_MODE_EMBY_MIXED_LATEST);
+        } else {
+            obs_log_rewrite_skipped(
+                db, "index_probe_error", OBS_MODE_EMBY_MIXED_LATEST
+            );
+        }
+        return EMBY_MATCH_MISS;
+    }
+
+    candidate->mode = OBS_MODE_EMBY_MIXED_LATEST;
+    candidate->expected_bind_count = bind_count;
+    candidate->require_mixed_acceptance = 1;
+    pieces[0].lit = EMBY_MIXED_LATEST_TPL_0;
+    pieces[0].slot = &user_id;
+    pieces[1].lit = EMBY_MIXED_LATEST_TPL_1;
+    pieces[1].slot = &limit_slot;
+    pieces[2].lit = EMBY_MIXED_LATEST_TPL_2;
+    pieces[2].slot = &ancestors;
+    pieces[3].lit = EMBY_MIXED_LATEST_TPL_3;
+    pieces[3].slot = &ancestors;
+    pieces[4].lit = EMBY_MIXED_LATEST_TPL_4;
+    pieces[4].slot = &projection;
+    pieces[5].lit = EMBY_MIXED_LATEST_TPL_5;
+    pieces[5].slot = NULL;
+    candidate->sql = emby_build_pieces(
+        zSql, pieces, sizeof(pieces) / sizeof(pieces[0]),
+        &candidate->rewrite_len
+    );
+    if (!candidate->sql) return EMBY_MATCH_BUILD_FAILED;
+    limit = (size_t)sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1);
+    if (candidate->rewrite_len > limit || candidate->rewrite_len > (size_t)INT_MAX) {
+        free(candidate->sql);
+        candidate->sql = NULL;
+        return EMBY_MATCH_BUILD_FAILED;
+    }
+    candidate->scan_out_len = candidate->rewrite_len;
+    return EMBY_MATCH_BUILT;
+}
+
 static char *emby_build_rewritten_sql(
     sqlite3 *db,
     const char *zSql,
@@ -2041,6 +2363,66 @@ static int emby_map_end_tail(
     return 1;
 }
 
+typedef enum emby_candidate_acceptance {
+    EMBY_CANDIDATE_ACCEPTED = 0,
+    EMBY_CANDIDATE_BIND_MISMATCH,
+    EMBY_CANDIDATE_COLUMN_MISMATCH,
+    EMBY_CANDIDATE_INDEX_MISMATCH
+} emby_candidate_acceptance;
+
+static int emby_count_bytes(const char *text, const char *needle) {
+    int count = 0;
+    size_t needle_len = strlen(needle);
+    const char *p = text;
+
+    if (needle_len == 0) return 0;
+    while ((p = strstr(p, needle)) != NULL) {
+        count++;
+        p += needle_len;
+    }
+    return count;
+}
+
+static emby_candidate_acceptance emby_accept_mixed_candidate(
+    sqlite3_stmt *stmt,
+    const emby_rewrite_candidate *candidate
+) {
+    int i;
+    int bind_count;
+
+    if (!stmt) return EMBY_CANDIDATE_BIND_MISMATCH;
+    bind_count = sqlite3_bind_parameter_count(stmt);
+    if (bind_count != candidate->expected_bind_count) {
+        return EMBY_CANDIDATE_BIND_MISMATCH;
+    }
+    for (i = 1; i <= bind_count; i++) {
+        if (sqlite3_bind_parameter_name(stmt, i) != NULL) {
+            return EMBY_CANDIDATE_BIND_MISMATCH;
+        }
+    }
+    if (sqlite3_column_count(stmt) != 19) {
+        return EMBY_CANDIDATE_COLUMN_MISMATCH;
+    }
+    if (emby_count_bytes(candidate->sql, EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME) != 1 ||
+        emby_count_bytes(candidate->sql, EMBY_LATEST_MIXED_GK_DC_INDEX_NAME) != 1) {
+        return EMBY_CANDIDATE_INDEX_MISMATCH;
+    }
+    return EMBY_CANDIDATE_ACCEPTED;
+}
+
+static const char *emby_candidate_acceptance_reason(emby_candidate_acceptance acceptance) {
+    switch (acceptance) {
+        case EMBY_CANDIDATE_BIND_MISMATCH:
+            return "candidate_bind_mismatch";
+        case EMBY_CANDIDATE_COLUMN_MISMATCH:
+            return "candidate_column_mismatch";
+        case EMBY_CANDIDATE_INDEX_MISMATCH:
+            return "candidate_index_mismatch";
+        default:
+            return "candidate_acceptance_failed";
+    }
+}
+
 static void emby_log_rewrite_applied(
     sqlite3 *db,
     const char *source,
@@ -2124,6 +2506,7 @@ static int emby_slow_rewrite_prepare(
     int rewrite_nbyte;
     const char *rewritten_tail = NULL;
     const char *mapped_tail = NULL;
+    emby_candidate_acceptance acceptance;
     int rc;
 
     if (!fanout_on && !dashboard_on) {
@@ -2144,6 +2527,9 @@ static int emby_slow_rewrite_prepare(
         mr = emby_match_episodes_latest(db, zSql, scan_len, &candidate);
         if (mr == EMBY_MATCH_MISS) {
             mr = emby_match_movies_latest(db, zSql, scan_len, &candidate);
+        }
+        if (mr == EMBY_MATCH_MISS) {
+            mr = emby_match_mixed_latest(db, zSql, scan_len, &candidate);
         }
     }
     if (mr == EMBY_MATCH_MISS) {
@@ -2174,6 +2560,18 @@ static int emby_slow_rewrite_prepare(
         return emby_retry_original_after_rewrite_failure(
             kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
         );
+    }
+    if (candidate.require_mixed_acceptance) {
+        acceptance = emby_accept_mixed_candidate(*ppStmt, &candidate);
+        if (acceptance != EMBY_CANDIDATE_ACCEPTED) {
+            obs_log_rewrite_skipped(
+                db, emby_candidate_acceptance_reason(acceptance), candidate.mode
+            );
+            free(candidate.sql);
+            return emby_retry_original_after_rewrite_failure(
+                kind, db, zSql, nByte, prepFlags, ppStmt, pzTail
+            );
+        }
     }
     emby_log_rewrite_applied(
         db, zSql, scan_len, candidate.sql, candidate.scan_out_len, candidate.mode

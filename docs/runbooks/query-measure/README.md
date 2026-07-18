@@ -106,6 +106,16 @@ The strict Emby dashboard identity gate has two canary limitations:
   fixture and `tests/fixtures/emby-fts-rewrite/latest-movies-played-limit12.expected.sql`
   cover the sibling candidate.
 
+The Emby mixed-Latest rewrite uses a stricter oracle. On a tie-free LIMIT-3
+boundary,
+serialize all 19 ordered columns with NULL markers, storage classes, byte
+lengths, and bytes, then compare the full SHA-256 before and after fresh
+`ANALYZE`. The copied-host and CI fixtures include Type-8/Type-5 groups, a
+cross-type shared `gk`, equal-date lower-`Id`, NULL `gk`, mixed and all-NULL
+dates, played/NULL/absent user state, and an ancestor-invisible newer row. When
+equal dates span the boundary, record vendor output as diagnostic only and
+require the hardened result's deterministic `gk` ordering.
+
 ## Bound Parameters And RAW Prepare Form
 
 Plex On-Deck keeps `library_section_id` as `?1` and `account_id` as `?2` in the

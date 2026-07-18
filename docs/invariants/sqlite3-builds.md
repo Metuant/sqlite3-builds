@@ -322,10 +322,10 @@ milestone lands.
   when formatted output exceeds its inline buffer, and emits one `fwrite()`
   plus one terminal newline per record. Allocation or record-size failure uses
   a bounded fallback. `index_missing` uses process-global per-mode counters for
-  Plex taggings/On-Deck and Emby Episodes/movies Latest. Count 1 and every
+  Plex taggings/On-Deck and Emby Episodes/movies/mixed Latest. Count 1 and every
   1024th occurrence emit; all others suppress across database handles. Probe
   errors stay unsuppressed. Missing-index logging has no clientdata allocation
-  dependency. Only those four catalogue rows are index-missing eligible.
+  dependency. Only those five catalogue rows are index-missing eligible.
 - Full `capture_miss` and `out_of_scope` records allocate and format outside the stderr stream
   lock, then emit one `fwrite()` plus one terminal newline; failure to build the
   full record falls back to `obs_logf` and never affects prepare behavior.
@@ -414,8 +414,9 @@ milestone lands.
   `SQLITE3_DISABLE_EMBY_FTS_REWRITE` or
   `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` disables that family; unset, literal
   `0`, and every other value enable. The Emby dashboard rewrite is opt-in:
-  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enables; unset, literal `1`, and
-  every other value disable. These Emby rewrites fail open and are independent
+  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enables Episodes-Latest,
+  movies-Latest, and mixed-Latest; unset, literal `1`, and every other value
+  disable all three. These Emby rewrites fail open and are independent
   of `SQLITE3_DISABLE_AUTOPRAGMA`.
 - Runtime optimize has two successful per-path cadences: LIMITED defaults to
   1800 seconds, sets `PRAGMA main.analysis_limit=0`, and runs

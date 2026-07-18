@@ -17,6 +17,7 @@ family_configure() {
 family_all_cases() {
   printf '%s\n' \
     movies-latest \
+    mixed-latest \
     episodes-latest \
     episodes-latest-single-index
 }
@@ -30,7 +31,7 @@ family_cases() {
 family_case_role() {
   case "$1" in
     movies-latest|episodes-latest) printf 'SHIPPED\n' ;;
-    episodes-latest-single-index) printf 'COMPARISON\n' ;;
+    mixed-latest|episodes-latest-single-index) printf 'COMPARISON\n' ;;
     *) die "unknown Emby dashboard case role: $1" ;;
   esac
 }
@@ -38,13 +39,14 @@ family_case_role() {
 family_contract_check() {
   local _role
   grep -Fx '    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby Episodes Latest mode catalogue contract drifted'
-  grep -Fx '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby movies Latest mode catalogue contract drifted'
-  [ "$(family_all_cases | wc -l | tr -d ' ')" -eq 3 ] || die 'Emby dashboard arm matrix incomplete'
-  for _case in movies-latest episodes-latest episodes-latest-single-index; do
+  grep -Fx '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1) \' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby movies Latest mode catalogue contract drifted'
+  grep -Fx '    X(EMBY_MIXED_LATEST, "emby", "dashboard+mixed_latest", "emby_fts_rewrite", 1)' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die 'Emby mixed Latest mode catalogue contract drifted'
+  [ "$(family_all_cases | wc -l | tr -d ' ')" -eq 4 ] || die 'Emby dashboard arm matrix incomplete'
+  for _case in movies-latest mixed-latest episodes-latest episodes-latest-single-index; do
     family_all_cases | grep -Fx "$_case" >/dev/null || die "missing Emby dashboard measurement arm: $_case"
     _role=$(family_case_role "$_case")
     case "$_case:$_role" in
-      movies-latest:SHIPPED|episodes-latest:SHIPPED|episodes-latest-single-index:COMPARISON) ;;
+      movies-latest:SHIPPED|mixed-latest:COMPARISON|episodes-latest:SHIPPED|episodes-latest-single-index:COMPARISON) ;;
       *) die "Emby dashboard arm role drifted: case=$_case role=$_role" ;;
     esac
   done
@@ -87,12 +89,15 @@ CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_gk_dc ON MediaItems (coalesce
 CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_episodes_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8;
 CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_dcn_puk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5;
 CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_puk_dc_cover ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5;
+CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type IN (8,5);
+CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type IN (8,5);
 SQL
 }
 
 dashboard_projection() {
   case "$1" in
     movies-latest) printf '%s' 'A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
+    mixed-latest) printf '%s' 'A.type,A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
     episodes-latest|episodes-latest-single-index) printf '%s' 'A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex ' ;;
     *) die "unknown Emby dashboard case: $1" ;;
   esac
@@ -125,6 +130,37 @@ WITH ranked(id, dc, puk) AS MATERIALIZED (
 SELECT ${projection}FROM ranked AS R JOIN MediaItems AS A ON A.Id=R.id
 LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.UserId=$DASHBOARD_USER_ID
 ORDER BY (R.dc IS NULL) ASC,R.dc DESC,R.puk ASC LIMIT 12;
+SQL
+      ;;
+    mixed-latest:vendor)
+      printf 'with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (%s) )select %sfrom mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=%s where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 3;\n' "$DASHBOARD_ANCESTORS" "$projection" "$DASHBOARD_USER_ID"
+      ;;
+    mixed-latest:candidate)
+      cat <<SQL
+WITH mixed_latest_args(user_id,row_limit) AS MATERIALIZED (VALUES ($DASHBOARD_USER_ID,3)),
+ranked(id,dc,gk) AS MATERIALIZED (
+  SELECT A.Id,A.DateCreated,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey)
+  FROM MediaItems AS A INDEXED BY idx_dshadow_emby_latest_mixed_dcn_gk
+  CROSS JOIN mixed_latest_args AS Args
+  WHERE A.Type IN (8,5)
+    AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId=A.Id AND X.AncestorId IN ($DASHBOARD_ANCESTORS))
+    AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId=A.UserDataKeyId AND U0.UserId=Args.user_id AND U0.played<>0)
+    AND NOT EXISTS (
+      SELECT 1 FROM MediaItems AS B INDEXED BY idx_dshadow_emby_latest_mixed_gk_dc
+      WHERE B.Type IN (8,5)
+        AND coalesce(B.SeriesPresentationUniqueKey,B.PresentationUniqueKey) IS coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey)
+        AND ((B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated>A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id<A.Id))
+        AND EXISTS (SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId=B.Id AND XB.AncestorId IN ($DASHBOARD_ANCESTORS))
+        AND NOT EXISTS (SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId=B.UserDataKeyId AND UB.UserId=Args.user_id AND UB.played<>0)
+    )
+  ORDER BY (A.DateCreated IS NULL) ASC,A.DateCreated DESC,coalesce(A.SeriesPresentationUniqueKey,A.PresentationUniqueKey) ASC
+  LIMIT (SELECT row_limit FROM mixed_latest_args)
+)
+SELECT ${projection}FROM ranked AS R JOIN MediaItems AS A ON A.Id=R.id
+CROSS JOIN mixed_latest_args AS Args
+LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.UserId=Args.user_id
+ORDER BY (R.dc IS NULL) ASC,R.dc DESC,R.gk ASC
+LIMIT (SELECT row_limit FROM mixed_latest_args);
 SQL
       ;;
     episodes-latest:vendor)
@@ -188,7 +224,7 @@ family_identity_sql() {
   local case_id=$1 vendor_file=$2 candidate_file=$3
   local comparison candidate_kind require_canonical vendor_core reference_core candidate_core
 
-  if [ "$case_id" = movies-latest ]; then
+  if [ "$case_id" = movies-latest ] || [ "$case_id" = mixed-latest ]; then
     write_readonly_preamble
     cat <<SQL
 WITH vendor_identity AS MATERIALIZED ($(dashboard_query_core "$vendor_file")),

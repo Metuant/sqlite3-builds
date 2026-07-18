@@ -17,7 +17,8 @@
     X(EMBY_RESUME_SIMPLE, "emby", "fanout+resume_simple", "emby_fts_rewrite", 0) \
     X(EMBY_SIMILAR, "emby", "fanout+similar", "emby_fts_rewrite", 0) \
     X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \
-    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)
+    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1) \
+    X(EMBY_MIXED_LATEST, "emby", "dashboard+mixed_latest", "emby_fts_rewrite", 1)
 
 typedef int32_t obs_rewrite_mode;
 

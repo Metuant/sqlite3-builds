@@ -502,7 +502,8 @@ applying the validated rewrite.
 
 The Emby fan-out rewrite family is opt-out and default-on:
 `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE=1` disables it; unset, literal `0`, and
-every other value enable it. It covers RES-A/RES-D complex resume,
+every other value enable it. It covers the complex-resume ancestor-EXISTS
+splice and complex-resume watched/progress conjunct,
 resume-simple, Similar-items, Browse-by-name, Favorites-first, People, Studios,
 Type-29, and links-search fan-out statements. It is independent of
 `SQLITE3_DISABLE_EMBY_FTS_REWRITE` and
@@ -514,9 +515,9 @@ projection-agnostic membership replacements: `A.Id IN <membership CTE>` becomes
 production-style correlated `EXISTS` arms, while projection, grouping,
 ordering, collation text, `RANDOM()`, and LIMIT stay unchanged. Browse keeps
 `ORDER BY A.SortName collate NATURALSORT ASC` byte-exact.
-Complex resume emits the RES-A ancestor `EXISTS` splice and the RES-D implied
-watched/progress conjunct in one candidate. Resume-simple and Similar-items emit
-the ancestor `EXISTS` splice.
+Complex resume emits the complex-resume ancestor-EXISTS splice and the
+complex-resume watched/progress conjunct in one candidate. Resume-simple and
+Similar-items emit the ancestor `EXISTS` splice.
 
 Links-search accepts the one-level ItemLinks CTE and the exact two-level UNION
 shape. The one-level form replaces the membership with one correlated
@@ -536,10 +537,13 @@ SQL.
 ## Emby Dashboard Latest Rewrites
 
 The dashboard rewrites are opt-in: literal
-`SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enables both; unset, literal `1`, and
-every other value disable both. They are independent of FTS, FANOUT, and
-AUTOPRAGMA. Both reject bare, numbered, and named bind tokens across the whole
-statement before readiness probes.
+`SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE=0` enables all three; unset, literal `1`, and
+every other value disable all three dashboard families. They are independent of
+FTS, FANOUT, and AUTOPRAGMA. Episodes-Latest and movies-Latest reject bare,
+numbered, and named bind tokens across the whole statement before readiness
+probes. Mixed-Latest accepts one bare anonymous `?` only at each of its user-id
+and LIMIT slots; it rejects numbered/named parameters and every parameter
+outside those two slots.
 
 Both matchers accept exactly one ancestor CTE grammar: the list form
 `AncestorId in (<integers>) )select` or the scalar form with either a
@@ -552,6 +556,14 @@ anchor pairs fail open. A positively detected bind emits
 `reason=out_of_scope sub_reason=limit_unsupported`. Limit parse failure remains
 `reason=capture_miss sub_reason=limit`. Generated SQL renders either validated
 source form as `AncestorId IN (<captured slot>)`.
+
+The mixed matcher is list-only and requires the exact discriminator
+`where A.Type in (8,5) `, the captured 19-column projection, the shared Latest
+FROM anchor, and the exact played/group/MAX/LIMIT tail. Literal user ids are
+unsigned decimals and the only supported literal LIMIT is `3`; either slot can
+instead be one bare `?`. The generated one-row `mixed_latest_args(user_id,row_limit)`
+CTE preserves anonymous parameter count and source order without duplicating
+parameters.
 
 `emby_match_episodes_latest` first requires exact Type=8. It emits mode
 `dashboard+episodes_latest` and a date-ordered anti-join using
@@ -576,7 +588,7 @@ outer projection structurally instead of requiring one fixed column list:
 empty or over-cap spans, `WithAncestors`, parentheses, aggregate/window
 identifiers, and bare `*` fail open; accepted projection bytes are copied
 verbatim into the owned outer SELECT. It emits mode
-`dashboard+movies_latest` and C2 using
+`dashboard+movies_latest` and the movies-Latest date-ordered anti-join using
 `idx_dshadow_emby_latest_movies_dcn_puk` plus
 `idx_dshadow_emby_latest_movies_puk_dc_cover`; it has no native-index
 dependency. The anti-join keeps the maximum non-NULL `DateCreated` per
@@ -588,14 +600,32 @@ no-guard statement is matcher-non-applying: Type=5 passes, the
 guarded tail misses, `capture_miss` logs when observability is enabled, and the
 original statement prepares.
 
-Sibling Type traffic is an unlogged clean miss, so neither family produces a
+`emby_match_mixed_latest` runs after Episodes-Latest and movies-Latest under the
+same cached DASHBOARD gate. It emits `dashboard+mixed_latest` and uses the
+mixed-Latest date-first/group-first index pair:
+outer `idx_dshadow_emby_latest_mixed_dcn_gk` and inner
+`idx_dshadow_emby_latest_mixed_gk_dc`, both exact partial indexes with
+`WHERE Type IN (8,5)`. The anti-join groups on
+`coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey)` across both
+types, uses `IS` for NULL group keys, ranks non-NULL dates before NULL dates,
+chooses lower `Id` within a date tie, and uses `gk` as the final ranked and
+output ordering key. It silently rejects sibling `over`,
+`LastWatchedEpisodes`, favorite, premiere-date, NATURALSORT, RANDOM, and OFFSET
+shapes before capture. After rewritten prepare it requires an end-mapped tail,
+the accepted anonymous bind count and names, exactly 19 result columns, and
+exactly one occurrence of each forced index name. Every failure finalizes the
+partial candidate and prepares the original once.
+
+Sibling Type traffic is an unlogged clean miss, so none of the three families produces a
 cross-family capture miss. Missing indexes, same-name definition mismatches,
 probe errors, build/allocation failure, candidate prepare failure, and tail
 mismatch fail open to original SQL. Missing-index and definition-mismatch
 records use `reason=index_missing` with process-global first/every-1024th
 counters per dashboard mode; `db=` identifies the emitted exemplar rather than
 every handle. Probe errors remain unsuppressed. Episodes requires its exact
-Type=8 index pair, and movies requires its exact Type=5 index pair, to prepare
-the corresponding anti-join. DateCreated storage class is not an enablement
+Type=8 index pair, movies requires its exact Type=5 index pair, and mixed
+requires its exact mixed-Latest date-first/group-first index pair definitions
+to prepare the corresponding anti-join.
+DateCreated storage class is not an enablement
 condition because the templates use only native comparison and ordering with no
 cast, arithmetic, or coercion.

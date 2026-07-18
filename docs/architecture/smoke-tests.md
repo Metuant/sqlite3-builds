@@ -104,7 +104,7 @@ It proves:
   fewer records on lexer/set failure and the master gate.
 - Catalogue-derived, delimited
   `event=rewrite_applied target=<target> mode=<mode> db=` matching covers all
-  14 registered modes. The A/A/B/B sequence proves count-1 correlation is
+  15 registered modes. The A/A/B/B sequence proves count-1 correlation is
   observed before schedule selection, and two fake connections prove applied
   counters reset per connection.
 - Signed invalid ids suppress requested records without allocation,
@@ -177,12 +177,23 @@ It proves:
 - FTS rewrite default-on behavior: unset, literal `0`, and garbage values
   enable; literal `1` disables.
 - FANOUT default-on behavior, literal-`1` opt-out, and enabled Browse-by-name,
-  Favorites-first, RES-A/RES-D, resume-simple, Similar-items, People, Studios,
-  Type-29, and links-search rewrites. Links-search covers both the one-level and
-  exact two-level ItemLinks forms, malformed type slots, duplicate membership,
-  duplicate-link/NULL/no-hit fixtures, and ordered type-tagged row parity.
+  Favorites-first, the complex-resume ancestor-EXISTS splice and
+  complex-resume watched/progress conjunct, resume-simple, Similar-items,
+  People, Studios, Type-29, and links-search rewrites. Links-search covers both
+  the one-level and exact two-level ItemLinks forms, malformed type slots,
+  duplicate membership, duplicate-link/NULL/no-hit fixtures, and ordered
+  type-tagged row parity.
 - DASHBOARD default-off behavior and literal-0 Episodes-Latest paired-index
-  anti-join plus guarded movies-Latest C2 behavior, list and one-parenthesis
+  anti-join, guarded movies-Latest date-ordered anti-join behavior, and the
+  mixed-Latest date-first/group-first index pair
+  anti-join behavior. Mixed coverage includes the exact 19-column list form,
+  literal/bare-`?` user and LIMIT combinations, anonymous parameter order,
+  Type/guard/grammar/projection negatives, zero disabled/clean-miss probes,
+  forced-index and 19-column acceptance, and tie-free full typed-byte identity
+  before and after `ANALYZE`. Its fixture separately exercises cross-type group
+  collisions, equal-date lower-`Id`, NULL group keys, all-NULL dates,
+  played/NULL/absent state, ancestor-invisible rows, and deterministic `gk`
+  ordering across a LIMIT-boundary tie. Existing single-type coverage retains list and one-parenthesis
   nonnegative/exact-`-1`
   scalar ancestor forms, structural wide/compact projection preservation,
   movies `over` and `LastWatchedEpisodes` guards, LIMIT variation,
@@ -222,9 +233,11 @@ It proves:
   played newer cells. It checks one row per group, deterministic candidate ID
   order, full projected-row provenance, and vendor group/max-date grain.
 - ordered all-column type-tagged byte identity between separate non-target
-  vendor and indexed `library.db` candidate databases for guarded C2 36/36
+  vendor and indexed `library.db` candidate databases for the guarded
+  movies-Latest date-ordered anti-join 36/36
   literal cells, plus separate 36/36 no-guard
-  original-SQL/tail passthrough. For guarded C2 expanded regimes in both stat
+  original-SQL/tail passthrough. For guarded movies-Latest date-ordered
+  anti-join expanded regimes in both stat
   states, the vendor query executes and must return 20 rows; the candidate must
   return the exact ID sequence `9001,9002,9003,9004,9005,9006,9007,9008,9009,9010,9119,9101,9104,9107,9111,9112,9113,9118,9116,9108`,
   and every projected candidate cell must match that ID's fixture row.

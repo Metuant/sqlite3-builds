@@ -9,18 +9,22 @@ PLEX_SETTINGS_INDEX="idx_dshadow_mis_account_updated_guid_cover"
 PLEX_RECENT_INDEX="idx_dshadow_metadata_items_section_added"
 PLEX_GUID_NOCASE_INDEX="idx_dshadow_metadata_items_guid_nocase"
 PLEX_VIEWS_GRANDPARENT_GUID_INDEX="idx_dshadow_metadata_item_views_account_grandparent_guid"
+PLEX_MEDIA_COUNT_INDEX="idx_dshadow_metadata_items_section_id_type"
 PLEX_GUID_NOCASE_DDL="CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_guid_nocase ON metadata_items (guid COLLATE NOCASE);"
 PLEX_VIEWS_GRANDPARENT_GUID_DDL="CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_item_views_account_grandparent_guid ON metadata_item_views (account_id, grandparent_guid);"
+PLEX_MEDIA_COUNT_DDL="CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_section_id_type ON metadata_items (library_section_id, id, metadata_type);"
 PLEX_INDEX_NAMES=(
   "$PLEX_TAGGINGS_INDEX"
   "$PLEX_SETTINGS_INDEX"
   "$PLEX_RECENT_INDEX"
   "$PLEX_GUID_NOCASE_INDEX"
   "$PLEX_VIEWS_GRANDPARENT_GUID_INDEX"
+  "$PLEX_MEDIA_COUNT_INDEX"
 )
 plex_index_ddl="$(printf '%s\n' "${_PLEX_INDEXES[@]}")"
 assert_contains "$plex_index_ddl" "$PLEX_GUID_NOCASE_DDL" "Plex guid NOCASE DDL"
 assert_contains "$plex_index_ddl" "$PLEX_VIEWS_GRANDPARENT_GUID_DDL" "Plex views grandparent DDL"
+assert_contains "$plex_index_ddl" "$PLEX_MEDIA_COUNT_DDL" "Plex media-count DDL"
 
 create_plex_index_db() {
   local db page_size
@@ -96,6 +100,18 @@ SELECT
   3000000 - x,
   2000000 - x
 FROM seq;
+CREATE TABLE media_items(
+  id INTEGER PRIMARY KEY,
+  metadata_item_id INTEGER NOT NULL
+);
+CREATE INDEX index_media_items_on_metadata_item_id ON media_items(metadata_item_id);
+WITH RECURSIVE seq(x) AS (
+  VALUES(1)
+  UNION ALL
+  SELECT x + 1 FROM seq WHERE x < 4500
+)
+INSERT INTO media_items(id, metadata_item_id)
+SELECT x, x FROM seq;
 CREATE TABLE metadata_item_views(
   id INTEGER PRIMARY KEY,
   account_id INTEGER NOT NULL,
@@ -187,6 +203,12 @@ views_vendor_guid_eqp() {
   "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT id FROM metadata_item_views INDEXED BY index_metadata_item_views_on_guid WHERE guid='plex://episode/142' AND account_id=42 AND grandparent_guid='plex://show/42';" | tr '\r\n' ' '
 }
 
+media_count_eqp() {
+  local db
+  db="$1"
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN SELECT metadata_items.id, count(media_items.id) AS cnt FROM metadata_items LEFT JOIN media_items ON media_items.metadata_item_id=metadata_items.id WHERE metadata_items.metadata_type IN (4,10) AND metadata_items.library_section_id=2 GROUP BY metadata_items.id HAVING cnt=0;" | tr '\r\n' ' '
+}
+
 assert_eqp_uses_taggings_index() {
   local eqp phase
   eqp="$1"
@@ -251,6 +273,15 @@ assert_eqp_uses_views_vendor_guid_index() {
   assert_not_contains "$eqp" "$PLEX_VIEWS_GRANDPARENT_GUID_INDEX" "$phase views vendor no g2 adoption"
 }
 
+assert_eqp_uses_media_count_index() {
+  local eqp phase
+  eqp="$1"
+  phase="$2"
+  assert_contains "$eqp" "SEARCH metadata_items USING COVERING INDEX" "$phase media-count EQP covering search"
+  assert_contains "$eqp" "$PLEX_MEDIA_COUNT_INDEX" "$phase media-count EQP index"
+  assert_not_contains "$eqp" "SCAN metadata_items" "$phase media-count EQP no metadata_items scan"
+}
+
 plex_dir="$tmp/plex-dbs"
 mkdir -p "$plex_dir"
 published="$plex_dir/$_PLEX_DB"
@@ -258,11 +289,11 @@ create_plex_index_db "$published"
 index_test_run_plex_optimize_capture published-first "$plex_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 assert_eq 0 "$(cat "$tmp/published-first.rc")" "first Plex index pipeline rc"
 assert_plex_indexes_present "$published"
-stat1_plex_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('taggings','metadata_item_settings','metadata_items','metadata_item_views') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX','$PLEX_RECENT_INDEX','$PLEX_GUID_NOCASE_INDEX','$PLEX_VIEWS_GRANDPARENT_GUID_INDEX');")"
+stat1_plex_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl IN ('taggings','metadata_item_settings','metadata_items','metadata_item_views') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX','$PLEX_RECENT_INDEX','$PLEX_GUID_NOCASE_INDEX','$PLEX_VIEWS_GRANDPARENT_GUID_INDEX','$PLEX_MEDIA_COUNT_INDEX');")"
 assert_int_gt "$stat1_plex_count" 0 "published sqlite_stat1 Plex index row count"
 stat4_exists="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='sqlite_stat4';")"
 if [ "$stat4_exists" = "1" ]; then
-  stat4_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat4 WHERE tbl IN ('taggings','metadata_item_settings','metadata_items','metadata_item_views') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX','$PLEX_RECENT_INDEX','$PLEX_GUID_NOCASE_INDEX','$PLEX_VIEWS_GRANDPARENT_GUID_INDEX');")"
+  stat4_count="$("$real_sqlite" "$published" "SELECT COUNT(*) FROM sqlite_stat4 WHERE tbl IN ('taggings','metadata_item_settings','metadata_items','metadata_item_views') OR idx IN ('$PLEX_TAGGINGS_INDEX','$PLEX_SETTINGS_INDEX','$PLEX_RECENT_INDEX','$PLEX_GUID_NOCASE_INDEX','$PLEX_VIEWS_GRANDPARENT_GUID_INDEX','$PLEX_MEDIA_COUNT_INDEX');")"
   printf 'sqlite_stat4 Plex index rows: %s\n' "$stat4_count"
 else
   printf 'SKIP: sqlite_stat4 unavailable in this sqlite3 build\n'
@@ -274,6 +305,7 @@ assert_eqp_uses_guid_nocase_index "$(guid_like_eqp "$published")" "published pos
 assert_eqp_uses_vendor_guid_index "$(guid_equality_eqp "$published")" "published post-ANALYZE"
 assert_eqp_uses_views_grandparent_index "$(views_grandparent_eqp "$published")" "published post-ANALYZE"
 assert_eqp_uses_views_vendor_guid_index "$(views_vendor_guid_eqp "$published")" "published post-ANALYZE"
+assert_eqp_uses_media_count_index "$(media_count_eqp "$published")" "published post-ANALYZE"
 
 index_test_run_plex_optimize_capture published-second "$plex_dir" "$_PLEX_DB" "SELECT 1 FROM versioned_metadata_items LIMIT 1;" ""
 assert_eq 0 "$(cat "$tmp/published-second.rc")" "second Plex index pipeline rc"
@@ -320,6 +352,7 @@ assert_eqp_uses_guid_nocase_index "$(guid_like_eqp "$eqp_db")" "pre-ANALYZE"
 assert_eqp_uses_vendor_guid_index "$(guid_equality_eqp "$eqp_db")" "pre-ANALYZE"
 assert_eqp_uses_views_grandparent_index "$(views_grandparent_eqp "$eqp_db")" "pre-ANALYZE"
 assert_eqp_uses_views_vendor_guid_index "$(views_vendor_guid_eqp "$eqp_db")" "pre-ANALYZE"
+assert_eqp_uses_media_count_index "$(media_count_eqp "$eqp_db")" "pre-ANALYZE"
 "$real_sqlite" "$eqp_db" "ANALYZE;"
 assert_eqp_uses_taggings_index "$(taggings_eqp "$eqp_db")" "post-ANALYZE"
 assert_eqp_uses_settings_index "$(settings_eqp "$eqp_db")" "post-ANALYZE"
@@ -328,6 +361,7 @@ assert_eqp_uses_guid_nocase_index "$(guid_like_eqp "$eqp_db")" "post-ANALYZE"
 assert_eqp_uses_vendor_guid_index "$(guid_equality_eqp "$eqp_db")" "post-ANALYZE"
 assert_eqp_uses_views_grandparent_index "$(views_grandparent_eqp "$eqp_db")" "post-ANALYZE"
 assert_eqp_uses_views_vendor_guid_index "$(views_vendor_guid_eqp "$eqp_db")" "post-ANALYZE"
+assert_eqp_uses_media_count_index "$(media_count_eqp "$eqp_db")" "post-ANALYZE"
 assert_eq "1" "$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM taggings INDEXED BY $PLEX_TAGGINGS_INDEX WHERE tag_id=7 AND metadata_item_id=1007;")" "taggings INDEXED BY usability probe"
 settings_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM metadata_item_settings INDEXED BY $PLEX_SETTINGS_INDEX WHERE account_id=42 AND view_offset > 0 AND last_viewed_at > 100000;")"
 assert_int_gt "$settings_indexed_count" 0 "settings INDEXED BY usability probe"
@@ -337,5 +371,7 @@ guid_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM metadata_it
 assert_int_gt "$guid_indexed_count" 0 "guid NOCASE INDEXED BY usability probe"
 views_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM metadata_item_views INDEXED BY $PLEX_VIEWS_GRANDPARENT_GUID_INDEX WHERE account_id=42 AND grandparent_guid='plex://show/42';")"
 assert_int_gt "$views_indexed_count" 0 "views grandparent INDEXED BY usability probe"
+media_count_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM metadata_items INDEXED BY $PLEX_MEDIA_COUNT_INDEX WHERE library_section_id=2 AND metadata_type IN (4,10);")"
+assert_int_gt "$media_count_indexed_count" 0 "media-count INDEXED BY usability probe"
 
 printf 'optimize_media_servers Plex index tests passed\n'

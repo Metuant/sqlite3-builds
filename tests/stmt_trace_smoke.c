@@ -707,6 +707,7 @@ static int child_index_missing_ineligible(void) {
         obs_log_index_missing((sqlite3 *)&db, OBS_MODE_EMBY_BROWSE);
     }
     obs_log_index_missing((sqlite3 *)&db, OBS_MODE_EMBY_EPISODES_LATEST);
+    obs_log_index_missing((sqlite3 *)&db, OBS_MODE_EMBY_MIXED_LATEST);
     return 0;
 }
 
@@ -1491,6 +1492,10 @@ int main(int argc, char **argv) {
     require_occurrences(
         "eligible index mode starts at one", out,
         "reason=index_missing mode=dashboard+episodes_latest db=", 1
+    );
+    require_occurrences(
+        "appended eligible mixed index mode starts at one", out,
+        "reason=index_missing mode=dashboard+mixed_latest db=", 1
     );
     require_contains("eligible index mode first", out, "sample=first count=1");
     require_absent(

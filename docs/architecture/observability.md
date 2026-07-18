@@ -7,13 +7,13 @@ Part of the [Repository Architecture index](../architecture.md).
 `src/observability.c` is compiled into both shared-library variants and is
 excluded from the CLI target. `src/observability.h` declares the private
 cross-translation-unit observability seam. `src/rewrite_modes.h` is the only
-rewrite-mode catalogue. Its 14 signed `OBS_MODE_*` ids each own target, wire
+rewrite-mode catalogue. Its 15 signed `OBS_MODE_*` ids each own target, wire
 mode, positional logger label, and index-missing eligibility metadata.
 Applied, miss, and index-missing counters share the `OBS_MODE_COUNT` index
 space. Applied counters remain per connection; miss counters and their bounded
 shape set remain process-global; index-missing counters remain process-global.
-Only Plex taggings, Plex On-Deck, Emby Episodes Latest, and Emby movies Latest
-are index-missing eligible.
+Only Plex taggings, Plex On-Deck, Emby Episodes Latest, Emby movies Latest, and
+Emby mixed-Latest are index-missing eligible.
 
 The library target patches SQLite's amalgamation so these public APIs are
 implemented by wrappers in `src/observability.c` while the original SQLite
@@ -58,8 +58,9 @@ rewriting. Plex modes are `fts+tag_type`, `guid+like-null`,
 `taggings+membership`, and `ondeck`. Emby modes are `fts+membership`,
 `fanout+resume`, `fanout+browse`, `fanout+favorites`, `fanout+people`,
 `fanout+links_search`, `fanout+resume_simple`, `fanout+similar`,
-`dashboard+episodes_latest`, and `dashboard+movies_latest`. No compatibility
-alias exists for the Episodes mode. Each dashboard family logs `capture_miss`
+`dashboard+episodes_latest`, `dashboard+movies_latest`, and
+`dashboard+mixed_latest`. No compatibility alias exists for the Episodes mode.
+Each dashboard family logs `capture_miss`
 only after its own Type discriminator; valid sibling traffic is an unlogged
 clean miss. The capture-gated fan-out modes are `fanout+people`, after its
 `itemPeople2` discriminator, and `fanout+links_search`, after its

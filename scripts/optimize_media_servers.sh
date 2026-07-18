@@ -22,6 +22,8 @@ if [ -z "${_EMBY_INDEXES+x}" ]; then
         "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_episodes_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8;"
         "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_dcn_puk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5;"
         "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_puk_dc_cover ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5;"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type IN (8,5);"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type IN (8,5);"
     )
 fi
 readonly -a _EMBY_INDEXES
@@ -32,6 +34,7 @@ if [ -z "${_PLEX_INDEXES+x}" ]; then
         "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_section_added ON metadata_items (library_section_id, added_at);"
         "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_guid_nocase ON metadata_items (guid COLLATE NOCASE);"
         "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_item_views_account_grandparent_guid ON metadata_item_views (account_id, grandparent_guid);"
+        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_section_id_type ON metadata_items (library_section_id, id, metadata_type);"
     )
 fi
 readonly -a _PLEX_INDEXES
@@ -42,6 +45,7 @@ if [ -z "${_PLEX_STAT4_LEADER_INDEXES+x}" ]; then
         "idx_dshadow_metadata_items_section_added"
         "idx_dshadow_metadata_items_guid_nocase"
         "idx_dshadow_metadata_item_views_account_grandparent_guid"
+        "idx_dshadow_metadata_items_section_id_type"
     )
 fi
 readonly -a _PLEX_STAT4_LEADER_INDEXES

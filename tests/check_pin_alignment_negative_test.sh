@@ -525,6 +525,23 @@ for raw_path in sys.argv[1:]:
     path.write_text(text.replace(old, new, 1))
 PY
       ;;
+    emby-mixed-readiness-production-ddl-drift)
+      python3 - \
+        "$scratch/scripts/optimize_media_servers.sh" \
+        "$scratch/tests/check_pin_alignment.sh" <<'PY'
+from pathlib import Path
+import sys
+
+old = "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type IN (8,5);"
+new = "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated ASC, Id, UserDataKeyId) WHERE Type IN (8,5);"
+for raw_path in sys.argv[1:]:
+    path = Path(raw_path)
+    text = path.read_text()
+    if text.count(old) != 1:
+        raise SystemExit(f"Emby mixed production DDL fixture missing from {path}")
+    path.write_text(text.replace(old, new, 1))
+PY
+      ;;
     source-id-pin-format)
       python3 - "$scratch/pins/versions.env" <<'PY'
 from pathlib import Path
@@ -649,5 +666,7 @@ assert_fails_with emby-readiness-definition-prefix-drift \
   'Emby readiness index definition drift: idx_dshadow_emby_latest_movies_dcn_puk'
 assert_fails_with emby-readiness-production-ddl-drift \
   'Emby readiness index definition drift: idx_dshadow_emby_latest_episodes_dcn_gk'
+assert_fails_with emby-mixed-readiness-production-ddl-drift \
+  'Emby readiness index definition drift: idx_dshadow_emby_latest_mixed_gk_dc'
 
 printf 'negative pin-alignment checks passed\n'

@@ -270,7 +270,9 @@ The Plex main-database staged optimize SQL creates the runbook-validated
 `idx_dshadow_mis_account_updated_guid_cover`, and
 `idx_dshadow_metadata_items_section_added`,
 `idx_dshadow_metadata_items_guid_nocase`, and
-`idx_dshadow_metadata_item_views_account_grandparent_guid` indexes before
+`idx_dshadow_metadata_item_views_account_grandparent_guid`, plus the
+section-scoped media-count covering index
+`idx_dshadow_metadata_items_section_id_type` before
 `REINDEX`, `ANALYZE`, and `PRAGMA optimize`. The existing Plex SQLite `ANALYZE`
 remains as the STAT1
 floor for ICU-collated or skipped objects. The subsequent STAT4 pass uses
@@ -285,7 +287,7 @@ collation-registration preamble.
 for configured Plex instances, so the pass runs only when that binary reports
 `ENABLE_STAT4`; execution remains on `PLEX_BINARY` because only the patched ICU
 engine can register `icu_root`. The explicit Plex STAT4 leader list includes all
-five `idx_dshadow_*` Plex indexes.
+six `idx_dshadow_*` Plex indexes.
 
 ### Emby Flow
 
@@ -312,16 +314,25 @@ The Emby staged optimize SQL creates the runbook-validated
 `idx_dshadow_mediaitems_parent_type`, `idx_dshadow_emby_latest_gk_dc`,
 `idx_dshadow_emby_latest_episodes_dcn_gk`,
 `idx_dshadow_emby_latest_movies_dcn_puk`, and
-`idx_dshadow_emby_latest_movies_puk_dc_cover` indexes before `REINDEX`,
-`ANALYZE`, and `PRAGMA optimize`. Both Episodes-Latest indexes therefore have
-statistics before staged publication. The dashboard readiness probes compare
-all four Latest index definitions with the exact `sqlite_master.sql` text
+`idx_dshadow_emby_latest_movies_puk_dc_cover`,
+`idx_dshadow_emby_latest_mixed_dcn_gk`, and
+`idx_dshadow_emby_latest_mixed_gk_dc` indexes before `REINDEX`, `ANALYZE`, and
+`PRAGMA optimize`. All six dashboard Latest indexes therefore have statistics
+before staged publication. The dashboard readiness probes compare all six
+Latest index definitions with the exact `sqlite_master.sql` text
 produced by the `_EMBY_INDEXES` DDL. Because `CREATE INDEX IF NOT EXISTS` does
 not replace a same-name index, a noncanonical existing definition leaves the
 corresponding rewrite fail-open with sampled `reason=index_missing`. The
 date-first Episodes index measured approximately 66.3 MB; the worst-case
 indexed-column update canary measured 1.28x write amplification and
 approximately 1.9 microseconds per row.
+
+The mixed-Latest date-first/group-first index pair definitions use
+`WHERE Type IN (8,5)`. The outer index
+orders `(DateCreated IS NULL), DateCreated DESC, gk` before `Id` and
+`UserDataKeyId`; the inner index orders `gk, DateCreated DESC` before `Id` and
+`UserDataKeyId`. Runtime never creates them and requires both exact definitions
+before emitting the forced mixed anti-join.
 
 Release note: an updated library deployed before this maintenance step sees
 only the older `idx_dshadow_emby_latest_gk_dc`, declines the Episodes-Latest

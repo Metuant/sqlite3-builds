@@ -290,6 +290,12 @@ check_emby_readiness_index_definitions() {
   check_emby_readiness_index_definition \
     EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME \
     EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION
+  check_emby_readiness_index_definition \
+    EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME \
+    EMBY_LATEST_MIXED_DCN_GK_INDEX_DEFINITION
+  check_emby_readiness_index_definition \
+    EMBY_LATEST_MIXED_GK_DC_INDEX_NAME \
+    EMBY_LATEST_MIXED_GK_DC_INDEX_DEFINITION
 }
 
 emby_latest_template_value() {
@@ -711,9 +717,11 @@ require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXI
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_taggings_tag_id_metadata_item_id ON taggings (tag_id, metadata_item_id);"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_guid_nocase ON metadata_items (guid COLLATE NOCASE);"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_item_views_account_grandparent_guid ON metadata_item_views (account_id, grandparent_guid);"'
+require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_metadata_items_section_id_type ON metadata_items (library_section_id, id, metadata_type);"'
 require_line scripts/optimize_media_servers.sh '        "idx_dshadow_taggings_tag_id_metadata_item_id"'
 require_line scripts/optimize_media_servers.sh '        "idx_dshadow_metadata_items_guid_nocase"'
 require_line scripts/optimize_media_servers.sh '        "idx_dshadow_metadata_item_views_account_grandparent_guid"'
+require_line scripts/optimize_media_servers.sh '        "idx_dshadow_metadata_items_section_id_type"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_INDEX_NAME "idx_dshadow_emby_latest_gk_dc"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME "idx_dshadow_emby_latest_episodes_dcn_gk"'
 require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_INDEX_DEFINITION \\"
@@ -729,6 +737,8 @@ require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EM
 require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_INDEX_NAME " "'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_dcn_puk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5;"'
 require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_movies_puk_dc_cover ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5;"'
+require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type IN (8,5);"'
+require_line scripts/optimize_media_servers.sh '        "CREATE INDEX IF NOT EXISTS idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type IN (8,5);"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MOVIES_INDEX_NAME "idx_dshadow_emby_latest_movies_dcn_puk"'
 require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME "idx_dshadow_emby_latest_movies_puk_dc_cover"'
 require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_MOVIES_INDEX_DEFINITION \\"
@@ -741,6 +751,14 @@ require_line src/emby_fts_rewrite.c '        "AND sql='\''" EMBY_LATEST_MOVIES_I
 require_line src/emby_fts_rewrite.c '        "AND sql='\''" EMBY_LATEST_MOVIES_PUK_DC_INDEX_DEFINITION "'\'')";'
 require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EMBY_LATEST_MOVIES_INDEX_NAME " "'
 require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME " "'
+require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME "idx_dshadow_emby_latest_mixed_dcn_gk"'
+require_line src/emby_fts_rewrite.c '#define EMBY_LATEST_MIXED_GK_DC_INDEX_NAME "idx_dshadow_emby_latest_mixed_gk_dc"'
+require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_MIXED_DCN_GK_INDEX_DEFINITION \\"
+require_line src/emby_fts_rewrite.c '    " ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type IN (8,5)"'
+require_line src/emby_fts_rewrite.c "#define EMBY_LATEST_MIXED_GK_DC_INDEX_DEFINITION \\"
+require_line src/emby_fts_rewrite.c '    " ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type IN (8,5)"'
+require_line src/emby_fts_rewrite.c '    "  FROM MediaItems AS A INDEXED BY " EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME " "'
+require_line src/emby_fts_rewrite.c '    "      FROM MediaItems AS B INDEXED BY " EMBY_LATEST_MIXED_GK_DC_INDEX_NAME " "'
 check_emby_readiness_index_definitions
 require_line src/plex_fts_rewrite.c '#define PLEX_TAG_INDEX_NAME "idx_dshadow_taggings_tag_id_metadata_item_id"'
 require_line src/plex_fts_rewrite.c '#define PLEX_ONDECK_INDEX_NAME "idx_dshadow_metadata_item_views_account_grandparent_guid"'
@@ -758,7 +776,8 @@ require_line src/rewrite_modes.h '    X(EMBY_RESUME, "emby", "fanout+resume", "e
 require_line src/rewrite_modes.h '    X(EMBY_RESUME_SIMPLE, "emby", "fanout+resume_simple", "emby_fts_rewrite", 0) \'
 require_line src/rewrite_modes.h '    X(EMBY_SIMILAR, "emby", "fanout+similar", "emby_fts_rewrite", 0) \'
 require_line src/rewrite_modes.h '    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \'
-require_line src/rewrite_modes.h '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)'
+require_line src/rewrite_modes.h '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(EMBY_MIXED_LATEST, "emby", "dashboard+mixed_latest", "emby_fts_rewrite", 1)'
 require_line src/rewrite_modes.h 'typedef int32_t obs_rewrite_mode;'
 require_line src/rewrite_modes.h '    OBS_MODE_NONE = 0,'
 require_line src/rewrite_modes.h '    OBS_MODE_COUNT'
@@ -776,7 +795,7 @@ awk '
     if ($0 ~ /, 1\)( \\)?$/) eligible[suffix]++
   }
   END {
-    if (rows != 14) exit 1
+    if (rows != 15) exit 1
     for (suffix in suffix_seen) {
       if (suffix_seen[suffix] != 1) exit 1
       suffix_count++
@@ -786,10 +805,11 @@ awk '
       wire_count++
     }
     for (suffix in eligible) eligible_count++
-    if (suffix_count != 14 || wire_count != 14 || eligible_count != 4) exit 1
+    if (suffix_count != 15 || wire_count != 15 || eligible_count != 5) exit 1
     if (!eligible["PLEX_TAGGINGS"] || !eligible["PLEX_ONDECK"] ||
         !eligible["EMBY_EPISODES_LATEST"] ||
-        !eligible["EMBY_MOVIES_LATEST"]) exit 1
+        !eligible["EMBY_MOVIES_LATEST"] ||
+        !eligible["EMBY_MIXED_LATEST"]) exit 1
   }
 ' src/rewrite_modes.h || fail 'rewrite mode catalogue cardinality, uniqueness, or eligibility invalid'
 
@@ -877,17 +897,21 @@ require_range_order src/emby_fts_rewrite.c \
   '    pieces[7].slot = &limit_slot;'
 require_range_token_count src/emby_fts_rewrite.c \
   'static emby_match_result emby_match_movies_latest(' \
-  'static char *emby_build_rewritten_sql(' OBS_MODE_EMBY_MOVIES_LATEST 11 \
+  'static emby_match_result emby_match_mixed_latest(' OBS_MODE_EMBY_MOVIES_LATEST 11 \
   'Emby movies Latest producer manifest'
+require_range_token_count src/emby_fts_rewrite.c \
+  'static emby_match_result emby_match_mixed_latest(' \
+  'static char *emby_build_rewritten_sql(' OBS_MODE_EMBY_MIXED_LATEST 11 \
+  'Emby mixed Latest producer manifest'
 require_range_token_count src/emby_fts_rewrite.c \
   '__attribute__((visibility("hidden"))) int emby_fts_rewrite_prepare(' \
   __EOF__ OBS_MODE_EMBY_FTS 5 'Emby FTS producer manifest'
 plex_mode_token_count="$(grep -Eo 'OBS_MODE_PLEX_[A-Z_]+' src/plex_fts_rewrite.c | wc -l | tr -d ' ')"
 emby_mode_token_count="$(grep -Eo 'OBS_MODE_EMBY_[A-Z_]+' src/emby_fts_rewrite.c | wc -l | tr -d ' ')"
 assert_eq 'Plex producer token total' 13 "$plex_mode_token_count"
-assert_eq 'Emby producer token total' 50 "$emby_mode_token_count"
+assert_eq 'Emby producer token total' 61 "$emby_mode_token_count"
 
-raw_mode_wire_ere='"(fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest)"'
+raw_mode_wire_ere='"(fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest|dashboard[+]mixed_latest)"'
 for file in \
   src/auto_extension.c \
   src/emby_fts_rewrite.c \
@@ -955,7 +979,8 @@ require_line docs/runbooks/query-measure/families/emby-fanout.sh '  grep -Fx '\'
 require_line docs/runbooks/query-measure/families/emby-search.sh '  grep -Fx '\''    X(EMBY_PEOPLE, "emby", "fanout+people", "emby_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby People mode catalogue contract drifted'\'''
 require_line docs/runbooks/query-measure/families/emby-search.sh '  grep -Fx '\''    X(EMBY_LINKS_SEARCH, "emby", "fanout+links_search", "emby_fts_rewrite", 0) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby links-search mode catalogue contract drifted'\'''
 require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby Episodes Latest mode catalogue contract drifted'\'''
-require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1)'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby movies Latest mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1) \'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby movies Latest mode catalogue contract drifted'\'''
+require_line docs/runbooks/query-measure/families/emby-dashboard.sh '  grep -Fx '\''    X(EMBY_MIXED_LATEST, "emby", "dashboard+mixed_latest", "emby_fts_rewrite", 1)'\'' "${REPO_ROOT}/src/rewrite_modes.h" >/dev/null || die '\''Emby mixed Latest mode catalogue contract drifted'\'''
 check_emby_dashboard_latest_sql_contract
 reject_line docs/runbooks/query-measure/families/plex-guid-like.sh '  grep -F '\''#define PLEX_MODE_GUID_LIKE "guid+like-null"'\'' "$source" >/dev/null || die '\''Plex GUID LIKE mode source contract drifted'\'''
 reject_pattern docs/runbooks/query-measure/families/emby-fanout.sh 'for _mode in.*fanout[+]resume'
@@ -978,7 +1003,7 @@ require_nearby_line \
   'Emby fan-out rewrite literal-1 opt-out'
 require_line docs/env-vars.md '| `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` | kill-switch | Control the Plex GUID LIKE NULL-pattern guard rewrite. | GUID LIKE rewrite disabled. | opt-in | Literal `0` enables the rewrite. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; build or verification failure prepares original SQL. |'
 require_line docs/env-vars.md '| `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE` | kill-switch | Control the Plex taggings-membership rewrite. | Taggings rewrite enabled in the Plex-ICU build. | opt-out | Literal `1` disables the rewrite. | Unset, literal `0`, and any other value enable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; missing taggings index or rewrite failure prepares original SQL. |'
-require_line docs/env-vars.md '| `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` | kill-switch | Control Emby fan-out rewrites: Browse-by-name, Favorites-first, RES-A/RES-D, resume-simple, Similar-items, People, Studios, Type-29, and links-search. | Fan-out rewrites enabled. | opt-out | Literal `1` disables the fan-out rewrites. | Unset, literal `0`, and any other value enable the fan-out rewrites. | Both variants; runtime-gated by target DB basename. | Cached once per process. Independent of FTS, dashboard, and `SQLITE3_DISABLE_AUTOPRAGMA`. |'
+require_line docs/env-vars.md '| `SQLITE3_DISABLE_EMBY_FANOUT_REWRITE` | kill-switch | Control Emby fan-out rewrites: Browse-by-name, Favorites-first, the complex-resume ancestor-EXISTS splice and complex-resume watched/progress conjunct, resume-simple, Similar-items, People, Studios, Type-29, and links-search. | Fan-out rewrites enabled. | opt-out | Literal `1` disables the fan-out rewrites. | Unset, literal `0`, and any other value enable the fan-out rewrites. | Both variants; runtime-gated by target DB basename. | Cached once per process. Independent of FTS, dashboard, and `SQLITE3_DISABLE_AUTOPRAGMA`. |'
 require_line CLAUDE.md '  `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` (GUID LIKE NULL guard) enables on'
 require_line CLAUDE.md '  literal `0`; unset, literal `1`, and every other value disable. It fails open'
 require_line CLAUDE.md '  Keep Plex taggings rewrite opt-out (default-on in the Plex/ICU build): literal'

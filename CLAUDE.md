@@ -58,8 +58,8 @@ Project-specific guidance:
   positional logger label, and index-missing eligibility metadata; all mode
   counter extents use `OBS_MODE_COUNT`. Applied counters remain per connection;
   miss and index-missing counters remain process-global. Only Plex taggings,
-  Plex On-Deck, Emby Episodes Latest, and Emby movies Latest are index-missing
-  eligible. Invalid ids suppress the requested record and can emit at most one
+  Plex On-Deck, Emby Episodes Latest, Emby movies Latest, and Emby mixed-Latest
+  are index-missing eligible. Invalid ids suppress the requested record and can emit at most one
   process-wide `obs_mode_unregistered` diagnostic while observability is
   enabled.
 - Keep runtime optimize opt-in: literal `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0`
@@ -106,8 +106,8 @@ Project-specific guidance:
   (`SQLITE3_DISABLE_EMBY_FANOUT_REWRITE`) opt-out (default-on in the Emby build):
   literal `1` disables; unset, literal `0`, and every other value enable. Keep
   the Emby dashboard knob opt-in:
-  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE` (Episodes-Latest and movies-Latest)
-  enables on literal `0`; unset, literal `1`, and every other value disable.
+  `SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE` (Episodes-Latest, movies-Latest, and
+  mixed-Latest) enables on literal `0`; unset, literal `1`, and every other value disable.
   All three are fail-open and independent of `SQLITE3_DISABLE_AUTOPRAGMA`.
   Knob naming:
   `SQLITE3_DISABLE_<ENGINE>_<PURPOSE>_REWRITE`.

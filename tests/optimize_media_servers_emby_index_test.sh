@@ -9,6 +9,8 @@ EMBY_LATEST_INDEX_NAME="idx_dshadow_emby_latest_gk_dc"
 EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME="idx_dshadow_emby_latest_episodes_dcn_gk"
 EMBY_LATEST_MOVIES_INDEX_NAME="idx_dshadow_emby_latest_movies_dcn_puk"
 EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME="idx_dshadow_emby_latest_movies_puk_dc_cover"
+EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME="idx_dshadow_emby_latest_mixed_dcn_gk"
+EMBY_LATEST_MIXED_GK_DC_INDEX_NAME="idx_dshadow_emby_latest_mixed_gk_dc"
 
 create_mediaitems_db() {
   local db page_size
@@ -136,11 +138,23 @@ movies_puk_dc_index_count() {
   index_test_index_count "$db" "$EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME"
 }
 
+mixed_dcn_gk_index_count() {
+  local db
+  db="$1"
+  index_test_index_count "$db" "$EMBY_LATEST_MIXED_DCN_GK_INDEX_NAME"
+}
+
+mixed_gk_dc_index_count() {
+  local db
+  db="$1"
+  index_test_index_count "$db" "$EMBY_LATEST_MIXED_GK_DC_INDEX_NAME"
+}
+
 movies_vendor_sql() {
   printf '%s' "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12"
 }
 
-movies_c2_sql() {
+movies_latest_antijoin_sql() {
   printf '%s' "WITH ranked(id, dc, puk) AS MATERIALIZED (SELECT A.Id,A.DateCreated,A.PresentationUniqueKey FROM MediaItems AS A INDEXED BY $EMBY_LATEST_MOVIES_INDEX_NAME WHERE A.Type=5 AND EXISTS (SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId=A.Id AND X.AncestorId IN (100)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId=A.UserDataKeyId AND U0.UserId=42 AND U0.played<>0) AND NOT EXISTS (SELECT 1 FROM MediaItems AS B INDEXED BY $EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME WHERE B.Type=5 AND B.PresentationUniqueKey IS A.PresentationUniqueKey AND ((B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated>A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id<A.Id)) AND EXISTS (SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId=B.Id AND XB.AncestorId IN (100)) AND NOT EXISTS (SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId=B.UserDataKeyId AND UB.UserId=42 AND UB.played<>0)) ORDER BY (A.DateCreated IS NULL),A.DateCreated DESC,A.PresentationUniqueKey LIMIT 12) SELECT A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex FROM ranked AS R JOIN MediaItems AS A ON A.Id=R.id LEFT JOIN UserDatas ON A.UserDataKeyId=UserDatas.UserDataKeyId AND UserDatas.UserId=42 ORDER BY (R.dc IS NULL),R.dc DESC,R.puk LIMIT 12"
 }
 
@@ -161,10 +175,10 @@ movies_vendor_eqp() {
   "$real_sqlite" "$db" "EXPLAIN QUERY PLAN $(movies_vendor_sql)" | tr '\r\n' ' '
 }
 
-movies_c2_eqp() {
+movies_latest_antijoin_eqp() {
   local db
   db="$1"
-  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN $(movies_c2_sql)" | tr '\r\n' ' '
+  "$real_sqlite" "$db" "EXPLAIN QUERY PLAN $(movies_latest_antijoin_sql)" | tr '\r\n' ' '
 }
 
 episodes_two_index_eqp() {
@@ -227,7 +241,7 @@ assert_episodes_two_index_eqp() {
   assert_not_contains "$ranked_eqp" "USE TEMP B-TREE" "$phase Episodes ranked EQP no temp sort"
 }
 
-assert_movies_c2_eqp() {
+assert_movies_latest_antijoin_eqp() {
   local eqp phase
   eqp="$1"
   phase="$2"
@@ -292,6 +306,8 @@ assert_eq "1" "$(latest_index_count "$published")" "published Emby latest index 
 assert_eq "1" "$(episodes_dcn_gk_index_count "$published")" "published Emby episodes date-first index count"
 assert_eq "1" "$(movies_index_count "$published")" "published Emby movies outer index count"
 assert_eq "1" "$(movies_puk_dc_index_count "$published")" "published Emby movies inner index count"
+assert_eq "1" "$(mixed_dcn_gk_index_count "$published")" "published Emby mixed outer index count"
+assert_eq "1" "$(mixed_gk_dc_index_count "$published")" "published Emby mixed inner index count"
 assert_eq "CREATE INDEX $EMBY_LATEST_MOVIES_INDEX_NAME ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) WHERE Type = 5" "$($real_sqlite "$published" "SELECT sql FROM sqlite_master WHERE name='$EMBY_LATEST_MOVIES_INDEX_NAME';")" "published movies outer sqlite_master.sql"
 assert_eq "CREATE INDEX $EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) WHERE Type = 5" "$($real_sqlite "$published" "SELECT sql FROM sqlite_master WHERE name='$EMBY_LATEST_MOVIES_PUK_DC_INDEX_NAME';")" "published movies inner sqlite_master.sql"
 assert_eq "CREATE INDEX $EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type = 8" "$($real_sqlite "$published" "SELECT sql FROM sqlite_master WHERE name='$EMBY_LATEST_EPISODES_DCN_GK_INDEX_NAME';")" "published Episodes outer sqlite_master.sql"
@@ -310,7 +326,7 @@ assert_eqp_uses_emby_index "$(mediaitems_eqp "$published")" "published post-ANAL
 assert_eqp_uses_latest_index "$(latest_eqp "$published")" "published post-ANALYZE"
 assert_episodes_two_index_eqp "$(episodes_two_index_eqp "$published")" "published post-ANALYZE"
 assert_eq "6401,6403,6404,6407,6411,6412,6413,6418,6416,6408" "$(episodes_two_index_ids "$published")" "published post-ANALYZE Episodes deterministic ids"
-assert_movies_c2_eqp "$(movies_c2_eqp "$published")" "published post-ANALYZE"
+assert_movies_latest_antijoin_eqp "$(movies_latest_antijoin_eqp "$published")" "published post-ANALYZE"
 assert_movies_vendor_eqp "$(movies_vendor_eqp "$published")" "published post-ANALYZE"
 
 run_rebuild_capture published-second "$published" 4096 "$optimize_sql"
@@ -321,6 +337,8 @@ assert_eq "1" "$(latest_index_count "$published")" "idempotent Emby latest index
 assert_eq "1" "$(episodes_dcn_gk_index_count "$published")" "idempotent Emby episodes date-first index count"
 assert_eq "1" "$(movies_index_count "$published")" "idempotent Emby movies outer index count"
 assert_eq "1" "$(movies_puk_dc_index_count "$published")" "idempotent Emby movies inner index count"
+assert_eq "1" "$(mixed_dcn_gk_index_count "$published")" "idempotent Emby mixed outer index count"
+assert_eq "1" "$(mixed_gk_dc_index_count "$published")" "idempotent Emby mixed inner index count"
 
 warn_db="$tmp/warn-not-abort.db"
 create_mediaitems_db "$warn_db" 1024
@@ -337,6 +355,8 @@ assert_eq "0" "$(latest_index_count "$warn_db")" "warn-not-abort no latest index
 assert_eq "0" "$(episodes_dcn_gk_index_count "$warn_db")" "warn-not-abort no Episodes date-first index"
 assert_eq "0" "$(movies_index_count "$warn_db")" "warn-not-abort no movies outer index"
 assert_eq "0" "$(movies_puk_dc_index_count "$warn_db")" "warn-not-abort no movies inner index"
+assert_eq "0" "$(mixed_dcn_gk_index_count "$warn_db")" "warn-not-abort no mixed outer index"
+assert_eq "0" "$(mixed_gk_dc_index_count "$warn_db")" "warn-not-abort no mixed inner index"
 
 gate_db="$tmp/staged-gate.db"
 create_mediaitems_db "$gate_db"
@@ -361,20 +381,20 @@ assert_eqp_uses_emby_index "$(mediaitems_eqp "$eqp_db")" "pre-ANALYZE"
 assert_eqp_uses_latest_index "$(latest_eqp "$eqp_db")" "pre-ANALYZE"
 assert_episodes_two_index_eqp "$(episodes_two_index_eqp "$eqp_db")" "pre-ANALYZE"
 assert_eq "6401,6403,6404,6407,6411,6412,6413,6418,6416,6408" "$(episodes_two_index_ids "$eqp_db")" "pre-ANALYZE Episodes deterministic ids"
-assert_movies_c2_eqp "$(movies_c2_eqp "$eqp_db")" "pre-ANALYZE"
+assert_movies_latest_antijoin_eqp "$(movies_latest_antijoin_eqp "$eqp_db")" "pre-ANALYZE"
 assert_movies_vendor_eqp "$(movies_vendor_eqp "$eqp_db")" "pre-ANALYZE"
 assert_movies_vendor_eqp "$vendor_eqp_before" "before indexes"
 assert_eq "$vendor_rows_before" "$(movies_rows "$eqp_db" "$(movies_vendor_sql)")" "vendor rows stable before ANALYZE"
-assert_eq "$vendor_rows_before" "$(movies_rows "$eqp_db" "$(movies_c2_sql)")" "C2/vendor full-row identity before ANALYZE"
+assert_eq "$vendor_rows_before" "$(movies_rows "$eqp_db" "$(movies_latest_antijoin_sql)")" "movies-Latest date-ordered anti-join/vendor full-row identity before ANALYZE"
 "$real_sqlite" "$eqp_db" "ANALYZE;"
 assert_eqp_uses_emby_index "$(mediaitems_eqp "$eqp_db")" "post-ANALYZE"
 assert_eqp_uses_latest_index "$(latest_eqp "$eqp_db")" "post-ANALYZE"
 assert_episodes_two_index_eqp "$(episodes_two_index_eqp "$eqp_db")" "post-ANALYZE"
 assert_eq "6401,6403,6404,6407,6411,6412,6413,6418,6416,6408" "$(episodes_two_index_ids "$eqp_db")" "post-ANALYZE Episodes deterministic ids"
-assert_movies_c2_eqp "$(movies_c2_eqp "$eqp_db")" "post-ANALYZE"
+assert_movies_latest_antijoin_eqp "$(movies_latest_antijoin_eqp "$eqp_db")" "post-ANALYZE"
 assert_movies_vendor_eqp "$(movies_vendor_eqp "$eqp_db")" "post-ANALYZE"
 assert_eq "$vendor_rows_before" "$(movies_rows "$eqp_db" "$(movies_vendor_sql)")" "vendor rows stable after ANALYZE"
-assert_eq "$vendor_rows_before" "$(movies_rows "$eqp_db" "$(movies_c2_sql)")" "C2/vendor full-row identity after ANALYZE"
+assert_eq "$vendor_rows_before" "$(movies_rows "$eqp_db" "$(movies_latest_antijoin_sql)")" "movies-Latest date-ordered anti-join/vendor full-row identity after ANALYZE"
 assert_eq "1" "$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM MediaItems INDEXED BY $EMBY_INDEX_NAME WHERE ParentId=4600 AND Type=8;")" "INDEXED BY usability probe"
 latest_indexed_count="$("$real_sqlite" "$eqp_db" "SELECT COUNT(*) FROM MediaItems INDEXED BY $EMBY_LATEST_INDEX_NAME WHERE Type=8 AND coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey)='series-6';")"
 assert_int_gt "$latest_indexed_count" 0 "latest INDEXED BY usability probe"

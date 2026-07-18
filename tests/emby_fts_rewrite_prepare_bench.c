@@ -39,10 +39,24 @@ static const char *LARGE_MISS_SQL =
     "(EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid=A.Id)) "
     "Group by A.Type ORDER BY Rank ASC LIMIT 50";
 
+static const char *MIXED_MATCH_SQL =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select "
+    "A.type,A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 3";
+
+static const char *MIXED_BOUND_MATCH_SQL =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select "
+    "A.type,A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=? "
+    "where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT ?";
+
 typedef enum bench_work {
     WORK_PREPARE_SELECT,
     WORK_PREPARE_LARGE_MISS,
     WORK_PREPARE_MATCH,
+    WORK_PREPARE_MIXED_MATCH,
+    WORK_PREPARE_MIXED_BOUND_MATCH,
     WORK_EXEC_PRAGMA
 } bench_work;
 
@@ -171,15 +185,19 @@ static void exec_sql(sqlite3 *db, const char *label, const char *sql) {
 static void setup_schema(const char *path) {
     sqlite3 *db = open_db(path);
     exec_sql(db, "schema",
-        "CREATE TABLE mediaitems(Id INTEGER PRIMARY KEY, Type INTEGER, UserDataKeyId INTEGER, IsPublic INTEGER, ExtraType INTEGER);"
+        "CREATE TABLE mediaitems(Id INTEGER PRIMARY KEY, Type INTEGER, IndexNumber INTEGER, Name TEXT, ParentIndexNumber INTEGER, RunTimeTicks INTEGER, ParentId INTEGER, SeriesName TEXT, AlbumId INTEGER, SeriesId INTEGER, Images TEXT, SortIndexNumber INTEGER, SortParentIndexNumber INTEGER, IndexNumberEnd INTEGER, DateCreated INTEGER, SeriesPresentationUniqueKey TEXT, PresentationUniqueKey TEXT, UserDataKeyId INTEGER, IsPublic INTEGER, ExtraType INTEGER);"
         "CREATE TABLE AncestorIds2(itemid INTEGER, AncestorId INTEGER, Distance INTEGER);"
         "CREATE TABLE ItemLinks2(ItemId INTEGER, LinkedId INTEGER, Type INTEGER);"
         "CREATE TABLE itemPeople2(ItemId INTEGER, PersonId INTEGER);"
         "CREATE TABLE ListItems(ListId INTEGER, ListItemId INTEGER);"
         "CREATE TABLE UserItemShares(UserId INTEGER, ItemId INTEGER, ShareLevel INTEGER);"
+        "CREATE TABLE UserDatas(UserDataKeyId INTEGER,UserId INTEGER,IsFavorite INTEGER,Played INTEGER,PlaybackPositionTicks INTEGER,AudioStreamIndex INTEGER,SubtitleStreamIndex INTEGER,PRIMARY KEY(UserDataKeyId,UserId)) WITHOUT ROWID;"
         "CREATE VIRTUAL TABLE fts_search9 USING fts5(title);"
-        "INSERT INTO mediaitems VALUES(1,1,1,1,NULL);"
+        "INSERT INTO mediaitems(Id,Type,Name,DateCreated,SeriesPresentationUniqueKey,PresentationUniqueKey,UserDataKeyId,IsPublic,ExtraType) VALUES(1,8,'bench',100,'bench-gk','bench-puk',1,1,NULL);"
         "INSERT INTO AncestorIds2 VALUES(1,100,0);"
+        "INSERT INTO UserDatas(UserDataKeyId,UserId,Played) VALUES(1,42,0);"
+        "CREATE INDEX idx_dshadow_emby_latest_mixed_dcn_gk ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) WHERE Type IN (8,5);"
+        "CREATE INDEX idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) WHERE Type IN (8,5);"
         "INSERT INTO fts_search9(rowid,title) VALUES(1,'alpha');"
     );
     if (sqlite3_close(db) != SQLITE_OK) failf("schema close failed");
@@ -198,8 +216,16 @@ static void *bench_worker(void *arg) {
             const char *sql = "SELECT 1";
             if (bt->work == WORK_PREPARE_MATCH) sql = MATCH_SQL;
             else if (bt->work == WORK_PREPARE_LARGE_MISS) sql = LARGE_MISS_SQL;
+            else if (bt->work == WORK_PREPARE_MIXED_MATCH) sql = MIXED_MATCH_SQL;
+            else if (bt->work == WORK_PREPARE_MIXED_BOUND_MATCH) sql = MIXED_BOUND_MATCH_SQL;
             int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
             if (rc != SQLITE_OK) failf("prepare rc=%d err=%s", rc, sqlite3_errmsg(db));
+            if (bt->work == WORK_PREPARE_MIXED_BOUND_MATCH) {
+                if (sqlite3_bind_int(stmt, 1, 42) != SQLITE_OK ||
+                    sqlite3_bind_int(stmt, 2, 3) != SQLITE_OK) {
+                    failf("mixed bound bind failed: %s", sqlite3_errmsg(db));
+                }
+            }
             rc = sqlite3_finalize(stmt);
             if (rc != SQLITE_OK) failf("finalize rc=%d err=%s", rc, sqlite3_errmsg(db));
         }
@@ -339,6 +365,16 @@ int main(void) {
               ASSERT_ADVISORY_LOW_PREPARE_COST);
     run_child("enabled-all-large-miss", "0", "0", "0", 0, "library.db", WORK_PREPARE_LARGE_MISS, 1,
               ASSERT_ADVISORY_LOW_PREPARE_COST);
+    run_child("disabled-mixed-match", "1", "1", NULL, 0, "library.db", WORK_PREPARE_MIXED_MATCH, 1,
+              ASSERT_ADVISORY_LOW_PREPARE_COST);
+    run_child("enabled-mixed-nonmatch", "1", "1", "0", 0, "library.db", WORK_PREPARE_SELECT, 1,
+              ASSERT_ADVISORY_LOW_PREPARE_COST);
+    run_child("enabled-mixed-large-nonmatch", "1", "1", "0", 0, "library.db", WORK_PREPARE_LARGE_MISS, 1,
+              ASSERT_ADVISORY_LOW_PREPARE_COST);
+    run_child("enabled-mixed-literal-match", "1", "1", "0", 0, "library.db", WORK_PREPARE_MIXED_MATCH, 1,
+              ASSERT_NONE);
+    run_child("enabled-mixed-bound-match", "1", "1", "0", 0, "library.db", WORK_PREPARE_MIXED_BOUND_MATCH, 1,
+              ASSERT_NONE);
     run_child("enabled-emby-observable-repeated-miss", "0", "0", NULL, 1,
               "library.db", WORK_PREPARE_LARGE_MISS, 1,
               ASSERT_ADVISORY_LOW_PREPARE_COST);
