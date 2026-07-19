@@ -1,3 +1,4 @@
+#include "rewrite_smoke_harness.h"
 #include "sqlite3.h"
 
 #include <errno.h>
@@ -246,6 +247,7 @@ static int scalar_authorizer_cb(
 );
 
 static int active_stderr_capture_fd = -1;
+static const rsh_suite_spec emby_suite_spec;
 
 static void failf(const char *fmt, ...) {
     va_list ap;
@@ -267,6 +269,49 @@ static void failf(const char *fmt, ...) {
 }
 
 #include "contract_parity.h"
+
+static int rsh_public_prepare(
+    sqlite3 *db,
+    const char *sql,
+    int nbyte,
+    rsh_prepare_kind kind,
+    sqlite3_stmt **stmt_out,
+    const char **tail_out
+) {
+    if (kind == RSH_PREPARE_V3) {
+        return sqlite3_prepare_v3(
+            db, sql, nbyte, SQLITE_PREPARE_PERSISTENT, stmt_out, tail_out
+        );
+    }
+    if (kind == RSH_PREPARE_V2) {
+        return sqlite3_prepare_v2(db, sql, nbyte, stmt_out, tail_out);
+    }
+    return sqlite3_prepare(db, sql, nbyte, stmt_out, tail_out);
+}
+
+#ifdef EMBY_FTS_REWRITE_DIRECT_TEST
+static int rsh_direct_prepare(
+    sqlite3 *db,
+    const char *sql,
+    int nbyte,
+    rsh_prepare_kind kind,
+    sqlite3_stmt **stmt_out,
+    const char **tail_out
+) {
+    fts_rewrite_prepare_kind engine_kind = FTS_REWRITE_PREPARE_LEGACY;
+    unsigned int flags = 0;
+
+    if (kind == RSH_PREPARE_V3) {
+        engine_kind = FTS_REWRITE_PREPARE_V3;
+        flags = SQLITE_PREPARE_PERSISTENT;
+    } else if (kind == RSH_PREPARE_V2) {
+        engine_kind = FTS_REWRITE_PREPARE_V2;
+    }
+    return emby_fts_rewrite_prepare(
+        db, sql, nbyte, flags, stmt_out, tail_out, engine_kind
+    );
+}
+#endif
 
 static char *xasprintf(const char *fmt, ...) {
     va_list ap;
@@ -524,13 +569,8 @@ static int naturalsort_cmp(void *ctx, int left_n, const void *left, int right_n,
     return (left_n > right_n) - (left_n < right_n);
 }
 
-static sqlite3 *open_seeded_temp(const char *basename) {
-    char path[512];
-    sqlite3 *db;
-
-    temp_path(path, sizeof(path), basename);
-    unlink(path);
-    db = open_db_path(path);
+static int rsh_base_seed(sqlite3 *db, void *suite_ctx) {
+    (void)suite_ctx;
     require_int("schema/collation",
                 sqlite3_create_collation(db, "NATURALSORT", SQLITE_UTF8, NULL, naturalsort_cmp),
                 SQLITE_OK);
@@ -586,7 +626,51 @@ static sqlite3 *open_seeded_temp(const char *basename) {
         "(6,42,0,0,0,0,0,0,60),(7,42,0,0,0,0,0,0,70),(8,42,0,0,0,0,0,0,80),"
         "(9,1,1,0,0,0,0,0,90),(10,42,0,0,0,0,0,0,100);"
     );
-    return db;
+    return SQLITE_OK;
+}
+
+static int rsh_open(const char *path, sqlite3 **db_out, void *suite_ctx) {
+    (void)suite_ctx;
+    *db_out = open_db_path(path);
+    return SQLITE_OK;
+}
+
+static rsh_apply_profile_fn rsh_resolve_setup_profile(
+    int profile,
+    void *suite_ctx
+) {
+    (void)profile;
+    (void)suite_ctx;
+    return NULL;
+}
+
+static sqlite3 *open_seeded_temp(const char *basename) {
+    rsh_db_spec db_spec;
+    rsh_db_handle handle;
+    int rc;
+
+    memset(&db_spec, 0, sizeof(db_spec));
+    memset(&handle, 0, sizeof(handle));
+    db_spec.role = "legacy";
+    rc = snprintf(
+        db_spec.relative_path, sizeof(db_spec.relative_path), "%s", basename
+    );
+    if (rc < 0 || (size_t)rc >= sizeof(db_spec.relative_path)) {
+        failf("FATAL: seeded relative path too long for %s", basename);
+    }
+    db_spec.kind = strcmp(basename, emby_suite_spec.target_basename) == 0
+        ? RSH_DB_CANDIDATE
+        : strcmp(basename, emby_suite_spec.vendor_basename) == 0
+            ? RSH_DB_VENDOR : RSH_DB_AUXILIARY;
+    db_spec.storage = RSH_DB_RELATIVE;
+    rsh_validate_db_specs(
+        &emby_suite_spec, "legacy", "seeded-open", &db_spec, 1
+    );
+    rsh_open_seeded_db(
+        &emby_suite_spec, getpid(), NULL, "legacy", "seeded-open",
+        &db_spec, &handle
+    );
+    return handle.db;
 }
 
 static sqlite3 *open_seeded_temp_with_latest_indexes(
@@ -3507,6 +3591,10 @@ static int child_dashboard_index_definition_gate(void) {
     int saved_stderr_fd;
 
     configure_env_observable("1", "1", "0");
+    if (setenv("SQLITE3_DISABLE_STMT_TRACE", "1", 1) != 0 ||
+        unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL") != 0) {
+        failf("FATAL: exec-child observable env failed: %s", strerror(errno));
+    }
     make_temp_dir();
     episodes_sql = make_latest_sql("A.Id ", "12");
     episodes_expected = make_latest_expected("A.Id ", "12");
@@ -5057,6 +5145,10 @@ static int child_observability_logs(void) {
     int saved_stderr_fd;
 
     configure_env_observable("1", "0", "0");
+    if (setenv("SQLITE3_DISABLE_STMT_TRACE", "1", 1) != 0 ||
+        unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL") != 0) {
+        failf("FATAL: exec-child observable env failed: %s", strerror(errno));
+    }
     make_temp_dir();
     capture = begin_stderr_capture(&saved_stderr_fd);
 
@@ -5592,152 +5684,478 @@ static int child_authorizer_and_ownership(void) {
     return 0;
 }
 
-static void run_exec_child(const char *program, const char *name) {
-    pid_t pid = fork();
-    int status;
+#define DEFINE_LEGACY_THUNK(name, call) \
+    static int legacy_##name(void) { return (call); }
 
-    if (pid < 0) failf("FATAL: fork-exec(%s) failed: %s", name, strerror(errno));
-    if (pid == 0) {
-        char *const args[] = {(char *)program, "--child", (char *)name, NULL};
-        if (strcmp(name, "observability-master-disabled") == 0) {
-            if (setenv("SQLITE3_DISABLE_OBSERVABILITY", "1", 1) != 0 ||
-                setenv("SQLITE3_DISABLE_STMT_TRACE", "0", 1) != 0) {
-                failf("FATAL: exec-child master-disable env failed: %s", strerror(errno));
-            }
-        } else if (unsetenv("SQLITE3_DISABLE_OBSERVABILITY") != 0 ||
-                   setenv("SQLITE3_DISABLE_STMT_TRACE", "1", 1) != 0 ||
-                   unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL") != 0) {
-            failf("FATAL: exec-child observable env failed: %s", strerror(errno));
-        }
-        if (strchr(program, '/')) {
-            execv(program, args);
-        } else {
-            execvp(program, args);
-        }
-        failf("FATAL: exec child %s failed: %s", name, strerror(errno));
-    }
-    if (waitpid(pid, &status, 0) < 0) failf("FATAL: waitpid(%s) failed: %s", name, strerror(errno));
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        failf("FATAL: child %s failed status=%d", name, status);
-    }
-}
-
-static void run_child(const char *name) {
-    pid_t pid = fork();
-    int status;
-    if (pid < 0) failf("FATAL: fork(%s) failed: %s", name, strerror(errno));
-    if (pid == 0) {
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST
-        if (strcmp(name, "direct-test-api") == 0) _exit(child_direct_test_api());
-        if (strcmp(name, "direct-fail-open-episodes") == 0) _exit(child_direct_fail_open_episodes());
-        if (strcmp(name, "direct-fail-open-movies") == 0) _exit(child_direct_fail_open_movies());
-        if (strcmp(name, "direct-fail-open-mixed") == 0) _exit(child_direct_fail_open_mixed());
+DEFINE_LEGACY_THUNK(direct_test_api, child_direct_test_api())
+DEFINE_LEGACY_THUNK(direct_fail_open_episodes, child_direct_fail_open_episodes())
+DEFINE_LEGACY_THUNK(direct_fail_open_movies, child_direct_fail_open_movies())
+DEFINE_LEGACY_THUNK(direct_fail_open_mixed, child_direct_fail_open_mixed())
 #endif
-        if (strcmp(name, "positive") == 0) _exit(child_positive());
-        if (strcmp(name, "fts-default-on") == 0) _exit(child_fts_env(NULL, "fts-default-on", 1));
-        if (strcmp(name, "fts-zero-enables") == 0) _exit(child_fts_env("0", "fts-zero-enables", 1));
-        if (strcmp(name, "fts-one-disables") == 0) _exit(child_fts_env("1", "fts-one-disables", 0));
-        if (strcmp(name, "fts-garbage-enables") == 0) _exit(child_fts_env("xyz", "fts-garbage-enables", 1));
-        if (strcmp(name, "path-negative") == 0) _exit(child_path_negative());
-        if (strcmp(name, "nonmatch") == 0) _exit(child_nonmatch());
-        if (strcmp(name, "collision") == 0) _exit(child_collision());
-        if (strcmp(name, "authorizer-ownership") == 0) _exit(child_authorizer_and_ownership());
-        if (strcmp(name, "fixture-canary") == 0) _exit(child_fixture_canary());
-        if (strcmp(name, "row-parity") == 0) _exit(child_row_parity());
-        if (strcmp(name, "complex-resume-watched-progress-row-parity") == 0) _exit(child_complex_resume_watched_progress_row_parity());
-        if (strcmp(name, "fanout-default-on") == 0) _exit(child_fanout_env(NULL, "fanout-default-on", 1));
-        if (strcmp(name, "fanout-zero-enables") == 0) _exit(child_fanout_env("0", "fanout-zero-enables", 1));
-        if (strcmp(name, "fanout-one-disables") == 0) _exit(child_fanout_env("1", "fanout-one-disables", 0));
-        if (strcmp(name, "fanout-garbage-enables") == 0) _exit(child_fanout_env("false", "fanout-garbage-enables", 1));
-        if (strcmp(name, "fanout-matrix") == 0) _exit(child_fanout_matrix());
-        if (strcmp(name, "links-two-level-row-parity") == 0) _exit(child_links_two_level_row_parity());
-        if (strcmp(name, "emby-slow-search-matrix") == 0) _exit(child_emby_slow_search_matrix());
-        if (strcmp(name, "dashboard-default-off") == 0) _exit(child_dashboard_default_off());
-        if (strcmp(name, "dashboard-one-off") == 0) _exit(child_dashboard_off_value("1", "dashboard-one-off"));
-        if (strcmp(name, "dashboard-empty-off") == 0) _exit(child_dashboard_off_value("", "dashboard-empty-off"));
-        if (strcmp(name, "dashboard-garbage-off") == 0) _exit(child_dashboard_off_value("false", "dashboard-garbage-off"));
-        if (strcmp(name, "dashboard-matrix") == 0) _exit(child_dashboard_matrix());
-        if (strcmp(name, "dashboard-fix-b-c") == 0) _exit(child_dashboard_fix_b_c());
-        if (strcmp(name, "dashboard-mixed-latest") == 0) _exit(child_dashboard_mixed_latest());
-        if (strcmp(name, "dashboard-mixed-disabled") == 0) _exit(child_dashboard_mixed_disabled());
-        if (strcmp(name, "dashboard-mixed-identity") == 0) _exit(child_dashboard_mixed_identity());
-        if (strcmp(name, "dashboard-matcher-negatives") == 0) _exit(child_dashboard_matcher_negatives());
-        if (strcmp(name, "dashboard-release-matrix") == 0) _exit(child_dashboard_release_matrix());
-        if (strcmp(name, "latest-limit20") == 0) _exit(child_latest_limit20());
-        if (strcmp(name, "latest-capture-miss-negative") == 0) {
-            _exit(child_latest_fixture_passthrough("latest-capture-miss-negative"));
-        }
-        if (strcmp(name, "latest-series-browse-negative") == 0) {
-            _exit(child_latest_fixture_passthrough("latest-series-browse-negative"));
-        }
-        if (strcmp(name, "latest-resume-no-misfire") == 0) _exit(child_latest_resume_no_misfire());
-        failf("FATAL: unknown child %s", name);
+DEFINE_LEGACY_THUNK(positive, child_positive())
+DEFINE_LEGACY_THUNK(fts_default_on, child_fts_env(NULL, "fts-default-on", 1))
+DEFINE_LEGACY_THUNK(fts_zero_enables, child_fts_env("0", "fts-zero-enables", 1))
+DEFINE_LEGACY_THUNK(fts_one_disables, child_fts_env("1", "fts-one-disables", 0))
+DEFINE_LEGACY_THUNK(fts_garbage_enables, child_fts_env("xyz", "fts-garbage-enables", 1))
+DEFINE_LEGACY_THUNK(path_negative, child_path_negative())
+DEFINE_LEGACY_THUNK(nonmatch, child_nonmatch())
+DEFINE_LEGACY_THUNK(collision, child_collision())
+DEFINE_LEGACY_THUNK(authorizer_ownership, child_authorizer_and_ownership())
+DEFINE_LEGACY_THUNK(fixture_canary, child_fixture_canary())
+DEFINE_LEGACY_THUNK(row_parity, child_row_parity())
+DEFINE_LEGACY_THUNK(
+    complex_resume_watched_progress_row_parity,
+    child_complex_resume_watched_progress_row_parity()
+)
+DEFINE_LEGACY_THUNK(
+    fanout_default_on, child_fanout_env(NULL, "fanout-default-on", 1)
+)
+DEFINE_LEGACY_THUNK(
+    fanout_zero_enables, child_fanout_env("0", "fanout-zero-enables", 1)
+)
+DEFINE_LEGACY_THUNK(
+    fanout_one_disables, child_fanout_env("1", "fanout-one-disables", 0)
+)
+DEFINE_LEGACY_THUNK(
+    fanout_garbage_enables,
+    child_fanout_env("false", "fanout-garbage-enables", 1)
+)
+DEFINE_LEGACY_THUNK(fanout_matrix, child_fanout_matrix())
+DEFINE_LEGACY_THUNK(links_two_level_row_parity, child_links_two_level_row_parity())
+DEFINE_LEGACY_THUNK(emby_slow_search_matrix, child_emby_slow_search_matrix())
+DEFINE_LEGACY_THUNK(dashboard_default_off, child_dashboard_default_off())
+DEFINE_LEGACY_THUNK(
+    dashboard_one_off, child_dashboard_off_value("1", "dashboard-one-off")
+)
+DEFINE_LEGACY_THUNK(
+    dashboard_empty_off, child_dashboard_off_value("", "dashboard-empty-off")
+)
+DEFINE_LEGACY_THUNK(
+    dashboard_garbage_off,
+    child_dashboard_off_value("false", "dashboard-garbage-off")
+)
+DEFINE_LEGACY_THUNK(dashboard_matrix, child_dashboard_matrix())
+DEFINE_LEGACY_THUNK(dashboard_fix_b_c, child_dashboard_fix_b_c())
+DEFINE_LEGACY_THUNK(dashboard_mixed_latest, child_dashboard_mixed_latest())
+DEFINE_LEGACY_THUNK(dashboard_mixed_disabled, child_dashboard_mixed_disabled())
+DEFINE_LEGACY_THUNK(dashboard_mixed_identity, child_dashboard_mixed_identity())
+DEFINE_LEGACY_THUNK(dashboard_matcher_negatives, child_dashboard_matcher_negatives())
+DEFINE_LEGACY_THUNK(dashboard_release_matrix, child_dashboard_release_matrix())
+DEFINE_LEGACY_THUNK(latest_limit20, child_latest_limit20())
+DEFINE_LEGACY_THUNK(
+    latest_capture_miss_negative,
+    child_latest_fixture_passthrough("latest-capture-miss-negative")
+)
+DEFINE_LEGACY_THUNK(
+    latest_series_browse_negative,
+    child_latest_fixture_passthrough("latest-series-browse-negative")
+)
+DEFINE_LEGACY_THUNK(latest_resume_no_misfire, child_latest_resume_no_misfire())
+DEFINE_LEGACY_THUNK(
+    dashboard_index_definition_gate, child_dashboard_index_definition_gate()
+)
+DEFINE_LEGACY_THUNK(observability_logs, child_observability_logs())
+DEFINE_LEGACY_THUNK(
+    observability_master_disabled, child_observability_master_disabled()
+)
+
+#undef DEFINE_LEGACY_THUNK
+
+static const char *const emby_controlled_env_gates[] = {
+    "SQLITE3_DISABLE_AUTOPRAGMA",
+    "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+    "SQLITE3_DISABLE_OBSERVABILITY",
+    "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+    "SQLITE3_DISABLE_EMBY_FTS_REWRITE",
+    "SQLITE3_DISABLE_EMBY_FANOUT_REWRITE",
+    "SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE",
+    "SQLITE3_DISABLE_STMT_TRACE",
+    "SQLITE3_DISABLE_REWRITE_APPLIED_SQL"
+};
+
+static const rsh_env_assignment emby_exec_observable_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
     }
-    if (waitpid(pid, &status, 0) < 0) failf("FATAL: waitpid(%s) failed: %s", name, strerror(errno));
-    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-        failf("FATAL: child %s failed status=%d", name, status);
+};
+
+static const rsh_env_assignment emby_exec_master_disabled_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "0"}
     }
-}
+};
+
+static const rsh_env_assignment emby_negative_control_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_AUTOPRAGMA",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_EMBY_FTS_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_EMBY_FANOUT_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
+    }
+};
+
+static const rsh_db_spec emby_negative_control_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE
+    }
+};
+
+static const char emby_vendor_prepare_control_sql[] =
+    "SELECT 'emby-negative-control-vendor-prepare' FROM";
+
+static const rsh_case_spec emby_vendor_prepare_control_cases[] = {
+    {
+        .label = "negative-control-vendor-prepare",
+        .kind = RSH_CASE_EXPECT_ABORT,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.expect_abort.negative = {
+            .source_kind = RSH_NEGATIVE_STATIC,
+            .sql = emby_vendor_prepare_control_sql,
+            .discriminating_needle = "emby-negative-control-vendor-prepare",
+            .prepare = {
+                .kind = RSH_PREPARE_V2,
+                .nbyte_kind = RSH_NBYTE_MINUS_ONE,
+                .tail_kind = RSH_TAIL_FULL
+            },
+            .vendor_role = "vendor",
+            .candidate_role = "candidate"
+        }
+    }
+};
+
+static const rsh_case_spec emby_matcher_miss_control_cases[] = {
+    {
+        .label = "negative-control-matcher-miss",
+        .kind = RSH_CASE_EXPECT_ABORT,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.expect_abort.negative = {
+            .source_kind = RSH_NEGATIVE_FIXTURE,
+            .fixture_path = "tests/fixtures/emby-fts-rewrite/slow-type.sql",
+            .strip_fixture_final_lf = 1,
+            .discriminating_needle = "fts_search9 match @SearchTerm",
+            .prepare = {
+                .kind = RSH_PREPARE_V2,
+                .nbyte_kind = RSH_NBYTE_MINUS_ONE,
+                .tail_kind = RSH_TAIL_FULL
+            },
+            .vendor_role = "vendor",
+            .candidate_role = "candidate"
+        }
+    }
+};
+
+static const rsh_phase_spec emby_vendor_prepare_control_phases[] = {
+    {
+        .label = "negative-control-vendor-prepare",
+        .dbs = emby_negative_control_dbs,
+        .db_count = sizeof(emby_negative_control_dbs) /
+                    sizeof(emby_negative_control_dbs[0]),
+        .cases = emby_vendor_prepare_control_cases,
+        .case_count = sizeof(emby_vendor_prepare_control_cases) /
+                      sizeof(emby_vendor_prepare_control_cases[0])
+    }
+};
+
+static const rsh_phase_spec emby_matcher_miss_control_phases[] = {
+    {
+        .label = "negative-control-matcher-miss",
+        .dbs = emby_negative_control_dbs,
+        .db_count = sizeof(emby_negative_control_dbs) /
+                    sizeof(emby_negative_control_dbs[0]),
+        .cases = emby_matcher_miss_control_cases,
+        .case_count = sizeof(emby_matcher_miss_control_cases) /
+                      sizeof(emby_matcher_miss_control_cases[0])
+    }
+};
+
+static const char *const emby_vendor_prepare_earlier_labels[] = {
+    "FAIL [negative-control-vendor-prepare/needle-unique]"
+};
+
+static const rsh_abort_expectation emby_vendor_prepare_abort_expectation = {
+    .expected_exit = 1,
+    .expected_stage_label =
+        "FAIL [negative-control-vendor-prepare/vendor-prepare]",
+    .earlier_stage_labels = emby_vendor_prepare_earlier_labels,
+    .earlier_stage_label_count = sizeof(emby_vendor_prepare_earlier_labels) /
+                                 sizeof(emby_vendor_prepare_earlier_labels[0])
+};
+
+static const char *const emby_matcher_miss_earlier_labels[] = {
+    "FAIL [negative-control-matcher-miss/needle-unique]",
+    "FAIL [negative-control-matcher-miss/vendor-prepare]",
+    "FAIL [negative-control-matcher-miss/vendor-sql]",
+    "FAIL [negative-control-matcher-miss/vendor-tail]",
+    "FAIL [negative-control-matcher-miss/vendor-finalize]",
+    "FAIL [negative-control-matcher-miss/matcher-prepare]"
+};
+
+static const rsh_abort_expectation emby_matcher_miss_abort_expectation = {
+    .expected_exit = 1,
+    .expected_stage_label =
+        "FAIL [negative-control-matcher-miss/matcher-miss]",
+    .earlier_stage_labels = emby_matcher_miss_earlier_labels,
+    .earlier_stage_label_count = sizeof(emby_matcher_miss_earlier_labels) /
+                                 sizeof(emby_matcher_miss_earlier_labels[0])
+};
+
+static const rsh_suite_spec emby_suite_spec = {
+#ifdef EMBY_FTS_REWRITE_DIRECT_TEST
+    .suite_name = "emby fts rewrite direct test passed",
+    .prepare = rsh_direct_prepare,
+#else
+    .suite_name = "emby fts rewrite smoke passed",
+    .prepare = rsh_public_prepare,
+#endif
+    .temp_prefix = "/tmp/emby-fts-rewrite-smoke",
+    .vendor_basename = "not-target.db",
+    .target_basename = "library.db",
+    .controlled_env_gates = emby_controlled_env_gates,
+    .controlled_env_gate_count =
+        sizeof(emby_controlled_env_gates) / sizeof(emby_controlled_env_gates[0]),
+    .open = rsh_open,
+    .base_seed = rsh_base_seed,
+    .resolve_setup_profile = rsh_resolve_setup_profile,
+    .failure = failf
+};
+
+#define LEGACY_RUN(dispatch, label, process, mask, body) \
+    { \
+        .dispatch_name = (dispatch), \
+        .pass_label = (label), \
+        .process_kind = (process), \
+        .outcome = RSH_OUTCOME_SUCCESS, \
+        .build_mask = (mask), \
+        .capture_scope = RSH_CAPTURE_NONE, \
+        .legacy_body = (body) \
+    }
+
+#define LEGACY_EXEC_RUN(dispatch, label, env, mask, body) \
+    { \
+        .dispatch_name = (dispatch), \
+        .pass_label = (label), \
+        .process_kind = RSH_PROCESS_EXEC, \
+        .outcome = RSH_OUTCOME_SUCCESS, \
+        .build_mask = (mask), \
+        .preload_env = (env), \
+        .preload_env_count = sizeof(env) / sizeof((env)[0]), \
+        .capture_scope = RSH_CAPTURE_NONE, \
+        .legacy_body = (body) \
+    }
+
+static const rsh_run_spec emby_runs[] = {
+#ifdef EMBY_FTS_REWRITE_DIRECT_TEST
+    LEGACY_RUN("direct-test-api", "direct-test-api", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_DIRECT, legacy_direct_test_api),
+    LEGACY_RUN("direct-fail-open-episodes", "direct-fail-open-episodes",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_DIRECT,
+               legacy_direct_fail_open_episodes),
+    LEGACY_RUN("direct-fail-open-movies", "direct-fail-open-movies",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_DIRECT,
+               legacy_direct_fail_open_movies),
+    LEGACY_RUN("direct-fail-open-mixed", "direct-fail-open-mixed",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_DIRECT,
+               legacy_direct_fail_open_mixed),
+#endif
+    LEGACY_RUN("positive", "positive", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_positive),
+    LEGACY_RUN("fts-default-on", "fts-default-on", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fts_default_on),
+    LEGACY_RUN("fts-zero-enables", "fts-zero-enables", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fts_zero_enables),
+    LEGACY_RUN("fts-one-disables", "fts-one-disables", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fts_one_disables),
+    LEGACY_RUN("fts-garbage-enables", "fts-garbage-enables", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fts_garbage_enables),
+    LEGACY_RUN("path-negative", "path-negative", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_path_negative),
+    LEGACY_RUN("nonmatch", "nonmatch", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_nonmatch),
+    LEGACY_RUN("collision", "collision", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_collision),
+    LEGACY_RUN("authorizer-ownership", "authorizer-ownership", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_authorizer_ownership),
+    LEGACY_RUN("fixture-canary", "fixture-canary", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fixture_canary),
+    LEGACY_RUN("row-parity", "row-parity", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_row_parity),
+    LEGACY_RUN("complex-resume-watched-progress-row-parity",
+               "complex-resume-watched-progress-row-parity", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED,
+               legacy_complex_resume_watched_progress_row_parity),
+    LEGACY_RUN("fanout-default-on", "fanout-default-on", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fanout_default_on),
+    LEGACY_RUN("fanout-zero-enables", "fanout-zero-enables", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fanout_zero_enables),
+    LEGACY_RUN("fanout-one-disables", "fanout-one-disables", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fanout_one_disables),
+    LEGACY_RUN("fanout-garbage-enables", "fanout-garbage-enables",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_fanout_garbage_enables),
+    LEGACY_RUN("fanout-matrix", "fanout-matrix", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_fanout_matrix),
+    LEGACY_RUN("links-two-level-row-parity", "links-two-level-row-parity",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_links_two_level_row_parity),
+    LEGACY_RUN("emby-slow-search-matrix", "emby-slow-search-matrix",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_emby_slow_search_matrix),
+    LEGACY_RUN("dashboard-default-off", "dashboard-default-off", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_dashboard_default_off),
+    LEGACY_RUN("dashboard-one-off", "dashboard-one-off", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_dashboard_one_off),
+    LEGACY_RUN("dashboard-empty-off", "dashboard-empty-off", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_dashboard_empty_off),
+    LEGACY_RUN("dashboard-garbage-off", "dashboard-garbage-off", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_dashboard_garbage_off),
+    LEGACY_RUN("dashboard-matrix", "dashboard-matrix", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_dashboard_matrix),
+    LEGACY_RUN("dashboard-fix-b-c", "dashboard-fix-b-c", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_dashboard_fix_b_c),
+    LEGACY_RUN("dashboard-mixed-latest", "dashboard-mixed-latest-real-path",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_dashboard_mixed_latest),
+    LEGACY_RUN("dashboard-mixed-disabled", "dashboard-mixed-disabled",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_dashboard_mixed_disabled),
+    LEGACY_RUN("dashboard-mixed-identity", "dashboard-mixed-identity",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_dashboard_mixed_identity),
+    LEGACY_RUN("dashboard-matcher-negatives", "dashboard-matcher-negatives",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_dashboard_matcher_negatives),
+    LEGACY_RUN("dashboard-release-matrix", "dashboard-release-matrix",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_dashboard_release_matrix),
+    LEGACY_RUN("latest-limit20", "latest-limit20", RSH_PROCESS_FORK,
+               RSH_BUILD_EMBY_LINKED, legacy_latest_limit20),
+    LEGACY_RUN("latest-capture-miss-negative", "latest-capture-miss-negative",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_latest_capture_miss_negative),
+    LEGACY_RUN("latest-series-browse-negative", "latest-series-browse-negative",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_latest_series_browse_negative),
+    LEGACY_RUN("latest-resume-no-misfire", "latest-resume-no-misfire",
+               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
+               legacy_latest_resume_no_misfire),
+    LEGACY_EXEC_RUN(
+        "dashboard-index-definition-gate", "dashboard-index-definition-gate",
+        emby_exec_observable_env, RSH_BUILD_EMBY_LINKED,
+        legacy_dashboard_index_definition_gate
+    ),
+    LEGACY_EXEC_RUN(
+        "observability-logs", "observability-logs", emby_exec_observable_env,
+        RSH_BUILD_EMBY_LINKED, legacy_observability_logs
+    ),
+    LEGACY_EXEC_RUN(
+        "observability-master-disabled", "observability-master-disabled",
+        emby_exec_master_disabled_env, RSH_BUILD_EMBY_LINKED,
+        legacy_observability_master_disabled
+    ),
+    {
+        .dispatch_name = "negative-control-vendor-prepare",
+        .pass_label = "negative-control-vendor-prepare",
+        .process_kind = RSH_PROCESS_FORK,
+        .outcome = RSH_OUTCOME_EXPECT_ABORT,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .preload_env = emby_negative_control_env,
+        .preload_env_count = sizeof(emby_negative_control_env) /
+                             sizeof(emby_negative_control_env[0]),
+        .capture_scope = RSH_CAPTURE_NONE,
+        .phases = emby_vendor_prepare_control_phases,
+        .phase_count = sizeof(emby_vendor_prepare_control_phases) /
+                       sizeof(emby_vendor_prepare_control_phases[0]),
+        .abort_expectation = &emby_vendor_prepare_abort_expectation
+    },
+    {
+        .dispatch_name = "negative-control-matcher-miss",
+        .pass_label = "negative-control-matcher-miss",
+        .process_kind = RSH_PROCESS_FORK,
+        .outcome = RSH_OUTCOME_EXPECT_ABORT,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .preload_env = emby_negative_control_env,
+        .preload_env_count = sizeof(emby_negative_control_env) /
+                             sizeof(emby_negative_control_env[0]),
+        .capture_scope = RSH_CAPTURE_NONE,
+        .phases = emby_matcher_miss_control_phases,
+        .phase_count = sizeof(emby_matcher_miss_control_phases) /
+                       sizeof(emby_matcher_miss_control_phases[0]),
+        .abort_expectation = &emby_matcher_miss_abort_expectation
+    }
+};
+
+#undef LEGACY_EXEC_RUN
+#undef LEGACY_RUN
 
 int main(int argc, char **argv) {
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST
-    (void)argc;
-    (void)argv;
-    run_child("direct-test-api");
-    run_child("direct-fail-open-episodes");
-    run_child("direct-fail-open-movies");
-    run_child("direct-fail-open-mixed");
-    printf("emby fts rewrite direct test passed\n");
-    return 0;
+    const uint32_t active_build = RSH_BUILD_EMBY_DIRECT;
 #else
-    if (argc == 3 && strcmp(argv[1], "--child") == 0) {
-        if (strcmp(argv[2], "observability-logs") == 0) return child_observability_logs();
-        if (strcmp(argv[2], "observability-master-disabled") == 0) {
-            return child_observability_master_disabled();
-        }
-        if (strcmp(argv[2], "dashboard-index-definition-gate") == 0) {
-            return child_dashboard_index_definition_gate();
-        }
-        failf("FATAL: unknown exec child %s", argv[2]);
-    }
-    run_child("positive");
-    run_child("fts-default-on");
-    run_child("fts-zero-enables");
-    run_child("fts-one-disables");
-    run_child("fts-garbage-enables");
-    run_child("path-negative");
-    run_child("nonmatch");
-    run_child("collision");
-    run_child("authorizer-ownership");
-    run_child("fixture-canary");
-    run_child("row-parity");
-    run_child("complex-resume-watched-progress-row-parity");
-    run_child("fanout-default-on");
-    run_child("fanout-zero-enables");
-    run_child("fanout-one-disables");
-    run_child("fanout-garbage-enables");
-    run_child("fanout-matrix");
-    run_child("links-two-level-row-parity");
-    run_child("emby-slow-search-matrix");
-    run_child("dashboard-default-off");
-    run_child("dashboard-one-off");
-    run_child("dashboard-empty-off");
-    run_child("dashboard-garbage-off");
-    run_child("dashboard-matrix");
-    run_child("dashboard-fix-b-c");
-    run_child("dashboard-mixed-latest");
-    run_child("dashboard-mixed-disabled");
-    run_child("dashboard-mixed-identity");
-    run_child("dashboard-matcher-negatives");
-    run_child("dashboard-release-matrix");
-    run_child("latest-limit20");
-    run_child("latest-capture-miss-negative");
-    run_child("latest-series-browse-negative");
-    run_child("latest-resume-no-misfire");
-    run_exec_child(argv[0], "dashboard-index-definition-gate");
-    run_exec_child(argv[0], "observability-logs");
-    run_exec_child(argv[0], "observability-master-disabled");
-    printf("emby fts rewrite smoke passed\n");
-    return 0;
+    const uint32_t active_build = RSH_BUILD_EMBY_LINKED;
 #endif
+
+    if (argc == 3 && strcmp(argv[1], "--child") == 0) {
+        return rsh_run_child(
+            &emby_suite_spec, emby_runs,
+            sizeof(emby_runs) / sizeof(emby_runs[0]), active_build, argv[2]
+        );
+    }
+    return rsh_run_all(
+        &emby_suite_spec, emby_runs,
+        sizeof(emby_runs) / sizeof(emby_runs[0]), argv[0], active_build
+    );
 }
