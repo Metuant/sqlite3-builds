@@ -1083,6 +1083,11 @@ require_line .github/workflows/base.yml '            --build-arg UBUNTU_TOOLCHAI
 
 require_pattern .github/workflows/sqlite-build.yml 'docker/setup-buildx-action@d7f5e7f509e45cec5c76c4d5afdd7de93d0b3df5' 'main workflow setup-buildx action'
 require_pattern .github/workflows/sqlite-build.yml 'docker buildx build --load' 'main workflow buildx local load'
+require_workflow_step_line \
+  .github/workflows/sqlite-build.yml \
+  'Custom adapter guard' \
+  '        run: bash tests/check_custom_adapter_guard.sh' \
+  'custom adapter guard invocation'
 require_line .github/workflows/sqlite-build.yml "  group: \${{ github.workflow }}-\${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.ref || github.run_id }}"
 require_line .github/workflows/sqlite-build.yml "  cancel-in-progress: \${{ !startsWith(github.ref, 'refs/tags/') }}"
 reject_line .github/workflows/sqlite-build.yml '  CACHE_EVENT_NAME: baseline'

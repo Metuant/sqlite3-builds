@@ -1,21 +1,35 @@
 #include "rewrite_smoke_harness.h"
 #include "sqlite3.h"
 
-#include <errno.h>
 #include <limits.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <sys/wait.h>
-#include <unistd.h>
+
+enum emby_smoke_rewrite_mode {
+    EMBY_SMOKE_MODE_EPISODES_LATEST = 13,
+    EMBY_SMOKE_MODE_MOVIES_LATEST = 14,
+    EMBY_SMOKE_MODE_MIXED_LATEST = 15
+};
 
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST
 #include "emby_fts_rewrite.h"
 #include "observability.h"
+
+_Static_assert(
+    EMBY_SMOKE_MODE_EPISODES_LATEST == OBS_MODE_EMBY_EPISODES_LATEST,
+    "Emby Episodes Latest rewrite mode ABI drift"
+);
+_Static_assert(
+    EMBY_SMOKE_MODE_MOVIES_LATEST == OBS_MODE_EMBY_MOVIES_LATEST,
+    "Emby movies Latest rewrite mode ABI drift"
+);
+_Static_assert(
+    EMBY_SMOKE_MODE_MIXED_LATEST == OBS_MODE_EMBY_MIXED_LATEST,
+    "Emby mixed Latest rewrite mode ABI drift"
+);
 
 enum direct_fault_mode {
     DIRECT_FAULT_NONE = 0,
@@ -246,20 +260,11 @@ static int scalar_authorizer_cb(
     const char *trigger
 );
 
-static int active_stderr_capture_fd = -1;
 static const rsh_suite_spec emby_suite_spec;
 
 static void failf(const char *fmt, ...) {
     va_list ap;
 
-    if (active_stderr_capture_fd >= 0) {
-        fflush(stderr);
-        if (dup2(active_stderr_capture_fd, STDERR_FILENO) >= 0) {
-            close(active_stderr_capture_fd);
-            active_stderr_capture_fd = -1;
-            clearerr(stderr);
-        }
-    }
     va_start(ap, fmt);
     vfprintf(stderr, fmt, ap);
     va_end(ap);
@@ -328,67 +333,6 @@ static char *xasprintf(const char *fmt, ...) {
     if (!buf) failf("FATAL: malloc failed");
     if (vsnprintf(buf, (size_t)n + 1, fmt, ap2) != n) failf("FATAL: vsnprintf write failed");
     va_end(ap2);
-    return buf;
-}
-
-static char *read_text_file(const char *path) {
-    FILE *fp = fopen(path, "rb");
-    long size;
-    char *buf;
-
-    if (!fp) failf("FATAL: open %s failed: %s", path, strerror(errno));
-    if (fseek(fp, 0, SEEK_END) != 0) failf("FATAL: seek end %s failed", path);
-    size = ftell(fp);
-    if (size < 0) failf("FATAL: tell %s failed", path);
-    if (fseek(fp, 0, SEEK_SET) != 0) failf("FATAL: seek start %s failed", path);
-    buf = (char *)malloc((size_t)size + 1);
-    if (!buf) failf("FATAL: malloc file buffer failed");
-    if (fread(buf, 1, (size_t)size, fp) != (size_t)size) {
-        failf("FATAL: read %s failed", path);
-    }
-    if (fclose(fp) != 0) failf("FATAL: close %s failed", path);
-    while (size > 0 && (buf[size - 1] == '\n' || buf[size - 1] == '\r')) size--;
-    buf[size] = 0;
-    return buf;
-}
-
-static FILE *begin_stderr_capture(int *saved_stderr_fd) {
-    FILE *fp = tmpfile();
-
-    if (!fp) failf("FATAL: tmpfile for stderr capture failed: %s", strerror(errno));
-    fflush(stderr);
-    *saved_stderr_fd = dup(STDERR_FILENO);
-    if (*saved_stderr_fd < 0) failf("FATAL: dup(stderr) failed: %s", strerror(errno));
-    if (dup2(fileno(fp), STDERR_FILENO) < 0) {
-        failf("FATAL: redirect stderr failed: %s", strerror(errno));
-    }
-    active_stderr_capture_fd = *saved_stderr_fd;
-    clearerr(stderr);
-    return fp;
-}
-
-static char *end_stderr_capture(FILE *fp, int saved_stderr_fd) {
-    long size;
-    char *buf;
-
-    fflush(stderr);
-    if (dup2(saved_stderr_fd, STDERR_FILENO) < 0) {
-        failf("FATAL: restore stderr failed: %s", strerror(errno));
-    }
-    active_stderr_capture_fd = -1;
-    close(saved_stderr_fd);
-    clearerr(stderr);
-    if (fseek(fp, 0, SEEK_END) != 0) failf("FATAL: seek capture end failed");
-    size = ftell(fp);
-    if (size < 0) failf("FATAL: tell capture failed");
-    if (fseek(fp, 0, SEEK_SET) != 0) failf("FATAL: seek capture start failed");
-    buf = (char *)malloc((size_t)size + 1);
-    if (!buf) failf("FATAL: malloc capture buffer failed");
-    if (fread(buf, 1, (size_t)size, fp) != (size_t)size) {
-        failf("FATAL: read capture failed");
-    }
-    if (fclose(fp) != 0) failf("FATAL: close capture failed");
-    buf[size] = 0;
     return buf;
 }
 
@@ -461,85 +405,6 @@ static uint64_t sql_corr_key(const char *sql, size_t len) {
         hash *= UINT64_C(1099511628211);
     }
     return hash;
-}
-
-static void configure_env_common(
-    const char *fts,
-    const char *fanout,
-    const char *dashboard,
-    int disable_observability
-) {
-    if (setenv("SQLITE3_DISABLE_AUTOPRAGMA", "1", 1) != 0) failf("setenv AUTOPRAGMA failed");
-    if (setenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1", 1) != 0) failf("setenv RUNTIME failed");
-    if (disable_observability) {
-        if (setenv("SQLITE3_DISABLE_OBSERVABILITY", "1", 1) != 0) failf("setenv OBS failed");
-    } else if (unsetenv("SQLITE3_DISABLE_OBSERVABILITY") != 0) {
-        failf("unsetenv OBS failed");
-    }
-    if (unsetenv("SQLITE3_DISABLE_PLEX_FTS_REWRITE") != 0) failf("unsetenv PLEX failed");
-    if (fts) {
-        if (setenv("SQLITE3_DISABLE_EMBY_FTS_REWRITE", fts, 1) != 0) {
-            failf("setenv EMBY FTS failed");
-        }
-    } else if (unsetenv("SQLITE3_DISABLE_EMBY_FTS_REWRITE") != 0) {
-        failf("unsetenv EMBY FTS failed");
-    }
-    if (fanout) {
-        if (setenv("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", fanout, 1) != 0) {
-            failf("setenv EMBY FANOUT failed");
-        }
-    } else if (unsetenv("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE") != 0) {
-        failf("unsetenv EMBY FANOUT failed");
-    }
-    if (dashboard) {
-        if (setenv("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", dashboard, 1) != 0) {
-            failf("setenv EMBY DASHBOARD failed");
-        }
-    } else if (unsetenv("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE") != 0) {
-        failf("unsetenv EMBY DASHBOARD failed");
-    }
-}
-
-static void configure_env(const char *fts, const char *fanout, const char *dashboard) {
-    configure_env_common(fts, fanout, dashboard, 1);
-}
-
-static void configure_env_observable(const char *fts, const char *fanout, const char *dashboard) {
-    configure_env_common(fts, fanout, dashboard, 0);
-}
-
-static void temp_path(char *buf, size_t n, const char *basename) {
-    int rc = snprintf(buf, n, "/tmp/emby-fts-rewrite-smoke-%ld/%s", (long)getpid(), basename);
-    if (rc < 0 || (size_t)rc >= n) failf("FATAL: temp path too long for %s", basename);
-}
-
-static void make_temp_dir(void) {
-    char dir[256];
-    int rc = snprintf(dir, sizeof(dir), "/tmp/emby-fts-rewrite-smoke-%ld", (long)getpid());
-    if (rc < 0 || (size_t)rc >= sizeof(dir)) failf("FATAL: temp dir too long");
-    if (mkdir(dir, 0700) != 0 && errno != EEXIST) {
-        failf("FATAL: mkdir(%s) failed: %s", dir, strerror(errno));
-    }
-}
-
-static void cleanup_temp_dir(void) {
-    char dir[256];
-    char path[512];
-    const char *names[] = {
-        "library.db", "com.plexapp.plugins.library.db", "jellyfin.db", "not-target.db"
-    };
-    size_t i;
-
-    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        temp_path(path, sizeof(path), names[i]);
-        unlink(path);
-        snprintf(path, sizeof(path), "/tmp/emby-fts-rewrite-smoke-%ld/%s-wal", (long)getpid(), names[i]);
-        unlink(path);
-        snprintf(path, sizeof(path), "/tmp/emby-fts-rewrite-smoke-%ld/%s-shm", (long)getpid(), names[i]);
-        unlink(path);
-    }
-    snprintf(dir, sizeof(dir), "/tmp/emby-fts-rewrite-smoke-%ld", (long)getpid());
-    rmdir(dir);
 }
 
 static void exec_sql(sqlite3 *db, const char *label, const char *sql) {
@@ -644,110 +509,6 @@ static rsh_apply_profile_fn rsh_resolve_setup_profile(
     return NULL;
 }
 
-static sqlite3 *open_seeded_temp(const char *basename) {
-    rsh_db_spec db_spec;
-    rsh_db_handle handle;
-    int rc;
-
-    memset(&db_spec, 0, sizeof(db_spec));
-    memset(&handle, 0, sizeof(handle));
-    db_spec.role = "legacy";
-    rc = snprintf(
-        db_spec.relative_path, sizeof(db_spec.relative_path), "%s", basename
-    );
-    if (rc < 0 || (size_t)rc >= sizeof(db_spec.relative_path)) {
-        failf("FATAL: seeded relative path too long for %s", basename);
-    }
-    db_spec.kind = strcmp(basename, emby_suite_spec.target_basename) == 0
-        ? RSH_DB_CANDIDATE
-        : strcmp(basename, emby_suite_spec.vendor_basename) == 0
-            ? RSH_DB_VENDOR : RSH_DB_AUXILIARY;
-    db_spec.storage = RSH_DB_RELATIVE;
-    rsh_validate_db_specs(
-        &emby_suite_spec, "legacy", "seeded-open", &db_spec, 1
-    );
-    rsh_open_seeded_db(
-        &emby_suite_spec, getpid(), NULL, "legacy", "seeded-open",
-        &db_spec, &handle
-    );
-    return handle.db;
-}
-
-static sqlite3 *open_seeded_temp_with_latest_indexes(
-    const char *basename,
-    int episodes_gk_dc_index,
-    int episodes_dcn_gk_index
-) {
-    sqlite3 *db = open_seeded_temp(basename);
-    if (episodes_gk_dc_index) {
-        exec_sql(db, "latest-index",
-            "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
-            "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
-            "WHERE Type = 8;"
-        );
-    }
-    if (episodes_dcn_gk_index) {
-        exec_sql(db, "latest-episodes-date-index",
-            "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
-            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
-            "WHERE Type = 8;"
-        );
-    }
-    return db;
-}
-
-static sqlite3 *open_seeded_temp_with_dashboard_indexes(
-    const char *basename,
-    int episodes_gk_dc_index,
-    int episodes_dcn_gk_index,
-    int movies_outer_index,
-    int movies_inner_index
-) {
-    sqlite3 *db = open_seeded_temp_with_latest_indexes(
-        basename, episodes_gk_dc_index, episodes_dcn_gk_index
-    );
-    if (movies_outer_index) {
-        exec_sql(db, "movies-outer-index",
-            "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
-            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) "
-            "WHERE Type = 5;"
-        );
-    }
-    if (movies_inner_index) {
-        exec_sql(db, "movies-inner-index",
-            "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
-            "ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) "
-            "WHERE Type = 5;"
-        );
-    }
-    return db;
-}
-
-static sqlite3 *open_seeded_temp_with_mixed_indexes(
-    const char *basename,
-    int mixed_outer_index,
-    int mixed_inner_index
-) {
-    sqlite3 *db = open_seeded_temp_with_dashboard_indexes(
-        basename, 1, 1, 1, 1
-    );
-    if (mixed_outer_index) {
-        exec_sql(db, "mixed-outer-index",
-            "CREATE INDEX idx_dshadow_emby_latest_mixed_dcn_gk "
-            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
-            "WHERE Type IN (8,5);"
-        );
-    }
-    if (mixed_inner_index) {
-        exec_sql(db, "mixed-inner-index",
-            "CREATE INDEX idx_dshadow_emby_latest_mixed_gk_dc "
-            "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
-            "WHERE Type IN (8,5);"
-        );
-    }
-    return db;
-}
-
 static void seed_mixed_latest_identity_rows(sqlite3 *db) {
     exec_sql(db, "mixed-identity-seed",
         "INSERT INTO MediaItems(Id,Type,Name,DateCreated,SeriesPresentationUniqueKey,PresentationUniqueKey,UserDataKeyId) VALUES"
@@ -784,44 +545,6 @@ static void seed_mixed_latest_identity_rows(sqlite3 *db) {
     );
 }
 
-static char *make_emby_sql(int presentation, const char *l1, const char *l2,
-                           const char *t1, const char *t2, int user_id) {
-    const char *select_type =
-        "select count(*) OVER() AS TotalRecordCount,A.type,"
-        "(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from";
-    const char *select_presentation =
-        "select count(*) OVER() AS TotalRecordCount,A.type,A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.PresentationUniqueKey,A.Images,A.Status,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex,"
-        "(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from";
-    const char *join_presentation =
-        " left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=%d";
-    char *left_join = presentation ? xasprintf(join_presentation, user_id) : xasprintf("%s", "");
-    char *sql = xasprintf(
-        "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (%s) ),"
-        "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (%s) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (%s)))"
-        "%s mediaitems A join fts_search9 on A.Id=fts_search9.RowId and fts_search9 match @SearchTerm%s where "
-        "A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,16,18,19,20,21,22,23,24,25,26,29,34) "
-        "AND (Coalesce(ShareLevel, 0) > 0 OR A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,29,34) OR A.IsPublic=1) "
-        "AND A.ExtraType is null AND "
-        "(A.Id in WithAncestors OR A.Id in (select ListItemsExemptionForPlaylists.ListId from ListItems ListItemsExemptionForPlaylists join ancestorids2 AncestorIdExemptionForPlaylists on ListItemsExemptionForPlaylists.ListItemId=AncestorIdExemptionForPlaylists.itemid and AncestorIdExemptionForPlaylists.AncestorId in (%s)) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds) "
-        "Group by %s ORDER BY Rank ASC LIMIT 50",
-        l1, t1, t2, presentation ? select_presentation : select_type,
-        left_join, l2, presentation ? "A.PresentationUniqueKey" : "A.Type"
-    );
-    free(left_join);
-    return sql;
-}
-
-static char *make_exists_arms(const char *l1, const char *l2, const char *t1, const char *t2) {
-    return xasprintf(
-        "(EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid = A.Id AND AncestorIds2.AncestorId in (%s))"
-        " OR  exists (select 1 from ListItems join ancestorids2 on ListItems.ListItemId=ancestorids2.itemid and ancestorids2.AncestorId in (%s) where ListItems.ListId=A.Id)"
-        " OR EXISTS (SELECT 1 FROM itemPeople2 JOIN AncestorIds2 ON AncestorIds2.itemid = itemPeople2.ItemId WHERE itemPeople2.PersonId = A.Id and AncestorIds2.AncestorId in (%s))"
-        " OR Exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (%s)  where ItemLinks2.LinkedId = A.Id AND ItemLinks2.Type in (%s))"
-        " OR Exists (select 1 from ItemLinks2 ItemLinks2TwoLevel where exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (%s)  where itemlinks2.linkedid = itemlinks2twolevel.itemid AND ItemLinks2.Type in (%s)) and ItemLinks2TwoLevel.LinkedId=A.Id))",
-        l1, l2, l1, l1, t1, l1, t2
-    );
-}
-
 static char *replace_once(const char *sql, const char *old, const char *new_text) {
     const char *p = strstr(sql, old);
     size_t prefix;
@@ -838,47 +561,6 @@ static char *replace_once(const char *sql, const char *old, const char *new_text
     memcpy(out + prefix, new_text, strlen(new_text));
     strcpy(out + prefix + strlen(new_text), p + strlen(old));
     return out;
-}
-
-static char *add_anchor_literal_predicate(const char *sql, const char *anchor) {
-    char *injected = xasprintf(" AND '%s'='%s' Group by ", anchor, anchor);
-    char *out = replace_once(sql, " Group by ", injected);
-    free(injected);
-    return out;
-}
-
-static char *make_numeric_list(size_t min_len) {
-    char *buf = (char *)malloc(min_len + 4);
-    size_t used = 0;
-    if (!buf) failf("FATAL: malloc numeric list failed");
-    while (used + 2 < min_len) {
-        buf[used++] = '1';
-        buf[used++] = ',';
-    }
-    buf[used++] = '1';
-    buf[used] = 0;
-    return buf;
-}
-
-static char *make_expected_sql(int presentation, const char *l1, const char *l2,
-                               const char *t1, const char *t2, int user_id) {
-    char *original = make_emby_sql(presentation, l1, l2, t1, t2, user_id);
-    char *old_membership = xasprintf(
-        "(A.Id in WithAncestors OR A.Id in (select ListItemsExemptionForPlaylists.ListId from ListItems ListItemsExemptionForPlaylists join ancestorids2 AncestorIdExemptionForPlaylists on ListItemsExemptionForPlaylists.ListItemId=AncestorIdExemptionForPlaylists.itemid and AncestorIdExemptionForPlaylists.AncestorId in (%s)) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds)",
-        l2
-    );
-    char *arms = make_exists_arms(l1, l2, t1, t2);
-    char *with_membership = replace_once(original, old_membership, arms);
-    char *expected = replace_once(
-        with_membership,
-        "fts_search9 match @SearchTerm",
-        "fts_search9 match dshadow_emby_fts_rewrite(@SearchTerm)"
-    );
-    free(original);
-    free(old_membership);
-    free(arms);
-    free(with_membership);
-    return expected;
 }
 
 static char *make_ancestor_exists_splice(const char *l1) {
@@ -1231,43 +913,24 @@ static char *make_mixed_latest_expected(const char *user_id, const char *limit) 
     return make_mixed_latest_expected_form("100", user_id, limit);
 }
 
-static sqlite3_stmt *prepare_entry(sqlite3 *db, const char *label, const char *sql,
-                                   int nbyte, int entry, const char **tail) {
-    sqlite3_stmt *stmt = NULL;
-    int rc;
-
-#ifdef EMBY_FTS_REWRITE_DIRECT_TEST
-    if (entry == 3) {
-        rc = emby_fts_rewrite_prepare(
-            db, sql, nbyte, SQLITE_PREPARE_PERSISTENT, &stmt, tail, FTS_REWRITE_PREPARE_V3
-        );
-    } else if (entry == 2) {
-        rc = emby_fts_rewrite_prepare(db, sql, nbyte, 0, &stmt, tail, FTS_REWRITE_PREPARE_V2);
-    } else {
-        rc = emby_fts_rewrite_prepare(db, sql, nbyte, 0, &stmt, tail, FTS_REWRITE_PREPARE_LEGACY);
-    }
-#else
-    if (entry == 3) {
-        rc = sqlite3_prepare_v3(db, sql, nbyte, SQLITE_PREPARE_PERSISTENT, &stmt, tail);
-    } else if (entry == 2) {
-        rc = sqlite3_prepare_v2(db, sql, nbyte, &stmt, tail);
-    } else {
-        rc = sqlite3_prepare(db, sql, nbyte, &stmt, tail);
-    }
-#endif
-    if (rc != SQLITE_OK) {
-        failf("FAIL [%s]: prepare entry=%d rc=%d err=%s", label, entry, rc, sqlite3_errmsg(db));
-    }
-    return stmt;
-}
-
 static sqlite3_stmt *contract_prepare_v2(
     sqlite3 *db,
     const char *label,
     const char *sql,
     const char **tail
 ) {
-    return prepare_entry(db, label, sql, -1, 2, tail);
+    sqlite3_stmt *stmt = NULL;
+    int rc = emby_suite_spec.prepare(
+        db, sql, -1, RSH_PREPARE_V2, &stmt, tail
+    );
+
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [%s]: prepare entry=2 rc=%d err=%s",
+            label, rc, sqlite3_errmsg(db)
+        );
+    }
+    return stmt;
 }
 
 static void bind_search_term(
@@ -1291,7 +954,20 @@ static void bind_search_term(
 static void expect_sql(sqlite3 *db, const char *label, const char *sql, int nbyte,
                        int entry, const char *want_sql, int want_rewrite) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, nbyte, entry, &tail);
+    sqlite3_stmt *stmt = NULL;
+    rsh_prepare_kind kind = entry == 3
+        ? RSH_PREPARE_V3
+        : entry == 2 ? RSH_PREPARE_V2 : RSH_PREPARE_LEGACY;
+    int rc = emby_suite_spec.prepare(
+        db, sql, nbyte, kind, &stmt, &tail
+    );
+
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [%s]: prepare entry=%d rc=%d err=%s",
+            label, entry, rc, sqlite3_errmsg(db)
+        );
+    }
     require_str_eq(label, sqlite3_sql(stmt), want_sql);
     if (tail != sql + strlen(sql)) {
         failf("FAIL [%s]: tail_offset=%ld want=%ld",
@@ -1308,17 +984,6 @@ static void expect_sql(sqlite3 *db, const char *label, const char *sql, int nbyt
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
 }
 
-static void expect_dashboard_negative(
-    sqlite3 *db,
-    const char *label,
-    const char *sql,
-    const char *boundary_needle,
-    int boundary_count
-) {
-    require_int(label, count_occurrences(sql, boundary_needle), boundary_count);
-    expect_sql(db, label, sql, -1, 2, sql, 0);
-}
-
 static void expect_mixed_latest_sql(
     sqlite3 *db,
     const char *label,
@@ -1328,11 +993,20 @@ static void expect_mixed_latest_sql(
     int limit_bound
 ) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, &tail);
+    sqlite3_stmt *stmt = NULL;
     int expected_binds = user_bound + limit_bound;
     int i;
     int parameter = 1;
-    int rc;
+    int rc = emby_suite_spec.prepare(
+        db, sql, -1, RSH_PREPARE_V2, &stmt, &tail
+    );
+
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [%s]: prepare entry=2 rc=%d err=%s",
+            label, rc, sqlite3_errmsg(db)
+        );
+    }
 
     require_str_eq(label, sqlite3_sql(stmt), want_sql);
     require_int(label, tail == sql + strlen(sql), 1);
@@ -1361,59 +1035,6 @@ static void expect_mixed_latest_sql(
     while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {}
     require_int(label, rc, SQLITE_DONE);
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
-}
-
-static void expect_mixed_latest_negative(
-    sqlite3 *db,
-    const char *label,
-    const char *sql
-) {
-    size_t sql_len = strlen(sql);
-    uint16_t *vendor_sql = (uint16_t *)malloc(
-        (sql_len + 1) * sizeof(*vendor_sql)
-    );
-    sqlite3_stmt *vendor = NULL;
-    const void *tail = NULL;
-    size_t i;
-
-    if (!vendor_sql) failf("FATAL: malloc vendor SQL failed");
-    for (i = 0; i <= sql_len; i++) {
-        unsigned char byte = (unsigned char)sql[i];
-        if (byte > 0x7f) {
-            free(vendor_sql);
-            failf("FAIL [%s/vendor-sql-ascii]: offset=%lu byte=0x%02x",
-                  label, (unsigned long)i, (unsigned int)byte);
-        }
-        vendor_sql[i] = (uint16_t)byte;
-    }
-    require_int(label, sqlite3_prepare16_v2(db, vendor_sql, -1, &vendor, &tail), SQLITE_OK);
-    require_int(label, tail == vendor_sql + sql_len, 1);
-    require_int(label, sqlite3_finalize(vendor), SQLITE_OK);
-    free(vendor_sql);
-    expect_sql(db, label, sql, -1, 2, sql, 0);
-}
-
-static void expect_legacy_authorizer(sqlite3 *db, const char *label, const char *sql,
-                                     int expect_rewrite) {
-    emby_auth_probe probe = {0, 0};
-    const char *tail = NULL;
-    sqlite3_stmt *stmt;
-
-    require_int("legacy-authorizer/set",
-                sqlite3_set_authorizer(db, scalar_authorizer_cb, &probe), SQLITE_OK);
-    stmt = prepare_entry(db, label, sql, -1, 1, &tail);
-    require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
-    require_int("legacy-authorizer/clear", sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
-    if (tail != sql + strlen(sql)) {
-        failf("FAIL [%s]: tail_offset=%ld want=%ld",
-              label, (long)(tail - sql), (long)strlen(sql));
-    }
-    if (expect_rewrite && probe.scalar_calls < 1) {
-        failf("FAIL [%s]: expected scalar authorizer call, got=%d", label, probe.scalar_calls);
-    }
-    if (!expect_rewrite && probe.scalar_calls != 0) {
-        failf("FAIL [%s]: unexpected scalar authorizer calls=%d", label, probe.scalar_calls);
-    }
 }
 
 static int g_collision_scalar_calls;
@@ -1508,42 +1129,26 @@ static int scalar_authorizer_cb(
     return SQLITE_OK;
 }
 
-static void expect_scalar(sqlite3 *db, const char *input, const char *want) {
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, "SELECT dshadow_emby_fts_rewrite(?)", -1, &stmt, NULL);
-    if (rc != SQLITE_OK) failf("FAIL [scalar/prepare]: rc=%d err=%s", rc, sqlite3_errmsg(db));
-    if (input) require_int("scalar/bind", sqlite3_bind_text(stmt, 1, input, -1, SQLITE_STATIC), SQLITE_OK);
-    else require_int("scalar/bind-null", sqlite3_bind_null(stmt, 1), SQLITE_OK);
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) failf("FAIL [scalar/step]: rc=%d err=%s", rc, sqlite3_errmsg(db));
-    if (want) require_str_eq("scalar/value", (const char *)sqlite3_column_text(stmt, 0), want);
-    else require_int("scalar/null", sqlite3_column_type(stmt, 0), SQLITE_NULL);
-    require_int("scalar/finalize", sqlite3_finalize(stmt), SQLITE_OK);
-}
-
-static void expect_scalar_type(sqlite3 *db, const char *label, int bind_blob) {
-    sqlite3_stmt *stmt = NULL;
-    int rc = sqlite3_prepare_v2(db, "SELECT dshadow_emby_fts_rewrite(?)", -1, &stmt, NULL);
-    if (rc != SQLITE_OK) failf("FAIL [%s/prepare]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
-    if (bind_blob) {
-        static const unsigned char blob[] = {0x01, 0x02, 0x03};
-        require_int("scalar-type/bind-blob", sqlite3_bind_blob(stmt, 1, blob, sizeof(blob), SQLITE_STATIC), SQLITE_OK);
-    } else {
-        require_int("scalar-type/bind-int", sqlite3_bind_int(stmt, 1, 42), SQLITE_OK);
-    }
-    rc = sqlite3_step(stmt);
-    if (rc != SQLITE_ROW) failf("FAIL [%s/step]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
-    require_int(label, sqlite3_column_type(stmt, 0), bind_blob ? SQLITE_BLOB : SQLITE_INTEGER);
-    require_int("scalar-type/finalize", sqlite3_finalize(stmt), SQLITE_OK);
-}
-
 #ifdef EMBY_FTS_REWRITE_TEST_API
 static void expect_scalar_counter(sqlite3 *db, const char *sql) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, "scalar-counter", sql, -1, 2, &tail);
-    int index = sqlite3_bind_parameter_index(stmt, "@SearchTerm");
+    sqlite3_stmt *stmt = NULL;
+    int index;
     int rc;
     int calls;
+
+    rc = emby_suite_spec.prepare(
+        db, sql, -1, RSH_PREPARE_V2, &stmt, &tail
+    );
+    if (rc != SQLITE_OK || !stmt) {
+        if (stmt) (void)sqlite3_finalize(stmt);
+        failf(
+            "FAIL [scalar-counter/prepare]: got_rc=%d got_stmt=%s "
+            "want_rc=%d want_stmt=non-NULL err=%s",
+            rc, stmt ? "non-NULL" : "NULL", SQLITE_OK, sqlite3_errmsg(db)
+        );
+    }
+    index = sqlite3_bind_parameter_index(stmt, "@SearchTerm");
 
     require_int("scalar-counter/bind-index", index > 0, 1);
     require_int("scalar-counter/bind1",
@@ -1552,7 +1157,10 @@ static void expect_scalar_counter(sqlite3 *db, const char *sql) {
     emby_fts_rewrite_test_reset_scalar_calls();
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_ROW) {
-        failf("FAIL [scalar-counter/first-step]: rc=%d err=%s", rc, sqlite3_errmsg(db));
+        failf(
+            "FAIL [scalar-counter/first-step]: got=%d want=%d err=%s",
+            rc, SQLITE_ROW, sqlite3_errmsg(db)
+        );
     }
     calls = emby_fts_rewrite_test_scalar_calls();
     if (calls <= 0) failf("FAIL [scalar-counter/first-calls]: got=%d want>0", calls);
@@ -1565,27 +1173,16 @@ static void expect_scalar_counter(sqlite3 *db, const char *sql) {
     emby_fts_rewrite_test_reset_scalar_calls();
     rc = sqlite3_step(stmt);
     if (rc != SQLITE_DONE) {
-        failf("FAIL [scalar-counter/second-step]: rc=%d err=%s", rc, sqlite3_errmsg(db));
+        failf(
+            "FAIL [scalar-counter/second-step]: got=%d want=%d err=%s",
+            rc, SQLITE_DONE, sqlite3_errmsg(db)
+        );
     }
     calls = emby_fts_rewrite_test_scalar_calls();
     if (calls <= 0) failf("FAIL [scalar-counter/second-calls]: got=%d want>0", calls);
     require_int("scalar-counter/finalize", sqlite3_finalize(stmt), SQLITE_OK);
 }
 #endif
-
-static void expect_fixture(sqlite3 *db, const char *name) {
-    char *input_path = xasprintf("tests/fixtures/emby-fts-rewrite/%s.sql", name);
-    char *expected_path = xasprintf("tests/fixtures/emby-fts-rewrite/%s.expected.sql", name);
-    char *input = read_text_file(input_path);
-    char *expected = read_text_file(expected_path);
-    int want_rewrite = strstr(expected, "dshadow_emby_fts_rewrite(") != NULL;
-
-    expect_sql(db, name, input, -1, 2, expected, want_rewrite);
-    free(input_path);
-    free(expected_path);
-    free(input);
-    free(expected);
-}
 
 static unsigned int collect_fts_id_mask(
     sqlite3 *db,
@@ -1596,11 +1193,21 @@ static unsigned int collect_fts_id_mask(
     const char *search_term
 ) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, nbyte, 2, &tail);
-    int index = sqlite3_bind_parameter_index(stmt, "@SearchTerm");
-    int rc;
+    sqlite3_stmt *stmt = NULL;
+    int index;
+    int rc = emby_suite_spec.prepare(
+        db, sql, nbyte, RSH_PREPARE_V2, &stmt, &tail
+    );
     int rows = 0;
     unsigned int mask = 0;
+
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [%s]: prepare entry=2 rc=%d err=%s",
+            label, rc, sqlite3_errmsg(db)
+        );
+    }
+    index = sqlite3_bind_parameter_index(stmt, "@SearchTerm");
 
     if (tail != sql + strlen(sql)) {
         failf("FAIL [%s/tail]: tail_offset=%ld want=%ld",
@@ -1661,94 +1268,23 @@ static int accept_emby_fts_legal_difference(
         candidate_id >= 1 && candidate_id <= 5;
 }
 
-static void require_emby_fts_ordered_contract(
-    sqlite3 *vendor_db,
-    sqlite3 *candidate_db,
-    const char *label,
-    const char *vendor_sql,
-    const char *candidate_sql,
-    const char *search_term
-) {
-    char *ordered_vendor_sql = xasprintf("SELECT * FROM (%s) ORDER BY 3", vendor_sql);
-    char *ordered_candidate_sql = xasprintf("SELECT * FROM (%s) ORDER BY 3", candidate_sql);
-    sqlite3_stmt *vendor = NULL;
-    sqlite3_stmt *candidate = NULL;
-    int row;
-    int columns;
-
-    require_int(label, sqlite3_prepare_v2(
-        vendor_db, ordered_vendor_sql, -1, &vendor, NULL
-    ), SQLITE_OK);
-    require_int(label, sqlite3_prepare_v2(
-        candidate_db, ordered_candidate_sql, -1, &candidate, NULL
-    ), SQLITE_OK);
-    columns = sqlite3_column_count(vendor);
-    require_int(label, sqlite3_column_count(candidate), columns);
-    bind_search_term(vendor, "vendor-ordered", label, (void *)search_term);
-    bind_search_term(candidate, "candidate-ordered", label, (void *)search_term);
-    for (row = 0; row < 5; row++) {
-        int col;
-        require_int(label, sqlite3_step(vendor), SQLITE_ROW);
-        require_int(label, sqlite3_step(candidate), SQLITE_ROW);
-        require_int(label, sqlite3_column_int(vendor, 2), row + 1);
-        require_int(label, sqlite3_column_int(candidate, 2), row + 1);
-        for (col = 0; col < columns; col++) {
-            if (!contract_parity_cell_equal(vendor, candidate, col)) {
-                failf("FAIL [%s/ordered-row-%d-column-%d]: vendor_type=%d "
-                      "candidate_type=%d vendor_bytes=%d candidate_bytes=%d",
-                      label, row, col, sqlite3_column_type(vendor, col),
-                      sqlite3_column_type(candidate, col),
-                      sqlite3_column_bytes(vendor, col),
-                      sqlite3_column_bytes(candidate, col));
-            }
-        }
-    }
-    require_int(label, sqlite3_step(vendor), SQLITE_DONE);
-    require_int(label, sqlite3_step(candidate), SQLITE_DONE);
-    require_int(label, sqlite3_finalize(vendor), SQLITE_OK);
-    require_int(label, sqlite3_finalize(candidate), SQLITE_OK);
-    free(ordered_vendor_sql);
-    free(ordered_candidate_sql);
-}
-
-static void collect_first_ints(sqlite3 *db, const char *label, const char *sql,
-                               const char *want_sql, char *out, size_t out_n) {
-    const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, &tail);
-    int rc;
-    size_t used = 0;
-    int rows = 0;
-
-    require_str_eq(label, sqlite3_sql(stmt), want_sql);
-    if (tail != sql + strlen(sql)) {
-        failf("FAIL [%s/tail]: tail_offset=%ld want=%ld",
-              label, (long)(tail - sql), (long)strlen(sql));
-    }
-    if (out_n == 0) failf("FAIL [%s]: output buffer empty", label);
-    out[0] = 0;
-    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
-        int n = snprintf(out + used, out_n - used, "%d,", sqlite3_column_int(stmt, 0));
-        if (n < 0 || (size_t)n >= out_n - used) {
-            failf("FAIL [%s]: output buffer too small", label);
-        }
-        used += (size_t)n;
-        rows++;
-    }
-    if (rc != SQLITE_DONE) {
-        failf("FAIL [%s/step]: rc=%d err=%s", label, rc, sqlite3_errmsg(db));
-    }
-    if (rows == 0) failf("FAIL [%s]: expected rows", label);
-    require_int("first-ints/finalize", sqlite3_finalize(stmt), SQLITE_OK);
-}
-
 static void collect_int_column(sqlite3 *db, const char *label, const char *sql,
                                const char *want_sql, int nbyte, int column,
                                char *out, size_t out_n) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, nbyte, 2, &tail);
-    int rc;
+    sqlite3_stmt *stmt = NULL;
+    int rc = emby_suite_spec.prepare(
+        db, sql, nbyte, RSH_PREPARE_V2, &stmt, &tail
+    );
     size_t used = 0;
     int rows = 0;
+
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [%s]: prepare entry=2 rc=%d err=%s",
+            label, rc, sqlite3_errmsg(db)
+        );
+    }
 
     require_str_eq(label, sqlite3_sql(stmt), want_sql);
     if (tail != sql + strlen(sql)) {
@@ -1834,7 +1370,7 @@ static typed_rows collect_typed_rows(sqlite3 *db, const char *label,
     typed_rows body = {0};
     typed_rows out = {0};
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, &tail);
+    sqlite3_stmt *stmt = contract_prepare_v2(db, label, sql, &tail);
     int rc;
     int col;
 
@@ -1898,7 +1434,7 @@ static typed_rows collect_bound_mixed_rows(
     typed_rows body = {0};
     typed_rows out = {0};
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, &tail);
+    sqlite3_stmt *stmt = contract_prepare_v2(db, label, sql, &tail);
     int rc;
     int col;
 
@@ -2079,7 +1615,7 @@ static void require_movies_latest_vendor_rows(
     const char *projection
 ) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, -1, 2, &tail);
+    sqlite3_stmt *stmt = contract_prepare_v2(db, label, sql, &tail);
     unsigned int group_mask = 0;
     int rows = 0;
     int rc;
@@ -2125,7 +1661,7 @@ static void require_movies_latest_candidate_rows(
     int expected_count
 ) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, source_sql, -1, 2, &tail);
+    sqlite3_stmt *stmt = contract_prepare_v2(db, label, source_sql, &tail);
     int row;
 
     require_str_eq(label, sqlite3_sql(stmt), expected_sql);
@@ -2152,16 +1688,6 @@ static void require_movies_latest_candidate_rows(
     }
     require_int(label, sqlite3_step(stmt), SQLITE_DONE);
     require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
-}
-
-static void require_typed_rows_differ(const char *label,
-                                      const typed_rows *left,
-                                      const typed_rows *right) {
-    if (left->columns == right->columns && left->rows == right->rows &&
-        left->len == right->len && memcmp(left->bytes, right->bytes, left->len) == 0) {
-        failf("FAIL [%s]: typed streams unexpectedly equal: %s", label,
-              (const char *)left->bytes);
-    }
 }
 
 static void free_typed_rows(typed_rows *rows) {
@@ -2191,227 +1717,7 @@ static void seed_complex_resume_watched_progress_parity_rows(sqlite3 *db) {
     );
 }
 
-static int child_positive(void) {
-    sqlite3 *db;
-    char *type_sql;
-    char *numbered_sql;
-    char *presentation_sql;
-    char *type_expected;
-    char *numbered_expected;
-    char *presentation_expected;
-
-    configure_env(NULL, "1", "1");
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    type_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    numbered_sql = replace_once(type_sql, "fts_search9 match @SearchTerm", "fts_search9 match ?1");
-    presentation_sql = make_emby_sql(1, "100", "100", "6", "7", 42);
-    type_expected = make_expected_sql(0, "100", "100", "6", "7", 1);
-    numbered_expected = replace_once(
-        type_expected,
-        "fts_search9 match dshadow_emby_fts_rewrite(@SearchTerm)",
-        "fts_search9 match dshadow_emby_fts_rewrite(?1)"
-    );
-    presentation_expected = make_expected_sql(1, "100", "100", "6", "7", 42);
-
-    expect_sql(db, "type-v2", type_sql, -1, 2, type_expected, 1);
-    expect_sql(db, "type-v3", type_sql, -1, 3, type_expected, 1);
-    expect_legacy_authorizer(db, "type-legacy", type_sql, 1);
-    expect_sql(db, "type-numbered-param", numbered_sql, -1, 2, numbered_expected, 1);
-    expect_sql(db, "type-nbyte-no-nul", type_sql, (int)strlen(type_sql), 2, type_expected, 1);
-    expect_sql(db, "type-nbyte-with-nul", type_sql, (int)strlen(type_sql) + 1, 2, type_expected, 1);
-    expect_sql(db, "presentation-user42", presentation_sql, -1, 2, presentation_expected, 1);
-
-    expect_scalar(db, "(\"Star\"*) OR (\"Wars\"*)", "(\"Star\"*) AND (\"Wars\"*)");
-    expect_scalar(db, "(\"a\"*) OR (\"b\"*) OR (\"c\"*)", "(\"a\"*) AND (\"b\"*) AND (\"c\"*)");
-    expect_scalar(db, "(\"a\"*) AND (\"b\"*)", "(\"a\"*) AND (\"b\"*)");
-    expect_scalar(db, "\"star wars\"", "\"star wars\"");
-    expect_scalar(db, "(\"a\"*) OR \"b\"*", "(\"a\"*) OR \"b\"*");
-    expect_scalar(db, "(\"a\"*) or (\"b\"*)", "(\"a\"*) or (\"b\"*)");
-    expect_scalar(db, "(\"caf\303\251\"*) OR (\"b\"*)", "(\"caf\303\251\"*) OR (\"b\"*)");
-    expect_scalar(db, "", "");
-    expect_scalar(db, NULL, NULL);
-    expect_scalar_type(db, "scalar-integer", 0);
-    expect_scalar_type(db, "scalar-blob", 1);
-#ifdef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
-    {
-        char *literal_sql = replace_once(
-            type_sql,
-            "fts_search9 match @SearchTerm",
-            "fts_search9 match '(\"alpha\"*) OR (\"direct\"*)'"
-        );
-        char *literal_expected = replace_once(
-            type_expected,
-            "fts_search9 match dshadow_emby_fts_rewrite(@SearchTerm)",
-            "fts_search9 match dshadow_emby_fts_rewrite('(\"alpha\"*) OR (\"direct\"*)')"
-        );
-        expect_sql(db, "literal-rhs-positive", literal_sql, -1, 2, literal_expected, 1);
-        free(literal_sql);
-        free(literal_expected);
-    }
-#endif
-#ifdef EMBY_FTS_REWRITE_TEST_API
-    expect_scalar_counter(db, type_sql);
-#endif
-
-    free(type_sql);
-    free(numbered_sql);
-    free(presentation_sql);
-    free(type_expected);
-    free(numbered_expected);
-    free(presentation_expected);
-    require_int("positive/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [positive]\n");
-    return 0;
-}
-
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST
-static int child_direct_test_api(void) {
-    sqlite3 *db;
-    char *type_sql;
-
-    configure_env("0", "1", "1");
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    type_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-
-#ifdef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
-    {
-        char *type_expected = make_expected_sql(0, "100", "100", "6", "7", 1);
-        char *literal_sql = replace_once(
-            type_sql,
-            "fts_search9 match @SearchTerm",
-            "fts_search9 match '(\"alpha\"*) OR (\"direct\"*)'"
-        );
-        char *literal_expected = replace_once(
-            type_expected,
-            "fts_search9 match dshadow_emby_fts_rewrite(@SearchTerm)",
-            "fts_search9 match dshadow_emby_fts_rewrite('(\"alpha\"*) OR (\"direct\"*)')"
-        );
-        expect_sql(db, "direct-literal-rhs-positive", literal_sql, -1, 2, literal_expected, 1);
-        free(type_expected);
-        free(literal_sql);
-        free(literal_expected);
-    }
-#endif
-#ifdef EMBY_FTS_REWRITE_TEST_API
-    require_int("direct-duplicate-anchor-guard",
-                emby_fts_rewrite_test_duplicate_anchor_guard(), 0);
-    require_int("direct-string-anchor-immunity",
-                emby_fts_rewrite_test_string_anchor_immunity(), 1);
-    expect_scalar_counter(db, type_sql);
-#endif
-
-    free(type_sql);
-    require_int("direct-test-api/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [direct-test-api]\n");
-    return 0;
-}
-
-static int child_direct_fail_open_family(int movies) {
-    sqlite3 *db;
-    char *raw;
-    enum direct_fault_mode faults[] = {
-        DIRECT_FAULT_CANDIDATE_ERROR,
-        DIRECT_FAULT_CANDIDATE_ERROR_WITH_STMT,
-        DIRECT_FAULT_CANDIDATE_WRONG_TAIL
-    };
-    size_t i;
-    sqlite3_stmt *baseline[64];
-    int baseline_n = 0;
-    sqlite3_stmt *bs;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-    seed_movies_latest_rows(db);
-    raw = movies ? make_movies_latest_sql(1, "100", "42", "12")
-                 : make_latest_sql("A.Id ", "12");
-    for (bs = sqlite3_next_stmt(db, NULL); bs; bs = sqlite3_next_stmt(db, bs)) {
-        if (baseline_n >= (int)(sizeof(baseline) / sizeof(baseline[0]))) {
-            failf("FAIL [direct-fail-open/baseline-overflow]: too many open statements");
-        }
-        baseline[baseline_n++] = bs;
-    }
-    for (i = 0; i < sizeof(faults) / sizeof(faults[0]); i++) {
-        sqlite3_stmt *stmt = NULL;
-        const char *tail = NULL;
-        int rc;
-        direct_original_sql = raw;
-        direct_fault = faults[i];
-        direct_candidate_calls = 0;
-        direct_original_calls = 0;
-        rc = emby_fts_rewrite_prepare(db, raw, -1, 0, &stmt, &tail,
-                                      FTS_REWRITE_PREPARE_V2);
-        require_int("direct-fail-open/rc", rc, SQLITE_OK);
-        require_int("direct-fail-open/candidate-calls", direct_candidate_calls, 1);
-        require_int("direct-fail-open/original-calls", direct_original_calls, 1);
-        require_str_eq("direct-fail-open/sql", sqlite3_sql(stmt), raw);
-        if (tail != raw + strlen(raw)) {
-            failf("FAIL [direct-fail-open/tail]: got=%ld want=%ld",
-                  (long)(tail - raw), (long)strlen(raw));
-        }
-        {
-            sqlite3_stmt *os;
-            int found = 0;
-            for (os = sqlite3_next_stmt(db, NULL); os; os = sqlite3_next_stmt(db, os)) {
-                int in_baseline = 0;
-                int k;
-                if (os == stmt) {
-                    found = 1;
-                    continue;
-                }
-                for (k = 0; k < baseline_n; k++) {
-                    if (os == baseline[k]) {
-                        in_baseline = 1;
-                        break;
-                    }
-                }
-                if (!in_baseline) {
-                    failf("FAIL [direct-fail-open/next-stmt]: candidate statement leaked");
-                }
-            }
-            if (!found) {
-                failf("FAIL [direct-fail-open/next-stmt]: expected statement missing");
-            }
-        }
-        require_int("direct-fail-open/finalize", sqlite3_finalize(stmt), SQLITE_OK);
-    }
-    {
-        char *invalid = make_latest_sql("A.NoSuchColumn ", "12");
-        sqlite3_stmt *stmt = NULL;
-        const char *tail = NULL;
-        int rc;
-        direct_original_sql = invalid;
-        direct_fault = DIRECT_FAULT_CANDIDATE_ERROR;
-        direct_candidate_calls = 0;
-        direct_original_calls = 0;
-        rc = emby_fts_rewrite_prepare(db, invalid, -1, 0, &stmt, &tail,
-                                      FTS_REWRITE_PREPARE_V2);
-        require_int("direct-invalid-original/rc", rc, SQLITE_ERROR);
-        require_int("direct-invalid-original/candidate-calls", direct_candidate_calls, 1);
-        require_int("direct-invalid-original/original-calls", direct_original_calls, 1);
-        if (stmt != NULL) failf("FAIL [direct-invalid-original/stmt]: expected NULL");
-        free(invalid);
-    }
-    direct_original_sql = NULL;
-    direct_fault = DIRECT_FAULT_NONE;
-    free(raw);
-    require_int("direct-fail-open/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [direct-fail-open-%s]\n", movies ? "movies" : "episodes");
-    return 0;
-}
-
-static int child_direct_fail_open_episodes(void) {
-    return child_direct_fail_open_family(0);
-}
-
-static int child_direct_fail_open_movies(void) {
-    return child_direct_fail_open_family(1);
-}
 
 typedef struct direct_mixed_fail_open_case {
     const char *name;
@@ -2438,1243 +1744,7 @@ static int direct_stmt_is_baseline(
     return 0;
 }
 
-static void require_direct_mixed_stmt_set(
-    const char *case_name,
-    sqlite3 *db,
-    sqlite3_stmt **baseline,
-    int baseline_n,
-    sqlite3_stmt *result_stmt
-) {
-    sqlite3_stmt *open_stmt;
-    int result_count = 0;
-
-    for (open_stmt = sqlite3_next_stmt(db, NULL); open_stmt;
-         open_stmt = sqlite3_next_stmt(db, open_stmt)) {
-        if (open_stmt == result_stmt) {
-            result_count++;
-        } else if (!direct_stmt_is_baseline(open_stmt, baseline, baseline_n)) {
-            failf("FAIL [direct-fail-open-mixed/%s/next-stmt]: candidate statement leaked",
-                  case_name);
-        }
-    }
-    if (result_count != 1) {
-        failf("FAIL [direct-fail-open-mixed/%s/next-stmt]: got result_count=%d want=1",
-              case_name, result_count);
-    }
-}
-
-static void require_direct_mixed_baseline_only(
-    const char *case_name,
-    sqlite3 *db,
-    sqlite3_stmt **baseline,
-    int baseline_n
-) {
-    sqlite3_stmt *open_stmt;
-
-    for (open_stmt = sqlite3_next_stmt(db, NULL); open_stmt;
-         open_stmt = sqlite3_next_stmt(db, open_stmt)) {
-        if (!direct_stmt_is_baseline(open_stmt, baseline, baseline_n)) {
-            failf("FAIL [direct-fail-open-mixed/%s/post-finalize]: statement leaked",
-                  case_name);
-        }
-    }
-}
-
-static int child_direct_fail_open_mixed(void) {
-    static const direct_mixed_fail_open_case cases[] = {
-        {"build-failure", DIRECT_FAULT_NONE, 1, 0, "build_failed", 0, -1, -1, -1, -1},
-        {"rewritten-prepare-failure", DIRECT_FAULT_CANDIDATE_ERROR, 0, 1,
-         "rewritten_prepare_failed", 0, -1, -1, 1, 1},
-        {"partial-candidate", DIRECT_FAULT_CANDIDATE_ERROR_WITH_STMT, 0, 1,
-         "rewritten_prepare_failed", 1, 0, 19, 1, 1},
-        {"tail-mismatch", DIRECT_FAULT_CANDIDATE_WRONG_TAIL, 0, 1,
-         "tail_mismatch", 1, 0, 19, 1, 1},
-        {"accept-bind-mismatch", DIRECT_FAULT_MIXED_BIND_MISMATCH, 0, 1,
-         "candidate_bind_mismatch", 1, 1, 1, 1, 1},
-        {"accept-column-mismatch", DIRECT_FAULT_MIXED_COLUMN_MISMATCH, 0, 1,
-         "candidate_column_mismatch", 1, 0, 1, 1, 1},
-        {"accept-index-mismatch", DIRECT_FAULT_MIXED_INDEX_MISMATCH, 0, 1,
-         "candidate_index_mismatch", 1, 0, 19, 0, 1}
-    };
-    sqlite3 *db;
-    sqlite3_stmt *baseline[64];
-    int baseline_n = 0;
-    sqlite3_stmt *baseline_stmt;
-    char *raw;
-    char *expected;
-    int prior_sql_limit;
-    size_t i;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    seed_mixed_latest_identity_rows(db);
-    raw = make_mixed_latest_sql("42", "3");
-    expected = make_mixed_latest_expected("42", "3");
-    require_int("direct-fail-open-mixed/rewrite-longer-than-source",
-                strlen(expected) > strlen(raw), 1);
-    require_int("direct-fail-open-mixed/rewrite-length-fits-int",
-                strlen(expected) <= (size_t)INT_MAX, 1);
-    prior_sql_limit = sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1);
-    for (baseline_stmt = sqlite3_next_stmt(db, NULL); baseline_stmt;
-         baseline_stmt = sqlite3_next_stmt(db, baseline_stmt)) {
-        if (baseline_n >= (int)(sizeof(baseline) / sizeof(baseline[0]))) {
-            failf("FAIL [direct-fail-open-mixed/baseline-overflow]: too many open statements");
-        }
-        baseline[baseline_n++] = baseline_stmt;
-    }
-
-    for (i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
-        const direct_mixed_fail_open_case *test_case = &cases[i];
-        sqlite3_stmt *stmt = NULL;
-        const char *tail = NULL;
-        char label[160];
-        int rc;
-
-        direct_original_sql = raw;
-        direct_fault = test_case->fault;
-        direct_candidate_calls = 0;
-        direct_original_calls = 0;
-        direct_candidate_input_len = 0;
-        direct_candidate_had_stmt = 0;
-        direct_candidate_bind_count = -1;
-        direct_candidate_column_count = -1;
-        direct_candidate_outer_index_count = -1;
-        direct_candidate_inner_index_count = -1;
-        direct_skipped_calls = 0;
-        direct_skipped_reason = NULL;
-        direct_skipped_mode = OBS_MODE_NONE;
-
-        if (test_case->constrain_sql_limit) {
-            int constrained_limit = (int)strlen(expected) - 1;
-            require_int("direct-fail-open-mixed/build/source-fits-limit",
-                        strlen(raw) <= (size_t)constrained_limit, 1);
-            sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, constrained_limit);
-            require_int("direct-fail-open-mixed/build/sql-limit",
-                        sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1),
-                        constrained_limit);
-        }
-
-        rc = emby_fts_rewrite_prepare(db, raw, -1, 0, &stmt, &tail,
-                                      FTS_REWRITE_PREPARE_V2);
-        if (test_case->constrain_sql_limit) {
-            sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, prior_sql_limit);
-        }
-
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/rc", test_case->name);
-        require_int(label, rc, SQLITE_OK);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/result-stmt",
-                 test_case->name);
-        require_int(label, stmt != NULL, 1);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/candidate-calls",
-                 test_case->name);
-        require_int(label, direct_candidate_calls, test_case->candidate_calls);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/original-calls",
-                 test_case->name);
-        require_int(label, direct_original_calls, 1);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/skipped-calls",
-                 test_case->name);
-        require_int(label, direct_skipped_calls, 1);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/skipped-reason",
-                 test_case->name);
-        require_str_eq(label, direct_skipped_reason, test_case->skip_reason);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/skipped-mode",
-                 test_case->name);
-        require_int(label, direct_skipped_mode, OBS_MODE_EMBY_MIXED_LATEST);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/candidate-length",
-                 test_case->name);
-        require_int(label, direct_candidate_input_len,
-                    test_case->candidate_calls ? strlen(expected) : 0);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/candidate-had-stmt",
-                 test_case->name);
-        require_int(label, direct_candidate_had_stmt, test_case->candidate_had_stmt);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/candidate-binds",
-                 test_case->name);
-        require_int(label, direct_candidate_bind_count, test_case->candidate_bind_count);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/candidate-columns",
-                 test_case->name);
-        require_int(label, direct_candidate_column_count, test_case->candidate_column_count);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/outer-index-count",
-                 test_case->name);
-        require_int(label, direct_candidate_outer_index_count,
-                    test_case->candidate_outer_index_count);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/inner-index-count",
-                 test_case->name);
-        require_int(label, direct_candidate_inner_index_count,
-                    test_case->candidate_inner_index_count);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/source-sql",
-                 test_case->name);
-        require_str_eq(label, sqlite3_sql(stmt), raw);
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/source-tail",
-                 test_case->name);
-        require_int(label, tail == raw + strlen(raw), 1);
-        require_direct_mixed_stmt_set(
-            test_case->name, db, baseline, baseline_n, stmt
-        );
-        snprintf(label, sizeof(label), "direct-fail-open-mixed/%s/finalize",
-                 test_case->name);
-        require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
-        require_direct_mixed_baseline_only(
-            test_case->name, db, baseline, baseline_n
-        );
-    }
-
-    direct_original_sql = NULL;
-    direct_fault = DIRECT_FAULT_NONE;
-    free(raw);
-    free(expected);
-    require_int("direct-fail-open-mixed/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [direct-fail-open-mixed]\n");
-    return 0;
-}
 #endif
-
-static int child_fts_env(const char *value, const char *label, int want_rewrite) {
-    sqlite3 *db;
-    char *sql;
-    char *expected;
-
-    configure_env(value, "1", "1");
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    expected = want_rewrite ? make_expected_sql(0, "100", "100", "6", "7", 1) : xasprintf("%s", sql);
-    expect_sql(db, label, sql, -1, 2, expected, want_rewrite);
-    free(sql);
-    free(expected);
-    require_int("env-off/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [%s]\n", label);
-    return 0;
-}
-
-static int child_path_negative(void) {
-    const char *names[] = {"com.plexapp.plugins.library.db", "jellyfin.db", "not-target.db"};
-    char non_ascii_name[256];
-    char non_ascii_dir[512];
-    char non_ascii_path[768];
-    char *sql;
-    size_t i;
-
-    configure_env("0", "1", "1");
-    make_temp_dir();
-    sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    for (i = 0; i < sizeof(names) / sizeof(names[0]); i++) {
-        sqlite3 *db = open_seeded_temp(names[i]);
-        expect_sql(db, names[i], sql, -1, 2, sql, 0);
-        require_int("path-negative/close", sqlite3_close(db), SQLITE_OK);
-    }
-    {
-        sqlite3 *db = open_db_path(":memory:");
-        exec_sql(db, "schema-memory", "CREATE TABLE t(x);");
-        expect_sql(db, "memory", "SELECT 1", -1, 2, "SELECT 1", 0);
-        require_int("memory/close", sqlite3_close(db), SQLITE_OK);
-    }
-    {
-        sqlite3 *db;
-        int rc = snprintf(non_ascii_dir, sizeof(non_ascii_dir),
-                          "/tmp/emby-fts-rewrite-smoke-%ld/emb\303\251",
-                          (long)getpid());
-        if (rc < 0 || (size_t)rc >= sizeof(non_ascii_dir)) {
-            failf("FATAL: non-ASCII temp dir too long");
-        }
-        if (mkdir(non_ascii_dir, 0700) != 0 && errno != EEXIST) {
-            failf("FATAL: mkdir(%s) failed: %s", non_ascii_dir, strerror(errno));
-        }
-        rc = snprintf(non_ascii_name, sizeof(non_ascii_name), "emb\303\251/library.db");
-        if (rc < 0 || (size_t)rc >= sizeof(non_ascii_name)) {
-            failf("FATAL: non-ASCII temp name too long");
-        }
-        db = open_seeded_temp(non_ascii_name);
-        expect_sql(db, "non-ascii-path", sql, -1, 2, sql, 0);
-        require_int("path-negative/non-ascii-close", sqlite3_close(db), SQLITE_OK);
-        temp_path(non_ascii_path, sizeof(non_ascii_path), non_ascii_name);
-        unlink(non_ascii_path);
-        snprintf(non_ascii_path, sizeof(non_ascii_path),
-                 "/tmp/emby-fts-rewrite-smoke-%ld/emb\303\251/library.db-wal",
-                 (long)getpid());
-        unlink(non_ascii_path);
-        snprintf(non_ascii_path, sizeof(non_ascii_path),
-                 "/tmp/emby-fts-rewrite-smoke-%ld/emb\303\251/library.db-shm",
-                 (long)getpid());
-        unlink(non_ascii_path);
-        rmdir(non_ascii_dir);
-    }
-    free(sql);
-    cleanup_temp_dir();
-    printf("PASS [path-negative]\n");
-    return 0;
-}
-
-static int child_nonmatch(void) {
-    sqlite3 *db;
-    char *sql;
-    char *type_expected;
-    char *fast;
-    char *duplicate;
-    char *literal;
-    char *concat_rhs;
-    char *named_colon_rhs;
-    char *named_func_rhs;
-    char *over_cap;
-    char *over_cap_sql;
-    char *ambiguous_after_l1;
-    char *ambiguous_after_t1;
-    char *ambiguous_after_t2;
-    char *ambiguous_after_l2;
-    char *ambiguous_after_l1_expected;
-    char *ambiguous_after_t1_expected;
-    char *ambiguous_after_t2_expected;
-    char *ambiguous_after_l2_expected;
-    char *embedded;
-    static const char after_l1[] =
-        ") ),WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (";
-    static const char after_t1[] =
-        ") union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (";
-    static const char after_t2[] =
-        ")))select";
-    static const char after_l2[] =
-        ")) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds)";
-    const char *tail = NULL;
-    sqlite3_stmt *stmt = NULL;
-    int rc;
-
-    configure_env("0", "1", "1");
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    type_expected = make_expected_sql(0, "100", "100", "6", "7", 1);
-    fast = replace_once(sql, "A.Id in WithAncestors", "EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid=A.Id)");
-    duplicate = replace_once(sql, "fts_search9 match @SearchTerm", "fts_search9 match @SearchTerm AND fts_search9 match @SearchTerm2");
-    literal = replace_once(sql, "fts_search9 match @SearchTerm", "fts_search9 match 'alpha'");
-    concat_rhs = replace_once(sql, "fts_search9 match @SearchTerm", "fts_search9 match @SearchTerm || ''");
-    named_colon_rhs = replace_once(sql, "fts_search9 match @SearchTerm", "fts_search9 match $SearchTerm::suffix");
-    named_func_rhs = replace_once(sql, "fts_search9 match @SearchTerm", "fts_search9 match $SearchTerm(extra)");
-    over_cap = make_numeric_list(66000);
-    over_cap_sql = make_emby_sql(0, over_cap, over_cap, "6", "7", 1);
-    ambiguous_after_l1 = add_anchor_literal_predicate(sql, after_l1);
-    ambiguous_after_t1 = add_anchor_literal_predicate(sql, after_t1);
-    ambiguous_after_t2 = add_anchor_literal_predicate(sql, after_t2);
-    ambiguous_after_l2 = add_anchor_literal_predicate(sql, after_l2);
-    ambiguous_after_l1_expected = add_anchor_literal_predicate(type_expected, after_l1);
-    ambiguous_after_t1_expected = add_anchor_literal_predicate(type_expected, after_t1);
-    ambiguous_after_t2_expected = add_anchor_literal_predicate(type_expected, after_t2);
-    ambiguous_after_l2_expected = add_anchor_literal_predicate(type_expected, after_l2);
-    expect_sql(db, "fast-form", fast, -1, 2, fast, 0);
-    expect_sql(db, "duplicate-fts", duplicate, -1, 2, duplicate, 0);
-#ifndef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
-    expect_sql(db, "literal-rhs", literal, -1, 2, literal, 0);
-#endif
-    expect_sql(db, "match-rhs-concat", concat_rhs, -1, 2, concat_rhs, 0);
-    expect_sql(db, "match-rhs-named-colon", named_colon_rhs, -1, 2, named_colon_rhs, 0);
-    expect_sql(db, "match-rhs-named-func", named_func_rhs, -1, 2, named_func_rhs, 0);
-    expect_sql(db, "over-cap-slot", over_cap_sql, -1, 2, over_cap_sql, 0);
-    expect_sql(db, "ambiguous-after-l1", ambiguous_after_l1, -1, 2, ambiguous_after_l1_expected, 1);
-    expect_sql(db, "ambiguous-after-t1", ambiguous_after_t1, -1, 2, ambiguous_after_t1_expected, 1);
-    expect_sql(db, "ambiguous-after-t2", ambiguous_after_t2, -1, 2, ambiguous_after_t2_expected, 1);
-    expect_sql(db, "ambiguous-after-l2", ambiguous_after_l2, -1, 2, ambiguous_after_l2_expected, 1);
-    stmt = prepare_entry(db, "semicolon", "SELECT 1; SELECT 2", -1, 2, &tail);
-    require_str_eq("semicolon/sql", sqlite3_sql(stmt), "SELECT 1;");
-    if (!tail || strcmp(tail, " SELECT 2") != 0) {
-        failf("FAIL [semicolon/tail]: tail=\"%s\"", tail ? tail : "(null)");
-    }
-    require_int("semicolon/finalize", sqlite3_finalize(stmt), SQLITE_OK);
-
-    embedded = xasprintf("SELECT 1%c SELECT 2", '\0');
-    rc = sqlite3_prepare_v2(db, embedded, (int)strlen("SELECT 1") + 1 + (int)strlen(" SELECT 2"),
-                            &stmt, &tail);
-    require_int("embedded-nul/rc", rc, SQLITE_OK);
-    require_str_eq("embedded-nul/sql", sqlite3_sql(stmt), "SELECT 1");
-    require_int("embedded-nul/finalize", sqlite3_finalize(stmt), SQLITE_OK);
-
-    free(sql);
-    free(type_expected);
-    free(fast);
-    free(duplicate);
-    free(literal);
-    free(concat_rhs);
-    free(named_colon_rhs);
-    free(named_func_rhs);
-    free(over_cap);
-    free(over_cap_sql);
-    free(ambiguous_after_l1);
-    free(ambiguous_after_t1);
-    free(ambiguous_after_t2);
-    free(ambiguous_after_l2);
-    free(ambiguous_after_l1_expected);
-    free(ambiguous_after_t1_expected);
-    free(ambiguous_after_t2_expected);
-    free(ambiguous_after_l2_expected);
-    free(embedded);
-    require_int("nonmatch/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [nonmatch]\n");
-    return 0;
-}
-
-static int child_fixture_canary(void) {
-    sqlite3 *db;
-    static const char *fixtures[] = {
-        "slow-type",
-        "slow-presentation",
-        "presentation-user42",
-        "l1-l2-mismatch",
-        "mutated-type-slots",
-        "fast-exists",
-        "string-anchor-passthrough",
-        "comment-anchor-passthrough",
-        "fanout-people",
-        "fanout-links-search",
-        "fanout-browse",
-        "fanout-favorites",
-        "latest-limit12",
-        "latest-limit16",
-        "latest-movies-played-limit12",
-        "latest-star-projection-negative",
-        "latest-capture-miss-negative",
-        "latest-aggregate-projection-negative",
-        "latest-over-negative",
-        "latest-series-browse-negative",
-        "latest-explain-prefix-negative"
-    };
-    size_t i;
-
-    configure_env("0", "0", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-    seed_movies_latest_rows(db);
-    for (i = 0; i < sizeof(fixtures) / sizeof(fixtures[0]); i++) {
-        expect_fixture(db, fixtures[i]);
-    }
-    require_int("fixture-canary/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [fixture-canary]\n");
-    return 0;
-}
-
-static int child_row_parity(void) {
-    sqlite3 *original_db;
-    sqlite3 *rewritten_db;
-    char *sql;
-    char *expected;
-    unsigned int original_mask;
-    unsigned int rewritten_mask;
-
-    configure_env("0", "1", "1");
-    make_temp_dir();
-    original_db = open_seeded_temp("not-target.db");
-    rewritten_db = open_seeded_temp("library.db");
-    sql = make_emby_sql(1, "100", "100", "6", "7", 1);
-    expected = make_expected_sql(1, "100", "100", "6", "7", 1);
-
-    contract_parity_require(
-        original_db, rewritten_db, contract_prepare_v2, "emby-fts-contract",
-        sql, sql, expected, bind_search_term, (void *)"(\"alpha\"*)",
-        accept_emby_fts_legal_difference, NULL
-    );
-
-    original_mask = collect_fts_id_mask(
-        original_db, "row-parity-original", sql, -1, 0, "(\"alpha\"*)"
-    );
-    rewritten_mask = collect_fts_id_mask(
-        rewritten_db, "row-parity-rewritten", sql, (int)strlen(sql) + 1, 1,
-        "(\"alpha\"*)"
-    );
-    require_int("row-parity/original-membership", (int)original_mask, 0x1f);
-    require_int("row-parity/candidate-membership", (int)rewritten_mask, 0x1f);
-    require_emby_fts_ordered_contract(
-        original_db, rewritten_db, "row-parity/ordered-contract", sql, expected,
-        "(\"alpha\"*)"
-    );
-    original_mask = collect_fts_id_mask(
-        original_db, "row-parity-or-original", sql, -1, 0,
-        "(\"alpha\"*) OR (\"alpha\"*)"
-    );
-    rewritten_mask = collect_fts_id_mask(
-        rewritten_db, "row-parity-or-rewritten", sql,
-        (int)strlen(sql) + 1, 1, "(\"alpha\"*) OR (\"alpha\"*)"
-    );
-    require_int("row-parity-or/original-membership", (int)original_mask, 0x1f);
-    require_int("row-parity-or/candidate-membership", (int)rewritten_mask, 0x1f);
-    require_emby_fts_ordered_contract(
-        original_db, rewritten_db, "row-parity-or/ordered-contract", sql, expected,
-        "(\"alpha\"*) OR (\"alpha\"*)"
-    );
-
-    free(expected);
-    free(sql);
-    require_int("row-parity/original-close", sqlite3_close(original_db), SQLITE_OK);
-    require_int("row-parity/rewrite-close", sqlite3_close(rewritten_db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [row-parity]\n");
-    return 0;
-}
-
-static int child_complex_resume_watched_progress_row_parity(void) {
-    sqlite3 *original_db;
-    sqlite3 *rewritten_db;
-    char *sql;
-    char *expected;
-    char original_ids[128];
-    char rewritten_ids[128];
-
-    configure_env("1", "0", NULL);
-    make_temp_dir();
-    original_db = open_seeded_temp("not-target.db");
-    rewritten_db = open_seeded_temp("library.db");
-    seed_complex_resume_watched_progress_parity_rows(original_db);
-    seed_complex_resume_watched_progress_parity_rows(rewritten_db);
-    sql = make_resume_sql();
-    expected = make_resume_expected(sql, "100", "1");
-
-    contract_parity_require(
-        original_db, rewritten_db, contract_prepare_v2, "emby-fanout-contract",
-        sql, sql, expected, NULL, NULL, NULL, NULL
-    );
-
-    collect_int_column(original_db, "complex-resume-watched-progress-row-original", sql, sql, -1, 2,
-                       original_ids, sizeof(original_ids));
-    collect_int_column(rewritten_db, "complex-resume-watched-progress-row-rewritten", sql, expected,
-                       (int)strlen(sql) + 1, 2, rewritten_ids, sizeof(rewritten_ids));
-    require_str_eq("complex-resume-watched-progress-row-parity/ids", rewritten_ids, original_ids);
-    require_str_eq("complex-resume-watched-progress-row-parity/expected", rewritten_ids, "102,100,");
-
-    free(sql);
-    free(expected);
-    require_int("complex-resume-watched-progress-row-parity/original-close", sqlite3_close(original_db), SQLITE_OK);
-    require_int("complex-resume-watched-progress-row-parity/rewrite-close", sqlite3_close(rewritten_db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [complex-resume-watched-progress-row-parity]\n");
-    return 0;
-}
-
-static int child_fanout_env(
-    const char *value,
-    const char *label,
-    int env_enables_rewrite
-) {
-    sqlite3 *db;
-    char *browse_sql;
-    char *browse_one;
-    char *browse_two;
-    char *browse_repl;
-    char *browse_expected;
-
-    configure_env("1", value, "1");
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    browse_sql = make_browse_sql();
-    browse_one = make_exists_links_one("100", "6");
-    browse_two = make_exists_links_two("100", "7");
-    browse_repl = xasprintf("(%s OR %s)", browse_one, browse_two);
-    browse_expected = replace_once(
-        browse_sql, "A.Id in WithItemLinkItemIds", browse_repl
-    );
-    expect_sql(
-        db, label, browse_sql, -1, 2,
-        env_enables_rewrite ? browse_expected : browse_sql, 0
-    );
-    free(browse_expected);
-    free(browse_repl);
-    free(browse_two);
-    free(browse_one);
-    free(browse_sql);
-    require_int("fanout-env/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [%s]\n", label);
-    return 0;
-}
-
-static int child_fanout_matrix(void) {
-    sqlite3 *db;
-    char *browse_sql;
-    char *browse_one;
-    char *browse_two;
-    char *browse_repl;
-    char *browse_expected;
-    char *favorites_sql;
-    char *favorites_ancestor;
-    char *favorites_one;
-    char *favorites_repl;
-    char *favorites_expected;
-    char *resume_sql;
-    char *resume_expected;
-    char *people_sql;
-    char *people_repl;
-    char *people_expected;
-    char *links_sql;
-    char *links_repl;
-    char *links_expected;
-    char *fts_sql;
-
-    configure_env("1", "0", NULL);
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    browse_sql = make_browse_sql();
-    browse_one = make_exists_links_one("100", "6");
-    browse_two = make_exists_links_two("100", "7");
-    browse_repl = xasprintf("(%s OR %s)", browse_one, browse_two);
-    browse_expected = replace_once(browse_sql, "A.Id in WithItemLinkItemIds", browse_repl);
-    expect_sql(db, "fanout-browse", browse_sql, -1, 2, browse_expected, 0);
-    expect_sql(db, "fanout-browse-v3", browse_sql, -1, 3, browse_expected, 0);
-
-    favorites_sql = make_favorites_sql();
-    favorites_ancestor = make_ancestor_exists_splice("100");
-    favorites_one = make_exists_links_one("100", "6");
-    favorites_repl = xasprintf("(%s OR %s)", favorites_ancestor, favorites_one);
-    favorites_expected = replace_once(favorites_sql, "(A.Id in WithAncestors OR A.Id in WithItemLinkItemIds)", favorites_repl);
-    expect_sql(db, "fanout-favorites", favorites_sql, -1, 2, favorites_expected, 0);
-
-    resume_sql = make_resume_sql();
-    resume_expected = make_resume_expected(resume_sql, "100", "1");
-    expect_sql(db, "fanout-resume", resume_sql, -1, 2, resume_expected, 0);
-
-    people_sql = make_people_sql();
-    people_repl = make_exists_people("100");
-    people_expected = replace_once(people_sql, "A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors)", people_repl);
-    expect_sql(db, "fanout-people", people_sql, -1, 2, people_expected, 0);
-
-    links_sql = make_links_search_sql("2,3");
-    links_repl = make_exists_links_one("100", "2,3");
-    links_expected = replace_once(links_sql, "A.Id in WithItemLinkItemIds", links_repl);
-    expect_sql(db, "fanout-links-search", links_sql, -1, 2, links_expected, 0);
-
-    fts_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    expect_sql(db, "fanout-search-shape-nomisfire", fts_sql, -1, 2, fts_sql, 0);
-
-    free(browse_sql);
-    free(browse_one);
-    free(browse_two);
-    free(browse_repl);
-    free(browse_expected);
-    free(favorites_sql);
-    free(favorites_ancestor);
-    free(favorites_one);
-    free(favorites_repl);
-    free(favorites_expected);
-    free(resume_sql);
-    free(resume_expected);
-    free(people_sql);
-    free(people_repl);
-    free(people_expected);
-    free(links_sql);
-    free(links_repl);
-    free(links_expected);
-    free(fts_sql);
-    require_int("fanout-matrix/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [fanout-matrix]\n");
-    return 0;
-}
-
-static int child_emby_slow_search_matrix(void) {
-    sqlite3 *db;
-    char *resume_simple_count_sql;
-    char *resume_simple_count_expected;
-    char *resume_simple_bare_sql;
-    char *resume_simple_bare_expected;
-    char *resume_unplayed_sql;
-    char *resume_bad_l1_sql;
-    char *resume_bad_limit_sql;
-    char *resume_simple_string_sql;
-    char *resume_simple_string_expected;
-    char *resume_simple_string_only_sql;
-    char *resume_simple_duplicate_sql;
-    char *resume_complex_sql;
-    char *resume_complex_expected;
-    char *resume_complex_no_not_null_sql;
-    char *resume_complex_comment_sql;
-    char *resume_complex_comment_expected;
-    char *resume_0065_sql;
-    char *resume_0065_expected;
-    char *resume_bound_user_sql;
-    char *resume_named_user_sql;
-    char *resume_derived_param_sql;
-    char *resume_conflict_user_sql;
-    char *resume_duplicate_sql;
-    char *similar_sql;
-    char *similar_expected;
-    char *similar_comment_sql;
-    char *similar_comment_expected;
-    char *similar_comment_only_sql;
-    char *people_sql;
-    char *people_repl;
-    char *people_expected;
-    char *links_sql;
-    char *links_repl;
-    char *links_expected;
-    char *fts_sql;
-    char *latest_sql;
-
-    configure_env("1", "0", NULL);
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-
-    resume_simple_count_sql = make_resume_simple_sql(1, "12");
-    resume_simple_count_expected = make_resume_simple_expected(resume_simple_count_sql);
-    expect_sql(db, "resume-simple-count", resume_simple_count_sql, -1, 2,
-               resume_simple_count_expected, 0);
-
-    resume_simple_bare_sql = make_resume_simple_sql(0, "24");
-    resume_simple_bare_expected = make_resume_simple_expected(resume_simple_bare_sql);
-    expect_sql(db, "resume-simple-bare", resume_simple_bare_sql, -1, 2,
-               resume_simple_bare_expected, 0);
-
-    resume_unplayed_sql = replace_once(
-        resume_simple_count_sql,
-        "UserDatas.playbackPositionTicks > 0",
-        "Coalesce(UserDatas.played, 0)=0"
-    );
-    expect_sql(db, "resume-simple-unplayed-negative", resume_unplayed_sql, -1, 2,
-               resume_unplayed_sql, 0);
-    expect_sql(db, "resume-simple-shape-07-547bab3e-negative",
-               EMBY_RESUME_SIMPLE_LEFT_JOIN_UNPLAYED_SHAPE_07_SQL, -1, 2,
-               EMBY_RESUME_SIMPLE_LEFT_JOIN_UNPLAYED_SHAPE_07_SQL, 0);
-
-    resume_bad_l1_sql = replace_once(resume_simple_count_sql, "AncestorId in (100)",
-                                     "AncestorId in (@AncestorId)");
-    expect_sql(db, "resume-simple-bad-l1-negative", resume_bad_l1_sql, -1, 2,
-               resume_bad_l1_sql, 0);
-
-    resume_bad_limit_sql = replace_once(resume_simple_count_sql, "LIMIT 12", "LIMIT @Limit");
-    expect_sql(db, "resume-simple-bad-limit-negative", resume_bad_limit_sql, -1, 2,
-               resume_bad_limit_sql, 0);
-
-    resume_simple_string_sql = replace_once(
-        resume_simple_count_sql,
-        "AND A.Id in WithAncestors",
-        "AND 'A.Id in WithAncestors' IS NOT NULL AND A.Id in WithAncestors"
-    );
-    resume_simple_string_expected = replace_once(
-        resume_simple_count_expected,
-        "AND EXISTS (SELECT 1 FROM AncestorIds2",
-        "AND 'A.Id in WithAncestors' IS NOT NULL AND EXISTS (SELECT 1 FROM AncestorIds2"
-    );
-    expect_sql(db, "resume-simple-string-embedded-immunity", resume_simple_string_sql,
-               -1, 2, resume_simple_string_expected, 0);
-
-    resume_simple_string_only_sql = replace_once(
-        resume_simple_count_sql,
-        "AND A.Id in WithAncestors",
-        "AND 'A.Id in WithAncestors' IS NOT NULL"
-    );
-    expect_sql(db, "resume-simple-string-only-negative", resume_simple_string_only_sql,
-               -1, 2, resume_simple_string_only_sql, 0);
-
-    resume_simple_duplicate_sql = replace_once(
-        resume_simple_count_sql,
-        "AND A.Id in WithAncestors",
-        "AND A.Id in WithAncestors AND A.Id in WithAncestors"
-    );
-    expect_sql(db, "resume-simple-duplicate-negative", resume_simple_duplicate_sql, -1, 2,
-               resume_simple_duplicate_sql, 0);
-
-    resume_complex_sql = make_resume_sql();
-    resume_complex_expected = make_resume_expected(resume_complex_sql, "100", "1");
-    expect_sql(db, "resume-complex-count", resume_complex_sql, -1, 2,
-               resume_complex_expected, 0);
-
-    resume_complex_no_not_null_sql = replace_once(
-        resume_complex_sql,
-        " AND LastWatchedEpisodes.LastPlayedDateInt not null",
-        ""
-    );
-    expect_sql(db, "resume-complex-missing-lastwatched-not-null-negative",
-               resume_complex_no_not_null_sql, -1, 2,
-               resume_complex_no_not_null_sql, 0);
-
-    resume_complex_comment_sql = replace_once(
-        resume_complex_sql,
-        "AND A.Id in WithAncestors Group by",
-        "AND /* A.Id in WithAncestors */ A.Id in WithAncestors Group by"
-    );
-    resume_complex_comment_expected = replace_once(
-        resume_complex_expected,
-        "AND EXISTS (SELECT 1 FROM AncestorIds2",
-        "AND /* A.Id in WithAncestors */ EXISTS (SELECT 1 FROM AncestorIds2"
-    );
-    expect_sql(db, "resume-complex-comment-embedded-immunity",
-               resume_complex_comment_sql, -1, 2, resume_complex_comment_expected, 0);
-
-    resume_0065_sql = make_resume_0065_sql();
-    resume_0065_expected = make_resume_expected(resume_0065_sql, "100", "13");
-    expect_sql(db, "resume-complex-0065", resume_0065_sql, -1, 2,
-               resume_0065_expected, 0);
-
-    resume_bound_user_sql = replace_once(resume_complex_sql, "UserDatas.UserId=1",
-                                         "UserDatas.UserId=?1");
-    expect_sql(db, "resume-complex-bound-user-negative", resume_bound_user_sql, -1, 2,
-               resume_bound_user_sql, 0);
-
-    resume_named_user_sql = replace_once(resume_complex_sql, "userdatas.userid=1",
-                                         "userdatas.userid=@UserId");
-    expect_sql(db, "resume-complex-named-user-negative", resume_named_user_sql, -1, 2,
-               resume_named_user_sql, 0);
-
-    resume_derived_param_sql = replace_once(resume_complex_sql, "UserDatas_N.UserId=1",
-                                            "UserDatas_N.UserId=:UserId");
-    expect_sql(db, "resume-complex-derived-param-negative", resume_derived_param_sql, -1, 2,
-               resume_derived_param_sql, 0);
-
-    resume_conflict_user_sql = replace_once(resume_complex_sql, "userdatas.userid=1",
-                                            "userdatas.userid=2");
-    expect_sql(db, "resume-complex-conflicting-user-negative", resume_conflict_user_sql, -1, 2,
-               resume_conflict_user_sql, 0);
-
-    resume_duplicate_sql = replace_once(
-        resume_complex_sql,
-        "AND A.Id in WithAncestors",
-        "AND A.Id in WithAncestors AND A.Id in WithAncestors"
-    );
-    expect_sql(db, "resume-complex-duplicate-negative", resume_duplicate_sql, -1, 2,
-               resume_duplicate_sql, 0);
-
-    similar_sql = make_similar_sql();
-    similar_expected = make_similar_expected(similar_sql);
-    expect_sql(db, "fanout-similar", similar_sql, -1, 2, similar_expected, 0);
-
-    similar_comment_sql = replace_once(
-        similar_sql,
-        "AND A.Id in WithAncestors",
-        "AND /* A.Id in WithAncestors */ A.Id in WithAncestors"
-    );
-    similar_comment_expected = replace_once(
-        similar_expected,
-        "AND EXISTS (SELECT 1 FROM AncestorIds2",
-        "AND /* A.Id in WithAncestors */ EXISTS (SELECT 1 FROM AncestorIds2"
-    );
-    expect_sql(db, "similar-comment-embedded-immunity", similar_comment_sql,
-               -1, 2, similar_comment_expected, 0);
-
-    similar_comment_only_sql = replace_once(
-        similar_sql,
-        "AND A.Id in WithAncestors",
-        "AND /* A.Id in WithAncestors */ 1=1"
-    );
-    expect_sql(db, "similar-comment-only-negative", similar_comment_only_sql, -1, 2,
-               similar_comment_only_sql, 0);
-
-    people_sql = make_people_sql();
-    people_repl = make_exists_people("100");
-    people_expected = replace_once(
-        people_sql,
-        "A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors)",
-        people_repl
-    );
-    expect_sql(db, "similar-people-negative", people_sql, -1, 2, people_expected, 0);
-
-    links_sql = make_links_search_sql("2,3");
-    links_repl = make_exists_links_one("100", "2,3");
-    links_expected = replace_once(links_sql, "A.Id in WithItemLinkItemIds", links_repl);
-    expect_sql(db, "similar-links-search-negative", links_sql, -1, 2, links_expected, 0);
-    /* Similar must not claim this shape on its SimB_Ids guard; links_search owns
-       the exact two-level links/type-count membership splice. */
-    {
-        char *type_count_expected = make_link_type_count_shape_05_expected();
-        char *bad_t1 = replace_once(
-            EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
-            "Type in (6,4,3,2) union",
-            "Type in (6,'bad') union"
-        );
-        char *bad_t2 = replace_once(
-            EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
-            "Type in (7,0,1,5,6,2)))select",
-            "Type in (7,'bad')))select"
-        );
-        char *duplicate_membership = replace_once(
-            EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
-            "AND A.Id in WithItemLinkItemIds Group by",
-            "AND A.Id in WithItemLinkItemIds AND A.Id in WithItemLinkItemIds Group by"
-        );
-
-        expect_sql(db, "links-type-count-shape-05-two-level",
-                   EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2,
-                   type_count_expected, 0);
-        expect_sql(db, "links-type-count-shape-05-bad-t1",
-                   bad_t1, -1, 2, bad_t1, 0);
-        expect_sql(db, "links-type-count-shape-05-bad-t2",
-                   bad_t2, -1, 2, bad_t2, 0);
-        expect_sql(db, "links-type-count-shape-05-duplicate-membership",
-                   duplicate_membership, -1, 2, duplicate_membership, 0);
-        free(type_count_expected);
-        free(bad_t1);
-        free(bad_t2);
-        free(duplicate_membership);
-    }
-
-    fts_sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    expect_sql(db, "fanout-search-fts-negative", fts_sql, -1, 2, fts_sql, 0);
-
-    latest_sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
-    expect_sql(db, "fanout-latest-negative", latest_sql, -1, 2, latest_sql, 0);
-    require_absent("fanout-latest-negative/indexed-by", latest_sql,
-                   "INDEXED BY idx_dshadow_emby_latest_gk_dc");
-
-    free(resume_simple_count_sql);
-    free(resume_simple_count_expected);
-    free(resume_simple_bare_sql);
-    free(resume_simple_bare_expected);
-    free(resume_unplayed_sql);
-    free(resume_bad_l1_sql);
-    free(resume_bad_limit_sql);
-    free(resume_simple_string_sql);
-    free(resume_simple_string_expected);
-    free(resume_simple_string_only_sql);
-    free(resume_simple_duplicate_sql);
-    free(resume_complex_sql);
-    free(resume_complex_expected);
-    free(resume_complex_no_not_null_sql);
-    free(resume_complex_comment_sql);
-    free(resume_complex_comment_expected);
-    free(resume_0065_sql);
-    free(resume_0065_expected);
-    free(resume_bound_user_sql);
-    free(resume_named_user_sql);
-    free(resume_derived_param_sql);
-    free(resume_conflict_user_sql);
-    free(resume_duplicate_sql);
-    free(similar_sql);
-    free(similar_expected);
-    free(similar_comment_sql);
-    free(similar_comment_expected);
-    free(similar_comment_only_sql);
-    free(people_sql);
-    free(people_repl);
-    free(people_expected);
-    free(links_sql);
-    free(links_repl);
-    free(links_expected);
-    free(fts_sql);
-    free(latest_sql);
-    require_int("emby-slow-search-matrix/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [emby-slow-search-matrix]\n");
-    return 0;
-}
-
-static int child_dashboard_off_value(const char *value, const char *label) {
-    sqlite3 *db;
-    char *latest_sql;
-    char *movies_sql;
-    char *mixed_sql;
-
-    configure_env("1", "1", value[0] ? value : NULL);
-    if (value[0] == 0 &&
-        setenv("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "", 1) != 0) {
-        failf("setenv empty dashboard failed");
-    }
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    seed_movies_latest_rows(db);
-    latest_sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
-    movies_sql = make_movies_latest_sql(1, "100", "42", "12");
-    mixed_sql = make_mixed_latest_sql("42", "3");
-    expect_sql(db, label, latest_sql, -1, 2, latest_sql, 0);
-    expect_sql(db, label, movies_sql, -1, 2, movies_sql, 0);
-    expect_sql(db, label, mixed_sql, -1, 2, mixed_sql, 0);
-    free(latest_sql);
-    free(movies_sql);
-    free(mixed_sql);
-    require_int("dashboard-off-value/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [%s]\n", label);
-    return 0;
-}
-
-static int child_dashboard_default_off(void) {
-    sqlite3 *db;
-    char *latest_sql;
-    char *movies_sql;
-    char *mixed_sql;
-
-    configure_env("1", "1", NULL);
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    seed_movies_latest_rows(db);
-    latest_sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
-    movies_sql = make_movies_latest_sql(1, "100", "42", "12");
-    mixed_sql = make_mixed_latest_sql("42", "3");
-    expect_sql(db, "dashboard-default-off", latest_sql, -1, 2, latest_sql, 0);
-    expect_sql(db, "dashboard-default-off-movies", movies_sql, -1, 2, movies_sql, 0);
-    expect_sql(db, "dashboard-default-off-mixed", mixed_sql, -1, 2, mixed_sql, 0);
-    free(latest_sql);
-    free(movies_sql);
-    free(mixed_sql);
-    require_int("dashboard-default-off/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [dashboard-default-off]\n");
-    return 0;
-}
-
-static int child_dashboard_matrix(void) {
-    sqlite3 *db;
-    sqlite3 *original_db;
-    char *latest_sql;
-    char *latest_expected;
-    char *latest16_sql;
-    char *latest16_expected;
-    char *distinct_sql;
-    char *aggregate_sql;
-    char *over_sql;
-    char *movies_sql[3];
-    char *movies_expected[3];
-    char *mixed_sql;
-    char *mixed_expected;
-    typed_rows vendor_rows;
-    typed_rows candidate_rows;
-    int i;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    seed_movies_latest_rows(db);
-    latest_sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
-    latest_expected = make_latest_expected("A.Id,A.SeriesName,A.SortName ", "12");
-    require_absent("dashboard-latest-original/indexed-by", latest_sql,
-                   "INDEXED BY idx_dshadow_emby_latest_gk_dc");
-    require_int("dashboard-latest-expected/outer-index-count",
-                count_occurrences(latest_expected,
-                                  "INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk"),
-                1);
-    require_int("dashboard-latest-expected/inner-index-count",
-                count_occurrences(latest_expected,
-                                  "INDEXED BY idx_dshadow_emby_latest_gk_dc"),
-                1);
-    require_contains("dashboard-latest-expected/ranked", latest_expected,
-                     "WITH ranked(id, dc, gk) AS MATERIALIZED (");
-    require_absent("dashboard-latest-expected/keys", latest_expected, "WITH keys(gk)");
-    require_absent("dashboard-latest-expected/picked", latest_expected, "picked AS MATERIALIZED");
-    require_absent("dashboard-latest-expected/exact-groups", latest_expected,
-                   "exact_groups AS MATERIALIZED");
-    expect_sql(db, "dashboard-latest", latest_sql, -1, 2, latest_expected, 0);
-    expect_sql(db, "dashboard-latest-nbyte-with-nul", latest_sql,
-               (int)strlen(latest_sql) + 1, 2, latest_expected, 0);
-    latest16_sql = make_latest_sql("A.Id ", "16");
-    latest16_expected = make_latest_expected("A.Id ", "16");
-    require_int("dashboard-latest-limit16/outer-index-count",
-                count_occurrences(latest16_expected,
-                                  "INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk"),
-                1);
-    require_int("dashboard-latest-limit16/inner-index-count",
-                count_occurrences(latest16_expected,
-                                  "INDEXED BY idx_dshadow_emby_latest_gk_dc"),
-                1);
-    require_contains("dashboard-latest-limit16/ranked", latest16_expected,
-                     "WITH ranked(id, dc, gk) AS MATERIALIZED (");
-    require_absent("dashboard-latest-limit16/keys", latest16_expected, "WITH keys(gk)");
-    require_absent("dashboard-latest-limit16/picked", latest16_expected,
-                   "picked AS MATERIALIZED");
-    require_absent("dashboard-latest-limit16/exact-groups", latest16_expected,
-                   "exact_groups AS MATERIALIZED");
-    expect_sql(db, "dashboard-latest-limit16", latest16_sql, -1, 2, latest16_expected, 0);
-    mixed_sql = make_mixed_latest_sql("42", "3");
-    mixed_expected = make_mixed_latest_expected("42", "3");
-    expect_mixed_latest_sql(
-        db, "dashboard-mixed-same-control", mixed_sql, mixed_expected, 0, 0
-    );
-
-    distinct_sql = make_latest_sql("DISTINCT A.Id ", "12");
-    expect_sql(db, "dashboard-distinct-negative", distinct_sql, -1, 2, distinct_sql, 0);
-    aggregate_sql = make_latest_sql("MAX(A.DateCreated) ", "12");
-    expect_sql(db, "dashboard-aggregate-negative", aggregate_sql, -1, 2, aggregate_sql, 0);
-    over_sql = make_latest_sql("count(*) OVER() AS TotalRecordCount,A.Id ", "12");
-    expect_sql(db, "dashboard-over-negative", over_sql, -1, 2, over_sql, 0);
-
-    movies_sql[0] = make_movies_latest_sql(1, "100", "42", "12");
-    movies_sql[1] = make_movies_latest_sql(1, "100", "42", "16");
-    movies_sql[2] = make_movies_latest_sql(1, "100", "42", "20");
-    movies_expected[0] = make_movies_latest_expected("100", "42", "12");
-    movies_expected[1] = make_movies_latest_expected("100", "42", "16");
-    movies_expected[2] = make_movies_latest_expected("100", "42", "20");
-    for (i = 0; i < 3; i++) {
-        expect_sql(db, "dashboard-movies-limits", movies_sql[i], -1, 2,
-                   movies_expected[i], 0);
-    }
-
-    original_db = open_seeded_temp_with_dashboard_indexes("not-target.db", 0, 0, 0, 0);
-    seed_movies_latest_rows(original_db);
-    vendor_rows = collect_typed_rows(original_db, "movies-row-original",
-                                     movies_sql[2], movies_sql[2]);
-    candidate_rows = collect_typed_rows(db, "movies-row-rewritten",
-                                        movies_sql[2], movies_expected[2]);
-    require_ordered_full_row_identity("movies-row-identity", &vendor_rows, &candidate_rows);
-    free_typed_rows(&vendor_rows);
-    free_typed_rows(&candidate_rows);
-
-    require_int("dashboard/original-close", sqlite3_close(original_db), SQLITE_OK);
-    require_int("dashboard/index-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 0, 1, 1);
-    seed_movies_latest_rows(db);
-    expect_sql(db, "dashboard-episodes-date-index-missing", latest_sql, -1, 2,
-               latest_sql, 0);
-    require_int("dashboard/episodes-date-index-missing-close",
-                sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 0, 1, 1, 1);
-    seed_movies_latest_rows(db);
-    expect_sql(db, "dashboard-episodes-group-index-missing", latest_sql, -1, 2,
-               latest_sql, 0);
-    require_int("dashboard/episodes-group-index-missing-close",
-                sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 0, 0, 1, 1);
-    seed_movies_latest_rows(db);
-    expect_sql(db, "dashboard-episodes-both-indexes-missing", latest_sql, -1, 2,
-               latest_sql, 0);
-    require_int("dashboard/episodes-both-indexes-missing-close",
-                sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 0, 1);
-    seed_movies_latest_rows(db);
-    expect_sql(db, "dashboard-movies-outer-missing", movies_sql[0], -1, 2,
-               movies_sql[0], 0);
-    require_int("dashboard/movies-outer-missing-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 0);
-    seed_movies_latest_rows(db);
-    expect_sql(db, "dashboard-movies-inner-missing", movies_sql[0], -1, 2,
-               movies_sql[0], 0);
-    require_int("dashboard/movies-inner-missing-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-    seed_movies_latest_rows(db);
-    require_int("dashboard/probe-authorizer-set",
-                sqlite3_set_authorizer(db, deny_sqlite_master_read, NULL), SQLITE_OK);
-    expect_sql(db, "dashboard-episodes-probe-error", latest_sql, -1, 2, latest_sql, 0);
-    expect_sql(db, "dashboard-movies-probe-error", movies_sql[0], -1, 2,
-               movies_sql[0], 0);
-    require_int("dashboard/probe-authorizer-clear",
-                sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
-    require_int("dashboard/probe-error-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    free(latest_sql);
-    free(latest_expected);
-    free(latest16_sql);
-    free(latest16_expected);
-    free(distinct_sql);
-    free(aggregate_sql);
-    free(over_sql);
-    free(mixed_sql);
-    free(mixed_expected);
-    for (i = 0; i < 3; i++) {
-        free(movies_sql[i]);
-        free(movies_expected[i]);
-    }
-    printf("PASS [dashboard-matrix]\n");
-    return 0;
-}
-
-static int child_dashboard_index_definition_gate(void) {
-    sqlite3 *db;
-    FILE *capture;
-    char *log_output;
-    char *episodes_sql;
-    char *episodes_expected;
-    char *movies_sql;
-    char *movies_expected;
-    int saved_stderr_fd;
-
-    configure_env_observable("1", "1", "0");
-    if (setenv("SQLITE3_DISABLE_STMT_TRACE", "1", 1) != 0 ||
-        unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL") != 0) {
-        failf("FATAL: exec-child observable env failed: %s", strerror(errno));
-    }
-    make_temp_dir();
-    episodes_sql = make_latest_sql("A.Id ", "12");
-    episodes_expected = make_latest_expected("A.Id ", "12");
-    movies_sql = make_movies_latest_sql(1, "100", "42", "12");
-    movies_expected = make_movies_latest_expected("100", "42", "12");
-    capture = begin_stderr_capture(&saved_stderr_fd);
-
-    db = open_seeded_temp_with_latest_indexes("library.db", 0, 1);
-    exec_sql(db, "malformed-episodes-group-index",
-        "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
-        "ON MediaItems (Id) WHERE Type = 8;"
-    );
-    expect_sql(db, "malformed-episodes-group-index-fail-open", episodes_sql,
-               -1, 2, episodes_sql, 0);
-    require_int("malformed-episodes-group-index/close", sqlite3_close(db), SQLITE_OK);
-
-    db = open_seeded_temp_with_latest_indexes("library.db", 1, 0);
-    exec_sql(db, "malformed-episodes-date-index",
-        "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
-        "ON MediaItems (Id) WHERE Type = 8;"
-    );
-    expect_sql(db, "malformed-episodes-date-index-fail-open", episodes_sql,
-               -1, 2, episodes_sql, 0);
-    require_int("malformed-episodes-date-index/close", sqlite3_close(db), SQLITE_OK);
-
-    db = open_seeded_temp_with_latest_indexes("library.db", 1, 1);
-    expect_sql(db, "canonical-episodes-indexes-rewrite", episodes_sql, -1, 2,
-               episodes_expected, 0);
-    require_int("canonical-episodes-indexes/close", sqlite3_close(db), SQLITE_OK);
-
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 0, 0, 0, 1);
-    exec_sql(db, "malformed-movies-outer-index",
-        "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
-        "ON MediaItems (Id) WHERE Type = 5;"
-    );
-    expect_sql(db, "malformed-movies-outer-index-fail-open", movies_sql,
-               -1, 2, movies_sql, 0);
-    require_int("malformed-movies-outer-index/close", sqlite3_close(db), SQLITE_OK);
-
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 0, 0, 1, 0);
-    exec_sql(db, "malformed-movies-inner-index",
-        "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
-        "ON MediaItems (Id) WHERE Type = 5;"
-    );
-    expect_sql(db, "malformed-movies-inner-index-fail-open", movies_sql,
-               -1, 2, movies_sql, 0);
-    require_int("malformed-movies-inner-index/close", sqlite3_close(db), SQLITE_OK);
-
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 0, 0, 1, 1);
-    expect_sql(db, "canonical-movies-indexes-rewrite", movies_sql, -1, 2,
-               movies_expected, 0);
-    require_int("canonical-movies-indexes/close", sqlite3_close(db), SQLITE_OK);
-
-    log_output = end_stderr_capture(capture, saved_stderr_fd);
-    require_contains(
-        "malformed-episodes-index-definitions/index-missing-log", log_output,
-        "reason=index_missing mode=dashboard+episodes_latest"
-    );
-    require_contains(
-        "canonical-episodes-index-definitions/applied-log", log_output,
-        "event=rewrite_applied target=emby mode=dashboard+episodes_latest"
-    );
-    require_contains(
-        "malformed-movies-index-definitions/index-missing-log", log_output,
-        "reason=index_missing mode=dashboard+movies_latest"
-    );
-    require_contains(
-        "canonical-movies-index-definitions/applied-log", log_output,
-        "event=rewrite_applied target=emby mode=dashboard+movies_latest"
-    );
-
-    free(log_output);
-    free(episodes_sql);
-    free(episodes_expected);
-    free(movies_sql);
-    free(movies_expected);
-    cleanup_temp_dir();
-    printf("PASS [dashboard-index-definition-gate]\n");
-    return 0;
-}
 
 #define TEST_MOVIES_LIST_PREFIX \
     "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select "
@@ -3769,7 +1839,9 @@ static void expect_movies_latest_semantics(sqlite3 *db) {
     char *sql = make_movies_latest_sql_form(
         1, "302", 0, "A.PresentationUniqueKey,A.DateCreated ", "42", "12"
     );
-    sqlite3_stmt *stmt = prepare_entry(db, "movies-latest-semantics", sql, -1, 2, NULL);
+    sqlite3_stmt *stmt = contract_prepare_v2(
+        db, "movies-latest-semantics", sql, NULL
+    );
     const char *saved_sql = sqlite3_sql(stmt);
     int row;
 
@@ -3808,282 +1880,6 @@ static void expect_movies_latest_semantics(sqlite3 *db) {
     require_int("movies-latest-semantics/done", sqlite3_step(stmt), SQLITE_DONE);
     require_int("movies-latest-semantics/finalize", sqlite3_finalize(stmt), SQLITE_OK);
     free(sql);
-}
-
-static int child_dashboard_fix_b_c(void) {
-    static const char *wide_ancestors[] = {"100", "100,200"};
-    static const char *compact_ancestors[] = {
-        "201,202,203,204", "9,10,11,12,13,14"
-    };
-    sqlite3 *vendor_db;
-    sqlite3 *candidate_db;
-    sqlite3 *missing_index_db;
-    size_t i;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    vendor_db = open_seeded_temp_with_dashboard_indexes("not-target.db", 0, 0, 0, 0);
-    candidate_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-    seed_movies_latest_rows(vendor_db);
-    seed_movies_latest_rows(candidate_db);
-    exec_sql(vendor_db, "dashboard-scalar-minus-one-vendor-seed",
-             "INSERT INTO AncestorIds2 VALUES(7,-1,0),(3,-1,0);");
-    exec_sql(candidate_db, "dashboard-scalar-minus-one-candidate-seed",
-             "INSERT INTO AncestorIds2 VALUES(7,-1,0),(3,-1,0);");
-    expect_movies_latest_semantics(candidate_db);
-
-    {
-        static const sqlite3_int64 candidate_ids[] = {9303, 9312, 9321};
-        movies_latest_contract contract = {
-            vendor_db,
-            candidate_db,
-            EMBY_MOVIES_LATEST_COMPACT_PROJECTION
-        };
-        char *raw = make_movies_latest_sql(1, "302", "42", "12");
-        char *expected = make_movies_latest_expected("302", "42", "12");
-
-        contract_parity_require(
-            vendor_db, candidate_db, contract_prepare_v2,
-            "emby-dashboard-movies-representative-contract",
-            raw, raw, expected, NULL, NULL,
-            accept_movies_latest_legal_difference, &contract
-        );
-        require_movies_latest_vendor_rows(
-            vendor_db, "emby-dashboard-movies-vendor-contract", raw,
-            EMBY_MOVIES_LATEST_COMPACT_PROJECTION
-        );
-        require_movies_latest_candidate_rows(
-            candidate_db, "emby-dashboard-movies-candidate-contract", raw,
-            expected, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, candidate_ids,
-            (int)(sizeof(candidate_ids) / sizeof(candidate_ids[0]))
-        );
-        free(raw);
-        free(expected);
-    }
-
-    for (i = 0; i < sizeof(wide_ancestors) / sizeof(wide_ancestors[0]); i++) {
-        char label[64];
-        char *raw = make_movies_latest_sql_form(
-            1, wide_ancestors[i], 0, EMBY_MOVIES_LATEST_WIDE_PROJECTION, "42", "20"
-        );
-        char *expected = make_movies_latest_expected_projection(
-            wide_ancestors[i], EMBY_MOVIES_LATEST_WIDE_PROJECTION, "42", "20"
-        );
-        char *outer_select = xasprintf(
-            " ) SELECT %sFROM ranked AS R", EMBY_MOVIES_LATEST_WIDE_PROJECTION
-        );
-        snprintf(label, sizeof(label), "dashboard-movies-wide-m%lu", (unsigned long)i + 3);
-        require_contains(label, expected, outer_select);
-        expect_sql(candidate_db, label, raw, -1, 2, expected, 0);
-        contract_parity_require(
-            vendor_db, candidate_db, contract_prepare_v2, label,
-            raw, raw, expected, NULL, NULL, NULL, NULL
-        );
-        free(raw);
-        free(expected);
-        free(outer_select);
-    }
-
-    for (i = 0; i < sizeof(compact_ancestors) / sizeof(compact_ancestors[0]); i++) {
-        char *raw = make_movies_latest_sql(1, compact_ancestors[i], "42", "12");
-        char *expected = make_movies_latest_expected(compact_ancestors[i], "42", "12");
-        expect_sql(candidate_db, i == 0 ? "dashboard-movies-m5-byte-identical"
-                                       : "dashboard-movies-m6-byte-identical",
-                   raw, -1, 2, expected, 0);
-        free(raw);
-        free(expected);
-    }
-
-    {
-        char *oracle = make_latest_sql_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 0, "12"
-        );
-        char *scalar = make_latest_sql_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 1, "12"
-        );
-        char *expected = make_latest_expected_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", "12"
-        );
-        expect_sql(candidate_db, "dashboard-episodes-e2-scalar", scalar, -1, 2, expected, 0);
-        contract_parity_require(
-            vendor_db, candidate_db, contract_prepare_v2,
-            "emby-dashboard-episodes-contract", oracle, scalar, expected,
-            NULL, NULL, NULL, NULL
-        );
-        free(oracle);
-        free(scalar);
-        free(expected);
-    }
-
-    {
-        char ids[32];
-        char *scalar = make_latest_sql_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", 1, "12"
-        );
-        char *expected = make_latest_expected_form(
-            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", "12"
-        );
-
-        expect_sql(candidate_db, "dashboard-episodes-scalar-minus-one",
-                   scalar, -1, 2, expected, 0);
-        contract_parity_require(
-            vendor_db, candidate_db, contract_prepare_v2,
-            "emby-dashboard-episodes-scalar-minus-one-contract",
-            scalar, scalar, expected, NULL, NULL, NULL, NULL
-        );
-        collect_int_column(
-            candidate_db, "dashboard-episodes-scalar-minus-one-ids",
-            scalar, expected, -1, 0, ids, sizeof(ids)
-        );
-        require_str_eq("dashboard-episodes-scalar-minus-one-exact-id", ids, "7,");
-        free(scalar);
-        free(expected);
-    }
-
-    {
-        char *oracle = make_movies_latest_sql(1, "100", "42", "12");
-        char *scalar = make_movies_latest_sql_form(
-            1, "100", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
-        );
-        char *expected = make_movies_latest_expected("100", "42", "12");
-        expect_sql(candidate_db, "dashboard-movies-m7-scalar", scalar, -1, 2, expected, 0);
-        contract_parity_require(
-            vendor_db, candidate_db, contract_prepare_v2,
-            "emby-dashboard-movies-singleton-contract", oracle, scalar, expected,
-            NULL, NULL, NULL, NULL
-        );
-        free(oracle);
-        free(scalar);
-        free(expected);
-    }
-
-    {
-        char ids[32];
-        char *scalar = make_movies_latest_sql_form(
-            1, "-1", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
-        );
-        char *expected = make_movies_latest_expected("-1", "42", "12");
-
-        expect_sql(candidate_db, "dashboard-movies-scalar-minus-one",
-                   scalar, -1, 2, expected, 0);
-        contract_parity_require(
-            vendor_db, candidate_db, contract_prepare_v2,
-            "emby-dashboard-movies-scalar-minus-one-contract",
-            scalar, scalar, expected, NULL, NULL, NULL, NULL
-        );
-        collect_int_column(
-            candidate_db, "dashboard-movies-scalar-minus-one-ids",
-            scalar, expected, -1, 0, ids, sizeof(ids)
-        );
-        require_str_eq("dashboard-movies-scalar-minus-one-exact-id", ids, "3,");
-        free(scalar);
-        free(expected);
-    }
-
-    {
-        FILE *capture;
-        char *log_output;
-        int saved_stderr_fd;
-        capture = begin_stderr_capture(&saved_stderr_fd);
-        expect_dashboard_negative(candidate_db, "dashboard-e1-favorites-silent",
-                                  TEST_E1_FAVORITES, "where A.Type=8 ", 1);
-        expect_dashboard_negative(candidate_db, "dashboard-m1-favorites-silent",
-                                  TEST_M1_FAVORITES, "where A.Type=5 ", 1);
-        expect_dashboard_negative(candidate_db, "dashboard-type5-resume-silent",
-                                  TEST_TYPE5_RESUME, "LastWatchedEpisodes", 2);
-        expect_dashboard_negative(candidate_db, "dashboard-m2-tail-miss",
-                                  TEST_M2_PREMIERE_TAIL, "A.PremiereDate>=1752355308", 1);
-        log_output = end_stderr_capture(capture, saved_stderr_fd);
-        require_int("dashboard-fix-b-c/episodes-silent",
-                    count_occurrences(log_output,
-                        "reason=capture_miss mode=dashboard+episodes_latest"), 0);
-        require_int("dashboard-fix-b-c/movies-only-m2-capture",
-                    count_occurrences(log_output,
-                        "reason=capture_miss mode=dashboard+movies_latest"), 1);
-        free(log_output);
-    }
-
-    expect_dashboard_negative(candidate_db, "dashboard-movies-aggregate-projection",
-                              TEST_MOVIES_AGGREGATE_PROJECTION, "MAX(A.DateCreated)", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-window-projection",
-                              TEST_MOVIES_WINDOW_PROJECTION, "count(*) OVER()", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-bare-star-projection",
-                              TEST_MOVIES_BARE_STAR_PROJECTION, "select * from", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-parenthesized-projection",
-                              TEST_MOVIES_PAREN_PROJECTION, "select (A.Id)", 1);
-
-    {
-        static const struct {
-            const char *label;
-            const char *ancestor_slot;
-            const char *boundary_needle;
-        } scalar_negative_cases[] = {
-            {"dashboard-movies-scalar-minus-two", "-2", "AncestorId=-2 )select"},
-            {"dashboard-movies-scalar-leading-space", " -1", "AncestorId= -1 )select"},
-            {"dashboard-movies-scalar-split-sign", "- 1", "AncestorId=- 1 )select"},
-            {"dashboard-movies-scalar-expression", "-1+0", "AncestorId=-1+0 )select"},
-            {"dashboard-movies-scalar-minus-one-or", "-1 OR AncestorId=200",
-             "AncestorId=-1 OR AncestorId=200 )select"},
-            {"dashboard-movies-scalar-minus-one-correlated", "-1 AND ItemId=A.Id",
-             "AncestorId=-1 AND ItemId=A.Id )select"},
-        };
-
-        for (i = 0; i < sizeof(scalar_negative_cases) / sizeof(scalar_negative_cases[0]); i++) {
-            char *sql = make_movies_latest_sql_form(
-                1, scalar_negative_cases[i].ancestor_slot, 1,
-                EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
-            );
-            expect_dashboard_negative(
-                candidate_db, scalar_negative_cases[i].label, sql,
-                scalar_negative_cases[i].boundary_needle, 1
-            );
-            free(sql);
-        }
-    }
-
-    expect_dashboard_negative(candidate_db, "dashboard-movies-scalar-bind",
-                              TEST_MOVIES_SCALAR_BIND, "AncestorId=?", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-bad-limit",
-                              TEST_MOVIES_BAD_LIMIT, "LIMIT 11", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-scalar-noninteger",
-                              TEST_MOVIES_SCALAR_NONINTEGER, "AncestorId=+100", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-scalar-operator",
-                              TEST_MOVIES_SCALAR_OPERATOR, "AncestorId=100 OR AncestorId=200", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-mixed-ancestor",
-                              TEST_MOVIES_MIXED_ANCESTOR,
-                              "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId=", 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-duplicate-list-ancestor",
-                              TEST_MOVIES_DUPLICATE_LIST_ANCESTOR,
-                              "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (", 2);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-ambiguous-select",
-                              TEST_MOVIES_AMBIGUOUS_SELECT, ") )select ", 2);
-    expect_dashboard_negative(candidate_db, "dashboard-episodes-date-window-offset",
-                              TEST_EPISODES_DATE_WINDOW_OFFSET, "OFFSET 12", 1);
-    require_int("dashboard-movies-correlated-random-image/images-boundary",
-                count_occurrences(TEST_MOVIES_CORRELATED_RANDOM_IMAGE,
-                                  "A.Images like '%Primary%'"), 1);
-    require_int("dashboard-movies-correlated-random-image/order-boundary",
-                count_occurrences(TEST_MOVIES_CORRELATED_RANDOM_IMAGE,
-                                  "ORDER BY RANDOM()"), 1);
-    expect_dashboard_negative(candidate_db, "dashboard-movies-correlated-random-image",
-                              TEST_MOVIES_CORRELATED_RANDOM_IMAGE,
-                              "AncestorId=838031 AND ItemId=A.Id", 1);
-
-    require_int("dashboard-fix-b-c/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
-    require_int("dashboard-fix-b-c/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
-    cleanup_temp_dir();
-
-    make_temp_dir();
-    missing_index_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 0, 1);
-    seed_movies_latest_rows(missing_index_db);
-    expect_dashboard_negative(missing_index_db, "dashboard-movies-missing-index",
-                              TEST_MOVIES_MISSING_INDEX,
-                              "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0", 1);
-    require_int("dashboard-fix-b-c/missing-index-close",
-                sqlite3_close(missing_index_db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [dashboard-fix-b-c]\n");
-    return 0;
 }
 
 static void seed_movies_latest_rows(sqlite3 *db) {
@@ -4241,7 +2037,9 @@ static void require_episodes_latest_semantics(sqlite3 *vendor_db, sqlite3 *candi
     int row;
     int rc;
 
-    stmt = prepare_entry(candidate_db, "episodes-semantic/candidate", raw, -1, 2, &tail);
+    stmt = contract_prepare_v2(
+        candidate_db, "episodes-semantic/candidate", raw, &tail
+    );
     require_str_eq("episodes-semantic/candidate-sql", sqlite3_sql(stmt), expected);
     if (tail != raw + strlen(raw)) {
         failf("FAIL [episodes-semantic/candidate-tail]: got=%ld want=%ld",
@@ -4270,7 +2068,9 @@ static void require_episodes_latest_semantics(sqlite3 *vendor_db, sqlite3 *candi
     require_int("episodes-semantic/candidate-finalize", sqlite3_finalize(stmt), SQLITE_OK);
 
     tail = NULL;
-    stmt = prepare_entry(vendor_db, "episodes-semantic/vendor", raw, -1, 2, &tail);
+    stmt = contract_prepare_v2(
+        vendor_db, "episodes-semantic/vendor", raw, &tail
+    );
     require_str_eq("episodes-semantic/vendor-sql", sqlite3_sql(stmt), raw);
     if (tail != raw + strlen(raw)) {
         failf("FAIL [episodes-semantic/vendor-tail]: got=%ld want=%ld",
@@ -4316,21 +2116,5240 @@ static int query_int(sqlite3 *db, const char *label, const char *sql) {
     return value;
 }
 
-static int child_links_two_level_row_parity(void) {
-    sqlite3 *vendor_db;
-    sqlite3 *candidate_db;
+static const char *const emby_controlled_env_gates[] = {
+    "SQLITE3_DISABLE_AUTOPRAGMA",
+    "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+    "SQLITE3_DISABLE_OBSERVABILITY",
+    "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+    "SQLITE3_DISABLE_EMBY_FTS_REWRITE",
+    "SQLITE3_DISABLE_EMBY_FANOUT_REWRITE",
+    "SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE",
+    "SQLITE3_DISABLE_STMT_TRACE",
+    "SQLITE3_DISABLE_REWRITE_APPLIED_SQL"
+};
+
+#define EMBY_ENV_UNSET(gate_name) \
+    {.name = (gate_name), .value = {.state = RSH_ENV_UNSET}}
+#define EMBY_ENV_EMPTY(gate_name) \
+    {.name = (gate_name), .value = {.state = RSH_ENV_EMPTY}}
+#define EMBY_ENV_SET(gate_name, gate_value) \
+    {.name = (gate_name), \
+     .value = {.state = RSH_ENV_VALUE, .value = (gate_value)}}
+#define EMBY_NATIVE_ENV_COMMON \
+    EMBY_ENV_SET("SQLITE3_DISABLE_AUTOPRAGMA", "1"), \
+    EMBY_ENV_SET("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1"), \
+    EMBY_ENV_SET("SQLITE3_DISABLE_OBSERVABILITY", "1"), \
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_PLEX_FTS_REWRITE"), \
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_STMT_TRACE"), \
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")
+
+static const rsh_env_assignment emby_fts_default_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_EMBY_FTS_REWRITE"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_fts_zero_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_fts_one_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_fts_garbage_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "xyz"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_fanout_default_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_fanout_zero_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_d6_fanout_zero_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "0"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE")
+};
+
+static const rsh_env_assignment emby_fanout_one_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_fanout_garbage_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "false"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_dashboard_default_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE")
+};
+
+static const rsh_env_assignment emby_dashboard_one_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "1")
+};
+
+static const rsh_env_assignment emby_dashboard_empty_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_EMPTY("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE")
+};
+
+static const rsh_env_assignment emby_dashboard_garbage_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "false")
+};
+
+static const rsh_env_assignment emby_fixture_canary_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "0")
+};
+
+static const rsh_env_assignment emby_latest_native_env[] = {
+    EMBY_NATIVE_ENV_COMMON,
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "0")
+};
+
+static const rsh_env_assignment emby_dashboard_matcher_negatives_env[] = {
+    EMBY_ENV_SET("SQLITE3_DISABLE_AUTOPRAGMA", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_OBSERVABILITY"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_PLEX_FTS_REWRITE"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "0"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_STMT_TRACE"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")
+};
+
+static const rsh_env_assignment emby_d8_index_definition_env[] = {
+    EMBY_ENV_SET("SQLITE3_DISABLE_AUTOPRAGMA", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_OBSERVABILITY"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_PLEX_FTS_REWRITE"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_STMT_TRACE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")
+};
+
+static const rsh_env_assignment emby_d8_observability_env[] = {
+    EMBY_ENV_SET("SQLITE3_DISABLE_AUTOPRAGMA", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_OBSERVABILITY"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_PLEX_FTS_REWRITE"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_STMT_TRACE", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")
+};
+
+static const rsh_env_assignment emby_d8_master_disabled_env[] = {
+    EMBY_ENV_SET("SQLITE3_DISABLE_AUTOPRAGMA", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_RUNTIME_OPTIMIZE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_OBSERVABILITY", "1"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_PLEX_FTS_REWRITE"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FTS_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_FANOUT_REWRITE", "1"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE", "0"),
+    EMBY_ENV_SET("SQLITE3_DISABLE_STMT_TRACE", "0"),
+    EMBY_ENV_UNSET("SQLITE3_DISABLE_REWRITE_APPLIED_SQL")
+};
+
+#undef EMBY_NATIVE_ENV_COMMON
+#undef EMBY_ENV_SET
+#undef EMBY_ENV_EMPTY
+#undef EMBY_ENV_UNSET
+
+enum {
+    EMBY_PROFILE_DASHBOARD_OFF = 1,
+    EMBY_PROFILE_LATEST_INDEXES,
+    EMBY_PROFILE_FIXTURE_CANARY,
+    EMBY_PROFILE_MOVIES_SEED_ONLY,
+    EMBY_PROFILE_EPISODES_DATE_INDEX_MISSING,
+    EMBY_PROFILE_EPISODES_GROUP_INDEX_MISSING,
+    EMBY_PROFILE_EPISODES_BOTH_INDEXES_MISSING,
+    EMBY_PROFILE_MOVIES_OUTER_INDEX_MISSING,
+    EMBY_PROFILE_MOVIES_INNER_INDEX_MISSING,
+    EMBY_PROFILE_D5B_FIX_CANDIDATE,
+    EMBY_PROFILE_D5B_SCALAR_MINUS_ONE_VENDOR_SEED,
+    EMBY_PROFILE_D5B_SCALAR_MINUS_ONE_CANDIDATE_SEED,
+    EMBY_PROFILE_D5B_MIXED_ALL_INDEXES,
+    EMBY_PROFILE_D5B_MIXED_OUTER_MISSING,
+    EMBY_PROFILE_D5B_MIXED_INNER_MISSING,
+    EMBY_PROFILE_D5B_MIXED_BOTH_MISSING,
+    EMBY_PROFILE_D5B_MIXED_OUTER_MALFORMED,
+    EMBY_PROFILE_D5B_MIXED_INNER_MALFORMED,
+    EMBY_PROFILE_D6_COMPLEX_RESUME_SEED,
+    EMBY_PROFILE_D6_LINKS_TWO_LEVEL_SEED,
+    EMBY_PROFILE_D6_MIXED_IDENTITY,
+    EMBY_PROFILE_D7_DASHBOARD_INDEXES,
+    EMBY_PROFILE_D7_EPISODES_SEMANTIC_SEED,
+    EMBY_PROFILE_D7_MOVIES_EXPANDED_SEED,
+    EMBY_PROFILE_D7_MOVIES_REWRITE_ORDER_SEED,
+    EMBY_PROFILE_D8_EPISODES_GROUP_MALFORMED,
+    EMBY_PROFILE_D8_EPISODES_DATE_MALFORMED,
+    EMBY_PROFILE_D8_MOVIES_OUTER_MALFORMED,
+    EMBY_PROFILE_D8_MOVIES_INNER_MALFORMED,
+    EMBY_PROFILE_D8_MOVIES_CANONICAL,
+    EMBY_PROFILE_D8_EPISODES_DATE_MISSING,
+    EMBY_PROFILE_D8_EPISODES_GROUP_MISSING,
+    EMBY_PROFILE_D8_EPISODES_BOTH_MISSING,
+    EMBY_PROFILE_D8_MIXED_ALL_INDEXES_WITH_MOVIES_SEED
+};
+
+static int rsh_apply_emby_dashboard_off_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    (void)suite_ctx;
+    if (profile != EMBY_PROFILE_DASHBOARD_OFF) return SQLITE_MISUSE;
+    exec_sql(
+        db, "latest-index",
+        "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+        "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    exec_sql(
+        db, "latest-episodes-date-index",
+        "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    exec_sql(
+        db, "movies-outer-index",
+        "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) "
+        "WHERE Type = 5;"
+    );
+    exec_sql(
+        db, "movies-inner-index",
+        "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
+        "ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) "
+        "WHERE Type = 5;"
+    );
+    exec_sql(
+        db, "mixed-outer-index",
+        "CREATE INDEX idx_dshadow_emby_latest_mixed_dcn_gk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+        "WHERE Type IN (8,5);"
+    );
+    exec_sql(
+        db, "mixed-inner-index",
+        "CREATE INDEX idx_dshadow_emby_latest_mixed_gk_dc "
+        "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+        "WHERE Type IN (8,5);"
+    );
+    seed_movies_latest_rows(db);
+    return SQLITE_OK;
+}
+
+static int rsh_apply_emby_latest_indexes_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    (void)suite_ctx;
+    if (profile != EMBY_PROFILE_LATEST_INDEXES) return SQLITE_MISUSE;
+    exec_sql(
+        db, "latest-index",
+        "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+        "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    exec_sql(
+        db, "latest-episodes-date-index",
+        "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    return SQLITE_OK;
+}
+
+static int rsh_apply_emby_fixture_canary_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    (void)suite_ctx;
+    if (profile != EMBY_PROFILE_FIXTURE_CANARY) return SQLITE_MISUSE;
+    exec_sql(
+        db, "latest-index",
+        "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+        "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    exec_sql(
+        db, "latest-episodes-date-index",
+        "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    exec_sql(
+        db, "movies-outer-index",
+        "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) "
+        "WHERE Type = 5;"
+    );
+    exec_sql(
+        db, "movies-inner-index",
+        "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
+        "ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) "
+        "WHERE Type = 5;"
+    );
+    seed_movies_latest_rows(db);
+    return SQLITE_OK;
+}
+
+static int rsh_apply_emby_dashboard_matrix_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    int episodes_gk_dc_index;
+    int episodes_dcn_gk_index;
+    int movies_outer_index;
+    int movies_inner_index;
+
+    (void)suite_ctx;
+    if (profile == EMBY_PROFILE_MOVIES_SEED_ONLY) {
+        episodes_gk_dc_index = 0;
+        episodes_dcn_gk_index = 0;
+        movies_outer_index = 0;
+        movies_inner_index = 0;
+    } else if (profile == EMBY_PROFILE_EPISODES_DATE_INDEX_MISSING) {
+        episodes_gk_dc_index = 1;
+        episodes_dcn_gk_index = 0;
+        movies_outer_index = 1;
+        movies_inner_index = 1;
+    } else if (profile == EMBY_PROFILE_EPISODES_GROUP_INDEX_MISSING) {
+        episodes_gk_dc_index = 0;
+        episodes_dcn_gk_index = 1;
+        movies_outer_index = 1;
+        movies_inner_index = 1;
+    } else if (profile == EMBY_PROFILE_EPISODES_BOTH_INDEXES_MISSING) {
+        episodes_gk_dc_index = 0;
+        episodes_dcn_gk_index = 0;
+        movies_outer_index = 1;
+        movies_inner_index = 1;
+    } else if (profile == EMBY_PROFILE_MOVIES_OUTER_INDEX_MISSING) {
+        episodes_gk_dc_index = 1;
+        episodes_dcn_gk_index = 1;
+        movies_outer_index = 0;
+        movies_inner_index = 1;
+    } else if (profile == EMBY_PROFILE_MOVIES_INNER_INDEX_MISSING) {
+        episodes_gk_dc_index = 1;
+        episodes_dcn_gk_index = 1;
+        movies_outer_index = 1;
+        movies_inner_index = 0;
+    } else {
+        return SQLITE_MISUSE;
+    }
+
+    if (episodes_gk_dc_index) {
+        exec_sql(
+            db, "latest-index",
+            "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+            "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+            "WHERE Type = 8;"
+        );
+    }
+    if (episodes_dcn_gk_index) {
+        exec_sql(
+            db, "latest-episodes-date-index",
+            "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+            "WHERE Type = 8;"
+        );
+    }
+    if (movies_outer_index) {
+        exec_sql(
+            db, "movies-outer-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
+            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) "
+            "WHERE Type = 5;"
+        );
+    }
+    if (movies_inner_index) {
+        exec_sql(
+            db, "movies-inner-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
+            "ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) "
+            "WHERE Type = 5;"
+        );
+    }
+    seed_movies_latest_rows(db);
+    return SQLITE_OK;
+}
+
+static int rsh_apply_emby_d5b_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    int mixed_outer_index = 1;
+    int mixed_inner_index = 1;
+
+    (void)suite_ctx;
+    if (profile == EMBY_PROFILE_D5B_FIX_CANDIDATE) {
+        return rsh_apply_emby_fixture_canary_profile(
+            db, EMBY_PROFILE_FIXTURE_CANARY, suite_ctx
+        );
+    }
+    if (profile == EMBY_PROFILE_D5B_SCALAR_MINUS_ONE_VENDOR_SEED ||
+        profile == EMBY_PROFILE_D5B_SCALAR_MINUS_ONE_CANDIDATE_SEED) {
+        exec_sql(
+            db,
+            profile == EMBY_PROFILE_D5B_SCALAR_MINUS_ONE_VENDOR_SEED
+                ? "dashboard-scalar-minus-one-vendor-seed"
+                : "dashboard-scalar-minus-one-candidate-seed",
+            "INSERT INTO AncestorIds2 VALUES(7,-1,0),(3,-1,0);"
+        );
+        return SQLITE_OK;
+    }
+    if (profile == EMBY_PROFILE_D5B_MIXED_OUTER_MISSING) {
+        mixed_outer_index = 0;
+    } else if (profile == EMBY_PROFILE_D5B_MIXED_INNER_MISSING) {
+        mixed_inner_index = 0;
+    } else if (profile == EMBY_PROFILE_D5B_MIXED_BOTH_MISSING) {
+        mixed_outer_index = 0;
+        mixed_inner_index = 0;
+    } else if (profile != EMBY_PROFILE_D5B_MIXED_ALL_INDEXES &&
+               profile != EMBY_PROFILE_D5B_MIXED_OUTER_MALFORMED &&
+               profile != EMBY_PROFILE_D5B_MIXED_INNER_MALFORMED) {
+        return SQLITE_MISUSE;
+    }
+
+    exec_sql(
+        db, "latest-index",
+        "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+        "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    exec_sql(
+        db, "latest-episodes-date-index",
+        "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+        "WHERE Type = 8;"
+    );
+    exec_sql(
+        db, "movies-outer-index",
+        "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
+        "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) "
+        "WHERE Type = 5;"
+    );
+    exec_sql(
+        db, "movies-inner-index",
+        "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
+        "ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) "
+        "WHERE Type = 5;"
+    );
+    if (mixed_outer_index) {
+        exec_sql(
+            db, "mixed-outer-index",
+            "CREATE INDEX idx_dshadow_emby_latest_mixed_dcn_gk "
+            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+            "WHERE Type IN (8,5);"
+        );
+    }
+    if (mixed_inner_index) {
+        exec_sql(
+            db, "mixed-inner-index",
+            "CREATE INDEX idx_dshadow_emby_latest_mixed_gk_dc "
+            "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+            "WHERE Type IN (8,5);"
+        );
+    }
+    if (profile == EMBY_PROFILE_D5B_MIXED_OUTER_MALFORMED) {
+        exec_sql(
+            db, "dashboard-mixed-outer-mismatch",
+            "DROP INDEX idx_dshadow_emby_latest_mixed_dcn_gk;"
+            "CREATE INDEX idx_dshadow_emby_latest_mixed_dcn_gk ON MediaItems (DateCreated) WHERE Type IN (8,5);"
+        );
+    }
+    if (profile == EMBY_PROFILE_D5B_MIXED_INNER_MALFORMED) {
+        exec_sql(
+            db, "dashboard-mixed-inner-mismatch",
+            "DROP INDEX idx_dshadow_emby_latest_mixed_gk_dc;"
+            "CREATE INDEX idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (DateCreated) WHERE Type IN (8,5);"
+        );
+    }
+    return SQLITE_OK;
+}
+
+static int rsh_apply_emby_d6_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    if (profile == EMBY_PROFILE_D6_COMPLEX_RESUME_SEED) {
+        seed_complex_resume_watched_progress_parity_rows(db);
+        return SQLITE_OK;
+    }
+    if (profile == EMBY_PROFILE_D6_LINKS_TWO_LEVEL_SEED) {
+        seed_link_type_count_shape_05_rows(db);
+        return SQLITE_OK;
+    }
+    if (profile == EMBY_PROFILE_D6_MIXED_IDENTITY) {
+        int rc = rsh_apply_emby_d5b_profile(
+            db, EMBY_PROFILE_D5B_MIXED_ALL_INDEXES, suite_ctx
+        );
+        if (rc != SQLITE_OK) return rc;
+        seed_mixed_latest_identity_rows(db);
+        return SQLITE_OK;
+    }
+    return SQLITE_MISUSE;
+}
+
+static int rsh_apply_emby_d7_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    (void)suite_ctx;
+    if (profile == EMBY_PROFILE_D7_DASHBOARD_INDEXES) {
+        exec_sql(
+            db, "latest-index",
+            "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+            "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+            "WHERE Type = 8;"
+        );
+        exec_sql(
+            db, "latest-episodes-date-index",
+            "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+            "WHERE Type = 8;"
+        );
+        exec_sql(
+            db, "movies-outer-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
+            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) "
+            "WHERE Type = 5;"
+        );
+        exec_sql(
+            db, "movies-inner-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
+            "ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) "
+            "WHERE Type = 5;"
+        );
+        return SQLITE_OK;
+    }
+    if (profile == EMBY_PROFILE_D7_EPISODES_SEMANTIC_SEED) {
+        seed_episodes_latest_semantic_rows(db);
+        return SQLITE_OK;
+    }
+    if (profile == EMBY_PROFILE_D7_MOVIES_EXPANDED_SEED) {
+        seed_movies_latest_expanded_rows(db);
+        return SQLITE_OK;
+    }
+    if (profile == EMBY_PROFILE_D7_MOVIES_REWRITE_ORDER_SEED) {
+        seed_movies_latest_rewrite_order_rows(db);
+        return SQLITE_OK;
+    }
+    return SQLITE_MISUSE;
+}
+
+static int rsh_apply_emby_d8_profile(
+    sqlite3 *db,
+    int profile,
+    void *suite_ctx
+) {
+    int episodes_group = 0;
+    int episodes_date = 0;
+    int movies_outer = 0;
+    int movies_inner = 0;
+    int rc;
+
+    if (profile == EMBY_PROFILE_D8_MIXED_ALL_INDEXES_WITH_MOVIES_SEED) {
+        rc = rsh_apply_emby_d5b_profile(
+            db, EMBY_PROFILE_D5B_MIXED_ALL_INDEXES, suite_ctx
+        );
+        if (rc != SQLITE_OK) return rc;
+        seed_movies_latest_rows(db);
+        return SQLITE_OK;
+    }
+    (void)suite_ctx;
+    if (profile == EMBY_PROFILE_D8_EPISODES_GROUP_MALFORMED) {
+        episodes_group = 2;
+        episodes_date = 1;
+    } else if (profile == EMBY_PROFILE_D8_EPISODES_DATE_MALFORMED) {
+        episodes_group = 1;
+        episodes_date = 2;
+    } else if (profile == EMBY_PROFILE_D8_MOVIES_OUTER_MALFORMED) {
+        movies_outer = 2;
+        movies_inner = 1;
+    } else if (profile == EMBY_PROFILE_D8_MOVIES_INNER_MALFORMED) {
+        movies_outer = 1;
+        movies_inner = 2;
+    } else if (profile == EMBY_PROFILE_D8_MOVIES_CANONICAL) {
+        movies_outer = 1;
+        movies_inner = 1;
+    } else if (profile == EMBY_PROFILE_D8_EPISODES_DATE_MISSING) {
+        episodes_group = 1;
+    } else if (profile == EMBY_PROFILE_D8_EPISODES_GROUP_MISSING) {
+        episodes_date = 1;
+    } else if (profile != EMBY_PROFILE_D8_EPISODES_BOTH_MISSING) {
+        return SQLITE_MISUSE;
+    }
+
+    if (episodes_group == 1) {
+        exec_sql(
+            db, "latest-index",
+            "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+            "ON MediaItems (coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), DateCreated DESC, Id, UserDataKeyId) "
+            "WHERE Type = 8;"
+        );
+    }
+    if (episodes_date == 1) {
+        exec_sql(
+            db, "latest-episodes-date-index",
+            "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, coalesce(SeriesPresentationUniqueKey, PresentationUniqueKey), Id, UserDataKeyId) "
+            "WHERE Type = 8;"
+        );
+    } else if (episodes_date == 2) {
+        exec_sql(
+            db, "malformed-episodes-date-index",
+            "CREATE INDEX idx_dshadow_emby_latest_episodes_dcn_gk "
+            "ON MediaItems (Id) WHERE Type = 8;"
+        );
+    }
+    if (episodes_group == 2) {
+        exec_sql(
+            db, "malformed-episodes-group-index",
+            "CREATE INDEX idx_dshadow_emby_latest_gk_dc "
+            "ON MediaItems (Id) WHERE Type = 8;"
+        );
+    }
+    if (movies_outer == 1) {
+        exec_sql(
+            db, "movies-outer-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
+            "ON MediaItems ((DateCreated IS NULL), DateCreated DESC, PresentationUniqueKey, Id, UserDataKeyId) "
+            "WHERE Type = 5;"
+        );
+    }
+    if (movies_inner == 1) {
+        exec_sql(
+            db, "movies-inner-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
+            "ON MediaItems (PresentationUniqueKey, DateCreated, Id, UserDataKeyId) "
+            "WHERE Type = 5;"
+        );
+    } else if (movies_inner == 2) {
+        exec_sql(
+            db, "malformed-movies-inner-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_puk_dc_cover "
+            "ON MediaItems (Id) WHERE Type = 5;"
+        );
+    }
+    if (movies_outer == 2) {
+        exec_sql(
+            db, "malformed-movies-outer-index",
+            "CREATE INDEX idx_dshadow_emby_latest_movies_dcn_puk "
+            "ON MediaItems (Id) WHERE Type = 5;"
+        );
+    }
+    return SQLITE_OK;
+}
+
+static rsh_apply_profile_fn rsh_resolve_native_setup_profile(
+    int profile,
+    void *suite_ctx
+) {
+    if (profile == EMBY_PROFILE_DASHBOARD_OFF) {
+        return rsh_apply_emby_dashboard_off_profile;
+    }
+    if (profile == EMBY_PROFILE_LATEST_INDEXES) {
+        return rsh_apply_emby_latest_indexes_profile;
+    }
+    if (profile == EMBY_PROFILE_FIXTURE_CANARY) {
+        return rsh_apply_emby_fixture_canary_profile;
+    }
+    if (profile >= EMBY_PROFILE_MOVIES_SEED_ONLY &&
+        profile <= EMBY_PROFILE_MOVIES_INNER_INDEX_MISSING) {
+        return rsh_apply_emby_dashboard_matrix_profile;
+    }
+    if (profile >= EMBY_PROFILE_D5B_FIX_CANDIDATE &&
+        profile <= EMBY_PROFILE_D5B_MIXED_INNER_MALFORMED) {
+        return rsh_apply_emby_d5b_profile;
+    }
+    if (profile >= EMBY_PROFILE_D6_COMPLEX_RESUME_SEED &&
+        profile <= EMBY_PROFILE_D6_MIXED_IDENTITY) {
+        return rsh_apply_emby_d6_profile;
+    }
+    if (profile >= EMBY_PROFILE_D7_DASHBOARD_INDEXES &&
+        profile <= EMBY_PROFILE_D7_MOVIES_REWRITE_ORDER_SEED) {
+        return rsh_apply_emby_d7_profile;
+    }
+    if (profile >= EMBY_PROFILE_D8_EPISODES_GROUP_MALFORMED &&
+        profile <= EMBY_PROFILE_D8_MIXED_ALL_INDEXES_WITH_MOVIES_SEED) {
+        return rsh_apply_emby_d8_profile;
+    }
+    return rsh_resolve_setup_profile(profile, suite_ctx);
+}
+
+static const char emby_fts_env_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+    "select count(*) OVER() AS TotalRecordCount,A.type,"
+    "(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from"
+    " mediaitems A join fts_search9 on A.Id=fts_search9.RowId and fts_search9 match @SearchTerm where "
+    "A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,16,18,19,20,21,22,23,24,25,26,29,34) "
+    "AND (Coalesce(ShareLevel, 0) > 0 OR A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,29,34) OR A.IsPublic=1) "
+    "AND A.ExtraType is null AND "
+    "(A.Id in WithAncestors OR A.Id in (select ListItemsExemptionForPlaylists.ListId from ListItems ListItemsExemptionForPlaylists join ancestorids2 AncestorIdExemptionForPlaylists on ListItemsExemptionForPlaylists.ListItemId=AncestorIdExemptionForPlaylists.itemid and AncestorIdExemptionForPlaylists.AncestorId in (100)) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds) "
+    "Group by A.Type ORDER BY Rank ASC LIMIT 50";
+
+static const char emby_fts_env_rewritten_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+    "select count(*) OVER() AS TotalRecordCount,A.type,"
+    "(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from"
+    " mediaitems A join fts_search9 on A.Id=fts_search9.RowId and fts_search9 match dshadow_emby_fts_rewrite(@SearchTerm) where "
+    "A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,16,18,19,20,21,22,23,24,25,26,29,34) "
+    "AND (Coalesce(ShareLevel, 0) > 0 OR A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,29,34) OR A.IsPublic=1) "
+    "AND A.ExtraType is null AND "
+    "(EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid = A.Id AND AncestorIds2.AncestorId in (100))"
+    " OR  exists (select 1 from ListItems join ancestorids2 on ListItems.ListItemId=ancestorids2.itemid and ancestorids2.AncestorId in (100) where ListItems.ListId=A.Id)"
+    " OR EXISTS (SELECT 1 FROM itemPeople2 JOIN AncestorIds2 ON AncestorIds2.itemid = itemPeople2.ItemId WHERE itemPeople2.PersonId = A.Id and AncestorIds2.AncestorId in (100))"
+    " OR Exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (100)  where ItemLinks2.LinkedId = A.Id AND ItemLinks2.Type in (6))"
+    " OR Exists (select 1 from ItemLinks2 ItemLinks2TwoLevel where exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (100)  where itemlinks2.linkedid = itemlinks2twolevel.itemid AND ItemLinks2.Type in (7)) and ItemLinks2TwoLevel.LinkedId=A.Id)) "
+    "Group by A.Type ORDER BY Rank ASC LIMIT 50";
+
+static const char emby_fanout_env_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type=6 union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+    "select A.Id,A.SortName from mediaitems A where A.Id in WithItemLinkItemIds ORDER BY A.SortName collate NATURALSORT ASC LIMIT 12";
+
+static const char emby_fanout_env_rewritten_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) ),"
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type=6 union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+    "select A.Id,A.SortName from mediaitems A where (Exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (100)  where ItemLinks2.LinkedId = A.Id AND ItemLinks2.Type in (6)) OR Exists (select 1 from ItemLinks2 ItemLinks2TwoLevel where exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (100)  where itemlinks2.linkedid = itemlinks2twolevel.itemid AND ItemLinks2.Type in (7)) and ItemLinks2TwoLevel.LinkedId=A.Id)) ORDER BY A.SortName collate NATURALSORT ASC LIMIT 12";
+
+static const char emby_dashboard_episodes_off_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )"
+    "select A.Id,A.SeriesName,A.SortName from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 12";
+
+static const char emby_dashboard_movies_off_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )"
+    "select A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12";
+
+static const char emby_dashboard_mixed_off_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )"
+    "select A.type,A.Id,A.IndexNumber,A.Name,A.ParentIndexNumber,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.Images,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 3";
+
+static const char *const emby_fts_env_bind_names[] = {
+    "@SearchTerm"
+};
+
+#define EMBY_PREPARE_V2 \
+    {.kind = RSH_PREPARE_V2, \
+     .nbyte_kind = RSH_NBYTE_MINUS_ONE, \
+     .tail_kind = RSH_TAIL_FULL}
+#define EMBY_SQL_CASE(case_label, source_sql, saved_sql) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_SQL_EXACT, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.sql_exact = { \
+            .role = "candidate", \
+            .sql = (source_sql), \
+            .expected_sql = (saved_sql), \
+            .prepare = EMBY_PREPARE_V2 \
+        } \
+    }
+#define EMBY_FTS_SQL_CASE(case_label, saved_sql) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_SQL_EXACT, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.sql_exact = { \
+            .role = "candidate", \
+            .sql = emby_fts_env_sql, \
+            .expected_sql = (saved_sql), \
+            .prepare = EMBY_PREPARE_V2, \
+            .check_bind_count = 1, \
+            .expected_bind_count = 1, \
+            .expected_bind_names = emby_fts_env_bind_names, \
+            .expected_bind_name_count = sizeof(emby_fts_env_bind_names) / \
+                                        sizeof(emby_fts_env_bind_names[0]) \
+        } \
+    }
+#define DEFINE_EMBY_SCALAR_PHASE(name, phase_label, db_rows, case_rows) \
+    static const rsh_phase_spec name[] = { \
+        { \
+            .label = (phase_label), \
+            .dbs = (db_rows), \
+            .db_count = sizeof(db_rows) / sizeof((db_rows)[0]), \
+            .cases = (case_rows), \
+            .case_count = sizeof(case_rows) / sizeof((case_rows)[0]) \
+        } \
+    }
+
+static const rsh_db_spec emby_env_candidate_db[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE
+    }
+};
+
+static const rsh_db_spec emby_dashboard_off_candidate_db[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_DASHBOARD_OFF
+    }
+};
+
+#define EMBY_POSITIVE_CTE \
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )," \
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+#define EMBY_POSITIVE_TYPE_SELECT \
+    "select count(*) OVER() AS TotalRecordCount,A.type," \
+    "(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from"
+#define EMBY_POSITIVE_PRESENTATION_SELECT \
+    "select count(*) OVER() AS TotalRecordCount,A.type,A.Id,A.EndDate,A.IndexNumber,A.Name,A.Path,A.ParentIndexNumber,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.SeriesName,A.AlbumId,A.SeriesId,A.PresentationUniqueKey,A.Images,A.Status,A.SortIndexNumber,A.SortParentIndexNumber,A.IndexNumberEnd,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex," \
+    "(Select ShareLevel from UserItemShares join AncestorIds2 on AncestorIds2.AncestorId=UserItemShares.ItemId where UserItemShares.UserId=1 and UserItemShares.ShareLevel not null and AncestorIds2.ItemId=A.Id order by Distance limit 1) as ShareLevel from"
+#define EMBY_POSITIVE_FROM \
+    " mediaitems A join fts_search9 on A.Id=fts_search9.RowId and fts_search9 match "
+#define EMBY_POSITIVE_WHERE \
+    " where A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,16,18,19,20,21,22,23,24,25,26,29,34) " \
+    "AND (Coalesce(ShareLevel, 0) > 0 OR A.Type in (1,2,5,6,8,9,10,11,12,13,14,15,18,19,20,21,22,23,24,25,26,29,34) OR A.IsPublic=1) " \
+    "AND A.ExtraType is null AND "
+#define EMBY_POSITIVE_ORIGINAL_MEMBERSHIP \
+    "(A.Id in WithAncestors OR A.Id in (select ListItemsExemptionForPlaylists.ListId from ListItems ListItemsExemptionForPlaylists join ancestorids2 AncestorIdExemptionForPlaylists on ListItemsExemptionForPlaylists.ListItemId=AncestorIdExemptionForPlaylists.itemid and AncestorIdExemptionForPlaylists.AncestorId in (100)) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds)"
+#define EMBY_POSITIVE_REWRITTEN_MEMBERSHIP \
+    "(EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid = A.Id AND AncestorIds2.AncestorId in (100))" \
+    " OR  exists (select 1 from ListItems join ancestorids2 on ListItems.ListItemId=ancestorids2.itemid and ancestorids2.AncestorId in (100) where ListItems.ListId=A.Id)" \
+    " OR EXISTS (SELECT 1 FROM itemPeople2 JOIN AncestorIds2 ON AncestorIds2.itemid = itemPeople2.ItemId WHERE itemPeople2.PersonId = A.Id and AncestorIds2.AncestorId in (100))" \
+    " OR Exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (100)  where ItemLinks2.LinkedId = A.Id AND ItemLinks2.Type in (6))" \
+    " OR Exists (select 1 from ItemLinks2 ItemLinks2TwoLevel where exists (select 1 From ItemLinks2 join ancestorids2 on ancestorids2.itemid=itemlinks2.itemid and ancestorids2.ancestorid in (100)  where itemlinks2.linkedid = itemlinks2twolevel.itemid AND ItemLinks2.Type in (7)) and ItemLinks2TwoLevel.LinkedId=A.Id))"
+
+static const char emby_positive_numbered_sql[] =
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_TYPE_SELECT EMBY_POSITIVE_FROM "?1"
+    EMBY_POSITIVE_WHERE EMBY_POSITIVE_ORIGINAL_MEMBERSHIP
+    " Group by A.Type ORDER BY Rank ASC LIMIT 50";
+
+static const char emby_positive_numbered_expected_sql[] =
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_TYPE_SELECT EMBY_POSITIVE_FROM
+    "dshadow_emby_fts_rewrite(?1)" EMBY_POSITIVE_WHERE
+    EMBY_POSITIVE_REWRITTEN_MEMBERSHIP
+    " Group by A.Type ORDER BY Rank ASC LIMIT 50";
+
+static const char emby_positive_presentation_sql[] =
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_PRESENTATION_SELECT EMBY_POSITIVE_FROM
+    "@SearchTerm left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42"
+    EMBY_POSITIVE_WHERE EMBY_POSITIVE_ORIGINAL_MEMBERSHIP
+    " Group by A.PresentationUniqueKey ORDER BY Rank ASC LIMIT 50";
+
+static const char emby_positive_presentation_expected_sql[] =
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_PRESENTATION_SELECT EMBY_POSITIVE_FROM
+    "dshadow_emby_fts_rewrite(@SearchTerm) left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42"
+    EMBY_POSITIVE_WHERE EMBY_POSITIVE_REWRITTEN_MEMBERSHIP
+    " Group by A.PresentationUniqueKey ORDER BY Rank ASC LIMIT 50";
+
+#define EMBY_D6_ROW_PARITY_SOURCE \
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_PRESENTATION_SELECT EMBY_POSITIVE_FROM \
+    "@SearchTerm left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1" \
+    EMBY_POSITIVE_WHERE EMBY_POSITIVE_ORIGINAL_MEMBERSHIP \
+    " Group by A.PresentationUniqueKey ORDER BY Rank ASC LIMIT 50"
+#define EMBY_D6_ROW_PARITY_EXPECTED \
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_PRESENTATION_SELECT EMBY_POSITIVE_FROM \
+    "dshadow_emby_fts_rewrite(@SearchTerm) left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1" \
+    EMBY_POSITIVE_WHERE EMBY_POSITIVE_REWRITTEN_MEMBERSHIP \
+    " Group by A.PresentationUniqueKey ORDER BY Rank ASC LIMIT 50"
+
+static const char emby_d6_row_parity_sql[] =
+    EMBY_D6_ROW_PARITY_SOURCE;
+static const char emby_d6_row_parity_expected_sql[] =
+    EMBY_D6_ROW_PARITY_EXPECTED;
+static const char emby_d6_row_parity_ordered_sql[] =
+    "SELECT * FROM (" EMBY_D6_ROW_PARITY_SOURCE ") ORDER BY 3";
+static const char emby_d6_row_parity_ordered_expected_sql[] =
+    "SELECT * FROM (" EMBY_D6_ROW_PARITY_EXPECTED ") ORDER BY 3";
+
+#undef EMBY_D6_ROW_PARITY_EXPECTED
+#undef EMBY_D6_ROW_PARITY_SOURCE
+
+#ifdef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
+static const char emby_positive_literal_sql[] =
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_TYPE_SELECT EMBY_POSITIVE_FROM
+    "'(\"alpha\"*) OR (\"direct\"*)'" EMBY_POSITIVE_WHERE
+    EMBY_POSITIVE_ORIGINAL_MEMBERSHIP
+    " Group by A.Type ORDER BY Rank ASC LIMIT 50";
+
+static const char emby_positive_literal_expected_sql[] =
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_TYPE_SELECT EMBY_POSITIVE_FROM
+    "dshadow_emby_fts_rewrite('(\"alpha\"*) OR (\"direct\"*)')"
+    EMBY_POSITIVE_WHERE EMBY_POSITIVE_REWRITTEN_MEMBERSHIP
+    " Group by A.Type ORDER BY Rank ASC LIMIT 50";
+#endif
+
+#define EMBY_NONMATCH_SQL(match_rhs, membership) \
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_TYPE_SELECT EMBY_POSITIVE_FROM \
+    match_rhs EMBY_POSITIVE_WHERE membership \
+    " Group by A.Type ORDER BY Rank ASC LIMIT 50"
+#define EMBY_NONMATCH_FAST_MEMBERSHIP \
+    "(EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid=A.Id)" \
+    " OR A.Id in (select ListItemsExemptionForPlaylists.ListId from ListItems ListItemsExemptionForPlaylists join ancestorids2 AncestorIdExemptionForPlaylists on ListItemsExemptionForPlaylists.ListItemId=AncestorIdExemptionForPlaylists.itemid and AncestorIdExemptionForPlaylists.AncestorId in (100))" \
+    " OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors)" \
+    " OR A.Id in WithItemLinkItemIds)"
+
+static const char emby_nonmatch_fast_sql[] =
+    EMBY_NONMATCH_SQL("@SearchTerm", EMBY_NONMATCH_FAST_MEMBERSHIP);
+static const char emby_nonmatch_duplicate_fts_sql[] =
+    EMBY_NONMATCH_SQL(
+        "@SearchTerm AND fts_search9 match @SearchTerm2",
+        EMBY_POSITIVE_ORIGINAL_MEMBERSHIP
+    );
+#ifndef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
+static const char emby_nonmatch_literal_rhs_sql[] =
+    EMBY_NONMATCH_SQL("'alpha'", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP);
+#endif
+static const char emby_nonmatch_concat_rhs_sql[] =
+    EMBY_NONMATCH_SQL("@SearchTerm || ''", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP);
+static const char emby_nonmatch_named_colon_rhs_sql[] =
+    EMBY_NONMATCH_SQL(
+        "$SearchTerm::suffix", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP
+    );
+static const char emby_nonmatch_named_func_rhs_sql[] =
+    EMBY_NONMATCH_SQL("$SearchTerm(extra)", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP);
+
+#define EMBY_NONMATCH_ONES_1 "1,"
+#define EMBY_NONMATCH_ONES_2 \
+    EMBY_NONMATCH_ONES_1 EMBY_NONMATCH_ONES_1
+#define EMBY_NONMATCH_ONES_4 \
+    EMBY_NONMATCH_ONES_2 EMBY_NONMATCH_ONES_2
+#define EMBY_NONMATCH_ONES_8 \
+    EMBY_NONMATCH_ONES_4 EMBY_NONMATCH_ONES_4
+#define EMBY_NONMATCH_ONES_16 \
+    EMBY_NONMATCH_ONES_8 EMBY_NONMATCH_ONES_8
+#define EMBY_NONMATCH_ONES_32 \
+    EMBY_NONMATCH_ONES_16 EMBY_NONMATCH_ONES_16
+#define EMBY_NONMATCH_ONES_64 \
+    EMBY_NONMATCH_ONES_32 EMBY_NONMATCH_ONES_32
+#define EMBY_NONMATCH_ONES_128 \
+    EMBY_NONMATCH_ONES_64 EMBY_NONMATCH_ONES_64
+#define EMBY_NONMATCH_ONES_256 \
+    EMBY_NONMATCH_ONES_128 EMBY_NONMATCH_ONES_128
+#define EMBY_NONMATCH_ONES_512 \
+    EMBY_NONMATCH_ONES_256 EMBY_NONMATCH_ONES_256
+#define EMBY_NONMATCH_ONES_1024 \
+    EMBY_NONMATCH_ONES_512 EMBY_NONMATCH_ONES_512
+#define EMBY_NONMATCH_ONES_2048 \
+    EMBY_NONMATCH_ONES_1024 EMBY_NONMATCH_ONES_1024
+#define EMBY_NONMATCH_ONES_4096 \
+    EMBY_NONMATCH_ONES_2048 EMBY_NONMATCH_ONES_2048
+#define EMBY_NONMATCH_ONES_8192 \
+    EMBY_NONMATCH_ONES_4096 EMBY_NONMATCH_ONES_4096
+#define EMBY_NONMATCH_ONES_16384 \
+    EMBY_NONMATCH_ONES_8192 EMBY_NONMATCH_ONES_8192
+#define EMBY_NONMATCH_ONES_32768 \
+    EMBY_NONMATCH_ONES_16384 EMBY_NONMATCH_ONES_16384
+#define EMBY_NONMATCH_OVER_CAP_LIST \
+    EMBY_NONMATCH_ONES_32768 EMBY_NONMATCH_ONES_128 \
+    EMBY_NONMATCH_ONES_64 EMBY_NONMATCH_ONES_32 EMBY_NONMATCH_ONES_4 \
+    EMBY_NONMATCH_ONES_2 EMBY_NONMATCH_ONES_1 "1"
+
+static const char emby_nonmatch_over_cap_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in ("
+    EMBY_NONMATCH_OVER_CAP_LIST
+    ") ),"
+    "WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (6) union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in (7)))"
+    EMBY_POSITIVE_TYPE_SELECT EMBY_POSITIVE_FROM "@SearchTerm"
+    EMBY_POSITIVE_WHERE
+    "(A.Id in WithAncestors OR A.Id in (select ListItemsExemptionForPlaylists.ListId from ListItems ListItemsExemptionForPlaylists join ancestorids2 AncestorIdExemptionForPlaylists on ListItemsExemptionForPlaylists.ListItemId=AncestorIdExemptionForPlaylists.itemid and AncestorIdExemptionForPlaylists.AncestorId in ("
+    EMBY_NONMATCH_OVER_CAP_LIST
+    ")) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds) "
+    "Group by A.Type ORDER BY Rank ASC LIMIT 50";
+static const char emby_nonmatch_over_cap_discriminator[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (1,1,";
+
+#undef EMBY_NONMATCH_OVER_CAP_LIST
+#undef EMBY_NONMATCH_ONES_32768
+#undef EMBY_NONMATCH_ONES_16384
+#undef EMBY_NONMATCH_ONES_8192
+#undef EMBY_NONMATCH_ONES_4096
+#undef EMBY_NONMATCH_ONES_2048
+#undef EMBY_NONMATCH_ONES_1024
+#undef EMBY_NONMATCH_ONES_512
+#undef EMBY_NONMATCH_ONES_256
+#undef EMBY_NONMATCH_ONES_128
+#undef EMBY_NONMATCH_ONES_64
+#undef EMBY_NONMATCH_ONES_32
+#undef EMBY_NONMATCH_ONES_16
+#undef EMBY_NONMATCH_ONES_8
+#undef EMBY_NONMATCH_ONES_4
+#undef EMBY_NONMATCH_ONES_2
+#undef EMBY_NONMATCH_ONES_1
+
+#define EMBY_NONMATCH_AFTER_L1 \
+    ") ),WithItemLinkItemIds AS (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in ("
+#define EMBY_NONMATCH_AFTER_T1 \
+    ") union select ItemLinks2TwoLevel.LinkedId from ItemLinks2 ItemLinks2TwoLevel where itemid in (select ItemLinks2.LinkedId From ItemLinks2 join withancestors on withancestors.itemid=itemlinks2.itemid  where ItemLinks2.Type in ("
+#define EMBY_NONMATCH_AFTER_T2 ")))select"
+#define EMBY_NONMATCH_AFTER_L2 \
+    ")) OR A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors) OR A.Id in WithItemLinkItemIds)"
+#define EMBY_NONMATCH_AMBIGUOUS_SQL(match_rhs, membership, anchor) \
+    EMBY_POSITIVE_CTE EMBY_POSITIVE_TYPE_SELECT EMBY_POSITIVE_FROM \
+    match_rhs EMBY_POSITIVE_WHERE membership \
+    " AND '" anchor "'='" anchor "' Group by A.Type ORDER BY Rank ASC LIMIT 50"
+
+static const char emby_nonmatch_ambiguous_after_l1_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "@SearchTerm", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP,
+        EMBY_NONMATCH_AFTER_L1
+    );
+static const char emby_nonmatch_ambiguous_after_l1_expected_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "dshadow_emby_fts_rewrite(@SearchTerm)",
+        EMBY_POSITIVE_REWRITTEN_MEMBERSHIP, EMBY_NONMATCH_AFTER_L1
+    );
+static const char emby_nonmatch_ambiguous_after_t1_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "@SearchTerm", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP,
+        EMBY_NONMATCH_AFTER_T1
+    );
+static const char emby_nonmatch_ambiguous_after_t1_expected_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "dshadow_emby_fts_rewrite(@SearchTerm)",
+        EMBY_POSITIVE_REWRITTEN_MEMBERSHIP, EMBY_NONMATCH_AFTER_T1
+    );
+static const char emby_nonmatch_ambiguous_after_t2_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "@SearchTerm", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP,
+        EMBY_NONMATCH_AFTER_T2
+    );
+static const char emby_nonmatch_ambiguous_after_t2_expected_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "dshadow_emby_fts_rewrite(@SearchTerm)",
+        EMBY_POSITIVE_REWRITTEN_MEMBERSHIP, EMBY_NONMATCH_AFTER_T2
+    );
+static const char emby_nonmatch_ambiguous_after_l2_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "@SearchTerm", EMBY_POSITIVE_ORIGINAL_MEMBERSHIP,
+        EMBY_NONMATCH_AFTER_L2
+    );
+static const char emby_nonmatch_ambiguous_after_l2_expected_sql[] =
+    EMBY_NONMATCH_AMBIGUOUS_SQL(
+        "dshadow_emby_fts_rewrite(@SearchTerm)",
+        EMBY_POSITIVE_REWRITTEN_MEMBERSHIP, EMBY_NONMATCH_AFTER_L2
+    );
+
+#undef EMBY_NONMATCH_AMBIGUOUS_SQL
+#undef EMBY_NONMATCH_AFTER_L2
+#undef EMBY_NONMATCH_AFTER_T2
+#undef EMBY_NONMATCH_AFTER_T1
+#undef EMBY_NONMATCH_AFTER_L1
+#undef EMBY_NONMATCH_FAST_MEMBERSHIP
+#undef EMBY_NONMATCH_SQL
+
+static const char emby_nonmatch_semicolon_sql[] = "SELECT 1; SELECT 2";
+static const char emby_nonmatch_semicolon_saved_sql[] = "SELECT 1;";
+static const char emby_nonmatch_embedded_nul_sql[] = "SELECT 1\0 SELECT 2";
+static const char emby_nonmatch_embedded_nul_saved_sql[] = "SELECT 1";
+
+#undef EMBY_POSITIVE_REWRITTEN_MEMBERSHIP
+#undef EMBY_POSITIVE_ORIGINAL_MEMBERSHIP
+#undef EMBY_POSITIVE_WHERE
+#undef EMBY_POSITIVE_FROM
+#undef EMBY_POSITIVE_PRESENTATION_SELECT
+#undef EMBY_POSITIVE_TYPE_SELECT
+#undef EMBY_POSITIVE_CTE
+
+static const char emby_positive_scalar_sql[] =
+    "SELECT dshadow_emby_fts_rewrite(?)";
+static const unsigned char emby_positive_scalar_blob[] = {0x01, 0x02, 0x03};
+
+static int rsh_bind_emby_positive_scalar_text(
+    sqlite3_stmt *stmt,
+    const char *label,
+    void *ctx
+) {
+    (void)label;
+    return sqlite3_bind_text(stmt, 1, (const char *)ctx, -1, SQLITE_STATIC);
+}
+
+static int rsh_bind_emby_positive_scalar_null(
+    sqlite3_stmt *stmt,
+    const char *label,
+    void *ctx
+) {
+    (void)label;
+    (void)ctx;
+    return sqlite3_bind_null(stmt, 1);
+}
+
+static int rsh_bind_emby_positive_scalar_integer(
+    sqlite3_stmt *stmt,
+    const char *label,
+    void *ctx
+) {
+    (void)label;
+    (void)ctx;
+    return sqlite3_bind_int(stmt, 1, 42);
+}
+
+static int rsh_bind_emby_positive_scalar_blob(
+    sqlite3_stmt *stmt,
+    const char *label,
+    void *ctx
+) {
+    (void)label;
+    (void)ctx;
+    return sqlite3_bind_blob(
+        stmt, 1, emby_positive_scalar_blob,
+        (int)sizeof(emby_positive_scalar_blob), SQLITE_STATIC
+    );
+}
+
+#ifdef EMBY_FTS_REWRITE_TEST_API
+static void rsh_reset_emby_positive_scalar_counter(void *ctx) {
+    (void)ctx;
+    emby_fts_rewrite_test_reset_scalar_calls();
+}
+
+static int rsh_read_emby_positive_scalar_counter(void *ctx) {
+    (void)ctx;
+    return emby_fts_rewrite_test_scalar_calls() > 0 ? 1 : 0;
+}
+#endif
+
+static const char *const emby_positive_numbered_bind_names[] = {
+    "?1"
+};
+
+#define EMBY_POSITIVE_SQL_CASE( \
+    case_label, source_sql, saved_sql, prepare_kind, nbyte_form, tail_form, \
+    bind_names, column_count) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_SQL_EXACT, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.sql_exact = { \
+            .role = "candidate", \
+            .sql = (source_sql), \
+            .expected_sql = (saved_sql), \
+            .prepare = { \
+                .kind = (prepare_kind), \
+                .nbyte_kind = (nbyte_form), \
+                .tail_kind = (tail_form) \
+            }, \
+            .check_bind_count = 1, \
+            .expected_bind_count = 1, \
+            .expected_bind_names = (bind_names), \
+            .expected_bind_name_count = sizeof(bind_names) / \
+                                        sizeof((bind_names)[0]), \
+            .check_column_count = 1, \
+            .expected_column_count = (column_count) \
+        } \
+    }
+
+#define EMBY_POSITIVE_SCALAR_PREPARE \
+    {.kind = RSH_PREPARE_V2, \
+     .nbyte_kind = RSH_NBYTE_MINUS_ONE, \
+     .tail_kind = RSH_TAIL_NULL_OUT}
+
+#define EMBY_POSITIVE_SCALAR_TEXT_CASE(case_label, input_text, expected_text) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_SCALAR, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.scalar = { \
+            .role = "candidate", \
+            .sql = emby_positive_scalar_sql, \
+            .expected_sql = emby_positive_scalar_sql, \
+            .prepare = EMBY_POSITIVE_SCALAR_PREPARE, \
+            .bind = rsh_bind_emby_positive_scalar_text, \
+            .bind_ctx = (void *)(input_text), \
+            .value_kind = RSH_SCALAR_TEXT, \
+            .bytes_value = (expected_text), \
+            .bytes_count = (int)sizeof(expected_text) - 1 \
+        } \
+    }
+
+static const rsh_case_spec emby_positive_type_legacy_assertion =
+    EMBY_POSITIVE_SQL_CASE(
+        "type-legacy", emby_fts_env_sql, emby_fts_env_rewritten_sql,
+        RSH_PREPARE_LEGACY, RSH_NBYTE_MINUS_ONE, RSH_TAIL_FULL,
+        emby_fts_env_bind_names, 3
+    );
+
+static int rsh_custom_adapter_emby_positive_type_legacy_authorizer(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const rsh_case_spec *assertion =
+        (const rsh_case_spec *)immutable_data;
+    const rsh_db_handle *handle = rsh_require_case_db(
+        &emby_suite_spec, assertion, context, assertion->data.sql_exact.role
+    );
+    emby_auth_probe probe = {0, 0};
+
+    require_int(
+        "type-legacy/authorizer-set",
+        sqlite3_set_authorizer(handle->db, scalar_authorizer_cb, &probe),
+        SQLITE_OK
+    );
+    rsh_run_sql_exact(
+        &emby_suite_spec, assertion, context, &assertion->data.sql_exact
+    );
+    require_int(
+        "type-legacy/authorizer-clear",
+        sqlite3_set_authorizer(handle->db, NULL, NULL), SQLITE_OK
+    );
+    if (probe.scalar_calls < 1) {
+        failf(
+            "FAIL [type-legacy/authorizer-count]: got=%d want=>=1",
+            probe.scalar_calls
+        );
+    }
+    return SQLITE_OK;
+}
+
+static const rsh_case_spec emby_positive_cases[] = {
+    EMBY_POSITIVE_SQL_CASE(
+        "type-v2", emby_fts_env_sql, emby_fts_env_rewritten_sql,
+        RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE, RSH_TAIL_FULL,
+        emby_fts_env_bind_names, 3
+    ),
+    EMBY_POSITIVE_SQL_CASE(
+        "type-v3", emby_fts_env_sql, emby_fts_env_rewritten_sql,
+        RSH_PREPARE_V3, RSH_NBYTE_MINUS_ONE, RSH_TAIL_FULL,
+        emby_fts_env_bind_names, 3
+    ),
+    {
+        .label = "type-legacy",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom =
+                rsh_custom_adapter_emby_positive_type_legacy_authorizer,
+            .immutable_data = &emby_positive_type_legacy_assertion
+        }
+    },
+    EMBY_POSITIVE_SQL_CASE(
+        "type-numbered-param", emby_positive_numbered_sql,
+        emby_positive_numbered_expected_sql,
+        RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE, RSH_TAIL_FULL,
+        emby_positive_numbered_bind_names, 3
+    ),
+    EMBY_POSITIVE_SQL_CASE(
+        "type-nbyte-no-nul", emby_fts_env_sql, emby_fts_env_rewritten_sql,
+        RSH_PREPARE_V2, RSH_NBYTE_EXACT_LENGTH, RSH_TAIL_FULL,
+        emby_fts_env_bind_names, 3
+    ),
+    EMBY_POSITIVE_SQL_CASE(
+        "type-nbyte-with-nul", emby_fts_env_sql, emby_fts_env_rewritten_sql,
+        RSH_PREPARE_V2, RSH_NBYTE_LENGTH_WITH_NUL, RSH_TAIL_FULL,
+        emby_fts_env_bind_names, 3
+    ),
+    EMBY_POSITIVE_SQL_CASE(
+        "pztail-null", emby_fts_env_sql, emby_fts_env_rewritten_sql,
+        RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE, RSH_TAIL_NULL_OUT,
+        emby_fts_env_bind_names, 3
+    ),
+    EMBY_POSITIVE_SQL_CASE(
+        "presentation-user42", emby_positive_presentation_sql,
+        emby_positive_presentation_expected_sql,
+        RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE, RSH_TAIL_FULL,
+        emby_fts_env_bind_names, 26
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE(
+        "scalar-star-wars", "(\"Star\"*) OR (\"Wars\"*)",
+        "(\"Star\"*) AND (\"Wars\"*)"
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE(
+        "scalar-three-way-or", "(\"a\"*) OR (\"b\"*) OR (\"c\"*)",
+        "(\"a\"*) AND (\"b\"*) AND (\"c\"*)"
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE(
+        "scalar-existing-and", "(\"a\"*) AND (\"b\"*)",
+        "(\"a\"*) AND (\"b\"*)"
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE(
+        "scalar-quoted-phrase", "\"star wars\"", "\"star wars\""
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE(
+        "scalar-mixed-form", "(\"a\"*) OR \"b\"*", "(\"a\"*) OR \"b\"*"
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE(
+        "scalar-lowercase-or", "(\"a\"*) or (\"b\"*)",
+        "(\"a\"*) or (\"b\"*)"
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE(
+        "scalar-non-ascii", "(\"caf\303\251\"*) OR (\"b\"*)",
+        "(\"caf\303\251\"*) OR (\"b\"*)"
+    ),
+    EMBY_POSITIVE_SCALAR_TEXT_CASE("scalar-empty", "", ""),
+    {
+        .label = "scalar-null",
+        .kind = RSH_CASE_SCALAR,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.scalar = {
+            .role = "candidate",
+            .sql = emby_positive_scalar_sql,
+            .expected_sql = emby_positive_scalar_sql,
+            .prepare = EMBY_POSITIVE_SCALAR_PREPARE,
+            .bind = rsh_bind_emby_positive_scalar_null,
+            .value_kind = RSH_SCALAR_NULL
+        }
+    },
+    {
+        .label = "scalar-integer",
+        .kind = RSH_CASE_SCALAR,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.scalar = {
+            .role = "candidate",
+            .sql = emby_positive_scalar_sql,
+            .expected_sql = emby_positive_scalar_sql,
+            .prepare = EMBY_POSITIVE_SCALAR_PREPARE,
+            .bind = rsh_bind_emby_positive_scalar_integer,
+            .value_kind = RSH_SCALAR_INTEGER,
+            .integer_value = 42
+        }
+    },
+    {
+        .label = "scalar-blob",
+        .kind = RSH_CASE_SCALAR,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.scalar = {
+            .role = "candidate",
+            .sql = emby_positive_scalar_sql,
+            .expected_sql = emby_positive_scalar_sql,
+            .prepare = EMBY_POSITIVE_SCALAR_PREPARE,
+            .bind = rsh_bind_emby_positive_scalar_blob,
+            .value_kind = RSH_SCALAR_BLOB,
+            .bytes_value = emby_positive_scalar_blob,
+            .bytes_count = (int)sizeof(emby_positive_scalar_blob)
+        }
+    },
+#ifdef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
+    {
+        .label = "literal-rhs-positive",
+        .kind = RSH_CASE_SQL_EXACT,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.sql_exact = {
+            .role = "candidate",
+            .sql = emby_positive_literal_sql,
+            .expected_sql = emby_positive_literal_expected_sql,
+            .prepare = EMBY_PREPARE_V2,
+            .check_bind_count = 1,
+            .expected_bind_count = 0,
+            .check_column_count = 1,
+            .expected_column_count = 3
+        }
+    },
+#endif
+#ifdef EMBY_FTS_REWRITE_TEST_API
+    {
+        .label = "scalar-counter",
+        .kind = RSH_CASE_SCALAR,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.scalar = {
+            .role = "candidate",
+            .sql = emby_positive_scalar_sql,
+            .expected_sql = emby_positive_scalar_sql,
+            .prepare = EMBY_PREPARE_V2,
+            .bind = rsh_bind_emby_positive_scalar_text,
+            .bind_ctx = (void *)"(\"alpha\"*) OR (\"direct\"*)",
+            .value_kind = RSH_SCALAR_TEXT,
+            .bytes_value = "(\"alpha\"*) AND (\"direct\"*)",
+            .bytes_count = (int)sizeof("(\"alpha\"*) AND (\"direct\"*)") - 1,
+            .reset_counter = rsh_reset_emby_positive_scalar_counter,
+            .read_counter = rsh_read_emby_positive_scalar_counter,
+            .expected_counter = 1
+        }
+    },
+#endif
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_positive_phases, "positive", emby_env_candidate_db,
+    emby_positive_cases
+);
+
+#undef EMBY_POSITIVE_SCALAR_TEXT_CASE
+#undef EMBY_POSITIVE_SCALAR_PREPARE
+#undef EMBY_POSITIVE_SQL_CASE
+
+static const rsh_case_spec emby_fts_default_cases[] = {
+    EMBY_FTS_SQL_CASE("fts-default-on", emby_fts_env_rewritten_sql)
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fts_default_phases, "fts-default-on", emby_env_candidate_db,
+    emby_fts_default_cases
+);
+
+static const rsh_case_spec emby_fts_zero_cases[] = {
+    EMBY_FTS_SQL_CASE("fts-zero-enables", emby_fts_env_rewritten_sql)
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fts_zero_phases, "fts-zero-enables", emby_env_candidate_db,
+    emby_fts_zero_cases
+);
+
+static const rsh_case_spec emby_fts_one_cases[] = {
+    EMBY_SQL_CASE("fts-one-disables", emby_fts_env_sql, emby_fts_env_sql)
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fts_one_phases, "fts-one-disables", emby_env_candidate_db,
+    emby_fts_one_cases
+);
+
+static const rsh_case_spec emby_fts_garbage_cases[] = {
+    EMBY_FTS_SQL_CASE("fts-garbage-enables", emby_fts_env_rewritten_sql)
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fts_garbage_phases, "fts-garbage-enables", emby_env_candidate_db,
+    emby_fts_garbage_cases
+);
+
+static const rsh_case_spec emby_fanout_default_cases[] = {
+    EMBY_SQL_CASE(
+        "fanout-default-on", emby_fanout_env_sql,
+        emby_fanout_env_rewritten_sql
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fanout_default_phases, "fanout-default-on", emby_env_candidate_db,
+    emby_fanout_default_cases
+);
+
+static const rsh_case_spec emby_fanout_zero_cases[] = {
+    EMBY_SQL_CASE(
+        "fanout-zero-enables", emby_fanout_env_sql,
+        emby_fanout_env_rewritten_sql
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fanout_zero_phases, "fanout-zero-enables", emby_env_candidate_db,
+    emby_fanout_zero_cases
+);
+
+static const rsh_case_spec emby_fanout_one_cases[] = {
+    EMBY_SQL_CASE(
+        "fanout-one-disables", emby_fanout_env_sql, emby_fanout_env_sql
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fanout_one_phases, "fanout-one-disables", emby_env_candidate_db,
+    emby_fanout_one_cases
+);
+
+static const rsh_case_spec emby_fanout_garbage_cases[] = {
+    EMBY_SQL_CASE(
+        "fanout-garbage-enables", emby_fanout_env_sql,
+        emby_fanout_env_rewritten_sql
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fanout_garbage_phases, "fanout-garbage-enables",
+    emby_env_candidate_db, emby_fanout_garbage_cases
+);
+
+static const rsh_case_spec emby_dashboard_default_cases[] = {
+    EMBY_SQL_CASE(
+        "dashboard-default-off", emby_dashboard_episodes_off_sql,
+        emby_dashboard_episodes_off_sql
+    ),
+    EMBY_SQL_CASE(
+        "dashboard-default-off-movies", emby_dashboard_movies_off_sql,
+        emby_dashboard_movies_off_sql
+    ),
+    EMBY_SQL_CASE(
+        "dashboard-default-off-mixed", emby_dashboard_mixed_off_sql,
+        emby_dashboard_mixed_off_sql
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_dashboard_default_phases, "dashboard-default-off",
+    emby_dashboard_off_candidate_db, emby_dashboard_default_cases
+);
+
+#define DEFINE_EMBY_DASHBOARD_OFF_ROW(name, case_label) \
+    static const rsh_case_spec name##_cases[] = { \
+        EMBY_SQL_CASE( \
+            (case_label), emby_dashboard_episodes_off_sql, \
+            emby_dashboard_episodes_off_sql \
+        ), \
+        EMBY_SQL_CASE( \
+            (case_label), emby_dashboard_movies_off_sql, \
+            emby_dashboard_movies_off_sql \
+        ), \
+        EMBY_SQL_CASE( \
+            (case_label), emby_dashboard_mixed_off_sql, \
+            emby_dashboard_mixed_off_sql \
+        ) \
+    }; \
+    DEFINE_EMBY_SCALAR_PHASE( \
+        name##_phases, (case_label), emby_dashboard_off_candidate_db, \
+        name##_cases \
+    )
+
+DEFINE_EMBY_DASHBOARD_OFF_ROW(emby_dashboard_one, "dashboard-one-off");
+DEFINE_EMBY_DASHBOARD_OFF_ROW(emby_dashboard_empty, "dashboard-empty-off");
+DEFINE_EMBY_DASHBOARD_OFF_ROW(emby_dashboard_garbage, "dashboard-garbage-off");
+
+static const char emby_select_one_sql[] = "SELECT 1";
+
+static const char emby_latest_limit20_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )"
+    "select A.Id from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 20";
+
+static const char emby_latest_limit20_expected_sql[] =
+    "WITH ranked(id, dc, gk) AS MATERIALIZED ("
+    "  SELECT A.Id, A.DateCreated, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) "
+    "  FROM MediaItems AS A INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk "
+    "  WHERE A.Type = 8 "
+    "AND EXISTS ( SELECT 1 FROM AncestorIds2 AS X WHERE X.ItemId = A.Id AND X.AncestorId IN (100) ) "
+    "AND NOT EXISTS ( SELECT 1 FROM UserDatas AS U0 WHERE U0.UserDataKeyId = A.UserDataKeyId AND U0.UserId = 42 AND U0.played <> 0 ) "
+    "AND NOT EXISTS (      SELECT 1 "
+    "      FROM MediaItems AS B INDEXED BY idx_dshadow_emby_latest_gk_dc "
+    "      WHERE B.Type = 8 AND coalesce(B.SeriesPresentationUniqueKey, B.PresentationUniqueKey) IS coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) "
+    "AND ( (B.DateCreated IS NOT NULL AND A.DateCreated IS NULL) OR B.DateCreated > A.DateCreated OR (B.DateCreated IS A.DateCreated AND B.Id < A.Id) ) "
+    "AND EXISTS ( SELECT 1 FROM AncestorIds2 AS XB WHERE XB.ItemId = B.Id AND XB.AncestorId IN (100) ) "
+    "AND NOT EXISTS ( SELECT 1 FROM UserDatas AS UB WHERE UB.UserDataKeyId = B.UserDataKeyId AND UB.UserId = 42 AND UB.played <> 0 ) ) "
+    "ORDER BY (A.DateCreated IS NULL) ASC, A.DateCreated DESC, coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ASC LIMIT 20 ) "
+    "SELECT A.Id FROM ranked AS R JOIN MediaItems AS A ON A.Id = R.id LEFT JOIN UserDatas "
+    "ON A.UserDataKeyId = UserDatas.UserDataKeyId AND UserDatas.UserId = 42 "
+    "ORDER BY (R.dc IS NULL) ASC, R.dc DESC, R.gk ASC LIMIT 20";
+
+static const char emby_latest_resume_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select count(*) OVER() AS TotalRecordCount,A.type,A.Id,A.SeriesPresentationUniqueKey,UserDatas.PlaybackPositionTicks,"
+    "((Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, 1) * 1000000) + Coalesce(A.SortIndexNumber, A.IndexNumber, 0) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then (Cast(Coalesce(A.IndexNumber, 0) as REAL) / 100000) Else 0 End)) EpisodeAbsoluteIndexNumber "
+    "from mediaitems A left join (Select N.SeriesPresentationUniqueKey,((Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber, 1) * 1000000) + Coalesce(N.SortIndexNumber, N.IndexNumber, 0) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then (Cast(Coalesce(N.IndexNumber, 0) as REAL) / 100000) Else 0 End)) AbsoluteIndexNumber,max(UserDatas_N.LastPlayedDateInt) LastPlayedDateInt,UserDatas_N.playbackPositionTicks from MediaItems N join UserDatas UserDatas_N on N.UserDataKeyId=UserDatas_N.UserDataKeyId And UserDatas_N.UserId=1 where N.Type=8 and Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber,-1) <> 0 and (UserDatas_N.Played=1 or UserDatas_N.playbackPositionTicks > 0) Group By N.SeriesPresentationUniqueKey ORDER BY UserDatas_N.LastPlayedDateInt desc, AbsoluteIndexNumber desc) LastWatchedEpisodes on LastWatchedEpisodes.SeriesPresentationUniqueKey=A.SeriesPresentationUniqueKey "
+    "left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where ((A.Type=5 and UserDatas.playbackPositionTicks > 0) OR (A.Type=8 AND (UserDatas.playbackPositionTicks > 0 or Coalesce(UserDatas.played,0) = 0) AND (select case when LastWatchedEpisodes.playbackPositionTicks > 0 then EpisodeAbsoluteIndexNumber >= Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) else EpisodeAbsoluteIndexNumber > Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) end) AND LastWatchedEpisodes.LastPlayedDateInt not null)) "
+    "AND (A.Type=5 OR Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, -1) <> 0) AND A.Type in (5,8) AND Coalesce(UserDatas.HideFromResume,0)=0 AND COALESCE((select hidefromresume from userdatas where userdatas.userid=1 and userdatas.userdatakeyid=(select userdatakeyid from mediaitems where mediaitems.id=A.seriesid)),0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT 12";
+
+static const rsh_occurrence_expectation emby_no_scalar_rewrite_occurrences[] = {
+    {
+        .needle = "dshadow_emby_fts_rewrite(",
+        .expected_count = 0
+    }
+};
+
+static const rsh_db_spec emby_nonmatch_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE
+    }
+};
+
+#define EMBY_NONMATCH_NEGATIVE_CASE(case_label, source_sql, unique_needle) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_NEGATIVE, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.negative = { \
+            .source_kind = RSH_NEGATIVE_STATIC, \
+            .sql = (source_sql), \
+            .discriminating_needle = (unique_needle), \
+            .prepare = EMBY_PREPARE_V2, \
+            .vendor_role = "vendor", \
+            .candidate_role = "candidate", \
+            .followup_occurrences = emby_no_scalar_rewrite_occurrences, \
+            .followup_occurrence_count = \
+                sizeof(emby_no_scalar_rewrite_occurrences) / \
+                sizeof(emby_no_scalar_rewrite_occurrences[0]) \
+        } \
+    }
+
+#define EMBY_NONMATCH_POSITIVE_CASE(case_label, source_sql, saved_sql) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_SQL_EXACT, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.sql_exact = { \
+            .role = "candidate", \
+            .sql = (source_sql), \
+            .expected_sql = (saved_sql), \
+            .prepare = EMBY_PREPARE_V2, \
+            .check_bind_count = 1, \
+            .expected_bind_count = 1, \
+            .expected_bind_names = emby_fts_env_bind_names, \
+            .expected_bind_name_count = sizeof(emby_fts_env_bind_names) / \
+                                        sizeof(emby_fts_env_bind_names[0]) \
+        } \
+    }
+
+static const rsh_case_spec emby_nonmatch_cases[] = {
+    EMBY_NONMATCH_NEGATIVE_CASE(
+        "fast-form", emby_nonmatch_fast_sql,
+        "EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid=A.Id)"
+    ),
+    EMBY_NONMATCH_NEGATIVE_CASE(
+        "duplicate-fts", emby_nonmatch_duplicate_fts_sql,
+        "@SearchTerm AND fts_search9 match @SearchTerm2"
+    ),
+#ifndef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
+    EMBY_NONMATCH_NEGATIVE_CASE(
+        "literal-rhs", emby_nonmatch_literal_rhs_sql,
+        "fts_search9 match 'alpha'"
+    ),
+#endif
+    EMBY_NONMATCH_NEGATIVE_CASE(
+        "match-rhs-concat", emby_nonmatch_concat_rhs_sql,
+        "fts_search9 match @SearchTerm || ''"
+    ),
+    EMBY_NONMATCH_NEGATIVE_CASE(
+        "match-rhs-named-colon", emby_nonmatch_named_colon_rhs_sql,
+        "$SearchTerm::suffix"
+    ),
+    EMBY_NONMATCH_NEGATIVE_CASE(
+        "match-rhs-named-func", emby_nonmatch_named_func_rhs_sql,
+        "$SearchTerm(extra)"
+    ),
+    EMBY_NONMATCH_NEGATIVE_CASE(
+        "over-cap-slot", emby_nonmatch_over_cap_sql,
+        emby_nonmatch_over_cap_discriminator
+    ),
+    EMBY_NONMATCH_POSITIVE_CASE(
+        "ambiguous-after-l1", emby_nonmatch_ambiguous_after_l1_sql,
+        emby_nonmatch_ambiguous_after_l1_expected_sql
+    ),
+    EMBY_NONMATCH_POSITIVE_CASE(
+        "ambiguous-after-t1", emby_nonmatch_ambiguous_after_t1_sql,
+        emby_nonmatch_ambiguous_after_t1_expected_sql
+    ),
+    EMBY_NONMATCH_POSITIVE_CASE(
+        "ambiguous-after-t2", emby_nonmatch_ambiguous_after_t2_sql,
+        emby_nonmatch_ambiguous_after_t2_expected_sql
+    ),
+    EMBY_NONMATCH_POSITIVE_CASE(
+        "ambiguous-after-l2", emby_nonmatch_ambiguous_after_l2_sql,
+        emby_nonmatch_ambiguous_after_l2_expected_sql
+    ),
+    {
+        .label = "semicolon",
+        .kind = RSH_CASE_SQL_EXACT,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.sql_exact = {
+            .role = "candidate",
+            .sql = emby_nonmatch_semicolon_sql,
+            .expected_sql = emby_nonmatch_semicolon_saved_sql,
+            .prepare = {
+                .kind = RSH_PREPARE_V2,
+                .nbyte_kind = RSH_NBYTE_MINUS_ONE,
+                .tail_kind = RSH_TAIL_OFFSET,
+                .tail_offset = sizeof(emby_nonmatch_semicolon_saved_sql) - 1
+            }
+        }
+    },
+    {
+        .label = "embedded-nul",
+        .kind = RSH_CASE_SQL_EXACT,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.sql_exact = {
+            .role = "candidate",
+            .sql = emby_nonmatch_embedded_nul_sql,
+            .expected_sql = emby_nonmatch_embedded_nul_saved_sql,
+            .prepare = {
+                .kind = RSH_PREPARE_V2,
+                .nbyte_kind = RSH_NBYTE_LITERAL,
+                .literal_nbyte =
+                    (int)sizeof(emby_nonmatch_embedded_nul_sql) - 1,
+                .tail_kind = RSH_TAIL_IGNORE
+            }
+        }
+    }
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_nonmatch_phases, "nonmatch", emby_nonmatch_dbs,
+    emby_nonmatch_cases
+);
+
+#undef EMBY_NONMATCH_POSITIVE_CASE
+#undef EMBY_NONMATCH_NEGATIVE_CASE
+
+static sqlite3 *rsh_context_db(
+    const rsh_case_context *context,
+    const char *role
+) {
+    size_t i;
+
+    for (i = 0; i < context->db_count; i++) {
+        if (context->dbs[i].spec &&
+            strcmp(context->dbs[i].spec->role, role) == 0) {
+            return context->dbs[i].db;
+        }
+    }
+    failf("FAIL [%s/%s/role]: missing=%s", context->run_name,
+          context->phase_label, role);
+    return NULL;
+}
+
+static int rsh_custom_adapter_emby_collision(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *db = rsh_context_db(context, "candidate");
+
+    (void)immutable_data;
+    g_collision_scalar_calls = 0;
+    require_int(
+        "collision/register",
+        sqlite3_create_function_v2(
+            db, "dshadow_emby_fts_rewrite", 1, SQLITE_UTF8, NULL,
+            scalar_collision_tripwire, NULL, NULL, NULL
+        ),
+        SQLITE_OK
+    );
+    expect_sql(
+        db, "collision", emby_fts_env_sql, -1, 2,
+        emby_fts_env_sql, 0
+    );
+    require_int("collision/scalar-calls", g_collision_scalar_calls, 0);
+    return SQLITE_OK;
+}
+
+static const rsh_case_spec emby_collision_cases[] = {
+    {
+        .label = "collision",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom = rsh_custom_adapter_emby_collision,
+        }
+    }
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_collision_phases, "collision", emby_env_candidate_db,
+    emby_collision_cases
+);
+
+static int rsh_custom_adapter_emby_authorizer_and_ownership(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *db = rsh_context_db(context, "candidate");
+
+    (void)immutable_data;
+    require_int(
+        "authorizer/set",
+        sqlite3_set_authorizer(db, deny_pragma_function_list, NULL),
+        SQLITE_OK
+    );
+    expect_sql(
+        db, "authorizer-deny-probe", emby_fts_env_sql, -1, 2,
+        emby_fts_env_sql, 0
+    );
+    require_int(
+        "authorizer/clear", sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK
+    );
+
+    expect_sql(
+        db, "ownership-ready", emby_fts_env_sql, -1, 2,
+        emby_fts_env_rewritten_sql, 1
+    );
+    require_int(
+        "ownership/replace",
+        sqlite3_create_function_v2(
+            db, "dshadow_emby_fts_rewrite", 1, SQLITE_UTF8, NULL,
+            scalar_owner_spoof, NULL, NULL, NULL
+        ),
+        SQLITE_OK
+    );
+    expect_sql(
+        db, "ownership-replaced", emby_fts_env_sql, -1, 2,
+        emby_fts_env_sql, 0
+    );
+    return SQLITE_OK;
+}
+
+static const rsh_case_spec emby_authorizer_ownership_cases[] = {
+    {
+        .label = "authorizer-ownership",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom =
+                rsh_custom_adapter_emby_authorizer_and_ownership,
+        }
+    }
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_authorizer_ownership_phases, "authorizer-ownership",
+    emby_env_candidate_db, emby_authorizer_ownership_cases
+);
+
+static const rsh_db_spec emby_path_negative_dbs[] = {
+    {
+        .role = "plex",
+        .relative_path = "com.plexapp.plugins.library.db",
+        .kind = RSH_DB_AUXILIARY,
+        .storage = RSH_DB_RELATIVE
+    },
+    {
+        .role = "jellyfin",
+        .relative_path = "jellyfin.db",
+        .kind = RSH_DB_AUXILIARY,
+        .storage = RSH_DB_RELATIVE
+    },
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE
+    },
+    {
+        .role = "memory",
+        .relative_path = ":memory:",
+        .kind = RSH_DB_AUXILIARY,
+        .storage = RSH_DB_MEMORY
+    },
+    {
+        .role = "non-ascii",
+        .relative_path = "emb\303\251/library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE
+    }
+};
+
+#define EMBY_PATH_CASE(case_label, role_name, source_sql) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_PATH, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.path.assertion = { \
+            .role = (role_name), \
+            .sql = (source_sql), \
+            .expected_sql = (source_sql), \
+            .prepare = EMBY_PREPARE_V2 \
+        } \
+    }
+
+static const rsh_case_spec emby_path_negative_cases[] = {
+    EMBY_PATH_CASE(
+        "com.plexapp.plugins.library.db", "plex", emby_fts_env_sql
+    ),
+    EMBY_PATH_CASE("jellyfin.db", "jellyfin", emby_fts_env_sql),
+    EMBY_PATH_CASE("not-target.db", "vendor", emby_fts_env_sql),
+    EMBY_PATH_CASE("memory", "memory", emby_select_one_sql),
+    EMBY_PATH_CASE("non-ascii-path", "non-ascii", emby_fts_env_sql)
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_path_negative_phases, "path-negative", emby_path_negative_dbs,
+    emby_path_negative_cases
+);
+
+#undef EMBY_PATH_CASE
+
+static const rsh_db_spec emby_fixture_canary_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_FIXTURE_CANARY
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_FIXTURE_CANARY
+    }
+};
+
+static const rsh_db_spec emby_latest_candidate_db[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_LATEST_INDEXES
+    }
+};
+
+static const rsh_db_spec emby_latest_negative_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_LATEST_INDEXES
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_LATEST_INDEXES
+    }
+};
+
+#define EMBY_FIXTURE_SQL_CASE(case_label) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_FIXTURE, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.fixture = { \
+            .source_path = \
+                "tests/fixtures/emby-fts-rewrite/" case_label ".sql", \
+            .expected_path = \
+                "tests/fixtures/emby-fts-rewrite/" case_label ".expected.sql", \
+            .strip_final_lf = 1, \
+            .assertion_kind = RSH_FIXTURE_SQL_EXACT, \
+            .sql_exact = { \
+                .role = "candidate", \
+                .prepare = EMBY_PREPARE_V2 \
+            } \
+        } \
+    }
+
+#define EMBY_FTS_FIXTURE_SQL_CASE(case_label) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_FIXTURE, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.fixture = { \
+            .source_path = \
+                "tests/fixtures/emby-fts-rewrite/" case_label ".sql", \
+            .expected_path = \
+                "tests/fixtures/emby-fts-rewrite/" case_label ".expected.sql", \
+            .strip_final_lf = 1, \
+            .assertion_kind = RSH_FIXTURE_SQL_EXACT, \
+            .sql_exact = { \
+                .role = "candidate", \
+                .prepare = EMBY_PREPARE_V2, \
+                .check_bind_count = 1, \
+                .expected_bind_count = 1, \
+                .expected_bind_names = emby_fts_env_bind_names, \
+                .expected_bind_name_count = \
+                    sizeof(emby_fts_env_bind_names) / \
+                    sizeof(emby_fts_env_bind_names[0]) \
+            } \
+        } \
+    }
+
+#define EMBY_FIXTURE_NEGATIVE_CASE(case_label, unique_needle) \
+    { \
+        .label = (case_label), \
+        .kind = RSH_CASE_FIXTURE, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .data.fixture = { \
+            .source_path = \
+                "tests/fixtures/emby-fts-rewrite/" case_label ".sql", \
+            .expected_path = \
+                "tests/fixtures/emby-fts-rewrite/" case_label ".expected.sql", \
+            .strip_final_lf = 1, \
+            .assertion_kind = RSH_FIXTURE_NEGATIVE, \
+            .negative = { \
+                .source_kind = RSH_NEGATIVE_STATIC, \
+                .discriminating_needle = (unique_needle), \
+                .prepare = EMBY_PREPARE_V2, \
+                .vendor_role = "vendor", \
+                .candidate_role = "candidate", \
+                .followup_occurrences = emby_no_scalar_rewrite_occurrences, \
+                .followup_occurrence_count = \
+                    sizeof(emby_no_scalar_rewrite_occurrences) / \
+                    sizeof(emby_no_scalar_rewrite_occurrences[0]) \
+            } \
+        } \
+    }
+
+static const rsh_case_spec emby_fixture_canary_cases[] = {
+    EMBY_FTS_FIXTURE_SQL_CASE("slow-type"),
+    EMBY_FTS_FIXTURE_SQL_CASE("slow-presentation"),
+    EMBY_FTS_FIXTURE_SQL_CASE("presentation-user42"),
+    EMBY_FTS_FIXTURE_SQL_CASE("l1-l2-mismatch"),
+    EMBY_FTS_FIXTURE_SQL_CASE("mutated-type-slots"),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "fast-exists", "AncestorIds2.itemid=A.Id"
+    ),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "string-anchor-passthrough", "'WithAncestors AS"
+    ),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "comment-anchor-passthrough", "-- WithAncestors AS"
+    ),
+    EMBY_FIXTURE_SQL_CASE("fanout-people"),
+    EMBY_FIXTURE_SQL_CASE("fanout-links-search"),
+    EMBY_FIXTURE_SQL_CASE("fanout-browse"),
+    EMBY_FIXTURE_SQL_CASE("fanout-favorites"),
+    EMBY_FIXTURE_SQL_CASE("latest-limit12"),
+    EMBY_FIXTURE_SQL_CASE("latest-limit16"),
+    EMBY_FIXTURE_SQL_CASE("latest-movies-played-limit12"),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-star-projection-negative", "select * from mediaitems A"
+    ),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-capture-miss-negative",
+        "select A.Id,(A.DateCreated) from"
+    ),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-aggregate-projection-negative",
+        "select MAX(A.DateCreated) from"
+    ),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-over-negative", "count(*) OVER() AS TotalRecordCount"
+    ),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-series-browse-negative", "ORDER BY SeriesName LIMIT 12"
+    ),
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-explain-prefix-negative", "EXPLAIN QUERY PLAN with"
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_fixture_canary_phases, "fixture-canary", emby_fixture_canary_dbs,
+    emby_fixture_canary_cases
+);
+
+static const rsh_case_spec emby_latest_limit20_cases[] = {
+    EMBY_SQL_CASE(
+        "latest-limit20", emby_latest_limit20_sql,
+        emby_latest_limit20_expected_sql
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_latest_limit20_phases, "latest-limit20", emby_latest_candidate_db,
+    emby_latest_limit20_cases
+);
+
+static const rsh_case_spec emby_latest_capture_miss_negative_cases[] = {
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-capture-miss-negative",
+        "select A.Id,(A.DateCreated) from"
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_latest_capture_miss_negative_phases,
+    "latest-capture-miss-negative", emby_latest_negative_dbs,
+    emby_latest_capture_miss_negative_cases
+);
+
+static const rsh_case_spec emby_latest_series_browse_negative_cases[] = {
+    EMBY_FIXTURE_NEGATIVE_CASE(
+        "latest-series-browse-negative", "ORDER BY SeriesName LIMIT 12"
+    )
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_latest_series_browse_negative_phases,
+    "latest-series-browse-negative", emby_latest_negative_dbs,
+    emby_latest_series_browse_negative_cases
+);
+
+static const rsh_case_spec emby_latest_resume_no_misfire_cases[] = {
+    {
+        .label = "latest-resume-no-misfire",
+        .kind = RSH_CASE_NEGATIVE,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.negative = {
+            .source_kind = RSH_NEGATIVE_STATIC,
+            .sql = emby_latest_resume_sql,
+            .discriminating_needle =
+                "LastWatchedEpisodes.LastPlayedDateInt not null",
+            .prepare = EMBY_PREPARE_V2,
+            .vendor_role = "vendor",
+            .candidate_role = "candidate",
+            .followup_occurrences = emby_no_scalar_rewrite_occurrences,
+            .followup_occurrence_count =
+                sizeof(emby_no_scalar_rewrite_occurrences) /
+                sizeof(emby_no_scalar_rewrite_occurrences[0])
+        }
+    }
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_latest_resume_no_misfire_phases, "latest-resume-no-misfire",
+    emby_latest_negative_dbs, emby_latest_resume_no_misfire_cases
+);
+
+typedef struct emby_matrix_case {
+    const char *label;
+    int case_id;
+} emby_matrix_case;
+
+static const emby_matrix_case *rsh_emby_matrix_case(
+    const rsh_case_context *context
+) {
+    const rsh_matrix_cell *cell = context->matrix_cell;
+
+    if (!cell || cell->axis_count != 1 || !cell->axis_values[0] ||
+        !cell->axis_values[0]->immutable_data) {
+        failf("FAIL [%s/%s/matrix-case]: invalid one-axis cell",
+              context->run_name, context->phase_label);
+    }
+    return (const emby_matrix_case *)cell->axis_values[0]->immutable_data;
+}
+
+static void rsh_run_emby_matrix_sql_exact(
+    const rsh_case_context *context,
+    const char *label,
+    const char *sql,
+    const char *expected_sql,
+    rsh_prepare_kind prepare_kind,
+    rsh_nbyte_kind nbyte_kind
+) {
+    rsh_case_spec test_case;
+
+    memset(&test_case, 0, sizeof(test_case));
+    test_case.label = label;
+    test_case.kind = RSH_CASE_SQL_EXACT;
+    test_case.build_mask = RSH_BUILD_EMBY_LINKED;
+    test_case.data.sql_exact.role = "candidate";
+    test_case.data.sql_exact.sql = sql;
+    test_case.data.sql_exact.expected_sql = expected_sql;
+    test_case.data.sql_exact.prepare.kind = prepare_kind;
+    test_case.data.sql_exact.prepare.nbyte_kind = nbyte_kind;
+    test_case.data.sql_exact.prepare.tail_kind = RSH_TAIL_FULL;
+    rsh_run_sql_exact(
+        &emby_suite_spec, &test_case, context, &test_case.data.sql_exact
+    );
+}
+
+static void rsh_run_emby_matrix_negative(
+    const rsh_case_context *context,
+    const char *label,
+    rsh_negative_source_kind source_kind,
+    const char *sql,
+    const char *base_sql,
+    const char *replacement_needle,
+    const char *replacement,
+    const char *discriminating_needle
+) {
+    rsh_case_spec test_case;
+
+    memset(&test_case, 0, sizeof(test_case));
+    test_case.label = label;
+    test_case.kind = RSH_CASE_NEGATIVE;
+    test_case.build_mask = RSH_BUILD_EMBY_LINKED;
+    test_case.data.negative.source_kind = source_kind;
+    test_case.data.negative.sql = sql;
+    test_case.data.negative.base_sql = base_sql;
+    test_case.data.negative.replacement_needle = replacement_needle;
+    test_case.data.negative.replacement = replacement;
+    test_case.data.negative.discriminating_needle = discriminating_needle;
+    test_case.data.negative.prepare = (rsh_prepare_spec)EMBY_PREPARE_V2;
+    test_case.data.negative.vendor_role = "vendor";
+    test_case.data.negative.candidate_role = "candidate";
+    test_case.data.negative.followup_occurrences =
+        emby_no_scalar_rewrite_occurrences;
+    test_case.data.negative.followup_occurrence_count =
+        sizeof(emby_no_scalar_rewrite_occurrences) /
+        sizeof(emby_no_scalar_rewrite_occurrences[0]);
+    rsh_run_negative(
+        &emby_suite_spec, &test_case, context, &test_case.data.negative
+    );
+}
+
+static void rsh_run_emby_matrix_static_negative(
+    const rsh_case_context *context,
+    const char *label,
+    const char *sql,
+    const char *discriminating_needle
+) {
+    rsh_run_emby_matrix_negative(
+        context, label, RSH_NEGATIVE_STATIC, sql, NULL, NULL, NULL,
+        discriminating_needle
+    );
+}
+
+static void rsh_run_emby_matrix_generated_negative(
+    const rsh_case_context *context,
+    const char *label,
+    const char *base_sql,
+    const char *replacement_needle,
+    const char *replacement,
+    const char *discriminating_needle
+) {
+    rsh_run_emby_matrix_negative(
+        context, label, RSH_NEGATIVE_GENERATED, NULL, base_sql,
+        replacement_needle, replacement, discriminating_needle
+    );
+}
+
+enum emby_fanout_matrix_case_id {
+    EMBY_FANOUT_MATRIX_BROWSE_V2 = 1,
+    EMBY_FANOUT_MATRIX_BROWSE_V3,
+    EMBY_FANOUT_MATRIX_FAVORITES,
+    EMBY_FANOUT_MATRIX_RESUME,
+    EMBY_FANOUT_MATRIX_PEOPLE,
+    EMBY_FANOUT_MATRIX_LINKS_SEARCH,
+    EMBY_FANOUT_MATRIX_SEARCH_SHAPE_NOMISFIRE
+};
+
+static int rsh_matrix_assert_emby_fanout(
+    const rsh_case_context *context,
+    const rsh_matrix_cell_step *step,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    char *sql = NULL;
+    char *expected = NULL;
+    char *one = NULL;
+    char *two = NULL;
+    char *replacement = NULL;
+
+    (void)step;
+    (void)ctx;
+    if (matrix_case->case_id == EMBY_FANOUT_MATRIX_BROWSE_V2 ||
+        matrix_case->case_id == EMBY_FANOUT_MATRIX_BROWSE_V3) {
+        sql = make_browse_sql();
+        one = make_exists_links_one("100", "6");
+        two = make_exists_links_two("100", "7");
+        replacement = xasprintf("(%s OR %s)", one, two);
+        expected = replace_once(sql, "A.Id in WithItemLinkItemIds", replacement);
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            matrix_case->case_id == EMBY_FANOUT_MATRIX_BROWSE_V3
+                ? RSH_PREPARE_V3 : RSH_PREPARE_V2,
+            RSH_NBYTE_MINUS_ONE
+        );
+    } else if (matrix_case->case_id == EMBY_FANOUT_MATRIX_FAVORITES) {
+        sql = make_favorites_sql();
+        one = make_ancestor_exists_splice("100");
+        two = make_exists_links_one("100", "6");
+        replacement = xasprintf("(%s OR %s)", one, two);
+        expected = replace_once(
+            sql, "(A.Id in WithAncestors OR A.Id in WithItemLinkItemIds)",
+            replacement
+        );
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+    } else if (matrix_case->case_id == EMBY_FANOUT_MATRIX_RESUME) {
+        sql = make_resume_sql();
+        expected = make_resume_expected(sql, "100", "1");
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+    } else if (matrix_case->case_id == EMBY_FANOUT_MATRIX_PEOPLE) {
+        sql = make_people_sql();
+        replacement = make_exists_people("100");
+        expected = replace_once(
+            sql,
+            "A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors)",
+            replacement
+        );
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+    } else if (matrix_case->case_id == EMBY_FANOUT_MATRIX_LINKS_SEARCH) {
+        sql = make_links_search_sql("2,3");
+        replacement = make_exists_links_one("100", "2,3");
+        expected = replace_once(sql, "A.Id in WithItemLinkItemIds", replacement);
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+    } else if (matrix_case->case_id ==
+               EMBY_FANOUT_MATRIX_SEARCH_SHAPE_NOMISFIRE) {
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, emby_fts_env_sql,
+            "fts_search9 match @SearchTerm"
+        );
+    } else {
+        failf("FAIL [fanout-matrix/case-id]: got=%d", matrix_case->case_id);
+    }
+
+    free(replacement);
+    free(two);
+    free(one);
+    free(expected);
+    free(sql);
+    return SQLITE_OK;
+}
+
+static const rsh_db_spec emby_matrix_base_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE
+    }
+};
+
+static const rsh_matrix_cell_step emby_matrix_assert_steps[] = {
+    {.kind = RSH_CELL_ASSERT}
+};
+
+#define EMBY_MATRIX_AXIS_VALUE(case_rows, row_index, case_label, case_number) \
+    { \
+        .label = (case_label), \
+        .integer = (case_number), \
+        .immutable_data = &(case_rows)[row_index] \
+    }
+
+static const emby_matrix_case emby_fanout_matrix_first_cases[] = {
+    {"fanout-browse", EMBY_FANOUT_MATRIX_BROWSE_V2},
+    {"fanout-browse-v3", EMBY_FANOUT_MATRIX_BROWSE_V3},
+    {"fanout-favorites", EMBY_FANOUT_MATRIX_FAVORITES}
+};
+static const rsh_matrix_axis_value emby_fanout_matrix_first_values[] = {
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_fanout_matrix_first_cases, 0, "fanout-browse",
+        EMBY_FANOUT_MATRIX_BROWSE_V2
+    ),
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_fanout_matrix_first_cases, 1, "fanout-browse-v3",
+        EMBY_FANOUT_MATRIX_BROWSE_V3
+    ),
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_fanout_matrix_first_cases, 2, "fanout-favorites",
+        EMBY_FANOUT_MATRIX_FAVORITES
+    )
+};
+static const rsh_matrix_axis emby_fanout_matrix_first_axes[] = {
+    {
+        .name = "case",
+        .values = emby_fanout_matrix_first_values,
+        .value_count = sizeof(emby_fanout_matrix_first_values) /
+                       sizeof(emby_fanout_matrix_first_values[0])
+    }
+};
+
+static const emby_matrix_case emby_fanout_matrix_second_cases[] = {
+    {"fanout-resume", EMBY_FANOUT_MATRIX_RESUME},
+    {"fanout-people", EMBY_FANOUT_MATRIX_PEOPLE},
+    {"fanout-links-search", EMBY_FANOUT_MATRIX_LINKS_SEARCH}
+};
+static const rsh_matrix_axis_value emby_fanout_matrix_second_values[] = {
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_fanout_matrix_second_cases, 0, "fanout-resume",
+        EMBY_FANOUT_MATRIX_RESUME
+    ),
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_fanout_matrix_second_cases, 1, "fanout-people",
+        EMBY_FANOUT_MATRIX_PEOPLE
+    ),
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_fanout_matrix_second_cases, 2, "fanout-links-search",
+        EMBY_FANOUT_MATRIX_LINKS_SEARCH
+    )
+};
+static const rsh_matrix_axis emby_fanout_matrix_second_axes[] = {
+    {
+        .name = "case",
+        .values = emby_fanout_matrix_second_values,
+        .value_count = sizeof(emby_fanout_matrix_second_values) /
+                       sizeof(emby_fanout_matrix_second_values[0])
+    }
+};
+
+static const emby_matrix_case emby_fanout_matrix_third_cases[] = {
+    {"fanout-search-shape-nomisfire",
+     EMBY_FANOUT_MATRIX_SEARCH_SHAPE_NOMISFIRE}
+};
+static const rsh_matrix_axis_value emby_fanout_matrix_third_values[] = {
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_fanout_matrix_third_cases, 0,
+        "fanout-search-shape-nomisfire",
+        EMBY_FANOUT_MATRIX_SEARCH_SHAPE_NOMISFIRE
+    )
+};
+static const rsh_matrix_axis emby_fanout_matrix_third_axes[] = {
+    {
+        .name = "case",
+        .values = emby_fanout_matrix_third_values,
+        .value_count = sizeof(emby_fanout_matrix_third_values) /
+                       sizeof(emby_fanout_matrix_third_values[0])
+    }
+};
+
+#define EMBY_DYNAMIC_MATRIX_PHASE( \
+    phase_label, prefix, axis_rows, db_rows, adapter, cell_count) \
+    { \
+        .label = (phase_label), \
+        .cell_dir_prefix = (prefix), \
+        .axes = (axis_rows), \
+        .axis_count = sizeof(axis_rows) / sizeof((axis_rows)[0]), \
+        .dbs = (db_rows), \
+        .db_count = sizeof(db_rows) / sizeof((db_rows)[0]), \
+        .steps = emby_matrix_assert_steps, \
+        .step_count = sizeof(emby_matrix_assert_steps) / \
+                      sizeof(emby_matrix_assert_steps[0]), \
+        .assertion_adapter = (adapter), \
+        .expected_cells = (cell_count) \
+    }
+
+static const rsh_matrix_phase_spec emby_fanout_matrix_phases[] = {
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fanout-first", "fanout-first", emby_fanout_matrix_first_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_fanout, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fanout-second", "fanout-second", emby_fanout_matrix_second_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_fanout, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fanout-third", "fanout-third", emby_fanout_matrix_third_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_fanout, 1
+    )
+};
+
+static const char emby_slow_resume_complex_missing_not_null_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select count(*) OVER() AS TotalRecordCount,A.type,A.Id,A.SeriesPresentationUniqueKey,UserDatas.PlaybackPositionTicks,"
+    "((Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, 1) * 1000000) + Coalesce(A.SortIndexNumber, A.IndexNumber, 0) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then (Cast(Coalesce(A.IndexNumber, 0) as REAL) / 100000) Else 0 End)) EpisodeAbsoluteIndexNumber "
+    "from mediaitems A left join (Select N.SeriesPresentationUniqueKey,((Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber, 1) * 1000000) + Coalesce(N.SortIndexNumber, N.IndexNumber, 0) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then (Cast(Coalesce(N.IndexNumber, 0) as REAL) / 100000) Else 0 End)) AbsoluteIndexNumber,max(UserDatas_N.LastPlayedDateInt) LastPlayedDateInt,UserDatas_N.playbackPositionTicks from MediaItems N join UserDatas UserDatas_N on N.UserDataKeyId=UserDatas_N.UserDataKeyId And UserDatas_N.UserId=1 where N.Type=8 and Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber,-1) <> 0 and (UserDatas_N.Played=1 or UserDatas_N.playbackPositionTicks > 0) Group By N.SeriesPresentationUniqueKey ORDER BY UserDatas_N.LastPlayedDateInt desc, AbsoluteIndexNumber desc) LastWatchedEpisodes on LastWatchedEpisodes.SeriesPresentationUniqueKey=A.SeriesPresentationUniqueKey "
+    "left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where ((A.Type=5 and UserDatas.playbackPositionTicks > 0) OR (A.Type=8 AND (UserDatas.playbackPositionTicks > 0 or Coalesce(UserDatas.played,0) = 0) AND (select case when LastWatchedEpisodes.playbackPositionTicks > 0 then EpisodeAbsoluteIndexNumber >= Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) else EpisodeAbsoluteIndexNumber > Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) end))) "
+    "AND (A.Type=5 OR Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, -1) <> 0) AND A.Type in (5,8) AND Coalesce(UserDatas.HideFromResume,0)=0 AND COALESCE((select hidefromresume from userdatas where userdatas.userid=1 and userdatas.userdatakeyid=(select userdatakeyid from mediaitems where mediaitems.id=A.seriesid)),0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT 12";
+
+enum emby_slow_matrix_case_id {
+    EMBY_SLOW_RESUME_SIMPLE_COUNT = 1,
+    EMBY_SLOW_RESUME_SIMPLE_BARE,
+    EMBY_SLOW_RESUME_SIMPLE_UNPLAYED_NEGATIVE,
+    EMBY_SLOW_RESUME_SIMPLE_SHAPE_07_NEGATIVE,
+    EMBY_SLOW_RESUME_SIMPLE_BAD_L1_NEGATIVE,
+    EMBY_SLOW_RESUME_SIMPLE_BAD_LIMIT_NEGATIVE,
+    EMBY_SLOW_RESUME_SIMPLE_STRING_EMBEDDED,
+    EMBY_SLOW_RESUME_SIMPLE_STRING_ONLY_NEGATIVE,
+    EMBY_SLOW_RESUME_SIMPLE_DUPLICATE_NEGATIVE,
+    EMBY_SLOW_RESUME_COMPLEX_COUNT,
+    EMBY_SLOW_RESUME_COMPLEX_MISSING_NOT_NULL_NEGATIVE,
+    EMBY_SLOW_RESUME_COMPLEX_COMMENT_EMBEDDED,
+    EMBY_SLOW_RESUME_COMPLEX_0065,
+    EMBY_SLOW_RESUME_COMPLEX_BOUND_USER_NEGATIVE,
+    EMBY_SLOW_RESUME_COMPLEX_NAMED_USER_NEGATIVE,
+    EMBY_SLOW_RESUME_COMPLEX_DERIVED_PARAM_NEGATIVE,
+    EMBY_SLOW_RESUME_COMPLEX_CONFLICTING_USER_NEGATIVE,
+    EMBY_SLOW_RESUME_COMPLEX_DUPLICATE_NEGATIVE,
+    EMBY_SLOW_SIMILAR,
+    EMBY_SLOW_SIMILAR_COMMENT_EMBEDDED,
+    EMBY_SLOW_SIMILAR_COMMENT_ONLY_NEGATIVE,
+    EMBY_SLOW_PEOPLE,
+    EMBY_SLOW_LINKS_SEARCH,
+    EMBY_SLOW_LINK_TYPE_COUNT,
+    EMBY_SLOW_LINK_TYPE_COUNT_BAD_T1,
+    EMBY_SLOW_LINK_TYPE_COUNT_BAD_T2,
+    EMBY_SLOW_LINK_TYPE_COUNT_DUPLICATE,
+    EMBY_SLOW_FTS_NEGATIVE,
+    EMBY_SLOW_LATEST_NEGATIVE
+};
+
+static int rsh_matrix_assert_emby_slow_search(
+    const rsh_case_context *context,
+    const rsh_matrix_cell_step *step,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    char *base = NULL;
+    char *expected_base = NULL;
+    char *sql = NULL;
+    char *expected = NULL;
+    char *replacement = NULL;
+
+    (void)step;
+    (void)ctx;
+    switch (matrix_case->case_id) {
+    case EMBY_SLOW_RESUME_SIMPLE_COUNT:
+        sql = make_resume_simple_sql(1, "12");
+        expected = make_resume_simple_expected(sql);
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_BARE:
+        sql = make_resume_simple_sql(0, "24");
+        expected = make_resume_simple_expected(sql);
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_UNPLAYED_NEGATIVE:
+        base = make_resume_simple_sql(1, "12");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "UserDatas.playbackPositionTicks > 0",
+            "Coalesce(UserDatas.played, 0)=0",
+            "Coalesce(UserDatas.played, 0)=0"
+        );
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_SHAPE_07_NEGATIVE:
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label,
+            EMBY_RESUME_SIMPLE_LEFT_JOIN_UNPLAYED_SHAPE_07_SQL,
+            "AncestorId in (9,10,11,12,13,14,101,102,103)"
+        );
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_BAD_L1_NEGATIVE:
+        base = make_resume_simple_sql(1, "12");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "AncestorId in (100)", "AncestorId in (@AncestorId)",
+            "AncestorId in (@AncestorId)"
+        );
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_BAD_LIMIT_NEGATIVE:
+        base = make_resume_simple_sql(1, "12");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "LIMIT 12", "LIMIT @Limit", "LIMIT @Limit"
+        );
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_STRING_EMBEDDED:
+        base = make_resume_simple_sql(1, "12");
+        expected_base = make_resume_simple_expected(base);
+        sql = replace_once(
+            base, "AND A.Id in WithAncestors",
+            "AND 'A.Id in WithAncestors' IS NOT NULL AND A.Id in WithAncestors"
+        );
+        expected = replace_once(
+            expected_base, "AND EXISTS (SELECT 1 FROM AncestorIds2",
+            "AND 'A.Id in WithAncestors' IS NOT NULL AND EXISTS (SELECT 1 FROM AncestorIds2"
+        );
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_STRING_ONLY_NEGATIVE:
+        base = make_resume_simple_sql(1, "12");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "AND A.Id in WithAncestors",
+            "AND 'A.Id in WithAncestors' IS NOT NULL",
+            "AND 'A.Id in WithAncestors' IS NOT NULL Group by"
+        );
+        break;
+    case EMBY_SLOW_RESUME_SIMPLE_DUPLICATE_NEGATIVE:
+        base = make_resume_simple_sql(1, "12");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "AND A.Id in WithAncestors",
+            "AND A.Id in WithAncestors AND A.Id in WithAncestors",
+            "AND A.Id in WithAncestors AND A.Id in WithAncestors"
+        );
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_COUNT:
+        sql = make_resume_sql();
+        expected = make_resume_expected(sql, "100", "1");
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_MISSING_NOT_NULL_NEGATIVE:
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label,
+            emby_slow_resume_complex_missing_not_null_sql,
+            "end))) AND (A.Type=5 OR"
+        );
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_COMMENT_EMBEDDED:
+        base = make_resume_sql();
+        expected_base = make_resume_expected(base, "100", "1");
+        sql = replace_once(
+            base, "AND A.Id in WithAncestors Group by",
+            "AND /* A.Id in WithAncestors */ A.Id in WithAncestors Group by"
+        );
+        expected = replace_once(
+            expected_base, "AND EXISTS (SELECT 1 FROM AncestorIds2",
+            "AND /* A.Id in WithAncestors */ EXISTS (SELECT 1 FROM AncestorIds2"
+        );
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_0065:
+        sql = make_resume_0065_sql();
+        expected = make_resume_expected(sql, "100", "13");
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_BOUND_USER_NEGATIVE:
+        base = make_resume_sql();
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "UserDatas.UserId=1", "UserDatas.UserId=?1",
+            "UserDatas.UserId=?1"
+        );
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_NAMED_USER_NEGATIVE:
+        base = make_resume_sql();
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "userdatas.userid=1", "userdatas.userid=@UserId",
+            "userdatas.userid=@UserId"
+        );
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_DERIVED_PARAM_NEGATIVE:
+        base = make_resume_sql();
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "UserDatas_N.UserId=1", "UserDatas_N.UserId=:UserId",
+            "UserDatas_N.UserId=:UserId"
+        );
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_CONFLICTING_USER_NEGATIVE:
+        base = make_resume_sql();
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "userdatas.userid=1", "userdatas.userid=2",
+            "userdatas.userid=2"
+        );
+        break;
+    case EMBY_SLOW_RESUME_COMPLEX_DUPLICATE_NEGATIVE:
+        base = make_resume_sql();
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "AND A.Id in WithAncestors",
+            "AND A.Id in WithAncestors AND A.Id in WithAncestors",
+            "AND A.Id in WithAncestors AND A.Id in WithAncestors"
+        );
+        break;
+    case EMBY_SLOW_SIMILAR:
+        sql = make_similar_sql();
+        expected = make_similar_expected(sql);
+        break;
+    case EMBY_SLOW_SIMILAR_COMMENT_EMBEDDED:
+        base = make_similar_sql();
+        expected_base = make_similar_expected(base);
+        sql = replace_once(
+            base, "AND A.Id in WithAncestors",
+            "AND /* A.Id in WithAncestors */ A.Id in WithAncestors"
+        );
+        expected = replace_once(
+            expected_base, "AND EXISTS (SELECT 1 FROM AncestorIds2",
+            "AND /* A.Id in WithAncestors */ EXISTS (SELECT 1 FROM AncestorIds2"
+        );
+        break;
+    case EMBY_SLOW_SIMILAR_COMMENT_ONLY_NEGATIVE:
+        base = make_similar_sql();
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "AND A.Id in WithAncestors",
+            "AND /* A.Id in WithAncestors */ 1=1",
+            "AND /* A.Id in WithAncestors */ 1=1"
+        );
+        break;
+    case EMBY_SLOW_PEOPLE:
+        sql = make_people_sql();
+        replacement = make_exists_people("100");
+        expected = replace_once(
+            sql,
+            "A.Id in (select PersonId from itemPeople2 where ItemId in WithAncestors)",
+            replacement
+        );
+        break;
+    case EMBY_SLOW_LINKS_SEARCH:
+        sql = make_links_search_sql("2,3");
+        replacement = make_exists_links_one("100", "2,3");
+        expected = replace_once(sql, "A.Id in WithItemLinkItemIds", replacement);
+        break;
+    case EMBY_SLOW_LINK_TYPE_COUNT:
+        sql = xasprintf("%s", EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL);
+        expected = make_link_type_count_shape_05_expected();
+        break;
+    case EMBY_SLOW_LINK_TYPE_COUNT_BAD_T1:
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+            "Type in (6,4,3,2) union", "Type in (6,'bad') union",
+            "Type in (6,'bad') union"
+        );
+        break;
+    case EMBY_SLOW_LINK_TYPE_COUNT_BAD_T2:
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+            "Type in (7,0,1,5,6,2)))select", "Type in (7,'bad')))select",
+            "Type in (7,'bad')))select"
+        );
+        break;
+    case EMBY_SLOW_LINK_TYPE_COUNT_DUPLICATE:
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL,
+            "AND A.Id in WithItemLinkItemIds Group by",
+            "AND A.Id in WithItemLinkItemIds AND A.Id in WithItemLinkItemIds Group by",
+            "AND A.Id in WithItemLinkItemIds AND A.Id in WithItemLinkItemIds"
+        );
+        break;
+    case EMBY_SLOW_FTS_NEGATIVE:
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, emby_fts_env_sql,
+            "fts_search9 match @SearchTerm"
+        );
+        break;
+    case EMBY_SLOW_LATEST_NEGATIVE:
+        require_absent(
+            "fanout-latest-negative/indexed-by",
+            emby_dashboard_episodes_off_sql,
+            "INDEXED BY idx_dshadow_emby_latest_gk_dc"
+        );
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, emby_dashboard_episodes_off_sql,
+            "ORDER BY MAX(A.DateCreated) DESC LIMIT 12"
+        );
+        break;
+    default:
+        failf("FAIL [emby-slow-search-matrix/case-id]: got=%d",
+              matrix_case->case_id);
+    }
+
+    if (sql) {
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+    }
+    free(replacement);
+    free(expected);
+    free(sql);
+    free(expected_base);
+    free(base);
+    return SQLITE_OK;
+}
+
+#define EMBY_DEFINE_MATRIX_AXIS_1(axis_id, label_1, id_1) \
+    static const emby_matrix_case axis_id##_cases[] = { \
+        {(label_1), (id_1)} \
+    }; \
+    static const rsh_matrix_axis_value axis_id##_values[] = { \
+        EMBY_MATRIX_AXIS_VALUE(axis_id##_cases, 0, (label_1), (id_1)) \
+    }; \
+    static const rsh_matrix_axis axis_id##_axes[] = { \
+        { \
+            .name = "case", \
+            .values = axis_id##_values, \
+            .value_count = sizeof(axis_id##_values) / \
+                           sizeof(axis_id##_values[0]) \
+        } \
+    }
+
+#define EMBY_DEFINE_MATRIX_AXIS_2( \
+    axis_id, label_1, id_1, label_2, id_2) \
+    static const emby_matrix_case axis_id##_cases[] = { \
+        {(label_1), (id_1)}, \
+        {(label_2), (id_2)} \
+    }; \
+    static const rsh_matrix_axis_value axis_id##_values[] = { \
+        EMBY_MATRIX_AXIS_VALUE(axis_id##_cases, 0, (label_1), (id_1)), \
+        EMBY_MATRIX_AXIS_VALUE(axis_id##_cases, 1, (label_2), (id_2)) \
+    }; \
+    static const rsh_matrix_axis axis_id##_axes[] = { \
+        { \
+            .name = "case", \
+            .values = axis_id##_values, \
+            .value_count = sizeof(axis_id##_values) / \
+                           sizeof(axis_id##_values[0]) \
+        } \
+    }
+
+#define EMBY_DEFINE_MATRIX_AXIS_3( \
+    axis_id, label_1, id_1, label_2, id_2, label_3, id_3) \
+    static const emby_matrix_case axis_id##_cases[] = { \
+        {(label_1), (id_1)}, \
+        {(label_2), (id_2)}, \
+        {(label_3), (id_3)} \
+    }; \
+    static const rsh_matrix_axis_value axis_id##_values[] = { \
+        EMBY_MATRIX_AXIS_VALUE(axis_id##_cases, 0, (label_1), (id_1)), \
+        EMBY_MATRIX_AXIS_VALUE(axis_id##_cases, 1, (label_2), (id_2)), \
+        EMBY_MATRIX_AXIS_VALUE(axis_id##_cases, 2, (label_3), (id_3)) \
+    }; \
+    static const rsh_matrix_axis axis_id##_axes[] = { \
+        { \
+            .name = "case", \
+            .values = axis_id##_values, \
+            .value_count = sizeof(axis_id##_values) / \
+                           sizeof(axis_id##_values[0]) \
+        } \
+    }
+
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_1,
+    "resume-simple-count", EMBY_SLOW_RESUME_SIMPLE_COUNT,
+    "resume-simple-bare", EMBY_SLOW_RESUME_SIMPLE_BARE,
+    "resume-simple-unplayed-negative",
+    EMBY_SLOW_RESUME_SIMPLE_UNPLAYED_NEGATIVE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_2,
+    "resume-simple-shape-07-547bab3e-negative",
+    EMBY_SLOW_RESUME_SIMPLE_SHAPE_07_NEGATIVE,
+    "resume-simple-bad-l1-negative", EMBY_SLOW_RESUME_SIMPLE_BAD_L1_NEGATIVE,
+    "resume-simple-bad-limit-negative",
+    EMBY_SLOW_RESUME_SIMPLE_BAD_LIMIT_NEGATIVE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_3,
+    "resume-simple-string-embedded-immunity",
+    EMBY_SLOW_RESUME_SIMPLE_STRING_EMBEDDED,
+    "resume-simple-string-only-negative",
+    EMBY_SLOW_RESUME_SIMPLE_STRING_ONLY_NEGATIVE,
+    "resume-simple-duplicate-negative",
+    EMBY_SLOW_RESUME_SIMPLE_DUPLICATE_NEGATIVE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_4,
+    "resume-complex-count", EMBY_SLOW_RESUME_COMPLEX_COUNT,
+    "resume-complex-missing-lastwatched-not-null-negative",
+    EMBY_SLOW_RESUME_COMPLEX_MISSING_NOT_NULL_NEGATIVE,
+    "resume-complex-comment-embedded-immunity",
+    EMBY_SLOW_RESUME_COMPLEX_COMMENT_EMBEDDED
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_5,
+    "resume-complex-0065", EMBY_SLOW_RESUME_COMPLEX_0065,
+    "resume-complex-bound-user-negative",
+    EMBY_SLOW_RESUME_COMPLEX_BOUND_USER_NEGATIVE,
+    "resume-complex-named-user-negative",
+    EMBY_SLOW_RESUME_COMPLEX_NAMED_USER_NEGATIVE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_6,
+    "resume-complex-derived-param-negative",
+    EMBY_SLOW_RESUME_COMPLEX_DERIVED_PARAM_NEGATIVE,
+    "resume-complex-conflicting-user-negative",
+    EMBY_SLOW_RESUME_COMPLEX_CONFLICTING_USER_NEGATIVE,
+    "resume-complex-duplicate-negative",
+    EMBY_SLOW_RESUME_COMPLEX_DUPLICATE_NEGATIVE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_7,
+    "fanout-similar", EMBY_SLOW_SIMILAR,
+    "similar-comment-embedded-immunity", EMBY_SLOW_SIMILAR_COMMENT_EMBEDDED,
+    "similar-comment-only-negative", EMBY_SLOW_SIMILAR_COMMENT_ONLY_NEGATIVE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_8,
+    "similar-people-negative", EMBY_SLOW_PEOPLE,
+    "similar-links-search-negative", EMBY_SLOW_LINKS_SEARCH,
+    "links-type-count-shape-05-two-level", EMBY_SLOW_LINK_TYPE_COUNT
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_slow_group_9,
+    "links-type-count-shape-05-bad-t1", EMBY_SLOW_LINK_TYPE_COUNT_BAD_T1,
+    "links-type-count-shape-05-bad-t2", EMBY_SLOW_LINK_TYPE_COUNT_BAD_T2,
+    "links-type-count-shape-05-duplicate-membership",
+    EMBY_SLOW_LINK_TYPE_COUNT_DUPLICATE
+);
+EMBY_DEFINE_MATRIX_AXIS_2(
+    emby_slow_group_10,
+    "fanout-search-fts-negative", EMBY_SLOW_FTS_NEGATIVE,
+    "fanout-latest-negative", EMBY_SLOW_LATEST_NEGATIVE
+);
+
+static const rsh_matrix_phase_spec emby_slow_search_matrix_phases[] = {
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-1", "slow-group-1", emby_slow_group_1_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-2", "slow-group-2", emby_slow_group_2_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-3", "slow-group-3", emby_slow_group_3_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-4", "slow-group-4", emby_slow_group_4_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-5", "slow-group-5", emby_slow_group_5_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-6", "slow-group-6", emby_slow_group_6_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-7", "slow-group-7", emby_slow_group_7_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-8", "slow-group-8", emby_slow_group_8_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-9", "slow-group-9", emby_slow_group_9_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "slow-group-10", "slow-group-10", emby_slow_group_10_axes,
+        emby_matrix_base_dbs, rsh_matrix_assert_emby_slow_search, 2
+    )
+};
+
+enum emby_dashboard_matrix_case_id {
+    EMBY_DASHBOARD_MATRIX_LATEST_12 = 1,
+    EMBY_DASHBOARD_MATRIX_LATEST_12_NUL,
+    EMBY_DASHBOARD_MATRIX_LATEST_16,
+    EMBY_DASHBOARD_MATRIX_MIXED_CONTROL,
+    EMBY_DASHBOARD_MATRIX_DISTINCT_NEGATIVE,
+    EMBY_DASHBOARD_MATRIX_AGGREGATE_NEGATIVE,
+    EMBY_DASHBOARD_MATRIX_OVER_NEGATIVE,
+    EMBY_DASHBOARD_MATRIX_MOVIES_12,
+    EMBY_DASHBOARD_MATRIX_MOVIES_16,
+    EMBY_DASHBOARD_MATRIX_MOVIES_20,
+    EMBY_DASHBOARD_MATRIX_EPISODES_DATE_INDEX_MISSING,
+    EMBY_DASHBOARD_MATRIX_EPISODES_GROUP_INDEX_MISSING,
+    EMBY_DASHBOARD_MATRIX_EPISODES_BOTH_INDEXES_MISSING,
+    EMBY_DASHBOARD_MATRIX_MOVIES_OUTER_INDEX_MISSING,
+    EMBY_DASHBOARD_MATRIX_MOVIES_INNER_INDEX_MISSING
+};
+
+static int rsh_matrix_assert_emby_dashboard(
+    const rsh_case_context *context,
+    const rsh_matrix_cell_step *step,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+    char *sql = NULL;
+    char *expected = NULL;
+
+    (void)step;
+    (void)ctx;
+    switch (matrix_case->case_id) {
+    case EMBY_DASHBOARD_MATRIX_LATEST_12:
+        sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
+        expected = make_latest_expected("A.Id,A.SeriesName,A.SortName ", "12");
+        require_absent(
+            "dashboard-latest-original/indexed-by", sql,
+            "INDEXED BY idx_dshadow_emby_latest_gk_dc"
+        );
+        require_int(
+            "dashboard-latest-expected/outer-index-count",
+            count_occurrences(
+                expected,
+                "INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk"
+            ),
+            1
+        );
+        require_int(
+            "dashboard-latest-expected/inner-index-count",
+            count_occurrences(
+                expected, "INDEXED BY idx_dshadow_emby_latest_gk_dc"
+            ),
+            1
+        );
+        require_contains(
+            "dashboard-latest-expected/ranked", expected,
+            "WITH ranked(id, dc, gk) AS MATERIALIZED ("
+        );
+        require_absent(
+            "dashboard-latest-expected/keys", expected, "WITH keys(gk)"
+        );
+        require_absent(
+            "dashboard-latest-expected/picked", expected,
+            "picked AS MATERIALIZED"
+        );
+        require_absent(
+            "dashboard-latest-expected/exact-groups", expected,
+            "exact_groups AS MATERIALIZED"
+        );
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_LATEST_12_NUL:
+        sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
+        expected = make_latest_expected("A.Id,A.SeriesName,A.SortName ", "12");
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_LENGTH_WITH_NUL
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_LATEST_16:
+        sql = make_latest_sql("A.Id ", "16");
+        expected = make_latest_expected("A.Id ", "16");
+        require_int(
+            "dashboard-latest-limit16/outer-index-count",
+            count_occurrences(
+                expected,
+                "INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk"
+            ),
+            1
+        );
+        require_int(
+            "dashboard-latest-limit16/inner-index-count",
+            count_occurrences(
+                expected, "INDEXED BY idx_dshadow_emby_latest_gk_dc"
+            ),
+            1
+        );
+        require_contains(
+            "dashboard-latest-limit16/ranked", expected,
+            "WITH ranked(id, dc, gk) AS MATERIALIZED ("
+        );
+        require_absent(
+            "dashboard-latest-limit16/keys", expected, "WITH keys(gk)"
+        );
+        require_absent(
+            "dashboard-latest-limit16/picked", expected,
+            "picked AS MATERIALIZED"
+        );
+        require_absent(
+            "dashboard-latest-limit16/exact-groups", expected,
+            "exact_groups AS MATERIALIZED"
+        );
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_MIXED_CONTROL:
+        sql = make_mixed_latest_sql("42", "3");
+        expected = make_mixed_latest_expected("42", "3");
+        expect_mixed_latest_sql(
+            candidate, matrix_case->label, sql, expected, 0, 0
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_DISTINCT_NEGATIVE:
+        sql = make_latest_sql("DISTINCT A.Id ", "12");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql, "select DISTINCT A.Id from"
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_AGGREGATE_NEGATIVE:
+        sql = make_latest_sql("MAX(A.DateCreated) ", "12");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql,
+            "select MAX(A.DateCreated) from"
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_OVER_NEGATIVE:
+        sql = make_latest_sql(
+            "count(*) OVER() AS TotalRecordCount,A.Id ", "12"
+        );
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql,
+            "select count(*) OVER() AS TotalRecordCount,A.Id from"
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_MOVIES_12:
+    case EMBY_DASHBOARD_MATRIX_MOVIES_16:
+    case EMBY_DASHBOARD_MATRIX_MOVIES_20:
+        {
+            const char *limit =
+                matrix_case->case_id == EMBY_DASHBOARD_MATRIX_MOVIES_12
+                    ? "12"
+                    : matrix_case->case_id == EMBY_DASHBOARD_MATRIX_MOVIES_16
+                        ? "16" : "20";
+            sql = make_movies_latest_sql(1, "100", "42", limit);
+            expected = make_movies_latest_expected("100", "42", limit);
+            rsh_run_emby_matrix_sql_exact(
+                context, matrix_case->label, sql, expected,
+                RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+            );
+            if (matrix_case->case_id == EMBY_DASHBOARD_MATRIX_MOVIES_20) {
+                sqlite3 *vendor = rsh_context_db(context, "vendor");
+                typed_rows vendor_rows = collect_typed_rows(
+                    vendor, "movies-row-original", sql, sql
+                );
+                typed_rows candidate_rows = collect_typed_rows(
+                    candidate, "movies-row-rewritten", sql, expected
+                );
+                require_ordered_full_row_identity(
+                    "movies-row-identity", &vendor_rows, &candidate_rows
+                );
+                free_typed_rows(&vendor_rows);
+                free_typed_rows(&candidate_rows);
+            }
+        }
+        break;
+    case EMBY_DASHBOARD_MATRIX_EPISODES_DATE_INDEX_MISSING:
+    case EMBY_DASHBOARD_MATRIX_EPISODES_GROUP_INDEX_MISSING:
+    case EMBY_DASHBOARD_MATRIX_EPISODES_BOTH_INDEXES_MISSING:
+        sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql,
+            "ORDER BY MAX(A.DateCreated) DESC LIMIT 12"
+        );
+        break;
+    case EMBY_DASHBOARD_MATRIX_MOVIES_OUTER_INDEX_MISSING:
+    case EMBY_DASHBOARD_MATRIX_MOVIES_INNER_INDEX_MISSING:
+        sql = make_movies_latest_sql(1, "100", "42", "12");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql,
+            "Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12"
+        );
+        break;
+    default:
+        failf("FAIL [dashboard-matrix/case-id]: got=%d", matrix_case->case_id);
+    }
+
+    free(expected);
+    free(sql);
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_dashboard_probe_authorizer_set(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+
+    (void)immutable_data;
+    require_int(
+        "dashboard/probe-authorizer-set",
+        sqlite3_set_authorizer(candidate, deny_sqlite_master_read, NULL),
+        SQLITE_OK
+    );
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_dashboard_probe_authorizer_clear(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+
+    (void)immutable_data;
+    require_int(
+        "dashboard/probe-authorizer-clear",
+        sqlite3_set_authorizer(candidate, NULL, NULL), SQLITE_OK
+    );
+    return SQLITE_OK;
+}
+
+static int rsh_assert_emby_dashboard_probe_error(
+    const rsh_case_context *context,
+    int mode_id,
+    int expected_delta,
+    void *ctx
+) {
+    char *sql;
+
+    (void)ctx;
+    if (expected_delta != 0) {
+        failf("FAIL [dashboard/probe-expected-delta]: got=%d want=0",
+              expected_delta);
+    }
+    if (mode_id == EMBY_SMOKE_MODE_EPISODES_LATEST) {
+        sql = make_latest_sql("A.Id,A.SeriesName,A.SortName ", "12");
+        rsh_run_emby_matrix_static_negative(
+            context, "dashboard-episodes-probe-error", sql,
+            "ORDER BY MAX(A.DateCreated) DESC LIMIT 12"
+        );
+    } else if (mode_id == EMBY_SMOKE_MODE_MOVIES_LATEST) {
+        sql = make_movies_latest_sql(1, "100", "42", "12");
+        rsh_run_emby_matrix_static_negative(
+            context, "dashboard-movies-probe-error", sql,
+            "Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12"
+        );
+    } else {
+        failf("FAIL [dashboard/probe-mode]: got=%d", mode_id);
+        return SQLITE_MISUSE;
+    }
+    free(sql);
+    return SQLITE_OK;
+}
+
+static const rsh_case_spec emby_dashboard_probe_error_cases[] = {
+    {
+        .label = "dashboard-probe-authorizer-set",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom =
+                rsh_custom_adapter_dashboard_probe_authorizer_set,
+        }
+    },
+    {
+        .label = "dashboard-episodes-probe-error",
+        .kind = RSH_CASE_INDEX_PROBE,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.index_probe = {
+            .role = "candidate",
+            .mode_id = EMBY_SMOKE_MODE_EPISODES_LATEST,
+            .expected_delta = 0,
+            .assert_probe = rsh_assert_emby_dashboard_probe_error
+        }
+    },
+    {
+        .label = "dashboard-movies-probe-error",
+        .kind = RSH_CASE_INDEX_PROBE,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.index_probe = {
+            .role = "candidate",
+            .mode_id = EMBY_SMOKE_MODE_MOVIES_LATEST,
+            .expected_delta = 0,
+            .assert_probe = rsh_assert_emby_dashboard_probe_error
+        }
+    },
+    {
+        .label = "dashboard-probe-authorizer-clear",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom =
+                rsh_custom_adapter_dashboard_probe_authorizer_clear,
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_dashboard_probe_error_steps[] = {
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_dashboard_probe_error_cases,
+        .case_count = sizeof(emby_dashboard_probe_error_cases) /
+                      sizeof(emby_dashboard_probe_error_cases[0])
+    }
+};
+
+static const rsh_db_spec emby_dashboard_matrix_all_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_MOVIES_SEED_ONLY
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_DASHBOARD_OFF
+    }
+};
+
+#define EMBY_DASHBOARD_MATRIX_DBS(name, candidate_profile) \
+    static const rsh_db_spec name[] = { \
+        { \
+            .role = "vendor", \
+            .relative_path = "not-target.db", \
+            .kind = RSH_DB_VENDOR, \
+            .storage = RSH_DB_RELATIVE, \
+            .setup_profile = EMBY_PROFILE_MOVIES_SEED_ONLY \
+        }, \
+        { \
+            .role = "candidate", \
+            .relative_path = "library.db", \
+            .kind = RSH_DB_CANDIDATE, \
+            .storage = RSH_DB_RELATIVE, \
+            .setup_profile = (candidate_profile) \
+        } \
+    }
+
+EMBY_DASHBOARD_MATRIX_DBS(
+    emby_dashboard_date_missing_dbs,
+    EMBY_PROFILE_EPISODES_DATE_INDEX_MISSING
+);
+EMBY_DASHBOARD_MATRIX_DBS(
+    emby_dashboard_group_missing_dbs,
+    EMBY_PROFILE_EPISODES_GROUP_INDEX_MISSING
+);
+EMBY_DASHBOARD_MATRIX_DBS(
+    emby_dashboard_both_missing_dbs,
+    EMBY_PROFILE_EPISODES_BOTH_INDEXES_MISSING
+);
+EMBY_DASHBOARD_MATRIX_DBS(
+    emby_dashboard_movies_outer_missing_dbs,
+    EMBY_PROFILE_MOVIES_OUTER_INDEX_MISSING
+);
+EMBY_DASHBOARD_MATRIX_DBS(
+    emby_dashboard_movies_inner_missing_dbs,
+    EMBY_PROFILE_MOVIES_INNER_INDEX_MISSING
+);
+EMBY_DASHBOARD_MATRIX_DBS(
+    emby_dashboard_probe_error_dbs,
+    EMBY_PROFILE_FIXTURE_CANARY
+);
+
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_dashboard_group_1,
+    "dashboard-latest", EMBY_DASHBOARD_MATRIX_LATEST_12,
+    "dashboard-latest-nbyte-with-nul", EMBY_DASHBOARD_MATRIX_LATEST_12_NUL,
+    "dashboard-latest-limit16", EMBY_DASHBOARD_MATRIX_LATEST_16
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_dashboard_group_2,
+    "dashboard-mixed-same-control", EMBY_DASHBOARD_MATRIX_MIXED_CONTROL,
+    "dashboard-distinct-negative", EMBY_DASHBOARD_MATRIX_DISTINCT_NEGATIVE,
+    "dashboard-aggregate-negative", EMBY_DASHBOARD_MATRIX_AGGREGATE_NEGATIVE
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_dashboard_group_3,
+    "dashboard-over-negative", EMBY_DASHBOARD_MATRIX_OVER_NEGATIVE
+);
+static const emby_matrix_case emby_dashboard_movies_cases[] = {
+    {"dashboard-movies-limits", EMBY_DASHBOARD_MATRIX_MOVIES_12},
+    {"dashboard-movies-limits", EMBY_DASHBOARD_MATRIX_MOVIES_16},
+    {"dashboard-movies-limits", EMBY_DASHBOARD_MATRIX_MOVIES_20}
+};
+static const rsh_matrix_axis_value emby_dashboard_movies_values[] = {
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_dashboard_movies_cases, 0, "limit-12",
+        EMBY_DASHBOARD_MATRIX_MOVIES_12
+    ),
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_dashboard_movies_cases, 1, "limit-16",
+        EMBY_DASHBOARD_MATRIX_MOVIES_16
+    ),
+    EMBY_MATRIX_AXIS_VALUE(
+        emby_dashboard_movies_cases, 2, "limit-20",
+        EMBY_DASHBOARD_MATRIX_MOVIES_20
+    )
+};
+static const rsh_matrix_axis emby_dashboard_movies_axes[] = {
+    {
+        .name = "limit",
+        .values = emby_dashboard_movies_values,
+        .value_count = sizeof(emby_dashboard_movies_values) /
+                       sizeof(emby_dashboard_movies_values[0])
+    }
+};
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_dashboard_date_missing,
+    "dashboard-episodes-date-index-missing",
+    EMBY_DASHBOARD_MATRIX_EPISODES_DATE_INDEX_MISSING
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_dashboard_group_missing,
+    "dashboard-episodes-group-index-missing",
+    EMBY_DASHBOARD_MATRIX_EPISODES_GROUP_INDEX_MISSING
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_dashboard_both_missing,
+    "dashboard-episodes-both-indexes-missing",
+    EMBY_DASHBOARD_MATRIX_EPISODES_BOTH_INDEXES_MISSING
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_dashboard_movies_outer_missing,
+    "dashboard-movies-outer-missing",
+    EMBY_DASHBOARD_MATRIX_MOVIES_OUTER_INDEX_MISSING
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_dashboard_movies_inner_missing,
+    "dashboard-movies-inner-missing",
+    EMBY_DASHBOARD_MATRIX_MOVIES_INNER_INDEX_MISSING
+);
+static const rsh_matrix_axis_value emby_dashboard_probe_error_values[] = {
+    {.label = "probe-error", .integer = 0}
+};
+static const rsh_matrix_axis emby_dashboard_probe_error_axes[] = {
+    {
+        .name = "probe-state",
+        .values = emby_dashboard_probe_error_values,
+        .value_count = sizeof(emby_dashboard_probe_error_values) /
+                       sizeof(emby_dashboard_probe_error_values[0])
+    }
+};
+
+static const rsh_matrix_phase_spec emby_dashboard_matrix_phases[] = {
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-group-1", "dashboard-group-1", emby_dashboard_group_1_axes,
+        emby_dashboard_matrix_all_dbs, rsh_matrix_assert_emby_dashboard, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-group-2", "dashboard-group-2", emby_dashboard_group_2_axes,
+        emby_dashboard_matrix_all_dbs, rsh_matrix_assert_emby_dashboard, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-group-3", "dashboard-group-3", emby_dashboard_group_3_axes,
+        emby_dashboard_matrix_all_dbs, rsh_matrix_assert_emby_dashboard, 1
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-movies", "dashboard-movies", emby_dashboard_movies_axes,
+        emby_dashboard_matrix_all_dbs, rsh_matrix_assert_emby_dashboard, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-date-missing", "dashboard-date-missing",
+        emby_dashboard_date_missing_axes, emby_dashboard_date_missing_dbs,
+        rsh_matrix_assert_emby_dashboard, 1
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-group-missing", "dashboard-group-missing",
+        emby_dashboard_group_missing_axes, emby_dashboard_group_missing_dbs,
+        rsh_matrix_assert_emby_dashboard, 1
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-both-missing", "dashboard-both-missing",
+        emby_dashboard_both_missing_axes, emby_dashboard_both_missing_dbs,
+        rsh_matrix_assert_emby_dashboard, 1
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-movies-outer-missing", "dashboard-movies-outer-missing",
+        emby_dashboard_movies_outer_missing_axes,
+        emby_dashboard_movies_outer_missing_dbs,
+        rsh_matrix_assert_emby_dashboard, 1
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-movies-inner-missing", "dashboard-movies-inner-missing",
+        emby_dashboard_movies_inner_missing_axes,
+        emby_dashboard_movies_inner_missing_dbs,
+        rsh_matrix_assert_emby_dashboard, 1
+    ),
+    {
+        .label = "dashboard-probe-error",
+        .cell_dir_prefix = "dashboard-probe-error",
+        .axes = emby_dashboard_probe_error_axes,
+        .axis_count = sizeof(emby_dashboard_probe_error_axes) /
+                      sizeof(emby_dashboard_probe_error_axes[0]),
+        .dbs = emby_dashboard_probe_error_dbs,
+        .db_count = sizeof(emby_dashboard_probe_error_dbs) /
+                    sizeof(emby_dashboard_probe_error_dbs[0]),
+        .steps = emby_dashboard_probe_error_steps,
+        .step_count = sizeof(emby_dashboard_probe_error_steps) /
+                      sizeof(emby_dashboard_probe_error_steps[0]),
+        .expected_cells = 1
+    }
+};
+
+enum emby_d5b_case_id {
+    EMBY_D5B_FIX_WIDE_M3 = 1,
+    EMBY_D5B_FIX_WIDE_M4,
+    EMBY_D5B_FIX_COMPACT_M5,
+    EMBY_D5B_FIX_COMPACT_M6,
+    EMBY_D5B_FIX_EPISODES_E2,
+    EMBY_D5B_FIX_EPISODES_MINUS_ONE,
+    EMBY_D5B_FIX_MOVIES_M7,
+    EMBY_D5B_FIX_MOVIES_MINUS_ONE,
+    EMBY_D5B_FIX_NEG_E1_FAVORITES,
+    EMBY_D5B_FIX_NEG_M1_FAVORITES,
+    EMBY_D5B_FIX_NEG_TYPE5_RESUME,
+    EMBY_D5B_FIX_NEG_M2_TAIL,
+    EMBY_D5B_FIX_NEG_AGGREGATE,
+    EMBY_D5B_FIX_NEG_WINDOW,
+    EMBY_D5B_FIX_NEG_STAR,
+    EMBY_D5B_FIX_NEG_PAREN,
+    EMBY_D5B_FIX_NEG_SCALAR_MINUS_TWO,
+    EMBY_D5B_FIX_NEG_SCALAR_LEADING_SPACE,
+    EMBY_D5B_FIX_NEG_SCALAR_SPLIT_SIGN,
+    EMBY_D5B_FIX_NEG_SCALAR_EXPRESSION,
+    EMBY_D5B_FIX_NEG_SCALAR_OR,
+    EMBY_D5B_FIX_NEG_SCALAR_CORRELATED,
+    EMBY_D5B_FIX_NEG_SCALAR_BIND,
+    EMBY_D5B_FIX_NEG_BAD_LIMIT,
+    EMBY_D5B_FIX_NEG_SCALAR_NONINTEGER,
+    EMBY_D5B_FIX_NEG_SCALAR_OPERATOR,
+    EMBY_D5B_FIX_NEG_MIXED_ANCESTOR,
+    EMBY_D5B_FIX_NEG_DUPLICATE_LIST,
+    EMBY_D5B_FIX_NEG_AMBIGUOUS_SELECT,
+    EMBY_D5B_FIX_NEG_EPISODES_OFFSET,
+    EMBY_D5B_FIX_NEG_RANDOM_IMAGE,
+    EMBY_D5B_FIX_NEG_MISSING_INDEX,
+    EMBY_D5B_MIXED_POS_LITERAL_LITERAL,
+    EMBY_D5B_MIXED_POS_BIND_LITERAL,
+    EMBY_D5B_MIXED_POS_LITERAL_BIND,
+    EMBY_D5B_MIXED_POS_BIND_BIND,
+    EMBY_D5B_MIXED_NEG_TYPE8,
+    EMBY_D5B_MIXED_NEG_TYPE58,
+    EMBY_D5B_MIXED_NEG_TYPE856,
+    EMBY_D5B_MIXED_NEG_TYPE_CASE,
+    EMBY_D5B_MIXED_NEG_FROM_CASE,
+    EMBY_D5B_MIXED_NEG_COALESCE,
+    EMBY_D5B_MIXED_NEG_GROUP_CASE,
+    EMBY_D5B_MIXED_NEG_ORDER_DESC,
+    EMBY_D5B_MIXED_NEG_LIMIT4,
+    EMBY_D5B_MIXED_NEG_USER_Q1,
+    EMBY_D5B_MIXED_NEG_USER_COLON,
+    EMBY_D5B_MIXED_NEG_USER_AT,
+    EMBY_D5B_MIXED_NEG_USER_DOLLAR,
+    EMBY_D5B_MIXED_NEG_OUTSIDE_SLOTS,
+    EMBY_D5B_MIXED_NEG_THIRD_BIND,
+    EMBY_D5B_MIXED_OUTER_MISSING,
+    EMBY_D5B_MIXED_INNER_MISSING,
+    EMBY_D5B_MIXED_BOTH_MISSING,
+    EMBY_D5B_MIXED_OUTER_MALFORMED,
+    EMBY_D5B_MIXED_INNER_MALFORMED,
+    EMBY_D5B_MIXED_DISABLED
+};
+
+static void rsh_run_emby_d5b_dashboard_negative(
+    const rsh_case_context *context,
+    const char *label,
+    const char *sql,
+    const char *boundary_needle,
+    int boundary_count,
+    const char *discriminating_needle
+) {
+    require_int(
+        label, count_occurrences(sql, boundary_needle), boundary_count
+    );
+    rsh_run_emby_matrix_static_negative(
+        context, label, sql, discriminating_needle
+    );
+}
+
+static int rsh_custom_adapter_dashboard_fix_b_c_identity(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *vendor_db = rsh_context_db(context, "vendor");
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    const char *const wide_ancestors[] = {"100", "100,200"};
+    size_t i;
+
+    (void)immutable_data;
+    expect_movies_latest_semantics(candidate_db);
+    {
+        static const sqlite3_int64 candidate_ids[] = {9303, 9312, 9321};
+        movies_latest_contract contract = {
+            vendor_db,
+            candidate_db,
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION
+        };
+        char *raw = make_movies_latest_sql(1, "302", "42", "12");
+        char *expected = make_movies_latest_expected("302", "42", "12");
+
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-movies-representative-contract",
+            raw, raw, expected, NULL, NULL,
+            accept_movies_latest_legal_difference, &contract
+        );
+        require_movies_latest_vendor_rows(
+            vendor_db, "emby-dashboard-movies-vendor-contract", raw,
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION
+        );
+        require_movies_latest_candidate_rows(
+            candidate_db, "emby-dashboard-movies-candidate-contract", raw,
+            expected, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, candidate_ids,
+            (int)(sizeof(candidate_ids) / sizeof(candidate_ids[0]))
+        );
+        free(raw);
+        free(expected);
+    }
+    for (i = 0; i < sizeof(wide_ancestors) / sizeof(wide_ancestors[0]); i++) {
+        char label[64];
+        char *raw = make_movies_latest_sql_form(
+            1, wide_ancestors[i], 0, EMBY_MOVIES_LATEST_WIDE_PROJECTION,
+            "42", "20"
+        );
+        char *expected = make_movies_latest_expected_projection(
+            wide_ancestors[i], EMBY_MOVIES_LATEST_WIDE_PROJECTION, "42", "20"
+        );
+
+        snprintf(
+            label, sizeof(label), "dashboard-movies-wide-m%lu",
+            (unsigned long)i + 3
+        );
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2, label,
+            raw, raw, expected, NULL, NULL, NULL, NULL
+        );
+        free(raw);
+        free(expected);
+    }
+    {
+        char *oracle = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 0, "12"
+        );
+        char *scalar = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 1, "12"
+        );
+        char *expected = make_latest_expected_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", "12"
+        );
+
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-episodes-contract", oracle, scalar, expected,
+            NULL, NULL, NULL, NULL
+        );
+        free(oracle);
+        free(scalar);
+        free(expected);
+    }
+    {
+        char ids[32];
+        char *scalar = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", 1, "12"
+        );
+        char *expected = make_latest_expected_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", "12"
+        );
+
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-episodes-scalar-minus-one-contract",
+            scalar, scalar, expected, NULL, NULL, NULL, NULL
+        );
+        collect_int_column(
+            candidate_db, "dashboard-episodes-scalar-minus-one-ids",
+            scalar, expected, -1, 0, ids, sizeof(ids)
+        );
+        require_str_eq(
+            "dashboard-episodes-scalar-minus-one-exact-id", ids, "7,"
+        );
+        free(scalar);
+        free(expected);
+    }
+    {
+        char *oracle = make_movies_latest_sql(1, "100", "42", "12");
+        char *scalar = make_movies_latest_sql_form(
+            1, "100", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        char *expected = make_movies_latest_expected("100", "42", "12");
+
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-movies-singleton-contract", oracle, scalar,
+            expected, NULL, NULL, NULL, NULL
+        );
+        free(oracle);
+        free(scalar);
+        free(expected);
+    }
+    {
+        char ids[32];
+        char *scalar = make_movies_latest_sql_form(
+            1, "-1", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        char *expected = make_movies_latest_expected("-1", "42", "12");
+
+        contract_parity_require(
+            vendor_db, candidate_db, contract_prepare_v2,
+            "emby-dashboard-movies-scalar-minus-one-contract",
+            scalar, scalar, expected, NULL, NULL, NULL, NULL
+        );
+        collect_int_column(
+            candidate_db, "dashboard-movies-scalar-minus-one-ids",
+            scalar, expected, -1, 0, ids, sizeof(ids)
+        );
+        require_str_eq(
+            "dashboard-movies-scalar-minus-one-exact-id", ids, "3,"
+        );
+        free(scalar);
+        free(expected);
+    }
+    return SQLITE_OK;
+}
+
+static int rsh_matrix_assert_emby_d5b_fix(
+    const rsh_case_context *context,
+    const rsh_matrix_cell_step *step,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    char *sql = NULL;
+    char *expected = NULL;
+    const char *boundary = NULL;
+    const char *discriminator = NULL;
+    int boundary_count = 1;
+    int sql_owned = 0;
+
+    (void)step;
+    (void)ctx;
+    switch (matrix_case->case_id) {
+    case EMBY_D5B_FIX_WIDE_M3:
+    case EMBY_D5B_FIX_WIDE_M4:
+        {
+            const char *ancestors =
+                matrix_case->case_id == EMBY_D5B_FIX_WIDE_M3
+                    ? "100" : "100,200";
+            char *outer_select;
+
+            sql = make_movies_latest_sql_form(
+                1, ancestors, 0, EMBY_MOVIES_LATEST_WIDE_PROJECTION,
+                "42", "20"
+            );
+            sql_owned = 1;
+            expected = make_movies_latest_expected_projection(
+                ancestors, EMBY_MOVIES_LATEST_WIDE_PROJECTION, "42", "20"
+            );
+            outer_select = xasprintf(
+                " ) SELECT %sFROM ranked AS R",
+                EMBY_MOVIES_LATEST_WIDE_PROJECTION
+            );
+            require_contains(matrix_case->label, expected, outer_select);
+            free(outer_select);
+            rsh_run_emby_matrix_sql_exact(
+                context, matrix_case->label, sql, expected,
+                RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+            );
+        }
+        break;
+    case EMBY_D5B_FIX_COMPACT_M5:
+    case EMBY_D5B_FIX_COMPACT_M6:
+        {
+            const char *ancestors =
+                matrix_case->case_id == EMBY_D5B_FIX_COMPACT_M5
+                    ? "201,202,203,204" : "9,10,11,12,13,14";
+            sql = make_movies_latest_sql(1, ancestors, "42", "12");
+            sql_owned = 1;
+            expected = make_movies_latest_expected(ancestors, "42", "12");
+            rsh_run_emby_matrix_sql_exact(
+                context, matrix_case->label, sql, expected,
+                RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+            );
+        }
+        break;
+    case EMBY_D5B_FIX_EPISODES_E2:
+        sql = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", 1, "12"
+        );
+        sql_owned = 1;
+        expected = make_latest_expected_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "100", "12"
+        );
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+        break;
+    case EMBY_D5B_FIX_EPISODES_MINUS_ONE:
+        sql = make_latest_sql_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", 1, "12"
+        );
+        sql_owned = 1;
+        expected = make_latest_expected_form(
+            EMBY_EPISODES_LATEST_WIDE_PROJECTION, "-1", "12"
+        );
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+        break;
+    case EMBY_D5B_FIX_MOVIES_M7:
+        sql = make_movies_latest_sql_form(
+            1, "100", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        expected = make_movies_latest_expected("100", "42", "12");
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+        break;
+    case EMBY_D5B_FIX_MOVIES_MINUS_ONE:
+        sql = make_movies_latest_sql_form(
+            1, "-1", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        expected = make_movies_latest_expected("-1", "42", "12");
+        rsh_run_emby_matrix_sql_exact(
+            context, matrix_case->label, sql, expected,
+            RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+        break;
+    case EMBY_D5B_FIX_NEG_E1_FAVORITES:
+        sql = (char *)TEST_E1_FAVORITES;
+        boundary = "where A.Type=8 ";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_M1_FAVORITES:
+        sql = (char *)TEST_M1_FAVORITES;
+        boundary = "where A.Type=5 ";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_TYPE5_RESUME:
+        sql = (char *)TEST_TYPE5_RESUME;
+        boundary = "LastWatchedEpisodes";
+        boundary_count = 2;
+        discriminator =
+            "left join MediaItems AS LastWatchedEpisodes ON "
+            "LastWatchedEpisodes.SeriesPresentationUniqueKey="
+            "A.SeriesPresentationUniqueKey";
+        break;
+    case EMBY_D5B_FIX_NEG_M2_TAIL:
+        sql = (char *)TEST_M2_PREMIERE_TAIL;
+        boundary = "A.PremiereDate>=1752355308";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_AGGREGATE:
+        sql = (char *)TEST_MOVIES_AGGREGATE_PROJECTION;
+        boundary = "MAX(A.DateCreated)";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_WINDOW:
+        sql = (char *)TEST_MOVIES_WINDOW_PROJECTION;
+        boundary = "count(*) OVER()";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_STAR:
+        sql = (char *)TEST_MOVIES_BARE_STAR_PROJECTION;
+        boundary = "select * from";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_PAREN:
+        sql = (char *)TEST_MOVIES_PAREN_PROJECTION;
+        boundary = "select (A.Id)";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_MINUS_TWO:
+        sql = make_movies_latest_sql_form(
+            1, "-2", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        boundary = "AncestorId=-2 )select";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_LEADING_SPACE:
+        sql = make_movies_latest_sql_form(
+            1, " -1", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        boundary = "AncestorId= -1 )select";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_SPLIT_SIGN:
+        sql = make_movies_latest_sql_form(
+            1, "- 1", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        boundary = "AncestorId=- 1 )select";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_EXPRESSION:
+        sql = make_movies_latest_sql_form(
+            1, "-1+0", 1, EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        boundary = "AncestorId=-1+0 )select";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_OR:
+        sql = make_movies_latest_sql_form(
+            1, "-1 OR AncestorId=200", 1,
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        boundary = "AncestorId=-1 OR AncestorId=200 )select";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_CORRELATED:
+        sql = make_movies_latest_sql_form(
+            1, "-1 AND ItemId=A.Id", 1,
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION, "42", "12"
+        );
+        sql_owned = 1;
+        boundary = "AncestorId=-1 AND ItemId=A.Id )select";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_BIND:
+        sql = (char *)TEST_MOVIES_SCALAR_BIND;
+        boundary = "AncestorId=?";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_BAD_LIMIT:
+        sql = (char *)TEST_MOVIES_BAD_LIMIT;
+        boundary = "LIMIT 11";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_NONINTEGER:
+        sql = (char *)TEST_MOVIES_SCALAR_NONINTEGER;
+        boundary = "AncestorId=+100";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_SCALAR_OPERATOR:
+        sql = (char *)TEST_MOVIES_SCALAR_OPERATOR;
+        boundary = "AncestorId=100 OR AncestorId=200";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_MIXED_ANCESTOR:
+        sql = (char *)TEST_MOVIES_MIXED_ANCESTOR;
+        boundary =
+            "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE "
+            "AncestorId=";
+        discriminator = "AncestorId=200 )select itemid FROM WithAncestors";
+        break;
+    case EMBY_D5B_FIX_NEG_DUPLICATE_LIST:
+        sql = (char *)TEST_MOVIES_DUPLICATE_LIST_ANCESTOR;
+        boundary =
+            "WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE "
+            "AncestorId in (";
+        boundary_count = 2;
+        discriminator =
+            "Other AS (WITH WithAncestors AS (SELECT itemid FROM "
+            "AncestorIds2 WHERE AncestorId in (200) )";
+        break;
+    case EMBY_D5B_FIX_NEG_AMBIGUOUS_SELECT:
+        sql = (char *)TEST_MOVIES_AMBIGUOUS_SELECT;
+        boundary = ") )select ";
+        boundary_count = 2;
+        discriminator =
+            "Other2 AS (WITH withancestors AS (SELECT itemid FROM "
+            "AncestorIds2 WHERE AncestorId in (300) )select itemid FROM "
+            "withancestors) select ";
+        break;
+    case EMBY_D5B_FIX_NEG_EPISODES_OFFSET:
+        sql = (char *)TEST_EPISODES_DATE_WINDOW_OFFSET;
+        boundary = "OFFSET 12";
+        discriminator = boundary;
+        break;
+    case EMBY_D5B_FIX_NEG_RANDOM_IMAGE:
+        sql = (char *)TEST_MOVIES_CORRELATED_RANDOM_IMAGE;
+        require_int(
+            "dashboard-movies-correlated-random-image/images-boundary",
+            count_occurrences(sql, "A.Images like '%Primary%'"), 1
+        );
+        require_int(
+            "dashboard-movies-correlated-random-image/order-boundary",
+            count_occurrences(sql, "ORDER BY RANDOM()"), 1
+        );
+        boundary = "AncestorId=838031 AND ItemId=A.Id";
+        discriminator = boundary;
+        break;
+    default:
+        failf("FAIL [dashboard-fix-b-c/case-id]: got=%d", matrix_case->case_id);
+    }
+    if (boundary) {
+        rsh_run_emby_d5b_dashboard_negative(
+            context, matrix_case->label, sql, boundary, boundary_count,
+            discriminator
+        );
+    }
+    if (sql_owned) free(sql);
+    free(expected);
+    return SQLITE_OK;
+}
+
+static sqlite_master_auth_probe emby_d5b_mixed_probe;
+
+static int rsh_custom_adapter_d5b_mixed_probe_set(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+    const char *label = strcmp(context->run_name, "dashboard-mixed-disabled") == 0
+        ? "dashboard-mixed-disabled/authorizer-set"
+        : "dashboard-mixed/authorizer-set";
+
+    (void)immutable_data;
+    memset(&emby_d5b_mixed_probe, 0, sizeof(emby_d5b_mixed_probe));
+    require_int(
+        label,
+        sqlite3_set_authorizer(
+            candidate, count_sqlite_master_read, &emby_d5b_mixed_probe
+        ),
+        SQLITE_OK
+    );
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_d5b_mixed_probe_clear(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+    const char *label = strcmp(context->run_name, "dashboard-mixed-disabled") == 0
+        ? "dashboard-mixed-disabled/authorizer-clear"
+        : "dashboard-mixed/authorizer-clear";
+
+    (void)immutable_data;
+    require_int(
+        label, sqlite3_set_authorizer(candidate, NULL, NULL), SQLITE_OK
+    );
+    return SQLITE_OK;
+}
+
+static void rsh_run_emby_d5b_mixed_negative(
+    const rsh_case_context *context,
+    const emby_matrix_case *matrix_case
+) {
+    char *sql = NULL;
+    char *base = NULL;
+
+    switch (matrix_case->case_id) {
+    case EMBY_D5B_MIXED_NEG_TYPE8:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "where A.Type in (8,5) ",
+            "where A.Type=8 ", "where A.Type=8 "
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_TYPE58:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "where A.Type in (8,5) ",
+            "where A.Type in (5,8) ", "where A.Type in (5,8) "
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_TYPE856:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "where A.Type in (8,5) ",
+            "where A.Type in (8,5,6) ", "where A.Type in (8,5,6) "
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_TYPE_CASE:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "A.type,A.Id", "A.Type,A.Id",
+            "A.Type,A.Id"
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_FROM_CASE:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "from mediaitems A left join",
+            "FROM mediaitems AS A left join",
+            "FROM mediaitems AS A left join"
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_COALESCE:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "Coalesce(UserDatas.played, 0)=0",
+            "Coalesce(UserDatas.played,0)=0",
+            "Coalesce(UserDatas.played,0)=0"
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_GROUP_CASE:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "Group by coalesce(A.SeriesPresentationUniqueKey, "
+            "A.PresentationUniqueKey)",
+            "Group By coalesce(A.SeriesPresentationUniqueKey, "
+            "A.PresentationUniqueKey)",
+            "Group By coalesce(A.SeriesPresentationUniqueKey, "
+            "A.PresentationUniqueKey)"
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_ORDER_DESC:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base,
+            "ORDER BY MAX(A.DateCreated) DESC",
+            "ORDER BY MAX(A.DateCreated) desc",
+            "ORDER BY MAX(A.DateCreated) desc"
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_LIMIT4:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "LIMIT 3", "LIMIT 4", "LIMIT 4"
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_USER_Q1:
+        sql = make_mixed_latest_sql("?1", "3");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql, "UserDatas.UserId=?1 "
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_USER_COLON:
+        sql = make_mixed_latest_sql(":name", "3");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql, "UserDatas.UserId=:name "
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_USER_AT:
+        sql = make_mixed_latest_sql("@name", "3");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql, "UserDatas.UserId=@name "
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_USER_DOLLAR:
+        sql = make_mixed_latest_sql("$name", "3");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql, "UserDatas.UserId=$name "
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_OUTSIDE_SLOTS:
+        base = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "A.type,A.Id",
+            "? AS extra,A.type,A.Id", "? AS extra,A.type,A.Id"
+        );
+        break;
+    case EMBY_D5B_MIXED_NEG_THIRD_BIND:
+        base = make_mixed_latest_sql("?", "?");
+        rsh_run_emby_matrix_generated_negative(
+            context, matrix_case->label, base, "A.type,A.Id",
+            "? AS third,A.type,A.Id", "? AS third,A.type,A.Id"
+        );
+        break;
+    case EMBY_D5B_MIXED_DISABLED:
+        sql = make_mixed_latest_sql("42", "3");
+        rsh_run_emby_matrix_static_negative(
+            context, matrix_case->label, sql,
+            "where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0"
+        );
+        break;
+    default:
+        failf("FAIL [dashboard-mixed/case-id]: got=%d", matrix_case->case_id);
+    }
+    free(base);
+    free(sql);
+}
+
+static int rsh_assert_emby_d5b_mixed_probe(
+    const rsh_case_context *context,
+    int mode_id,
+    int expected_delta,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    int before = emby_d5b_mixed_probe.reads;
+
+    (void)ctx;
+    if (mode_id != EMBY_SMOKE_MODE_MIXED_LATEST || expected_delta != 0) {
+        failf(
+            "FAIL [dashboard-mixed/probe-contract]: mode=%d delta=%d",
+            mode_id, expected_delta
+        );
+    }
+    rsh_run_emby_d5b_mixed_negative(context, matrix_case);
+    if (matrix_case->case_id == EMBY_D5B_MIXED_DISABLED) {
+        require_int(
+            "dashboard-mixed-disabled/probes",
+            emby_d5b_mixed_probe.reads, 0
+        );
+    } else if (matrix_case->case_id >= EMBY_D5B_MIXED_NEG_TYPE8 &&
+               matrix_case->case_id <= EMBY_D5B_MIXED_NEG_TYPE856 &&
+               emby_d5b_mixed_probe.reads - before != expected_delta) {
+        failf(
+            "FAIL [%s/probe]: expected=%d actual=%d",
+            matrix_case->label, before, emby_d5b_mixed_probe.reads
+        );
+    }
+    return SQLITE_OK;
+}
+
+static int rsh_matrix_assert_emby_d5b_mixed_positive(
+    const rsh_case_context *context,
+    const rsh_matrix_cell_step *step,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+    const char *user = "42";
+    const char *limit = "3";
+    int user_bound = 0;
+    int limit_bound = 0;
+    char *sql;
     char *expected;
+
+    (void)step;
+    (void)ctx;
+    if (matrix_case->case_id == EMBY_D5B_MIXED_POS_BIND_LITERAL ||
+        matrix_case->case_id == EMBY_D5B_MIXED_POS_BIND_BIND) {
+        user = "?";
+        user_bound = 1;
+    }
+    if (matrix_case->case_id == EMBY_D5B_MIXED_POS_LITERAL_BIND ||
+        matrix_case->case_id == EMBY_D5B_MIXED_POS_BIND_BIND) {
+        limit = "?";
+        limit_bound = 1;
+    }
+    sql = make_mixed_latest_sql(user, limit);
+    expected = make_mixed_latest_expected(user, limit);
+    expect_mixed_latest_sql(
+        candidate, matrix_case->label, sql, expected,
+        user_bound, limit_bound
+    );
+    free(sql);
+    free(expected);
+    return SQLITE_OK;
+}
+
+static int rsh_assert_emby_d5b_index_negative(
+    const rsh_case_context *context,
+    int mode_id,
+    int expected_delta,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    char *sql;
+
+    (void)ctx;
+    if (expected_delta != 0) {
+        failf("FAIL [d5b/index-delta]: got=%d want=0", expected_delta);
+    }
+    if (matrix_case->case_id == EMBY_D5B_FIX_NEG_MISSING_INDEX) {
+        if (mode_id != EMBY_SMOKE_MODE_MOVIES_LATEST) {
+            failf("FAIL [d5b/index-mode]: got=%d want=movies", mode_id);
+        }
+        rsh_run_emby_d5b_dashboard_negative(
+            context, matrix_case->label, TEST_MOVIES_MISSING_INDEX,
+            "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0", 1,
+            "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0"
+        );
+        return SQLITE_OK;
+    }
+    if (mode_id != EMBY_SMOKE_MODE_MIXED_LATEST) {
+        failf("FAIL [d5b/index-mode]: got=%d want=mixed", mode_id);
+    }
+    sql = make_mixed_latest_sql("42", "3");
+    rsh_run_emby_matrix_static_negative(
+        context, matrix_case->label, sql,
+        "where A.Type in (8,5) AND Coalesce(UserDatas.played, 0)=0"
+    );
+    free(sql);
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_dashboard_fix_b_c_log_assert(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const char *line = context->captured_stderr;
+    int episodes_misses = 0;
+    int movies_misses = 0;
+
+    (void)immutable_data;
+    while (line && *line) {
+        const char *end = strchr(line, '\n');
+        const char *e1 = strstr(line, "where A.Type=8 AND UserDatas.IsFavorite=1");
+        const char *m1 = strstr(line, "where A.Type=5 AND UserDatas.IsFavorite=1");
+        const char *type5 = strstr(line, "LastWatchedEpisodes ON");
+        const char *m2 = strstr(line, "A.PremiereDate>=1752355308");
+        int legacy_capture_source =
+            (e1 && (!end || e1 < end)) || (m1 && (!end || m1 < end)) ||
+            (type5 && (!end || type5 < end)) || (m2 && (!end || m2 < end));
+
+        if (legacy_capture_source) {
+            const char *episodes = strstr(
+                line, "reason=capture_miss mode=dashboard+episodes_latest"
+            );
+            const char *movies = strstr(
+                line, "reason=capture_miss mode=dashboard+movies_latest"
+            );
+            if (episodes && (!end || episodes < end)) episodes_misses++;
+            if (movies && (!end || movies < end)) movies_misses++;
+        }
+        if (!end) break;
+        line = end + 1;
+    }
+    require_int(
+        "dashboard-fix-b-c/episodes-silent",
+        episodes_misses, 0
+    );
+    require_int(
+        "dashboard-fix-b-c/movies-only-m2-capture",
+        movies_misses, 1
+    );
+    return SQLITE_OK;
+}
+
+static const rsh_db_spec emby_d5b_fix_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_MOVIES_SEED_ONLY,
+        .setup_profile = EMBY_PROFILE_D5B_SCALAR_MINUS_ONE_VENDOR_SEED
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_D5B_FIX_CANDIDATE,
+        .setup_profile = EMBY_PROFILE_D5B_SCALAR_MINUS_ONE_CANDIDATE_SEED
+    }
+};
+
+static const rsh_case_spec emby_d5b_fix_identity_cases[] = {
+    {
+        .label = "dashboard-fix-b-c-identity",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom = rsh_custom_adapter_dashboard_fix_b_c_identity,
+        }
+    }
+};
+
+static const rsh_phase_spec emby_dashboard_fix_b_c_identity_phases[] = {
+    {
+        .label = "dashboard-fix-b-c-identity",
+        .dbs = emby_d5b_fix_dbs,
+        .db_count = sizeof(emby_d5b_fix_dbs) / sizeof(emby_d5b_fix_dbs[0]),
+        .cases = emby_d5b_fix_identity_cases,
+        .case_count = sizeof(emby_d5b_fix_identity_cases) /
+                      sizeof(emby_d5b_fix_identity_cases[0])
+    }
+};
+
+#define EMBY_D5B_PROFILE_DBS(name, profile_value) \
+    static const rsh_db_spec name[] = { \
+        { \
+            .role = "vendor", \
+            .relative_path = "not-target.db", \
+            .kind = RSH_DB_VENDOR, \
+            .storage = RSH_DB_RELATIVE, \
+            .setup_profile = (profile_value) \
+        }, \
+        { \
+            .role = "candidate", \
+            .relative_path = "library.db", \
+            .kind = RSH_DB_CANDIDATE, \
+            .storage = RSH_DB_RELATIVE, \
+            .setup_profile = (profile_value) \
+        } \
+    }
+
+EMBY_D5B_PROFILE_DBS(
+    emby_d5b_fix_missing_index_dbs,
+    EMBY_PROFILE_MOVIES_OUTER_INDEX_MISSING
+);
+EMBY_D5B_PROFILE_DBS(
+    emby_d5b_mixed_all_dbs, EMBY_PROFILE_D5B_MIXED_ALL_INDEXES
+);
+EMBY_D5B_PROFILE_DBS(
+    emby_d5b_mixed_outer_missing_dbs,
+    EMBY_PROFILE_D5B_MIXED_OUTER_MISSING
+);
+EMBY_D5B_PROFILE_DBS(
+    emby_d5b_mixed_inner_missing_dbs,
+    EMBY_PROFILE_D5B_MIXED_INNER_MISSING
+);
+EMBY_D5B_PROFILE_DBS(
+    emby_d5b_mixed_both_missing_dbs,
+    EMBY_PROFILE_D5B_MIXED_BOTH_MISSING
+);
+EMBY_D5B_PROFILE_DBS(
+    emby_d5b_mixed_outer_malformed_dbs,
+    EMBY_PROFILE_D5B_MIXED_OUTER_MALFORMED
+);
+EMBY_D5B_PROFILE_DBS(
+    emby_d5b_mixed_inner_malformed_dbs,
+    EMBY_PROFILE_D5B_MIXED_INNER_MALFORMED
+);
+
+static const rsh_case_spec emby_d5b_mixed_probe_cases[] = {
+    {
+        .label = "dashboard-mixed-probe-set",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom = rsh_custom_adapter_d5b_mixed_probe_set,
+        }
+    },
+    {
+        .label = "dashboard-mixed-probe-negative",
+        .kind = RSH_CASE_INDEX_PROBE,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.index_probe = {
+            .role = "candidate",
+            .mode_id = EMBY_SMOKE_MODE_MIXED_LATEST,
+            .expected_delta = 0,
+            .assert_probe = rsh_assert_emby_d5b_mixed_probe
+        }
+    },
+    {
+        .label = "dashboard-mixed-probe-clear",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom = rsh_custom_adapter_d5b_mixed_probe_clear,
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_d5b_mixed_probe_steps[] = {
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d5b_mixed_probe_cases,
+        .case_count = sizeof(emby_d5b_mixed_probe_cases) /
+                      sizeof(emby_d5b_mixed_probe_cases[0])
+    }
+};
+
+static const rsh_case_spec emby_d5b_fix_index_cases[] = {
+    {
+        .label = "dashboard-movies-missing-index",
+        .kind = RSH_CASE_INDEX_PROBE,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.index_probe = {
+            .role = "candidate",
+            .mode_id = EMBY_SMOKE_MODE_MOVIES_LATEST,
+            .expected_delta = 0,
+            .assert_probe = rsh_assert_emby_d5b_index_negative
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_d5b_fix_index_steps[] = {
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d5b_fix_index_cases,
+        .case_count = sizeof(emby_d5b_fix_index_cases) /
+                      sizeof(emby_d5b_fix_index_cases[0])
+    }
+};
+
+static const rsh_case_spec emby_d5b_mixed_index_cases[] = {
+    {
+        .label = "dashboard-mixed-index-negative",
+        .kind = RSH_CASE_INDEX_PROBE,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.index_probe = {
+            .role = "candidate",
+            .mode_id = EMBY_SMOKE_MODE_MIXED_LATEST,
+            .expected_delta = 0,
+            .assert_probe = rsh_assert_emby_d5b_index_negative
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_d5b_mixed_index_steps[] = {
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d5b_mixed_index_cases,
+        .case_count = sizeof(emby_d5b_mixed_index_cases) /
+                      sizeof(emby_d5b_mixed_index_cases[0])
+    }
+};
+
+#define EMBY_D5B_CASE_MATRIX_PHASE( \
+    phase_label, prefix, axis_rows, db_rows, step_rows, cell_count) \
+    { \
+        .label = (phase_label), \
+        .cell_dir_prefix = (prefix), \
+        .axes = (axis_rows), \
+        .axis_count = sizeof(axis_rows) / sizeof((axis_rows)[0]), \
+        .dbs = (db_rows), \
+        .db_count = sizeof(db_rows) / sizeof((db_rows)[0]), \
+        .steps = (step_rows), \
+        .step_count = sizeof(step_rows) / sizeof((step_rows)[0]), \
+        .expected_cells = (cell_count) \
+    }
+
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_positive_1,
+    "dashboard-movies-wide-m3", EMBY_D5B_FIX_WIDE_M3,
+    "dashboard-movies-wide-m4", EMBY_D5B_FIX_WIDE_M4,
+    "dashboard-movies-m5-byte-identical", EMBY_D5B_FIX_COMPACT_M5
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_positive_2,
+    "dashboard-movies-m6-byte-identical", EMBY_D5B_FIX_COMPACT_M6,
+    "dashboard-episodes-e2-scalar", EMBY_D5B_FIX_EPISODES_E2,
+    "dashboard-episodes-scalar-minus-one", EMBY_D5B_FIX_EPISODES_MINUS_ONE
+);
+EMBY_DEFINE_MATRIX_AXIS_2(
+    emby_d5b_fix_positive_3,
+    "dashboard-movies-m7-scalar", EMBY_D5B_FIX_MOVIES_M7,
+    "dashboard-movies-scalar-minus-one", EMBY_D5B_FIX_MOVIES_MINUS_ONE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_negative_1,
+    "dashboard-e1-favorites-silent", EMBY_D5B_FIX_NEG_E1_FAVORITES,
+    "dashboard-m1-favorites-silent", EMBY_D5B_FIX_NEG_M1_FAVORITES,
+    "dashboard-type5-resume-silent", EMBY_D5B_FIX_NEG_TYPE5_RESUME
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_negative_2,
+    "dashboard-m2-tail-miss", EMBY_D5B_FIX_NEG_M2_TAIL,
+    "dashboard-movies-aggregate-projection", EMBY_D5B_FIX_NEG_AGGREGATE,
+    "dashboard-movies-window-projection", EMBY_D5B_FIX_NEG_WINDOW
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_negative_3,
+    "dashboard-movies-bare-star-projection", EMBY_D5B_FIX_NEG_STAR,
+    "dashboard-movies-parenthesized-projection", EMBY_D5B_FIX_NEG_PAREN,
+    "dashboard-movies-scalar-minus-two", EMBY_D5B_FIX_NEG_SCALAR_MINUS_TWO
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_negative_4,
+    "dashboard-movies-scalar-leading-space",
+    EMBY_D5B_FIX_NEG_SCALAR_LEADING_SPACE,
+    "dashboard-movies-scalar-split-sign",
+    EMBY_D5B_FIX_NEG_SCALAR_SPLIT_SIGN,
+    "dashboard-movies-scalar-expression",
+    EMBY_D5B_FIX_NEG_SCALAR_EXPRESSION
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_negative_5,
+    "dashboard-movies-scalar-minus-one-or", EMBY_D5B_FIX_NEG_SCALAR_OR,
+    "dashboard-movies-scalar-minus-one-correlated",
+    EMBY_D5B_FIX_NEG_SCALAR_CORRELATED,
+    "dashboard-movies-scalar-bind", EMBY_D5B_FIX_NEG_SCALAR_BIND
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_negative_6,
+    "dashboard-movies-bad-limit", EMBY_D5B_FIX_NEG_BAD_LIMIT,
+    "dashboard-movies-scalar-noninteger",
+    EMBY_D5B_FIX_NEG_SCALAR_NONINTEGER,
+    "dashboard-movies-scalar-operator", EMBY_D5B_FIX_NEG_SCALAR_OPERATOR
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_fix_negative_7,
+    "dashboard-movies-mixed-ancestor", EMBY_D5B_FIX_NEG_MIXED_ANCESTOR,
+    "dashboard-movies-duplicate-list-ancestor",
+    EMBY_D5B_FIX_NEG_DUPLICATE_LIST,
+    "dashboard-movies-ambiguous-select", EMBY_D5B_FIX_NEG_AMBIGUOUS_SELECT
+);
+EMBY_DEFINE_MATRIX_AXIS_2(
+    emby_d5b_fix_negative_8,
+    "dashboard-episodes-date-window-offset",
+    EMBY_D5B_FIX_NEG_EPISODES_OFFSET,
+    "dashboard-movies-correlated-random-image",
+    EMBY_D5B_FIX_NEG_RANDOM_IMAGE
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_fix_missing_index,
+    "dashboard-movies-missing-index", EMBY_D5B_FIX_NEG_MISSING_INDEX
+);
+
+static const rsh_matrix_phase_spec emby_dashboard_fix_b_c_matrix_phases[] = {
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-positive-1", "fix-positive-1", emby_d5b_fix_positive_1_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-positive-2", "fix-positive-2", emby_d5b_fix_positive_2_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-positive-3", "fix-positive-3", emby_d5b_fix_positive_3_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 2
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-1", "fix-negative-1", emby_d5b_fix_negative_1_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-2", "fix-negative-2", emby_d5b_fix_negative_2_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-3", "fix-negative-3", emby_d5b_fix_negative_3_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-4", "fix-negative-4", emby_d5b_fix_negative_4_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-5", "fix-negative-5", emby_d5b_fix_negative_5_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-6", "fix-negative-6", emby_d5b_fix_negative_6_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-7", "fix-negative-7", emby_d5b_fix_negative_7_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "fix-negative-8", "fix-negative-8", emby_d5b_fix_negative_8_axes,
+        emby_d5b_fix_dbs, rsh_matrix_assert_emby_d5b_fix, 2
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "fix-missing-index", "fix-missing-index",
+        emby_d5b_fix_missing_index_axes, emby_d5b_fix_missing_index_dbs,
+        emby_d5b_fix_index_steps, 1
+    )
+};
+
+static const rsh_case_spec emby_dashboard_fix_b_c_post_close_cases[] = {
+    {
+        .label = "dashboard-fix-b-c-log-assert",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_LOG_CAPTURE,
+            .assert_custom = rsh_custom_adapter_dashboard_fix_b_c_log_assert,
+        }
+    }
+};
+
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_mixed_positive_1,
+    "dashboard-mixed-latest-bind-0", EMBY_D5B_MIXED_POS_LITERAL_LITERAL,
+    "dashboard-mixed-latest-bind-1", EMBY_D5B_MIXED_POS_BIND_LITERAL,
+    "dashboard-mixed-latest-bind-2", EMBY_D5B_MIXED_POS_LITERAL_BIND
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_positive_2,
+    "dashboard-mixed-latest-bind-3", EMBY_D5B_MIXED_POS_BIND_BIND
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_mixed_probe_negatives,
+    "dashboard-mixed-negative-0", EMBY_D5B_MIXED_NEG_TYPE8,
+    "dashboard-mixed-negative-1", EMBY_D5B_MIXED_NEG_TYPE58,
+    "dashboard-mixed-negative-2", EMBY_D5B_MIXED_NEG_TYPE856
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_mixed_negatives_1,
+    "dashboard-mixed-negative-3", EMBY_D5B_MIXED_NEG_TYPE_CASE,
+    "dashboard-mixed-negative-4", EMBY_D5B_MIXED_NEG_FROM_CASE,
+    "dashboard-mixed-negative-5", EMBY_D5B_MIXED_NEG_COALESCE
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_mixed_negatives_2,
+    "dashboard-mixed-negative-6", EMBY_D5B_MIXED_NEG_GROUP_CASE,
+    "dashboard-mixed-negative-7", EMBY_D5B_MIXED_NEG_ORDER_DESC,
+    "dashboard-mixed-negative-8", EMBY_D5B_MIXED_NEG_LIMIT4
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_mixed_negatives_3,
+    "dashboard-mixed-bind-reject-0", EMBY_D5B_MIXED_NEG_USER_Q1,
+    "dashboard-mixed-bind-reject-1", EMBY_D5B_MIXED_NEG_USER_COLON,
+    "dashboard-mixed-bind-reject-2", EMBY_D5B_MIXED_NEG_USER_AT
+);
+EMBY_DEFINE_MATRIX_AXIS_3(
+    emby_d5b_mixed_negatives_4,
+    "dashboard-mixed-bind-reject-3", EMBY_D5B_MIXED_NEG_USER_DOLLAR,
+    "dashboard-mixed-bind-outside-slots", EMBY_D5B_MIXED_NEG_OUTSIDE_SLOTS,
+    "dashboard-mixed-third-bind", EMBY_D5B_MIXED_NEG_THIRD_BIND
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_outer_missing,
+    "dashboard-mixed-outer-missing", EMBY_D5B_MIXED_OUTER_MISSING
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_inner_missing,
+    "dashboard-mixed-inner-missing", EMBY_D5B_MIXED_INNER_MISSING
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_both_missing,
+    "dashboard-mixed-both-missing", EMBY_D5B_MIXED_BOTH_MISSING
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_outer_malformed,
+    "dashboard-mixed-outer-mismatch", EMBY_D5B_MIXED_OUTER_MALFORMED
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_inner_malformed,
+    "dashboard-mixed-inner-mismatch", EMBY_D5B_MIXED_INNER_MALFORMED
+);
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5b_mixed_disabled,
+    "dashboard-mixed-disabled", EMBY_D5B_MIXED_DISABLED
+);
+
+static const rsh_matrix_phase_spec emby_dashboard_mixed_latest_matrix_phases[] = {
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "mixed-positive-1", "mixed-positive-1",
+        emby_d5b_mixed_positive_1_axes, emby_d5b_mixed_all_dbs,
+        rsh_matrix_assert_emby_d5b_mixed_positive, 3
+    ),
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "mixed-positive-2", "mixed-positive-2",
+        emby_d5b_mixed_positive_2_axes, emby_d5b_mixed_all_dbs,
+        rsh_matrix_assert_emby_d5b_mixed_positive, 1
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-probe-negatives", "mixed-probe-negatives",
+        emby_d5b_mixed_probe_negatives_axes, emby_d5b_mixed_all_dbs,
+        emby_d5b_mixed_probe_steps, 3
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-negatives-1", "mixed-negatives-1",
+        emby_d5b_mixed_negatives_1_axes, emby_d5b_mixed_all_dbs,
+        emby_d5b_mixed_probe_steps, 3
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-negatives-2", "mixed-negatives-2",
+        emby_d5b_mixed_negatives_2_axes, emby_d5b_mixed_all_dbs,
+        emby_d5b_mixed_probe_steps, 3
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-negatives-3", "mixed-negatives-3",
+        emby_d5b_mixed_negatives_3_axes, emby_d5b_mixed_all_dbs,
+        emby_d5b_mixed_probe_steps, 3
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-negatives-4", "mixed-negatives-4",
+        emby_d5b_mixed_negatives_4_axes, emby_d5b_mixed_all_dbs,
+        emby_d5b_mixed_probe_steps, 3
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-outer-missing", "mixed-outer-missing",
+        emby_d5b_mixed_outer_missing_axes,
+        emby_d5b_mixed_outer_missing_dbs, emby_d5b_mixed_index_steps, 1
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-inner-missing", "mixed-inner-missing",
+        emby_d5b_mixed_inner_missing_axes,
+        emby_d5b_mixed_inner_missing_dbs, emby_d5b_mixed_index_steps, 1
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-both-missing", "mixed-both-missing",
+        emby_d5b_mixed_both_missing_axes,
+        emby_d5b_mixed_both_missing_dbs, emby_d5b_mixed_index_steps, 1
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-outer-malformed", "mixed-outer-malformed",
+        emby_d5b_mixed_outer_malformed_axes,
+        emby_d5b_mixed_outer_malformed_dbs, emby_d5b_mixed_index_steps, 1
+    ),
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-inner-malformed", "mixed-inner-malformed",
+        emby_d5b_mixed_inner_malformed_axes,
+        emby_d5b_mixed_inner_malformed_dbs, emby_d5b_mixed_index_steps, 1
+    )
+};
+
+static const rsh_matrix_phase_spec emby_dashboard_mixed_disabled_matrix_phases[] = {
+    EMBY_D5B_CASE_MATRIX_PHASE(
+        "mixed-disabled", "mixed-disabled", emby_d5b_mixed_disabled_axes,
+        emby_d5b_mixed_all_dbs, emby_d5b_mixed_probe_steps, 1
+    )
+};
+
+static const char emby_d5c_bind_qmark[] = "?";
+static const char emby_d5c_bind_qmark_1[] = "?1";
+static const char emby_d5c_bind_colon_name[] = ":name";
+static const char emby_d5c_bind_at_name[] = "@name";
+static const char emby_d5c_bind_dollar_name[] = "$name";
+static const char emby_d5c_bind_colon_1[] = ":1";
+static const char emby_d5c_bind_at_1[] = "@1";
+static const char emby_d5c_bind_dollar_1[] = "$1";
+static const char emby_d5c_bind_colon_e_acute[] = ":\xC3\xA9";
+
+static const char *const emby_d5c_binds[] = {
+    emby_d5c_bind_qmark,
+    emby_d5c_bind_qmark_1,
+    emby_d5c_bind_colon_name,
+    emby_d5c_bind_at_name,
+    emby_d5c_bind_dollar_name,
+    emby_d5c_bind_colon_1,
+    emby_d5c_bind_at_1,
+    emby_d5c_bind_dollar_1,
+    emby_d5c_bind_colon_e_acute
+};
+
+static const char emby_d5c_bind_episode_projection_needle[] =
+    "select A.Id from mediaitems A";
+static const char emby_d5c_bind_ancestor_needle[] = "in (100)";
+static const char emby_d5c_bind_user_needle[] = "UserDatas.UserId=42";
+static const char emby_d5c_bind_limit_needle[] = "LIMIT 12";
+static const char emby_d5c_bind_movie_projection_needle[] = "A.Id,A.Name";
+
+static const char *const emby_d5c_bind_needles[] = {
+    emby_d5c_bind_episode_projection_needle,
+    emby_d5c_bind_ancestor_needle,
+    emby_d5c_bind_user_needle,
+    emby_d5c_bind_limit_needle,
+    emby_d5c_bind_movie_projection_needle,
+    emby_d5c_bind_ancestor_needle,
+    emby_d5c_bind_user_needle,
+    emby_d5c_bind_limit_needle
+};
+
+static const char emby_d5c_bind_episode_projection_format[] =
+    "select %s AS bound,A.Id from mediaitems A";
+static const char emby_d5c_bind_ancestor_format[] = "in (%s)";
+static const char emby_d5c_bind_user_format[] = "UserDatas.UserId=%s";
+static const char emby_d5c_bind_limit_format[] = "LIMIT %s";
+static const char emby_d5c_bind_movie_projection_format[] =
+    "%s AS bound,A.Id,A.Name";
+
+static const char *const emby_d5c_bind_replacement_formats[] = {
+    emby_d5c_bind_episode_projection_format,
+    emby_d5c_bind_ancestor_format,
+    emby_d5c_bind_user_format,
+    emby_d5c_bind_limit_format,
+    emby_d5c_bind_movie_projection_format,
+    emby_d5c_bind_ancestor_format,
+    emby_d5c_bind_user_format,
+    emby_d5c_bind_limit_format
+};
+
+static const char emby_d5c_episode_projection_needle[] =
+    "select A.Id from mediaitems A";
+static const char emby_d5c_episode_projection_replacement[] =
+    "select * from mediaitems A";
+static const char emby_d5c_episode_group_needle[] =
+    " Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey)";
+static const char emby_d5c_episode_group_replacement[] =
+    " Group by A.PresentationUniqueKey";
+static const char emby_d5c_episode_order_needle[] =
+    " ORDER BY MAX(A.DateCreated) DESC";
+static const char emby_d5c_episode_order_replacement[] =
+    " ORDER BY A.DateCreated DESC";
+static const char emby_d5c_episode_limit_needle[] = " LIMIT 12";
+static const char emby_d5c_episode_limit_replacement[] = " LIMIT 11";
+
+static const char *const emby_d5c_episode_structural_needles[] = {
+    emby_d5c_episode_projection_needle,
+    emby_d5c_episode_group_needle,
+    emby_d5c_episode_order_needle,
+    emby_d5c_episode_limit_needle
+};
+
+static const char *const emby_d5c_episode_structural_replacements[] = {
+    emby_d5c_episode_projection_replacement,
+    emby_d5c_episode_group_replacement,
+    emby_d5c_episode_order_replacement,
+    emby_d5c_episode_limit_replacement
+};
+
+static const char emby_d5c_movie_projection_needle[] = "A.Id,A.Name";
+static const char emby_d5c_movie_projection_reorder[] = "A.Name,A.Id";
+static const char emby_d5c_movie_group_needle[] =
+    " Group by A.PresentationUniqueKey";
+static const char emby_d5c_movie_group_replacement[] = " Group by A.Id";
+static const char emby_d5c_movie_order_needle[] =
+    " ORDER BY A.DateCreated DESC";
+static const char emby_d5c_movie_order_replacement[] =
+    " ORDER BY A.Name DESC";
+static const char emby_d5c_movie_limit_needle[] = " LIMIT 12";
+static const char emby_d5c_movie_limit_replacement[] = " LIMIT 21";
+static const char emby_d5c_movie_anchor_needle[] =
+    "AND A.Id in WithAncestors";
+static const char emby_d5c_movie_anchor_replacement[] =
+    "AND A.Id in WithAncestors AND A.IsPublic=1";
+static const char emby_d5c_movie_aggregate_replacement[] =
+    "MAX(A.Id),A.Name";
+
+static const char *const emby_d5c_movie_structural_needles[] = {
+    emby_d5c_movie_projection_needle,
+    emby_d5c_movie_group_needle,
+    emby_d5c_movie_order_needle,
+    emby_d5c_movie_limit_needle,
+    emby_d5c_movie_anchor_needle,
+    emby_d5c_movie_projection_needle
+};
+
+static const char *const emby_d5c_movie_structural_replacements[] = {
+    emby_d5c_movie_projection_reorder,
+    emby_d5c_movie_group_replacement,
+    emby_d5c_movie_order_replacement,
+    emby_d5c_movie_limit_replacement,
+    emby_d5c_movie_anchor_replacement,
+    emby_d5c_movie_aggregate_replacement
+};
+
+static const char emby_d5c_movie_no_guard_discriminator[] =
+    "where A.Type=5 AND A.Id in WithAncestors";
+static const char emby_d5c_movie_no_guard_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type=5 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12";
+static const char emby_d5c_movie_empty_ancestor_discriminator[] =
+    "AncestorId in ()";
+static const char emby_d5c_movie_empty_ancestor_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in () )select "
+    "A.Id,A.Name,A.Path,A.ProductionYear,A.RunTimeTicks,A.ParentId,A.Images,UserDatas.IsFavorite,UserDatas.Played,UserDatas.PlaybackPositionTicks,UserDatas.AudioStreamIndex,UserDatas.SubtitleStreamIndex "
+    "from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by A.PresentationUniqueKey ORDER BY A.DateCreated DESC LIMIT 12";
+static const char emby_d5c_movie_comment_needle[] =
+    "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0";
+static const char emby_d5c_movie_comment_replacement[] =
+    "where A.Type=5 /* guarded tail text: where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 */ AND Coalesce(UserDatas.played, 0)=0";
+static const char emby_d5c_movie_string_projection_replacement[] =
+    "'where A.Type=5 ' AS marker,A.Id,A.Name";
+static const char emby_d5c_movie_type_gate_needle[] = "where A.Type=5 ";
+static const char emby_d5c_episode_explain_discriminator[] =
+    "EXPLAIN with WithAncestors AS";
+static const char emby_d5c_episode_explain_sql[] =
+    "EXPLAIN with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select A.Id from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 "
+    "where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY MAX(A.DateCreated) DESC LIMIT 12";
+static const char emby_d5c_applied_log_needle[] =
+    "event=rewrite_applied target=emby mode=dashboard+";
+static const char emby_d5c_index_missing_log_needle[] =
+    "reason=index_missing mode=dashboard+";
+static const char emby_d5c_index_probe_error_log_needle[] =
+    "reason=index_probe_error mode=dashboard+";
+static const char emby_d5c_bind_capture_start_marker[] =
+    "rsh-window=dashboard-bind start";
+static const char emby_d5c_bind_capture_end_marker[] =
+    "rsh-window=dashboard-bind end";
+
+static sqlite_master_auth_probe emby_d5c_matcher_probe;
+
+static int rsh_matrix_assert_emby_d5c_matcher_negatives(
+    const rsh_case_context *context,
+    const rsh_matrix_cell_step *step,
+    void *ctx
+) {
+    const emby_matrix_case *matrix_case = rsh_emby_matrix_case(context);
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+    char *episodes = make_latest_sql("A.Id ", "12");
+    char *movies = make_movies_latest_sql(1, "100", "42", "12");
+    size_t i;
+
+    (void)step;
+    (void)ctx;
+    if (matrix_case->case_id != 1) {
+        failf(
+            "FAIL [dashboard-matcher-negatives/case-id]: got=%d want=1",
+            matrix_case->case_id
+        );
+    }
+
+    memset(&emby_d5c_matcher_probe, 0, sizeof(emby_d5c_matcher_probe));
+    fprintf(stderr, "%s\n", emby_d5c_bind_capture_start_marker);
+    fflush(stderr);
+    require_int(
+        "dashboard-bind/authorizer-set",
+        sqlite3_set_authorizer(
+            candidate, count_sqlite_master_read, &emby_d5c_matcher_probe
+        ),
+        SQLITE_OK
+    );
+    for (i = 0; i < sizeof(emby_d5c_binds) / sizeof(emby_d5c_binds[0]); i++) {
+        size_t c;
+        for (c = 0; c < sizeof(emby_d5c_bind_needles) /
+                            sizeof(emby_d5c_bind_needles[0]); c++) {
+            const char *base = c < 4 ? episodes : movies;
+            char label[128];
+            char *replacement = xasprintf(
+                emby_d5c_bind_replacement_formats[c], emby_d5c_binds[i]
+            );
+
+            snprintf(
+                label, sizeof(label), "dashboard-bind-%lu-%lu",
+                (unsigned long)i, (unsigned long)c
+            );
+            rsh_run_emby_matrix_generated_negative(
+                context, label, base, emby_d5c_bind_needles[c], replacement,
+                replacement
+            );
+            free(replacement);
+        }
+    }
+    require_int(
+        "dashboard-bind/authorizer-clear",
+        sqlite3_set_authorizer(candidate, NULL, NULL), SQLITE_OK
+    );
+    fprintf(stderr, "%s\n", emby_d5c_bind_capture_end_marker);
+    fflush(stderr);
+
+    for (i = 0; i < sizeof(emby_d5c_episode_structural_needles) /
+                        sizeof(emby_d5c_episode_structural_needles[0]); i++) {
+        char label[128];
+        snprintf(
+            label, sizeof(label), "episodes-structural-negative[%lu]",
+            (unsigned long)i
+        );
+        rsh_run_emby_matrix_generated_negative(
+            context, label, episodes,
+            emby_d5c_episode_structural_needles[i],
+            emby_d5c_episode_structural_replacements[i],
+            emby_d5c_episode_structural_replacements[i]
+        );
+    }
+    for (i = 0; i < sizeof(emby_d5c_movie_structural_needles) /
+                        sizeof(emby_d5c_movie_structural_needles[0]); i++) {
+        char label[128];
+        if (i == 0) {
+            char *source = replace_once(
+                movies, emby_d5c_movie_structural_needles[i],
+                emby_d5c_movie_structural_replacements[i]
+            );
+            char *projection = replace_once(
+                EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
+                emby_d5c_movie_structural_needles[i],
+                emby_d5c_movie_structural_replacements[i]
+            );
+            char *expected = make_movies_latest_expected_projection(
+                "100", projection, "42", "12"
+            );
+
+            snprintf(
+                label, sizeof(label), "movies-structural-positive[%lu]",
+                (unsigned long)i
+            );
+            rsh_run_emby_matrix_sql_exact(
+                context, label, source, expected,
+                RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+            );
+            free(expected);
+            free(projection);
+            free(source);
+        } else {
+            snprintf(
+                label, sizeof(label), "movies-structural-negative[%lu]",
+                (unsigned long)i
+            );
+            rsh_run_emby_matrix_generated_negative(
+                context, label, movies,
+                emby_d5c_movie_structural_needles[i],
+                emby_d5c_movie_structural_replacements[i],
+                emby_d5c_movie_structural_replacements[i]
+            );
+        }
+    }
+
+    {
+        char *movies_string_projection = replace_once(
+            EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
+            emby_d5c_movie_projection_needle,
+            emby_d5c_movie_string_projection_replacement
+        );
+        char *movies_string = make_movies_latest_sql_form(
+            1, "100", 0, movies_string_projection, "42", "12"
+        );
+        char *movies_string_expected = make_movies_latest_expected_projection(
+            "100", movies_string_projection, "42", "12"
+        );
+
+        rsh_run_emby_matrix_static_negative(
+            context, "movies-no-guard-negative", emby_d5c_movie_no_guard_sql,
+            emby_d5c_movie_no_guard_discriminator
+        );
+        rsh_run_emby_matrix_static_negative(
+            context, "movies-empty-ancestor-negative",
+            emby_d5c_movie_empty_ancestor_sql,
+            emby_d5c_movie_empty_ancestor_discriminator
+        );
+        rsh_run_emby_matrix_generated_negative(
+            context, "movies-comment-tail-negative", movies,
+            emby_d5c_movie_comment_needle,
+            emby_d5c_movie_comment_replacement,
+            emby_d5c_movie_comment_replacement
+        );
+        require_int(
+            "movies-string-type-gate-immunity/type-gate-count",
+            count_occurrences(movies_string, emby_d5c_movie_type_gate_needle),
+            2
+        );
+        rsh_run_emby_matrix_sql_exact(
+            context, "movies-string-type-gate-immunity", movies_string,
+            movies_string_expected, RSH_PREPARE_V2, RSH_NBYTE_MINUS_ONE
+        );
+        rsh_run_emby_matrix_static_negative(
+            context, "episodes-explain-negative", emby_d5c_episode_explain_sql,
+            emby_d5c_episode_explain_discriminator
+        );
+
+        free(movies_string_expected);
+        free(movies_string);
+        free(movies_string_projection);
+    }
+
+    free(movies);
+    free(episodes);
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_emby_d5c_matcher_log_assert(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const char *capture_start;
+    const char *capture_end;
+    char *bind_capture;
+    size_t bind_capture_len;
+
+    (void)immutable_data;
+    require_int(
+        "dashboard-bind/readiness-probes", emby_d5c_matcher_probe.reads, 0
+    );
+    require_int(
+        "dashboard-bind/capture-start-markers",
+        count_occurrences(
+            context->captured_stderr, emby_d5c_bind_capture_start_marker
+        ),
+        1
+    );
+    require_int(
+        "dashboard-bind/capture-end-markers",
+        count_occurrences(
+            context->captured_stderr, emby_d5c_bind_capture_end_marker
+        ),
+        1
+    );
+    capture_start = strstr(
+        context->captured_stderr, emby_d5c_bind_capture_start_marker
+    );
+    capture_start += strlen(emby_d5c_bind_capture_start_marker);
+    capture_end = strstr(capture_start, emby_d5c_bind_capture_end_marker);
+    if (!capture_end) {
+        failf("FAIL [dashboard-bind/capture-window]: end marker precedes start");
+    }
+    bind_capture_len = (size_t)(capture_end - capture_start);
+    bind_capture = (char *)malloc(bind_capture_len + 1);
+    if (!bind_capture) {
+        failf(
+            "FAIL [dashboard-bind/capture-window-allocation]: bytes=%lu",
+            (unsigned long)(bind_capture_len + 1)
+        );
+    }
+    memcpy(bind_capture, capture_start, bind_capture_len);
+    bind_capture[bind_capture_len] = '\0';
+    require_absent(
+        "dashboard-bind/applied-log", bind_capture,
+        emby_d5c_applied_log_needle
+    );
+    require_absent(
+        "dashboard-bind/index-missing-log", bind_capture,
+        emby_d5c_index_missing_log_needle
+    );
+    require_absent(
+        "dashboard-bind/index-probe-error-log", bind_capture,
+        emby_d5c_index_probe_error_log_needle
+    );
+    free(bind_capture);
+    return SQLITE_OK;
+}
+
+static const rsh_db_spec emby_d5c_matcher_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_D5B_FIX_CANDIDATE
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_D5B_FIX_CANDIDATE
+    }
+};
+
+EMBY_DEFINE_MATRIX_AXIS_1(
+    emby_d5c_matcher, "dashboard-matcher-negatives", 1
+);
+
+static const rsh_matrix_phase_spec emby_dashboard_matcher_negative_phases[] = {
+    EMBY_DYNAMIC_MATRIX_PHASE(
+        "dashboard-matcher-negatives", "dashboard-matcher-negatives",
+        emby_d5c_matcher_axes, emby_d5c_matcher_dbs,
+        rsh_matrix_assert_emby_d5c_matcher_negatives, 1
+    )
+};
+
+static const rsh_case_spec emby_dashboard_matcher_negative_post_close_cases[] = {
+    {
+        .label = "dashboard-matcher-negatives-log-assert",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_LOG_CAPTURE,
+            .assert_custom = rsh_custom_adapter_emby_d5c_matcher_log_assert,
+        }
+    }
+};
+
+#define EMBY_D6_COMPLEX_RESUME_PREFIX \
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select count(*) OVER() AS TotalRecordCount,A.type,A.Id,A.SeriesPresentationUniqueKey,UserDatas.PlaybackPositionTicks," \
+    "((Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, 1) * 1000000) + Coalesce(A.SortIndexNumber, A.IndexNumber, 0) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(A.ParentIndexNumber,1)=0 Then (Cast(Coalesce(A.IndexNumber, 0) as REAL) / 100000) Else 0 End)) EpisodeAbsoluteIndexNumber " \
+    "from mediaitems A left join (Select N.SeriesPresentationUniqueKey,((Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber, 1) * 1000000) + Coalesce(N.SortIndexNumber, N.IndexNumber, 0) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then 0 Else 0.5 End) + (Select Case When Coalesce(N.ParentIndexNumber,1)=0 Then (Cast(Coalesce(N.IndexNumber, 0) as REAL) / 100000) Else 0 End)) AbsoluteIndexNumber,max(UserDatas_N.LastPlayedDateInt) LastPlayedDateInt,UserDatas_N.playbackPositionTicks from MediaItems N join UserDatas UserDatas_N on N.UserDataKeyId=UserDatas_N.UserDataKeyId And UserDatas_N.UserId=1 where N.Type=8 and Coalesce(N.SortParentIndexNumber,N.ParentIndexNumber,-1) <> 0 and (UserDatas_N.Played=1 or UserDatas_N.playbackPositionTicks > 0) Group By N.SeriesPresentationUniqueKey ORDER BY UserDatas_N.LastPlayedDateInt desc, AbsoluteIndexNumber desc) LastWatchedEpisodes on LastWatchedEpisodes.SeriesPresentationUniqueKey=A.SeriesPresentationUniqueKey " \
+    "left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=1 where ((A.Type=5 and UserDatas.playbackPositionTicks > 0) OR (A.Type=8 AND (UserDatas.playbackPositionTicks > 0 or Coalesce(UserDatas.played,0) = 0) AND (select case when LastWatchedEpisodes.playbackPositionTicks > 0 then EpisodeAbsoluteIndexNumber >= Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) else EpisodeAbsoluteIndexNumber > Coalesce(LastWatchedEpisodes.AbsoluteIndexNumber,EpisodeAbsoluteIndexNumber) end) AND LastWatchedEpisodes.LastPlayedDateInt not null)) " \
+    "AND (A.Type=5 OR Coalesce(A.SortParentIndexNumber,A.ParentIndexNumber, -1) <> 0) AND A.Type in (5,8) AND Coalesce(UserDatas.HideFromResume,0)=0 AND COALESCE((select hidefromresume from userdatas where userdatas.userid=1 and userdatas.userdatakeyid=(select userdatakeyid from mediaitems where mediaitems.id=A.seriesid)),0)=0 AND "
+#define EMBY_D6_COMPLEX_RESUME_TAIL \
+    " Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY COALESCE(lastwatchedepisodes.lastplayeddateint, userdatas.lastplayeddateint, 0) DESC,Min(EpisodeAbsoluteIndexNumber) ASC LIMIT 12"
+#define EMBY_D6_COMPLEX_RESUME_SOURCE \
+    EMBY_D6_COMPLEX_RESUME_PREFIX "A.Id in WithAncestors" \
+    EMBY_D6_COMPLEX_RESUME_TAIL
+#define EMBY_D6_COMPLEX_RESUME_EXPECTED \
+    EMBY_D6_COMPLEX_RESUME_PREFIX \
+    "EXISTS (SELECT 1 FROM AncestorIds2 WHERE AncestorIds2.itemid = A.Id AND AncestorIds2.AncestorId in (100))" \
+    " AND ((A.Type=5 AND A.UserDataKeyId IN (SELECT UserDataKeyId FROM UserDatas WHERE UserId=1 AND playbackPositionTicks>0)) OR (A.Type=8 AND A.SeriesPresentationUniqueKey IN (SELECT N2.SeriesPresentationUniqueKey FROM MediaItems N2 JOIN UserDatas UN2 ON N2.UserDataKeyId=UN2.UserDataKeyId AND UN2.UserId=1 WHERE N2.Type=8 AND Coalesce(N2.SortParentIndexNumber,N2.ParentIndexNumber,-1) <> 0 AND (UN2.Played=1 OR UN2.playbackPositionTicks>0))))" \
+    EMBY_D6_COMPLEX_RESUME_TAIL
+
+static const char emby_d6_complex_resume_sql[] =
+    EMBY_D6_COMPLEX_RESUME_SOURCE;
+static const char emby_d6_complex_resume_expected_sql[] =
+    EMBY_D6_COMPLEX_RESUME_EXPECTED;
+static const char emby_d6_complex_resume_expected_ids_sql[] =
+    "SELECT Id FROM (" EMBY_D6_COMPLEX_RESUME_EXPECTED ")";
+
+#undef EMBY_D6_COMPLEX_RESUME_EXPECTED
+#undef EMBY_D6_COMPLEX_RESUME_SOURCE
+#undef EMBY_D6_COMPLEX_RESUME_TAIL
+#undef EMBY_D6_COMPLEX_RESUME_PREFIX
+
+static const sqlite3_int64 emby_d6_complex_resume_expected_ids[] = {
+    102, 100
+};
+
+typedef struct emby_d6_row_parity_membership_spec {
+    const char *vendor_collect_label;
+    const char *candidate_collect_label;
+    const char *vendor_assertion_label;
+    const char *candidate_assertion_label;
+    const char *search_term;
+} emby_d6_row_parity_membership_spec;
+
+static const emby_d6_row_parity_membership_spec
+emby_d6_row_parity_single_membership = {
+    .vendor_collect_label = "row-parity-original",
+    .candidate_collect_label = "row-parity-rewritten",
+    .vendor_assertion_label = "row-parity/original-membership",
+    .candidate_assertion_label = "row-parity/candidate-membership",
+    .search_term = "(\"alpha\"*)"
+};
+
+static const emby_d6_row_parity_membership_spec
+emby_d6_row_parity_or_membership = {
+    .vendor_collect_label = "row-parity-or-original",
+    .candidate_collect_label = "row-parity-or-rewritten",
+    .vendor_assertion_label = "row-parity-or/original-membership",
+    .candidate_assertion_label = "row-parity-or/candidate-membership",
+    .search_term = "(\"alpha\"*) OR (\"alpha\"*)"
+};
+
+static int rsh_custom_adapter_row_parity_membership(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const emby_d6_row_parity_membership_spec *spec =
+        (const emby_d6_row_parity_membership_spec *)immutable_data;
+    sqlite3 *vendor_db = rsh_context_db(context, "vendor");
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    unsigned int vendor_mask;
+    unsigned int candidate_mask;
+
+    vendor_mask = collect_fts_id_mask(
+        vendor_db, spec->vendor_collect_label, emby_d6_row_parity_sql,
+        -1, 0, spec->search_term
+    );
+    candidate_mask = collect_fts_id_mask(
+        candidate_db, spec->candidate_collect_label, emby_d6_row_parity_sql,
+        (int)strlen(emby_d6_row_parity_sql) + 1, 1, spec->search_term
+    );
+    if (vendor_mask != 0x1f) {
+        failf("FAIL [%s]: got=0x%x want=0x1f",
+              spec->vendor_assertion_label, vendor_mask);
+    }
+    if (candidate_mask != 0x1f) {
+        failf("FAIL [%s]: got=0x%x want=0x1f",
+              spec->candidate_assertion_label, candidate_mask);
+    }
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_links_two_level_identity(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *vendor_db = rsh_context_db(context, "vendor");
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    char *expected = make_link_type_count_shape_05_expected();
     typed_rows vendor_rows;
     typed_rows candidate_rows;
 
-    configure_env("1", "0", NULL);
-    make_temp_dir();
-    vendor_db = open_seeded_temp("not-target.db");
-    candidate_db = open_seeded_temp("library.db");
-    seed_link_type_count_shape_05_rows(vendor_db);
-    seed_link_type_count_shape_05_rows(candidate_db);
-    expected = make_link_type_count_shape_05_expected();
-
+    (void)immutable_data;
     require_int(
         "links-two-level/l1-only-fixture",
         query_int(vendor_db, "links-two-level/l1-only-fixture-sql",
@@ -4413,468 +7432,49 @@ static int child_links_two_level_row_parity(void) {
     free_typed_rows(&vendor_rows);
     free_typed_rows(&candidate_rows);
     free(expected);
-    require_int("links-two-level/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
-    require_int("links-two-level/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [links-two-level-row-parity]\n");
-    return 0;
+    return SQLITE_OK;
 }
 
-static int child_dashboard_release_matrix(void) {
-    static const char *ancestors[] = {"100", "200", "999"};
-    static const char *users[] = {"42", "777"};
-    static const char *limits[] = {"12", "16", "20"};
-    int guarded = 0;
-    int passthrough = 0;
-    int ai, ui, li, stat;
-
-    configure_env("1", "1", "0");
-    require_str_eq("matrix/hot-literal", ancestors[0], "100");
-    require_str_eq("matrix/typical-literal", ancestors[1], "200");
-    require_str_eq("matrix/empty-literal", ancestors[2], "999");
-    require_str_eq("matrix/heavy-user-literal", users[0], "42");
-    require_str_eq("matrix/zero-user-literal", users[1], "777");
-    if (!strcmp(ancestors[0], ancestors[1]) || !strcmp(ancestors[0], ancestors[2]) ||
-        !strcmp(ancestors[1], ancestors[2]) || !strcmp(users[0], users[1])) {
-        failf("FAIL [matrix/literal-distinctness]");
-    }
-
-    make_temp_dir();
-    {
-        sqlite3 *pre = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-        typed_rows streams[3][2];
-        int pai;
-        int pui;
-        seed_movies_latest_rows(pre);
-        require_int("matrix/hot-count", query_int(pre, "matrix/hot-count-sql", "SELECT count(*) FROM AncestorIds2 WHERE AncestorId=100 AND itemid BETWEEN 5001 AND 5030"), 30);
-        require_int("matrix/typical-count", query_int(pre, "matrix/typical-count-sql", "SELECT count(*) FROM AncestorIds2 WHERE AncestorId=200 AND itemid BETWEEN 6001 AND 6024"), 24);
-        require_int("matrix/empty-count", query_int(pre, "matrix/empty-count-sql", "SELECT count(*) FROM AncestorIds2 WHERE AncestorId=999 AND itemid BETWEEN 5001 AND 6024"), 0);
-        require_int("matrix/user42-count", query_int(pre, "matrix/user42-count-sql", "SELECT count(*) FROM UserDatas WHERE UserId=42 AND UserDataKeyId BETWEEN 7001 AND 8024"), 54);
-        require_int("matrix/user42-played", query_int(pre, "matrix/user42-played-sql", "SELECT count(*) FROM UserDatas WHERE UserId=42 AND Played=1 AND UserDataKeyId BETWEEN 7001 AND 8024"), 10);
-        require_int("matrix/user777-count", query_int(pre, "matrix/user777-count-sql", "SELECT count(*) FROM UserDatas WHERE UserId=777"), 0);
-        for (pai = 0; pai < 3; pai++) {
-            for (pui = 0; pui < 2; pui++) {
-                char *raw = make_movies_latest_sql(1, ancestors[pai], users[pui], "20");
-                char *expected = make_movies_latest_expected(ancestors[pai], users[pui], "20");
-                streams[pai][pui] = collect_typed_rows(pre, "matrix/distinct-preflight", raw, expected);
-                free(raw);
-                free(expected);
-            }
-        }
-        require_typed_rows_differ("matrix/hot-vs-typical-user42", &streams[0][0], &streams[1][0]);
-        require_typed_rows_differ("matrix/hot-vs-typical-user777", &streams[0][1], &streams[1][1]);
-        require_typed_rows_differ("matrix/hot-users", &streams[0][0], &streams[0][1]);
-        require_typed_rows_differ("matrix/typical-users", &streams[1][0], &streams[1][1]);
-        require_int("matrix/empty-user42-rows", streams[2][0].rows, 0);
-        require_int("matrix/empty-user777-rows", streams[2][1].rows, 0);
-        for (pai = 0; pai < 3; pai++) {
-            for (pui = 0; pui < 2; pui++) free_typed_rows(&streams[pai][pui]);
-        }
-        require_int("matrix/pre-close", sqlite3_close(pre), SQLITE_OK);
-    }
-    cleanup_temp_dir();
-
-    for (stat = 0; stat < 2; stat++) {
-        for (ai = 0; ai < 3; ai++) {
-            for (ui = 0; ui < 2; ui++) {
-                for (li = 0; li < 3; li++) {
-                    sqlite3 *vendor_db;
-                    sqlite3 *candidate_db;
-                    char *raw;
-                    char *expected;
-                    typed_rows vendor;
-                    typed_rows candidate;
-                    int want_rows = ai == 2 ? 0 : atoi(limits[li]);
-
-                    make_temp_dir();
-                    vendor_db = open_seeded_temp_with_dashboard_indexes("not-target.db", 0, 0, 0, 0);
-                    candidate_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-                    seed_movies_latest_rows(vendor_db);
-                    seed_movies_latest_rows(candidate_db);
-                    if (stat) {
-                        exec_sql(vendor_db, "matrix-vendor-analyze", "PRAGMA analysis_limit=0; ANALYZE;");
-                        exec_sql(candidate_db, "matrix-candidate-analyze", "PRAGMA analysis_limit=0; ANALYZE;");
-                    }
-                    raw = make_movies_latest_sql(1, ancestors[ai], users[ui], limits[li]);
-                    expected = make_movies_latest_expected(ancestors[ai], users[ui], limits[li]);
-                    vendor = collect_typed_rows(vendor_db, "matrix/vendor", raw, raw);
-                    candidate = collect_typed_rows(candidate_db, "matrix/candidate", raw, expected);
-                    require_int("matrix/vendor-row-count", vendor.rows, want_rows);
-                    require_int("matrix/candidate-row-count", candidate.rows, want_rows);
-                    require_ordered_full_row_identity("matrix/guarded-identity", &vendor, &candidate);
-                    if (ai < 2 && li > 0) {
-                        char current_ids[1024];
-                        char prior_ids[1024];
-                        const char *prior_limit = li == 1 ? "12" : "16";
-                        char *prior_raw = make_movies_latest_sql(1, ancestors[ai], users[ui], prior_limit);
-                        collect_int_column(vendor_db, "matrix/current-ids", raw, raw, -1, 0,
-                                           current_ids, sizeof(current_ids));
-                        collect_int_column(vendor_db, "matrix/prior-ids", prior_raw, prior_raw, -1, 0,
-                                           prior_ids, sizeof(prior_ids));
-                        if (strncmp(current_ids, prior_ids, strlen(prior_ids)) != 0) {
-                            failf("FAIL [matrix/row-slice]: current=%s prior=%s",
-                                  current_ids, prior_ids);
-                        }
-                        free(prior_raw);
-                    }
-                    guarded++;
-                    free_typed_rows(&vendor);
-                    free_typed_rows(&candidate);
-
-                    free(raw);
-                    raw = make_movies_latest_sql(0, ancestors[ai], users[ui], limits[li]);
-                    vendor = collect_typed_rows(vendor_db, "matrix/no-guard-vendor", raw, raw);
-                    candidate = collect_typed_rows(candidate_db, "matrix/no-guard-candidate", raw, raw);
-                    require_ordered_full_row_identity("matrix/no-guard-identity", &vendor, &candidate);
-                    passthrough++;
-                    free_typed_rows(&vendor);
-                    free_typed_rows(&candidate);
-                    free(raw);
-                    free(expected);
-                    require_int("matrix/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
-                    require_int("matrix/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
-                    cleanup_temp_dir();
-                }
-            }
-        }
-    }
-    require_int("matrix/guarded-cells", guarded, 36);
-    require_int("matrix/no-guard-cells", passthrough, 36);
-
-    for (stat = 0; stat < 2; stat++) {
-        sqlite3 *vendor_db;
-        sqlite3 *candidate_db;
-
-        make_temp_dir();
-        vendor_db = open_seeded_temp_with_dashboard_indexes(
-            "not-target.db", 0, 0, 0, 0
-        );
-        candidate_db = open_seeded_temp_with_dashboard_indexes(
-            "library.db", 1, 1, 1, 1
-        );
-        seed_episodes_latest_semantic_rows(vendor_db);
-        seed_episodes_latest_semantic_rows(candidate_db);
-        if (stat) {
-            exec_sql(vendor_db, "episodes-semantic-vendor-analyze",
-                     "PRAGMA analysis_limit=0; ANALYZE;");
-            exec_sql(candidate_db, "episodes-semantic-candidate-analyze",
-                     "PRAGMA analysis_limit=0; ANALYZE;");
-        }
-        require_episodes_latest_semantics(vendor_db, candidate_db);
-        require_int("episodes-semantic/vendor-close",
-                    sqlite3_close(vendor_db), SQLITE_OK);
-        require_int("episodes-semantic/candidate-close",
-                    sqlite3_close(candidate_db), SQLITE_OK);
-        cleanup_temp_dir();
-    }
-
-    for (stat = 0; stat < 2; stat++) {
-        /* The movies-Latest date-ordered anti-join selects max DateCreated, then lower Id, and owns this exact order. */
-        static const sqlite3_int64 expected_candidate_ids[] = {
-            9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010,
-            9119, 9101, 9104, 9107, 9111, 9112, 9113, 9118, 9116, 9108
-        };
-        sqlite3 *vendor_db;
-        sqlite3 *candidate_db;
-        char *raw;
-        char *expected;
-        typed_rows vendor;
-        typed_rows candidate;
-        make_temp_dir();
-        vendor_db = open_seeded_temp_with_dashboard_indexes("not-target.db", 0, 0, 0, 0);
-        candidate_db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-        seed_movies_latest_expanded_rows(vendor_db);
-        seed_movies_latest_expanded_rows(candidate_db);
-        if (stat) {
-            exec_sql(vendor_db, "expanded-vendor-analyze", "PRAGMA analysis_limit=0; ANALYZE;");
-            exec_sql(candidate_db, "expanded-candidate-analyze", "PRAGMA analysis_limit=0; ANALYZE;");
-        }
-        raw = make_movies_latest_sql(1, "300", "42", "20");
-        expected = make_movies_latest_expected("300", "42", "20");
-        vendor = collect_typed_rows(vendor_db, "expanded/vendor", raw, raw);
-        candidate = collect_typed_rows(candidate_db, "expanded/candidate", raw, expected);
-        require_int("expanded/vendor-row-count", vendor.rows, 20);
-        require_int("expanded/candidate-row-count", candidate.rows, 20);
-        require_movies_latest_candidate_rows(
-            candidate_db, "expanded/candidate-contract", raw, expected,
-            EMBY_MOVIES_LATEST_COMPACT_PROJECTION, expected_candidate_ids,
-            (int)(sizeof(expected_candidate_ids) / sizeof(expected_candidate_ids[0]))
-        );
-        free_typed_rows(&vendor);
-        free_typed_rows(&candidate);
-        free(raw);
-        free(expected);
-        {
-            char order_ids[128];
-            char *order_raw;
-            char *order_expected;
-            seed_movies_latest_rewrite_order_rows(candidate_db);
-            order_raw = make_movies_latest_sql(1, "301", "42", "12");
-            order_expected = make_movies_latest_expected("301", "42", "12");
-            collect_int_column(candidate_db, "expanded/rewrite-order", order_raw,
-                               order_expected, -1, 0, order_ids, sizeof(order_ids));
-            require_str_eq("expanded/rewrite-order-ids", order_ids,
-                           "9202,9201,9204,9203,");
-            free(order_raw);
-            free(order_expected);
-        }
-        require_int("expanded/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
-        require_int("expanded/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
-        cleanup_temp_dir();
-    }
-    printf("PASS [dashboard-release-matrix]\n");
-    return 0;
-}
-
-static int child_latest_limit20(void) {
-    sqlite3 *db;
-    char *latest_sql;
-    char *latest_expected;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_latest_indexes("library.db", 1, 1);
-    latest_sql = make_latest_sql("A.Id ", "20");
-    latest_expected = make_latest_expected("A.Id ", "20");
-    require_int("latest-limit20/outer-index-count",
-                count_occurrences(latest_expected,
-                                  "INDEXED BY idx_dshadow_emby_latest_episodes_dcn_gk"),
-                1);
-    require_int("latest-limit20/inner-index-count",
-                count_occurrences(latest_expected,
-                                  "INDEXED BY idx_dshadow_emby_latest_gk_dc"),
-                1);
-    require_contains("latest-limit20/ranked", latest_expected,
-                     "WITH ranked(id, dc, gk) AS MATERIALIZED (");
-    require_absent("latest-limit20/keys", latest_expected, "WITH keys(gk)");
-    require_absent("latest-limit20/picked", latest_expected, "picked AS MATERIALIZED");
-    require_absent("latest-limit20/exact-groups", latest_expected,
-                   "exact_groups AS MATERIALIZED");
-    expect_sql(db, "latest-limit20", latest_sql, -1, 2, latest_expected, 0);
-    free(latest_sql);
-    free(latest_expected);
-    require_int("latest-limit20/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [latest-limit20]\n");
-    return 0;
-}
-
-static int child_latest_fixture_passthrough(const char *name) {
-    sqlite3 *db;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_latest_indexes("library.db", 1, 1);
-    expect_fixture(db, name);
-    require_int("latest-fixture-passthrough/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [%s]\n", name);
-    return 0;
-}
-
-static int child_latest_resume_no_misfire(void) {
-    sqlite3 *db;
-    char *resume_sql;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_latest_indexes("library.db", 1, 1);
-    resume_sql = make_resume_sql();
-    expect_sql(db, "latest-resume-no-misfire", resume_sql, -1, 2, resume_sql, 0);
-    free(resume_sql);
-    require_int("latest-resume-no-misfire/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [latest-resume-no-misfire]\n");
-    return 0;
-}
-
-static int child_dashboard_mixed_latest(void) {
-    sqlite3 *db;
-    sqlite_master_auth_probe probe = {0};
-    char *raw;
-    char *expected;
-    char *mutated;
-    const char *users[] = {"42", "?", "42", "?"};
-    const char *limits[] = {"3", "3", "?", "?"};
-    int user_bound[] = {0, 1, 0, 1};
-    int limit_bound[] = {0, 0, 1, 1};
-    size_t i;
-
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    for (i = 0; i < sizeof(users) / sizeof(users[0]); i++) {
-        char label[96];
-        raw = make_mixed_latest_sql(users[i], limits[i]);
-        expected = make_mixed_latest_expected(users[i], limits[i]);
-        snprintf(label, sizeof(label), "dashboard-mixed-latest-bind-%lu",
-                 (unsigned long)i);
-        expect_mixed_latest_sql(
-            db, label, raw, expected, user_bound[i], limit_bound[i]
-        );
-        free(raw);
-        free(expected);
-    }
-
-    raw = make_mixed_latest_sql("42", "3");
-    require_int("dashboard-mixed/authorizer-set",
-                sqlite3_set_authorizer(db, count_sqlite_master_read, &probe),
-                SQLITE_OK);
-    {
-        static const char *const old_text[] = {
-            "where A.Type in (8,5) ",
-            "where A.Type in (8,5) ",
-            "where A.Type in (8,5) ",
-            "A.type,A.Id",
-            "from mediaitems A left join",
-            "Coalesce(UserDatas.played, 0)=0",
-            "Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey)",
-            "ORDER BY MAX(A.DateCreated) DESC",
-            "LIMIT 3"
-        };
-        static const char *const new_text[] = {
-            "where A.Type=8 ",
-            "where A.Type in (5,8) ",
-            "where A.Type in (8,5,6) ",
-            "A.Type,A.Id",
-            "FROM mediaitems AS A left join",
-            "Coalesce(UserDatas.played,0)=0",
-            "Group By coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey)",
-            "ORDER BY MAX(A.DateCreated) desc",
-            "LIMIT 4"
-        };
-        for (i = 0; i < sizeof(old_text) / sizeof(old_text[0]); i++) {
-            char label[96];
-            int before = probe.reads;
-            mutated = replace_once(raw, old_text[i], new_text[i]);
-            snprintf(label, sizeof(label), "dashboard-mixed-negative-%lu",
-                     (unsigned long)i);
-            expect_mixed_latest_negative(db, label, mutated);
-            if (i < 3 && probe.reads != before) {
-                failf("FAIL [%s/probe]: expected=%d actual=%d",
-                      label, before, probe.reads);
-            }
-            free(mutated);
-        }
-    }
-    {
-        static const char *const invalid_user[] = {"?1", ":name", "@name", "$name"};
-        for (i = 0; i < sizeof(invalid_user) / sizeof(invalid_user[0]); i++) {
-            char label[96];
-            mutated = make_mixed_latest_sql(invalid_user[i], "3");
-            snprintf(label, sizeof(label), "dashboard-mixed-bind-reject-%lu",
-                     (unsigned long)i);
-            expect_mixed_latest_negative(db, label, mutated);
-            free(mutated);
-        }
-    }
-    mutated = replace_once(raw, "A.type,A.Id", "? AS extra,A.type,A.Id");
-    expect_mixed_latest_negative(db, "dashboard-mixed-bind-outside-slots", mutated);
-    free(mutated);
-    {
-        char *two_binds = make_mixed_latest_sql("?", "?");
-        mutated = replace_once(two_binds, "A.type,A.Id", "? AS third,A.type,A.Id");
-        expect_mixed_latest_negative(db, "dashboard-mixed-third-bind", mutated);
-        free(two_binds);
-        free(mutated);
-    }
-    require_int("dashboard-mixed/authorizer-clear",
-                sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
-    free(raw);
-    require_int("dashboard-mixed/close", sqlite3_close(db), SQLITE_OK);
-
-    raw = make_mixed_latest_sql("42", "3");
-    db = open_seeded_temp_with_mixed_indexes("library.db", 0, 1);
-    expect_mixed_latest_negative(db, "dashboard-mixed-outer-missing", raw);
-    require_int("dashboard-mixed/outer-missing-close", sqlite3_close(db), SQLITE_OK);
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 0);
-    expect_mixed_latest_negative(db, "dashboard-mixed-inner-missing", raw);
-    require_int("dashboard-mixed/inner-missing-close", sqlite3_close(db), SQLITE_OK);
-    db = open_seeded_temp_with_mixed_indexes("library.db", 0, 0);
-    expect_mixed_latest_negative(db, "dashboard-mixed-both-missing", raw);
-    require_int("dashboard-mixed/both-missing-close", sqlite3_close(db), SQLITE_OK);
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    exec_sql(db, "dashboard-mixed-outer-mismatch",
-             "DROP INDEX idx_dshadow_emby_latest_mixed_dcn_gk;"
-             "CREATE INDEX idx_dshadow_emby_latest_mixed_dcn_gk ON MediaItems (DateCreated) WHERE Type IN (8,5);");
-    expect_mixed_latest_negative(db, "dashboard-mixed-outer-mismatch", raw);
-    require_int("dashboard-mixed/outer-mismatch-close", sqlite3_close(db), SQLITE_OK);
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    exec_sql(db, "dashboard-mixed-inner-mismatch",
-             "DROP INDEX idx_dshadow_emby_latest_mixed_gk_dc;"
-             "CREATE INDEX idx_dshadow_emby_latest_mixed_gk_dc ON MediaItems (DateCreated) WHERE Type IN (8,5);");
-    expect_mixed_latest_negative(db, "dashboard-mixed-inner-mismatch", raw);
-    require_int("dashboard-mixed/inner-mismatch-close", sqlite3_close(db), SQLITE_OK);
-    free(raw);
-
-    cleanup_temp_dir();
-    printf("PASS [dashboard-mixed-latest-real-path]\n");
-    return 0;
-}
-
-static int child_dashboard_mixed_disabled(void) {
-    sqlite3 *db;
-    sqlite_master_auth_probe probe = {0};
-    char *raw;
-
-    configure_env("1", "1", NULL);
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    raw = make_mixed_latest_sql("42", "3");
-    require_int("dashboard-mixed-disabled/authorizer-set",
-                sqlite3_set_authorizer(db, count_sqlite_master_read, &probe),
-                SQLITE_OK);
-    expect_mixed_latest_negative(db, "dashboard-mixed-disabled", raw);
-    require_int("dashboard-mixed-disabled/probes", probe.reads, 0);
-    require_int("dashboard-mixed-disabled/authorizer-clear",
-                sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
-    free(raw);
-    require_int("dashboard-mixed-disabled/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [dashboard-mixed-disabled]\n");
-    return 0;
-}
-
-static int child_dashboard_mixed_identity(void) {
-    sqlite3 *vendor_db;
-    sqlite3 *candidate_db;
+static int rsh_custom_adapter_dashboard_mixed_identity(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *vendor_db = rsh_context_db(context, "vendor");
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    int analyzed;
     char *raw;
     char *expected;
     typed_rows vendor_rows;
     typed_rows candidate_rows;
     char ids[128];
-    int analyzed;
 
-    configure_env("1", "1", "0");
-    make_temp_dir();
-    vendor_db = open_seeded_temp_with_mixed_indexes("not-target.db", 1, 1);
-    candidate_db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    seed_mixed_latest_identity_rows(vendor_db);
-    seed_mixed_latest_identity_rows(candidate_db);
+    (void)immutable_data;
+    if (!context->matrix_cell || context->matrix_cell->axis_count != 1) {
+        failf("FAIL [dashboard-mixed-identity/matrix-context]");
+    }
+    analyzed = context->matrix_cell->axis_indices[0] == 1;
     raw = make_mixed_latest_sql("42", "3");
     expected = make_mixed_latest_expected("42", "3");
-    for (analyzed = 0; analyzed < 2; analyzed++) {
-        if (analyzed) {
-            exec_sql(vendor_db, "mixed-vendor-analyze", "PRAGMA analysis_limit=0; ANALYZE;");
-            exec_sql(candidate_db, "mixed-candidate-analyze", "PRAGMA analysis_limit=0; ANALYZE;");
-        }
-        vendor_rows = collect_typed_rows(
-            vendor_db, analyzed ? "mixed-vendor-after-analyze" : "mixed-vendor-before-analyze",
-            raw, raw
-        );
-        candidate_rows = collect_typed_rows(
-            candidate_db, analyzed ? "mixed-candidate-after-analyze" : "mixed-candidate-before-analyze",
-            raw, expected
-        );
-        require_ordered_full_row_identity(
-            analyzed ? "mixed-byte-identity-after-analyze" : "mixed-byte-identity-before-analyze",
-            &vendor_rows, &candidate_rows
-        );
-        free_typed_rows(&vendor_rows);
-        free_typed_rows(&candidate_rows);
-    }
+    vendor_rows = collect_typed_rows(
+        vendor_db,
+        analyzed ? "mixed-vendor-after-analyze" : "mixed-vendor-before-analyze",
+        raw, raw
+    );
+    candidate_rows = collect_typed_rows(
+        candidate_db,
+        analyzed ? "mixed-candidate-after-analyze" : "mixed-candidate-before-analyze",
+        raw, expected
+    );
+    require_ordered_full_row_identity(
+        analyzed ? "mixed-byte-identity-after-analyze" :
+                   "mixed-byte-identity-before-analyze",
+        &vendor_rows, &candidate_rows
+    );
+    free_typed_rows(&vendor_rows);
+    free_typed_rows(&candidate_rows);
     free(raw);
     free(expected);
+    if (!analyzed) return SQLITE_OK;
 
     raw = make_mixed_latest_sql("?", "?");
     expected = make_mixed_latest_expected("?", "?");
@@ -4914,206 +7514,1156 @@ static int child_dashboard_mixed_identity(void) {
     free(raw);
     free(expected);
 
-    raw = make_mixed_latest_sql_form("101", "42", "3");
-    expected = make_mixed_latest_expected_form("101", "42", "3");
-    collect_int_column(candidate_db, "mixed-all-null-date", raw, expected, -1, 1,
-                       ids, sizeof(ids));
-    require_str_eq("mixed-all-null-date/lower-id", ids, "2010,");
-    free(raw);
-    free(expected);
+#define EMBY_D6_MIXED_ID_ASSERT( \
+    ancestor, collect_label, assertion_label, expected_ids) \
+    do { \
+        raw = make_mixed_latest_sql_form((ancestor), "42", "3"); \
+        expected = make_mixed_latest_expected_form((ancestor), "42", "3"); \
+        collect_int_column(candidate_db, (collect_label), raw, expected, -1, 1, \
+                           ids, sizeof(ids)); \
+        require_str_eq((assertion_label), ids, (expected_ids)); \
+        free(raw); \
+        free(expected); \
+    } while (0)
 
-    raw = make_mixed_latest_sql_form("102", "42", "3");
-    expected = make_mixed_latest_expected_form("102", "42", "3");
-    collect_int_column(candidate_db, "mixed-played-state", raw, expected, -1, 1,
-                       ids, sizeof(ids));
-    require_str_eq("mixed-played-state/exclusion", ids, "2021,");
-    free(raw);
-    free(expected);
+    EMBY_D6_MIXED_ID_ASSERT(
+        "101", "mixed-all-null-date", "mixed-all-null-date/lower-id", "2010,"
+    );
+    EMBY_D6_MIXED_ID_ASSERT(
+        "102", "mixed-played-state", "mixed-played-state/exclusion", "2021,"
+    );
+    EMBY_D6_MIXED_ID_ASSERT(
+        "103", "mixed-ancestor-invisible",
+        "mixed-ancestor-invisible/exclusion", "2031,"
+    );
+    EMBY_D6_MIXED_ID_ASSERT(
+        "105", "mixed-same-date-lower-id",
+        "mixed-same-date-lower-id/selection", "2039,"
+    );
+    EMBY_D6_MIXED_ID_ASSERT(
+        "104", "mixed-limit-boundary-gk", "mixed-limit-boundary-gk/order",
+        "2051,2053,2052,"
+    );
 
-    raw = make_mixed_latest_sql_form("103", "42", "3");
-    expected = make_mixed_latest_expected_form("103", "42", "3");
-    collect_int_column(candidate_db, "mixed-ancestor-invisible", raw, expected, -1, 1,
-                       ids, sizeof(ids));
-    require_str_eq("mixed-ancestor-invisible/exclusion", ids, "2031,");
-    free(raw);
-    free(expected);
+#undef EMBY_D6_MIXED_ID_ASSERT
 
-    raw = make_mixed_latest_sql_form("105", "42", "3");
-    expected = make_mixed_latest_expected_form("105", "42", "3");
-    collect_int_column(candidate_db, "mixed-same-date-lower-id", raw, expected, -1, 1,
-                       ids, sizeof(ids));
-    require_str_eq("mixed-same-date-lower-id/selection", ids, "2039,");
-    free(raw);
-    free(expected);
-
-    raw = make_mixed_latest_sql_form("104", "42", "3");
-    expected = make_mixed_latest_expected_form("104", "42", "3");
-    collect_int_column(candidate_db, "mixed-limit-boundary-gk", raw, expected, -1, 1,
-                       ids, sizeof(ids));
-    require_str_eq("mixed-limit-boundary-gk/order", ids, "2051,2053,2052,");
-    free(raw);
-    free(expected);
-
-    require_int("mixed-identity/vendor-close", sqlite3_close(vendor_db), SQLITE_OK);
-    require_int("mixed-identity/candidate-close", sqlite3_close(candidate_db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [dashboard-mixed-identity]\n");
-    return 0;
+    return SQLITE_OK;
 }
 
-static int child_dashboard_matcher_negatives(void) {
-    static const char *binds[] = {
-        "?", "?1", ":name", "@name", "$name", ":1", "@1", "$1", ":\xC3\xA9"
+static const rsh_db_spec emby_d6_row_parity_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE
+    }
+};
+
+static const rsh_case_spec emby_d6_row_parity_cases[] = {
+    {
+        .label = "emby-fts-contract",
+        .kind = RSH_CASE_CONTRACT_PARITY,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.contract_parity = {
+            .vendor_role = "vendor",
+            .candidate_role = "candidate",
+            .vendor_sql = emby_d6_row_parity_sql,
+            .candidate_source_sql = emby_d6_row_parity_sql,
+            .expected_candidate_sql = emby_d6_row_parity_expected_sql,
+            .prepare = EMBY_PREPARE_V2,
+            .bind = bind_search_term,
+            .bind_ctx = (void *)"(\"alpha\"*)",
+            .row_exception = accept_emby_fts_legal_difference,
+            .minimum_rows = 5
+        }
+    },
+    {
+        .label = "row-parity/membership",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom = rsh_custom_adapter_row_parity_membership,
+            .immutable_data = &emby_d6_row_parity_single_membership
+        }
+    },
+    {
+        .label = "row-parity/ordered-contract",
+        .kind = RSH_CASE_CONTRACT_PARITY,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.contract_parity = {
+            .vendor_role = "vendor",
+            .candidate_role = "candidate",
+            .vendor_sql = emby_d6_row_parity_ordered_sql,
+            .candidate_source_sql = emby_d6_row_parity_ordered_sql,
+            .expected_candidate_sql = emby_d6_row_parity_ordered_expected_sql,
+            .prepare = EMBY_PREPARE_V2,
+            .bind = bind_search_term,
+            .bind_ctx = (void *)"(\"alpha\"*)",
+            .minimum_rows = 5
+        }
+    },
+    {
+        .label = "row-parity-or/membership",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom = rsh_custom_adapter_row_parity_membership,
+            .immutable_data = &emby_d6_row_parity_or_membership
+        }
+    },
+    {
+        .label = "row-parity-or/ordered-contract",
+        .kind = RSH_CASE_CONTRACT_PARITY,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.contract_parity = {
+            .vendor_role = "vendor",
+            .candidate_role = "candidate",
+            .vendor_sql = emby_d6_row_parity_ordered_sql,
+            .candidate_source_sql = emby_d6_row_parity_ordered_sql,
+            .expected_candidate_sql = emby_d6_row_parity_ordered_expected_sql,
+            .prepare = EMBY_PREPARE_V2,
+            .bind = bind_search_term,
+            .bind_ctx = (void *)"(\"alpha\"*) OR (\"alpha\"*)",
+            .minimum_rows = 5
+        }
+    }
+};
+
+static const rsh_phase_spec emby_d6_row_parity_phases[] = {
+    {
+        .label = "row-parity",
+        .dbs = emby_d6_row_parity_dbs,
+        .db_count = sizeof(emby_d6_row_parity_dbs) /
+                    sizeof(emby_d6_row_parity_dbs[0]),
+        .cases = emby_d6_row_parity_cases,
+        .case_count = sizeof(emby_d6_row_parity_cases) /
+                      sizeof(emby_d6_row_parity_cases[0])
+    }
+};
+
+static const rsh_db_spec emby_d6_complex_resume_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D6_COMPLEX_RESUME_SEED
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D6_COMPLEX_RESUME_SEED
+    }
+};
+
+static const rsh_case_spec emby_d6_complex_resume_cases[] = {
+    {
+        .label = "emby-fanout-contract",
+        .kind = RSH_CASE_CONTRACT_PARITY,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.contract_parity = {
+            .vendor_role = "vendor",
+            .candidate_role = "candidate",
+            .vendor_sql = emby_d6_complex_resume_sql,
+            .candidate_source_sql = emby_d6_complex_resume_sql,
+            .expected_candidate_sql = emby_d6_complex_resume_expected_sql,
+            .prepare = EMBY_PREPARE_V2,
+            .minimum_rows = 1
+        }
+    },
+    {
+        .label = "complex-resume-watched-progress-row-parity/expected",
+        .kind = RSH_CASE_EXACT_IDS,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.exact_ids = {
+            .role = "candidate",
+            .sql = emby_d6_complex_resume_expected_ids_sql,
+            .prepare = EMBY_PREPARE_V2,
+            .expected_ids = emby_d6_complex_resume_expected_ids,
+            .expected_id_count = sizeof(emby_d6_complex_resume_expected_ids) /
+                                 sizeof(emby_d6_complex_resume_expected_ids[0])
+        }
+    }
+};
+
+static const rsh_phase_spec emby_d6_complex_resume_phases[] = {
+    {
+        .label = "complex-resume-watched-progress-row-parity",
+        .dbs = emby_d6_complex_resume_dbs,
+        .db_count = sizeof(emby_d6_complex_resume_dbs) /
+                    sizeof(emby_d6_complex_resume_dbs[0]),
+        .cases = emby_d6_complex_resume_cases,
+        .case_count = sizeof(emby_d6_complex_resume_cases) /
+                      sizeof(emby_d6_complex_resume_cases[0])
+    }
+};
+
+static const rsh_db_spec emby_d6_links_two_level_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D6_LINKS_TWO_LEVEL_SEED
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D6_LINKS_TWO_LEVEL_SEED
+    }
+};
+
+static const rsh_case_spec emby_d6_links_two_level_cases[] = {
+    {
+        .label = "links-two-level-row-parity",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom = rsh_custom_adapter_links_two_level_identity,
+        }
+    }
+};
+
+static const rsh_phase_spec emby_d6_links_two_level_phases[] = {
+    {
+        .label = "links-two-level-row-parity",
+        .dbs = emby_d6_links_two_level_dbs,
+        .db_count = sizeof(emby_d6_links_two_level_dbs) /
+                    sizeof(emby_d6_links_two_level_dbs[0]),
+        .cases = emby_d6_links_two_level_cases,
+        .case_count = sizeof(emby_d6_links_two_level_cases) /
+                      sizeof(emby_d6_links_two_level_cases[0])
+    }
+};
+
+static const rsh_db_spec emby_d6_mixed_identity_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D6_MIXED_IDENTITY
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D6_MIXED_IDENTITY
+    }
+};
+
+static const rsh_matrix_axis_value emby_d6_mixed_identity_stat_values[] = {
+    {.label = "before-analyze", .integer = 0},
+    {.label = "after-analyze", .integer = 1}
+};
+
+static const rsh_matrix_axis emby_d6_mixed_identity_axes[] = {
+    {
+        .name = "stat-state",
+        .values = emby_d6_mixed_identity_stat_values,
+        .value_count = sizeof(emby_d6_mixed_identity_stat_values) /
+                       sizeof(emby_d6_mixed_identity_stat_values[0])
+    }
+};
+
+static const rsh_case_spec emby_d6_mixed_identity_cases[] = {
+    {
+        .label = "dashboard-mixed-identity",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom = rsh_custom_adapter_dashboard_mixed_identity,
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_d6_mixed_identity_steps[] = {
+    {
+        .kind = RSH_CELL_ANALYZE_IF,
+        .predicate = {.axis_index = 0, .value_index = 1}
+    },
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d6_mixed_identity_cases,
+        .case_count = sizeof(emby_d6_mixed_identity_cases) /
+                      sizeof(emby_d6_mixed_identity_cases[0])
+    }
+};
+
+static const rsh_matrix_phase_spec emby_d6_mixed_identity_matrix_phases[] = {
+    {
+        .label = "dashboard-mixed-identity",
+        .cell_dir_prefix = "dashboard-mixed-identity",
+        .axes = emby_d6_mixed_identity_axes,
+        .axis_count = sizeof(emby_d6_mixed_identity_axes) /
+                      sizeof(emby_d6_mixed_identity_axes[0]),
+        .dbs = emby_d6_mixed_identity_dbs,
+        .db_count = sizeof(emby_d6_mixed_identity_dbs) /
+                    sizeof(emby_d6_mixed_identity_dbs[0]),
+        .steps = emby_d6_mixed_identity_steps,
+        .step_count = sizeof(emby_d6_mixed_identity_steps) /
+                      sizeof(emby_d6_mixed_identity_steps[0]),
+        .expected_cells = 2
+    }
+};
+
+enum emby_d7_release_counter_id {
+    EMBY_D7_RELEASE_GUARDED = 0,
+    EMBY_D7_RELEASE_PASSTHROUGH,
+    EMBY_D7_RELEASE_COUNTER_COUNT
+};
+
+static const rsh_matrix_axis_value emby_d7_stat_state_values[] = {
+    {.label = "before-analyze", .integer = 0},
+    {.label = "after-analyze", .integer = 1}
+};
+
+static const rsh_matrix_axis_value emby_d7_ancestor_values[] = {
+    {.label = "100", .integer = 100},
+    {.label = "200", .integer = 200},
+    {.label = "999", .integer = 999}
+};
+
+static const rsh_matrix_axis_value emby_d7_user_values[] = {
+    {.label = "42", .integer = 42},
+    {.label = "777", .integer = 777}
+};
+
+static const rsh_matrix_axis_value emby_d7_limit_values[] = {
+    {.label = "12", .integer = 12},
+    {.label = "16", .integer = 16},
+    {.label = "20", .integer = 20}
+};
+
+static const rsh_matrix_axis emby_d7_release_grid_axes[] = {
+    {
+        .name = "stat-state",
+        .values = emby_d7_stat_state_values,
+        .value_count = sizeof(emby_d7_stat_state_values) /
+                       sizeof(emby_d7_stat_state_values[0])
+    },
+    {
+        .name = "ancestor",
+        .values = emby_d7_ancestor_values,
+        .value_count = sizeof(emby_d7_ancestor_values) /
+                       sizeof(emby_d7_ancestor_values[0])
+    },
+    {
+        .name = "user",
+        .values = emby_d7_user_values,
+        .value_count = sizeof(emby_d7_user_values) /
+                       sizeof(emby_d7_user_values[0])
+    },
+    {
+        .name = "limit",
+        .values = emby_d7_limit_values,
+        .value_count = sizeof(emby_d7_limit_values) /
+                       sizeof(emby_d7_limit_values[0])
+    }
+};
+
+static const rsh_matrix_axis emby_d7_stat_state_axes[] = {
+    {
+        .name = "stat-state",
+        .values = emby_d7_stat_state_values,
+        .value_count = sizeof(emby_d7_stat_state_values) /
+                       sizeof(emby_d7_stat_state_values[0])
+    }
+};
+
+static int rsh_d7_typed_rows_equal(
+    const typed_rows *left,
+    const typed_rows *right
+) {
+    return left->columns == right->columns && left->rows == right->rows &&
+           left->len == right->len &&
+           memcmp(left->bytes, right->bytes, left->len) == 0;
+}
+
+static void rsh_d7_require_typed_rows_differ(
+    const char *label,
+    const typed_rows *left,
+    const typed_rows *right
+) {
+    if (rsh_d7_typed_rows_equal(left, right)) {
+        failf("FAIL [%s]: got=equal(\"%s\") want=different", label,
+              (const char *)left->bytes);
+    }
+}
+
+static int rsh_custom_adapter_dashboard_release_preflight(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    typed_rows streams[3][2];
+    int ancestor_index;
+    int user_index;
+
+    (void)immutable_data;
+    require_str_eq("matrix/hot-literal", emby_d7_ancestor_values[0].label, "100");
+    require_str_eq("matrix/typical-literal", emby_d7_ancestor_values[1].label, "200");
+    require_str_eq("matrix/empty-literal", emby_d7_ancestor_values[2].label, "999");
+    require_str_eq("matrix/heavy-user-literal", emby_d7_user_values[0].label, "42");
+    require_str_eq("matrix/zero-user-literal", emby_d7_user_values[1].label, "777");
+    if (!strcmp(emby_d7_ancestor_values[0].label,
+                emby_d7_ancestor_values[1].label) ||
+        !strcmp(emby_d7_ancestor_values[0].label,
+                emby_d7_ancestor_values[2].label) ||
+        !strcmp(emby_d7_ancestor_values[1].label,
+                emby_d7_ancestor_values[2].label) ||
+        !strcmp(emby_d7_user_values[0].label, emby_d7_user_values[1].label)) {
+        failf(
+            "FAIL [matrix/literal-distinctness]: got={%s,%s,%s;%s,%s} "
+            "want=all-distinct-per-axis",
+            emby_d7_ancestor_values[0].label,
+            emby_d7_ancestor_values[1].label,
+            emby_d7_ancestor_values[2].label,
+            emby_d7_user_values[0].label,
+            emby_d7_user_values[1].label
+        );
+    }
+
+    require_int(
+        "matrix/hot-count",
+        query_int(
+            candidate_db, "matrix/hot-count-sql",
+            "SELECT count(*) FROM AncestorIds2 WHERE AncestorId=100 AND itemid BETWEEN 5001 AND 5030"
+        ),
+        30
+    );
+    require_int(
+        "matrix/typical-count",
+        query_int(
+            candidate_db, "matrix/typical-count-sql",
+            "SELECT count(*) FROM AncestorIds2 WHERE AncestorId=200 AND itemid BETWEEN 6001 AND 6024"
+        ),
+        24
+    );
+    require_int(
+        "matrix/empty-count",
+        query_int(
+            candidate_db, "matrix/empty-count-sql",
+            "SELECT count(*) FROM AncestorIds2 WHERE AncestorId=999 AND itemid BETWEEN 5001 AND 6024"
+        ),
+        0
+    );
+    require_int(
+        "matrix/user42-count",
+        query_int(
+            candidate_db, "matrix/user42-count-sql",
+            "SELECT count(*) FROM UserDatas WHERE UserId=42 AND UserDataKeyId BETWEEN 7001 AND 8024"
+        ),
+        54
+    );
+    require_int(
+        "matrix/user42-played",
+        query_int(
+            candidate_db, "matrix/user42-played-sql",
+            "SELECT count(*) FROM UserDatas WHERE UserId=42 AND Played=1 AND UserDataKeyId BETWEEN 7001 AND 8024"
+        ),
+        10
+    );
+    require_int(
+        "matrix/user777-count",
+        query_int(
+            candidate_db, "matrix/user777-count-sql",
+            "SELECT count(*) FROM UserDatas WHERE UserId=777"
+        ),
+        0
+    );
+    for (ancestor_index = 0; ancestor_index < 3; ancestor_index++) {
+        for (user_index = 0; user_index < 2; user_index++) {
+            char *raw = make_movies_latest_sql(
+                1, emby_d7_ancestor_values[ancestor_index].label,
+                emby_d7_user_values[user_index].label, "20"
+            );
+            char *expected = make_movies_latest_expected(
+                emby_d7_ancestor_values[ancestor_index].label,
+                emby_d7_user_values[user_index].label, "20"
+            );
+            streams[ancestor_index][user_index] = collect_typed_rows(
+                candidate_db, "matrix/distinct-preflight", raw, expected
+            );
+            free(raw);
+            free(expected);
+        }
+    }
+    rsh_d7_require_typed_rows_differ(
+        "matrix/hot-vs-typical-user42", &streams[0][0], &streams[1][0]
+    );
+    rsh_d7_require_typed_rows_differ(
+        "matrix/hot-vs-typical-user777", &streams[0][1], &streams[1][1]
+    );
+    rsh_d7_require_typed_rows_differ(
+        "matrix/hot-users", &streams[0][0], &streams[0][1]
+    );
+    rsh_d7_require_typed_rows_differ(
+        "matrix/typical-users", &streams[1][0], &streams[1][1]
+    );
+    require_int("matrix/empty-user42-rows", streams[2][0].rows, 0);
+    require_int("matrix/empty-user777-rows", streams[2][1].rows, 0);
+    for (ancestor_index = 0; ancestor_index < 3; ancestor_index++) {
+        for (user_index = 0; user_index < 2; user_index++) {
+            free_typed_rows(&streams[ancestor_index][user_index]);
+        }
+    }
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_dashboard_release_grid(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const rsh_matrix_cell *cell = context->matrix_cell;
+    sqlite3 *vendor_db = rsh_context_db(context, "vendor");
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    const char *ancestor;
+    const char *user;
+    const char *limit;
+    char *raw;
+    char *expected;
+    typed_rows vendor_rows;
+    typed_rows candidate_rows;
+    int want_rows;
+
+    (void)immutable_data;
+    if (!cell || cell->axis_count != 4) {
+        failf("FAIL [matrix/context-axis-count]: got=%lu want=4",
+              (unsigned long)(cell ? cell->axis_count : 0));
+    }
+    if (cell->counter_count != EMBY_D7_RELEASE_COUNTER_COUNT) {
+        failf("FAIL [matrix/context-counter-count]: got=%lu want=%d",
+              (unsigned long)cell->counter_count,
+              EMBY_D7_RELEASE_COUNTER_COUNT);
+    }
+    ancestor = cell->axis_values[1]->label;
+    user = cell->axis_values[2]->label;
+    limit = cell->axis_values[3]->label;
+    want_rows = cell->axis_indices[1] == 2
+        ? 0 : (int)cell->axis_values[3]->integer;
+
+    raw = make_movies_latest_sql(1, ancestor, user, limit);
+    expected = make_movies_latest_expected(ancestor, user, limit);
+    vendor_rows = collect_typed_rows(vendor_db, "matrix/vendor", raw, raw);
+    candidate_rows = collect_typed_rows(
+        candidate_db, "matrix/candidate", raw, expected
+    );
+    require_int("matrix/vendor-row-count", vendor_rows.rows, want_rows);
+    require_int("matrix/candidate-row-count", candidate_rows.rows, want_rows);
+    require_ordered_full_row_identity(
+        "matrix/guarded-identity", &vendor_rows, &candidate_rows
+    );
+    if (cell->axis_indices[1] < 2 && cell->axis_indices[3] > 0) {
+        char current_ids[1024];
+        char prior_ids[1024];
+        const char *prior_limit =
+            emby_d7_limit_values[cell->axis_indices[3] - 1].label;
+        char *prior_raw = make_movies_latest_sql(
+            1, ancestor, user, prior_limit
+        );
+        collect_int_column(
+            vendor_db, "matrix/current-ids", raw, raw, -1, 0,
+            current_ids, sizeof(current_ids)
+        );
+        collect_int_column(
+            vendor_db, "matrix/prior-ids", prior_raw, prior_raw, -1, 0,
+            prior_ids, sizeof(prior_ids)
+        );
+        if (strncmp(current_ids, prior_ids, strlen(prior_ids)) != 0) {
+            failf("FAIL [matrix/row-slice]: got=%s want_prefix=%s",
+                  current_ids, prior_ids);
+        }
+        free(prior_raw);
+    }
+    cell->counters[EMBY_D7_RELEASE_GUARDED]++;
+    free_typed_rows(&vendor_rows);
+    free_typed_rows(&candidate_rows);
+    free(raw);
+
+    raw = make_movies_latest_sql(0, ancestor, user, limit);
+    vendor_rows = collect_typed_rows(
+        vendor_db, "matrix/no-guard-vendor", raw, raw
+    );
+    candidate_rows = collect_typed_rows(
+        candidate_db, "matrix/no-guard-candidate", raw, raw
+    );
+    require_ordered_full_row_identity(
+        "matrix/no-guard-identity", &vendor_rows, &candidate_rows
+    );
+    cell->counters[EMBY_D7_RELEASE_PASSTHROUGH]++;
+    free_typed_rows(&vendor_rows);
+    free_typed_rows(&candidate_rows);
+    free(raw);
+    free(expected);
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_dashboard_release_episodes_semantic(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *vendor_db = rsh_context_db(context, "vendor");
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+
+    (void)immutable_data;
+    require_episodes_latest_semantics(vendor_db, candidate_db);
+    return SQLITE_OK;
+}
+
+static const sqlite3_int64 emby_d7_movies_expanded_expected_ids[] = {
+    9001, 9002, 9003, 9004, 9005, 9006, 9007, 9008, 9009, 9010,
+    9119, 9101, 9104, 9107, 9111, 9112, 9113, 9118, 9116, 9108
+};
+
+static int rsh_custom_adapter_dashboard_release_movies_expanded_identity(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *vendor_db = rsh_context_db(context, "vendor");
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    char *raw = make_movies_latest_sql(1, "300", "42", "20");
+    char *expected = make_movies_latest_expected("300", "42", "20");
+    typed_rows vendor_rows = collect_typed_rows(
+        vendor_db, "expanded/vendor", raw, raw
+    );
+    typed_rows candidate_rows = collect_typed_rows(
+        candidate_db, "expanded/candidate", raw, expected
+    );
+
+    (void)immutable_data;
+    require_int("expanded/vendor-row-count", vendor_rows.rows, 20);
+    require_int("expanded/candidate-row-count", candidate_rows.rows, 20);
+    require_movies_latest_candidate_rows(
+        candidate_db, "expanded/candidate-contract", raw, expected,
+        EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
+        emby_d7_movies_expanded_expected_ids,
+        (int)(sizeof(emby_d7_movies_expanded_expected_ids) /
+              sizeof(emby_d7_movies_expanded_expected_ids[0]))
+    );
+    free_typed_rows(&vendor_rows);
+    free_typed_rows(&candidate_rows);
+    free(raw);
+    free(expected);
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_dashboard_release_movies_expanded_order(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *candidate_db = rsh_context_db(context, "candidate");
+    char order_ids[128];
+    char *raw = make_movies_latest_sql(1, "301", "42", "12");
+    char *expected = make_movies_latest_expected("301", "42", "12");
+
+    (void)immutable_data;
+    collect_int_column(
+        candidate_db, "expanded/rewrite-order", raw, expected, -1, 0,
+        order_ids, sizeof(order_ids)
+    );
+    require_str_eq(
+        "expanded/rewrite-order-ids", order_ids, "9202,9201,9204,9203,"
+    );
+    free(raw);
+    free(expected);
+    return SQLITE_OK;
+}
+
+static const rsh_db_spec emby_d7_release_preflight_dbs[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_FIXTURE_CANARY
+    }
+};
+
+static const rsh_case_spec emby_d7_release_preflight_cases[] = {
+    {
+        .label = "release-preflight",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom = rsh_custom_adapter_dashboard_release_preflight,
+        }
+    }
+};
+
+static const rsh_phase_spec emby_d7_release_preflight_phases[] = {
+    {
+        .label = "release-preflight",
+        .dbs = emby_d7_release_preflight_dbs,
+        .db_count = sizeof(emby_d7_release_preflight_dbs) /
+                    sizeof(emby_d7_release_preflight_dbs[0]),
+        .cases = emby_d7_release_preflight_cases,
+        .case_count = sizeof(emby_d7_release_preflight_cases) /
+                      sizeof(emby_d7_release_preflight_cases[0])
+    }
+};
+
+static const rsh_db_spec emby_d7_release_grid_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_MOVIES_SEED_ONLY
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_MOVIES_SEED_ONLY,
+        .setup_profile = EMBY_PROFILE_D7_DASHBOARD_INDEXES
+    }
+};
+
+static const rsh_case_spec emby_d7_release_grid_cases[] = {
+    {
+        .label = "release-grid",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom = rsh_custom_adapter_dashboard_release_grid,
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_d7_release_grid_steps[] = {
+    {
+        .kind = RSH_CELL_ANALYZE_IF,
+        .predicate = {.axis_index = 0, .value_index = 1}
+    },
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d7_release_grid_cases,
+        .case_count = sizeof(emby_d7_release_grid_cases) /
+                      sizeof(emby_d7_release_grid_cases[0])
+    }
+};
+
+static const rsh_matrix_counter_spec emby_d7_release_grid_counters[] = {
+    {.name = "guarded-cells", .expected = 36},
+    {.name = "no-guard-cells", .expected = 36}
+};
+
+static const rsh_db_spec emby_d7_episodes_semantic_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_D7_EPISODES_SEMANTIC_SEED
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_D7_EPISODES_SEMANTIC_SEED,
+        .setup_profile = EMBY_PROFILE_D7_DASHBOARD_INDEXES
+    }
+};
+
+static const rsh_case_spec emby_d7_episodes_semantic_cases[] = {
+    {
+        .label = "episodes-semantic",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom =
+                rsh_custom_adapter_dashboard_release_episodes_semantic,
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_d7_episodes_semantic_steps[] = {
+    {
+        .kind = RSH_CELL_ANALYZE_IF,
+        .predicate = {.axis_index = 0, .value_index = 1}
+    },
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d7_episodes_semantic_cases,
+        .case_count = sizeof(emby_d7_episodes_semantic_cases) /
+                      sizeof(emby_d7_episodes_semantic_cases[0])
+    }
+};
+
+static const rsh_db_spec emby_d7_movies_expanded_dbs[] = {
+    {
+        .role = "vendor",
+        .relative_path = "not-target.db",
+        .kind = RSH_DB_VENDOR,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_D7_MOVIES_EXPANDED_SEED
+    },
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .seed_profile = EMBY_PROFILE_D7_MOVIES_EXPANDED_SEED,
+        .setup_profile = EMBY_PROFILE_D7_DASHBOARD_INDEXES
+    }
+};
+
+static const rsh_case_spec emby_d7_movies_expanded_identity_cases[] = {
+    {
+        .label = "movies-expanded-identity",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom =
+                rsh_custom_adapter_dashboard_release_movies_expanded_identity,
+        }
+    }
+};
+
+static const rsh_case_spec emby_d7_movies_expanded_order_cases[] = {
+    {
+        .label = "movies-expanded-order",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom =
+                rsh_custom_adapter_dashboard_release_movies_expanded_order,
+        }
+    }
+};
+
+static const rsh_matrix_cell_step emby_d7_movies_expanded_steps[] = {
+    {
+        .kind = RSH_CELL_ANALYZE_IF,
+        .predicate = {.axis_index = 0, .value_index = 1}
+    },
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d7_movies_expanded_identity_cases,
+        .case_count = sizeof(emby_d7_movies_expanded_identity_cases) /
+                      sizeof(emby_d7_movies_expanded_identity_cases[0])
+    },
+    {
+        .kind = RSH_CELL_SETUP_PROFILE,
+        .role = "candidate",
+        .setup_profile = EMBY_PROFILE_D7_MOVIES_REWRITE_ORDER_SEED
+    },
+    {
+        .kind = RSH_CELL_ASSERT,
+        .cases = emby_d7_movies_expanded_order_cases,
+        .case_count = sizeof(emby_d7_movies_expanded_order_cases) /
+                      sizeof(emby_d7_movies_expanded_order_cases[0])
+    }
+};
+
+static const rsh_matrix_phase_spec emby_d7_release_matrix_phases[] = {
+    {
+        .label = "release-grid",
+        .cell_dir_prefix = "dashboard-release-grid",
+        .axes = emby_d7_release_grid_axes,
+        .axis_count = sizeof(emby_d7_release_grid_axes) /
+                      sizeof(emby_d7_release_grid_axes[0]),
+        .dbs = emby_d7_release_grid_dbs,
+        .db_count = sizeof(emby_d7_release_grid_dbs) /
+                    sizeof(emby_d7_release_grid_dbs[0]),
+        .steps = emby_d7_release_grid_steps,
+        .step_count = sizeof(emby_d7_release_grid_steps) /
+                      sizeof(emby_d7_release_grid_steps[0]),
+        .expected_cells = 36,
+        .counters = emby_d7_release_grid_counters,
+        .counter_count = sizeof(emby_d7_release_grid_counters) /
+                         sizeof(emby_d7_release_grid_counters[0])
+    },
+    {
+        .label = "episodes-semantic",
+        .cell_dir_prefix = "dashboard-release-episodes",
+        .axes = emby_d7_stat_state_axes,
+        .axis_count = sizeof(emby_d7_stat_state_axes) /
+                      sizeof(emby_d7_stat_state_axes[0]),
+        .dbs = emby_d7_episodes_semantic_dbs,
+        .db_count = sizeof(emby_d7_episodes_semantic_dbs) /
+                    sizeof(emby_d7_episodes_semantic_dbs[0]),
+        .steps = emby_d7_episodes_semantic_steps,
+        .step_count = sizeof(emby_d7_episodes_semantic_steps) /
+                      sizeof(emby_d7_episodes_semantic_steps[0]),
+        .expected_cells = 2
+    },
+    {
+        .label = "movies-expanded",
+        .cell_dir_prefix = "dashboard-release-expanded",
+        .axes = emby_d7_stat_state_axes,
+        .axis_count = sizeof(emby_d7_stat_state_axes) /
+                      sizeof(emby_d7_stat_state_axes[0]),
+        .dbs = emby_d7_movies_expanded_dbs,
+        .db_count = sizeof(emby_d7_movies_expanded_dbs) /
+                    sizeof(emby_d7_movies_expanded_dbs[0]),
+        .steps = emby_d7_movies_expanded_steps,
+        .step_count = sizeof(emby_d7_movies_expanded_steps) /
+                      sizeof(emby_d7_movies_expanded_steps[0]),
+        .expected_cells = 2
+    }
+};
+
+typedef struct emby_d8_index_definition_expectation {
+    const char *label;
+    int rewritten;
+    int movies;
+} emby_d8_index_definition_expectation;
+
+static const emby_d8_index_definition_expectation
+    emby_d8_malformed_episodes_group_expectation = {
+        "malformed-episodes-group-index-fail-open", 0, 0
     };
-    sqlite_master_auth_probe readiness_probe = {0};
-    sqlite3 *db;
-    FILE *capture;
-    char *log_output;
-    char *episodes;
-    char *movies;
-    int saved_stderr_fd;
-    size_t i;
+static const emby_d8_index_definition_expectation
+    emby_d8_malformed_episodes_date_expectation = {
+        "malformed-episodes-date-index-fail-open", 0, 0
+    };
+static const emby_d8_index_definition_expectation
+    emby_d8_canonical_episodes_expectation = {
+        "canonical-episodes-indexes-rewrite", 1, 0
+    };
+static const emby_d8_index_definition_expectation
+    emby_d8_malformed_movies_outer_expectation = {
+        "malformed-movies-outer-index-fail-open", 0, 1
+    };
+static const emby_d8_index_definition_expectation
+    emby_d8_malformed_movies_inner_expectation = {
+        "malformed-movies-inner-index-fail-open", 0, 1
+    };
+static const emby_d8_index_definition_expectation
+    emby_d8_canonical_movies_expectation = {
+        "canonical-movies-indexes-rewrite", 1, 1
+    };
 
-    configure_env_observable("1", NULL, "0");
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 1);
-    seed_movies_latest_rows(db);
-    episodes = make_latest_sql("A.Id ", "12");
-    movies = make_movies_latest_sql(1, "100", "42", "12");
+static int rsh_assert_emby_d8_index_definition_gate(
+    const rsh_case_context *context,
+    int mode_id,
+    int expected_delta,
+    void *ctx
+) {
+    const emby_d8_index_definition_expectation *expectation =
+        (const emby_d8_index_definition_expectation *)ctx;
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+    char *sql;
+    char *rewritten = NULL;
+    const char *expected;
 
-    capture = begin_stderr_capture(&saved_stderr_fd);
-    require_int("dashboard-bind/authorizer-set",
-                sqlite3_set_authorizer(db, count_sqlite_master_read, &readiness_probe),
-                SQLITE_OK);
-
-    for (i = 0; i < sizeof(binds) / sizeof(binds[0]); i++) {
-        char label[128];
-        char *cases[8];
-        cases[0] = replace_once(episodes, "select A.Id from mediaitems A",
-                                xasprintf("select %s AS bound,A.Id from mediaitems A", binds[i]));
-        cases[1] = replace_once(episodes, "in (100)", xasprintf("in (%s)", binds[i]));
-        cases[2] = replace_once(episodes, "UserDatas.UserId=42", xasprintf("UserDatas.UserId=%s", binds[i]));
-        cases[3] = replace_once(episodes, "LIMIT 12", xasprintf("LIMIT %s", binds[i]));
-        cases[4] = replace_once(movies, "A.Id,A.Name", xasprintf("%s AS bound,A.Id,A.Name", binds[i]));
-        cases[5] = replace_once(movies, "in (100)", xasprintf("in (%s)", binds[i]));
-        cases[6] = replace_once(movies, "UserDatas.UserId=42", xasprintf("UserDatas.UserId=%s", binds[i]));
-        cases[7] = replace_once(movies, "LIMIT 12", xasprintf("LIMIT %s", binds[i]));
-        for (int c = 0; c < 8; c++) {
-            snprintf(label, sizeof(label), "dashboard-bind-%lu-%d", (unsigned long)i, c);
-            expect_sql(db, label, cases[c], -1, 2, cases[c], 0);
-            free(cases[c]);
+    (void)mode_id;
+    (void)expected_delta;
+    if (!expectation->movies) {
+        sql = make_latest_sql("A.Id ", "12");
+        if (expectation->rewritten) {
+            rewritten = make_latest_expected("A.Id ", "12");
+        }
+    } else {
+        sql = make_movies_latest_sql(1, "100", "42", "12");
+        if (expectation->rewritten) {
+            rewritten = make_movies_latest_expected("100", "42", "12");
         }
     }
-    require_int("dashboard-bind/authorizer-clear",
-                sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
-    log_output = end_stderr_capture(capture, saved_stderr_fd);
-    require_int("dashboard-bind/readiness-probes", readiness_probe.reads, 0);
-    require_absent("dashboard-bind/applied-log", log_output,
-                   "event=rewrite_applied target=emby mode=dashboard+");
-    require_absent("dashboard-bind/index-missing-log", log_output,
-                   "reason=index_missing mode=dashboard+");
-    require_absent("dashboard-bind/index-probe-error-log", log_output,
-                   "reason=index_probe_error mode=dashboard+");
-    free(log_output);
-
-    {
-        const char *episode_needles[] = {
-            "select A.Id from mediaitems A", " Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey)", " ORDER BY MAX(A.DateCreated) DESC", " LIMIT 12"
-        };
-        const char *episode_repls[] = {
-            "select * from mediaitems A", " Group by A.PresentationUniqueKey", " ORDER BY A.DateCreated DESC", " LIMIT 11"
-        };
-        const char *movies_needles[] = {
-            "A.Id,A.Name", " Group by A.PresentationUniqueKey", " ORDER BY A.DateCreated DESC", " LIMIT 12",
-            "AND A.Id in WithAncestors", "A.Id,A.Name"
-        };
-        const char *movies_repls[] = {
-            "A.Name,A.Id", " Group by A.Id", " ORDER BY A.Name DESC", " LIMIT 21",
-            "AND A.Id in WithAncestors AND A.IsPublic=1", "MAX(A.Id),A.Name"
-        };
-        size_t c;
-        for (c = 0; c < sizeof(episode_needles) / sizeof(episode_needles[0]); c++) {
-            char label[128];
-            char *mutated = replace_once(episodes, episode_needles[c], episode_repls[c]);
-            snprintf(label, sizeof(label), "episodes-structural-negative[%lu]",
-                     (unsigned long)c);
-            expect_sql(db, label, mutated, -1, 2, mutated, 0);
-            free(mutated);
-        }
-        for (c = 0; c < sizeof(movies_needles) / sizeof(movies_needles[0]); c++) {
-            char label[128];
-            char *mutated = replace_once(movies, movies_needles[c], movies_repls[c]);
-            if (c == 0) {
-                char *projection = replace_once(
-                    EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
-                    movies_needles[c], movies_repls[c]
-                );
-                char *expected = make_movies_latest_expected_projection(
-                    "100", projection, "42", "12"
-                );
-                snprintf(label, sizeof(label), "movies-structural-positive[%lu]",
-                         (unsigned long)c);
-                expect_sql(db, label, mutated, -1, 2, expected, 0);
-                free(projection);
-                free(expected);
-            } else {
-                snprintf(label, sizeof(label), "movies-structural-negative[%lu]",
-                         (unsigned long)c);
-                expect_sql(db, label, mutated, -1, 2, mutated, 0);
-            }
-            free(mutated);
-        }
-    }
-
-    {
-        char *movies_no_guard = make_movies_latest_sql(0, "100", "42", "12");
-        char *movies_empty = make_movies_latest_sql(1, "", "42", "12");
-        char *movies_comment = replace_once(
-            movies,
-            "where A.Type=5 AND Coalesce(UserDatas.played, 0)=0",
-            "where A.Type=5 /* guarded tail text: where A.Type=5 AND Coalesce(UserDatas.played, 0)=0 */ AND Coalesce(UserDatas.played, 0)=0"
-        );
-        char *movies_string_projection = replace_once(
-            EMBY_MOVIES_LATEST_COMPACT_PROJECTION,
-            "A.Id,A.Name",
-            "'where A.Type=5 ' AS marker,A.Id,A.Name"
-        );
-        char *movies_string = make_movies_latest_sql_form(
-            1, "100", 0, movies_string_projection, "42", "12"
-        );
-        char *movies_string_expected = make_movies_latest_expected_projection(
-            "100", movies_string_projection, "42", "12"
-        );
-        char *episodes_explain = xasprintf("EXPLAIN %s", episodes);
-        expect_sql(db, "movies-no-guard-negative", movies_no_guard, -1, 2, movies_no_guard, 0);
-        expect_sql(db, "movies-empty-ancestor-negative", movies_empty, -1, 2, movies_empty, 0);
-        expect_sql(db, "movies-comment-tail-negative", movies_comment, -1, 2, movies_comment, 0);
-        require_int("movies-string-type-gate-immunity/type-gate-count",
-                    count_occurrences(movies_string, "where A.Type=5 "), 2);
-        expect_sql(db, "movies-string-type-gate-immunity", movies_string, -1, 2,
-                   movies_string_expected, 0);
-        expect_sql(db, "episodes-explain-negative", episodes_explain, -1, 2, episodes_explain, 0);
-        free(movies_no_guard);
-        free(movies_empty);
-        free(movies_comment);
-        free(movies_string_projection);
-        free(movies_string);
-        free(movies_string_expected);
-        free(episodes_explain);
-    }
-
-    free(episodes);
-    free(movies);
-    require_int("dashboard-negatives/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [dashboard-matcher-negatives]\n");
-    return 0;
+    expected = rewritten ? rewritten : sql;
+    expect_sql(candidate, expectation->label, sql, -1, 2, expected, 0);
+    free(rewritten);
+    free(sql);
+    return SQLITE_OK;
 }
 
-static int child_observability_logs(void) {
-    sqlite3 *db;
-    FILE *capture;
-    char *log_output;
+static int rsh_custom_adapter_emby_d8_index_definition_log_assert(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const char *log_output = context->captured_stderr;
+
+    (void)immutable_data;
+    require_contains(
+        "malformed-episodes-index-definitions/index-missing-log", log_output,
+        "reason=index_missing mode=dashboard+episodes_latest"
+    );
+    require_contains(
+        "canonical-episodes-index-definitions/applied-log", log_output,
+        "event=rewrite_applied target=emby mode=dashboard+episodes_latest"
+    );
+    require_contains(
+        "malformed-movies-index-definitions/index-missing-log", log_output,
+        "reason=index_missing mode=dashboard+movies_latest"
+    );
+    require_contains(
+        "canonical-movies-index-definitions/applied-log", log_output,
+        "event=rewrite_applied target=emby mode=dashboard+movies_latest"
+    );
+    return SQLITE_OK;
+}
+
+#define EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE( \
+    name, phase_label, profile_value, mode_value, expectation_value) \
+    static const rsh_db_spec name##_dbs[] = { \
+        { \
+            .role = "candidate", \
+            .relative_path = "library.db", \
+            .kind = RSH_DB_CANDIDATE, \
+            .storage = RSH_DB_RELATIVE, \
+            .setup_profile = (profile_value) \
+        } \
+    }; \
+    static const rsh_case_spec name##_cases[] = { \
+        { \
+            .label = (phase_label), \
+            .kind = RSH_CASE_INDEX_PROBE, \
+            .build_mask = RSH_BUILD_EMBY_LINKED, \
+            .data.index_probe = { \
+                .role = "candidate", \
+                .mode_id = (mode_value), \
+                .expected_delta = 0, \
+                .assert_probe = rsh_assert_emby_d8_index_definition_gate, \
+                .assert_ctx = (void *)&(expectation_value) \
+            } \
+        } \
+    }
+
+EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE(
+    emby_d8_malformed_episodes_group,
+    "malformed-episodes-group-index-fail-open",
+    EMBY_PROFILE_D8_EPISODES_GROUP_MALFORMED,
+    EMBY_SMOKE_MODE_EPISODES_LATEST,
+    emby_d8_malformed_episodes_group_expectation
+);
+EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE(
+    emby_d8_malformed_episodes_date,
+    "malformed-episodes-date-index-fail-open",
+    EMBY_PROFILE_D8_EPISODES_DATE_MALFORMED,
+    EMBY_SMOKE_MODE_EPISODES_LATEST,
+    emby_d8_malformed_episodes_date_expectation
+);
+EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE(
+    emby_d8_canonical_episodes,
+    "canonical-episodes-indexes-rewrite",
+    EMBY_PROFILE_LATEST_INDEXES,
+    EMBY_SMOKE_MODE_EPISODES_LATEST,
+    emby_d8_canonical_episodes_expectation
+);
+EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE(
+    emby_d8_malformed_movies_outer,
+    "malformed-movies-outer-index-fail-open",
+    EMBY_PROFILE_D8_MOVIES_OUTER_MALFORMED,
+    EMBY_SMOKE_MODE_MOVIES_LATEST,
+    emby_d8_malformed_movies_outer_expectation
+);
+EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE(
+    emby_d8_malformed_movies_inner,
+    "malformed-movies-inner-index-fail-open",
+    EMBY_PROFILE_D8_MOVIES_INNER_MALFORMED,
+    EMBY_SMOKE_MODE_MOVIES_LATEST,
+    emby_d8_malformed_movies_inner_expectation
+);
+EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE(
+    emby_d8_canonical_movies,
+    "canonical-movies-indexes-rewrite",
+    EMBY_PROFILE_D8_MOVIES_CANONICAL,
+    EMBY_SMOKE_MODE_MOVIES_LATEST,
+    emby_d8_canonical_movies_expectation
+);
+
+static const rsh_phase_spec emby_d8_index_definition_phases[] = {
+    {
+        .label = "malformed-episodes-group-index",
+        .dbs = emby_d8_malformed_episodes_group_dbs,
+        .db_count = sizeof(emby_d8_malformed_episodes_group_dbs) /
+                    sizeof(emby_d8_malformed_episodes_group_dbs[0]),
+        .cases = emby_d8_malformed_episodes_group_cases,
+        .case_count = sizeof(emby_d8_malformed_episodes_group_cases) /
+                      sizeof(emby_d8_malformed_episodes_group_cases[0])
+    },
+    {
+        .label = "malformed-episodes-date-index",
+        .dbs = emby_d8_malformed_episodes_date_dbs,
+        .db_count = sizeof(emby_d8_malformed_episodes_date_dbs) /
+                    sizeof(emby_d8_malformed_episodes_date_dbs[0]),
+        .cases = emby_d8_malformed_episodes_date_cases,
+        .case_count = sizeof(emby_d8_malformed_episodes_date_cases) /
+                      sizeof(emby_d8_malformed_episodes_date_cases[0])
+    },
+    {
+        .label = "canonical-episodes-indexes",
+        .dbs = emby_d8_canonical_episodes_dbs,
+        .db_count = sizeof(emby_d8_canonical_episodes_dbs) /
+                    sizeof(emby_d8_canonical_episodes_dbs[0]),
+        .cases = emby_d8_canonical_episodes_cases,
+        .case_count = sizeof(emby_d8_canonical_episodes_cases) /
+                      sizeof(emby_d8_canonical_episodes_cases[0])
+    },
+    {
+        .label = "malformed-movies-outer-index",
+        .dbs = emby_d8_malformed_movies_outer_dbs,
+        .db_count = sizeof(emby_d8_malformed_movies_outer_dbs) /
+                    sizeof(emby_d8_malformed_movies_outer_dbs[0]),
+        .cases = emby_d8_malformed_movies_outer_cases,
+        .case_count = sizeof(emby_d8_malformed_movies_outer_cases) /
+                      sizeof(emby_d8_malformed_movies_outer_cases[0])
+    },
+    {
+        .label = "malformed-movies-inner-index",
+        .dbs = emby_d8_malformed_movies_inner_dbs,
+        .db_count = sizeof(emby_d8_malformed_movies_inner_dbs) /
+                    sizeof(emby_d8_malformed_movies_inner_dbs[0]),
+        .cases = emby_d8_malformed_movies_inner_cases,
+        .case_count = sizeof(emby_d8_malformed_movies_inner_cases) /
+                      sizeof(emby_d8_malformed_movies_inner_cases[0])
+    },
+    {
+        .label = "canonical-movies-indexes",
+        .dbs = emby_d8_canonical_movies_dbs,
+        .db_count = sizeof(emby_d8_canonical_movies_dbs) /
+                    sizeof(emby_d8_canonical_movies_dbs[0]),
+        .cases = emby_d8_canonical_movies_cases,
+        .case_count = sizeof(emby_d8_canonical_movies_cases) /
+                      sizeof(emby_d8_canonical_movies_cases[0])
+    }
+};
+
+static const rsh_case_spec emby_d8_index_definition_post_close_cases[] = {
+    {
+        .label = "dashboard-index-definition-gate-log-assert",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_LOG_CAPTURE,
+            .assert_custom =
+                rsh_custom_adapter_emby_d8_index_definition_log_assert,
+        }
+    }
+};
+
+static const char emby_d8_latest_series_browse_sql[] =
+    "with WithAncestors AS (SELECT itemid FROM AncestorIds2 WHERE AncestorId in (100) )select A.Id,A.SeriesName from mediaitems A left join UserDatas on A.UserDataKeyId=UserDatas.UserDataKeyId And UserDatas.UserId=42 where A.Type=8 AND Coalesce(UserDatas.played, 0)=0 AND A.Id in WithAncestors Group by coalesce(A.SeriesPresentationUniqueKey, A.PresentationUniqueKey) ORDER BY SeriesName LIMIT 12";
+
+static int rsh_custom_adapter_emby_d8_observability_primary_producer(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *db = rsh_context_db(context, "candidate");
     char *links_sql;
     char *links_repl;
     char *links_expected;
@@ -5131,7 +8681,6 @@ static int child_observability_logs(void) {
     char *latest_miss_sql;
     char *latest_unsupported_sql;
     char *latest_bind_sql;
-    char *latest_series_sql;
     char *movies_sql;
     char *movies_expected;
     char *movies_miss_sql;
@@ -5142,35 +8691,36 @@ static int child_observability_logs(void) {
     char *mixed_expected;
     char *mixed_miss_sql;
     char *mixed_bind_sql;
-    int saved_stderr_fd;
 
-    configure_env_observable("1", "0", "0");
-    if (setenv("SQLITE3_DISABLE_STMT_TRACE", "1", 1) != 0 ||
-        unsetenv("SQLITE3_DISABLE_REWRITE_APPLIED_SQL") != 0) {
-        failf("FATAL: exec-child observable env failed: %s", strerror(errno));
-    }
-    make_temp_dir();
-    capture = begin_stderr_capture(&saved_stderr_fd);
-
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    seed_movies_latest_rows(db);
+    (void)immutable_data;
     links_sql = make_links_search_sql("2,3");
     links_repl = make_exists_links_one("100", "2,3");
-    links_expected = replace_once(links_sql, "A.Id in WithItemLinkItemIds", links_repl);
-    expect_sql(db, "obs-fanout-links-applied", links_sql, -1, 2, links_expected, 0);
+    links_expected = replace_once(
+        links_sql, "A.Id in WithItemLinkItemIds", links_repl
+    );
+    expect_sql(
+        db, "obs-fanout-links-applied", links_sql, -1, 2,
+        links_expected, 0
+    );
     links_two_level_expected = make_link_type_count_shape_05_expected();
-    expect_sql(db, "obs-fanout-links-two-level-applied",
-               EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2,
-               links_two_level_expected, 0);
+    expect_sql(
+        db, "obs-fanout-links-two-level-applied",
+        EMBY_LINK_TYPE_COUNT_SHAPE_05_SQL, -1, 2,
+        links_two_level_expected, 0
+    );
 
     links_miss_sql = make_links_search_sql("'bad'");
-    expect_sql(db, "obs-fanout-links-capture-miss", links_miss_sql, -1, 2, links_miss_sql, 0);
+    expect_sql(
+        db, "obs-fanout-links-capture-miss", links_miss_sql, -1, 2,
+        links_miss_sql, 0
+    );
 
     resume_simple_sql = make_resume_simple_sql(1, "12");
     resume_simple_expected = make_resume_simple_expected(resume_simple_sql);
-    expect_sql(db, "obs-fanout-resume-simple-applied", resume_simple_sql,
-               -1, 2, resume_simple_expected, 0);
-
+    expect_sql(
+        db, "obs-fanout-resume-simple-applied", resume_simple_sql, -1, 2,
+        resume_simple_expected, 0
+    );
     {
         char *resume_sql = make_resume_sql();
         resume_early_sql = replace_once(
@@ -5180,153 +8730,466 @@ static int child_observability_logs(void) {
         );
         free(resume_sql);
     }
-    expect_sql(db, "obs-fanout-resume-early-miss", resume_early_sql,
-               -1, 2, resume_early_sql, 0);
+    expect_sql(
+        db, "obs-fanout-resume-early-miss", resume_early_sql, -1, 2,
+        resume_early_sql, 0
+    );
 
     similar_sql = make_similar_sql();
     similar_expected = make_similar_expected(similar_sql);
-    expect_sql(db, "obs-fanout-similar-applied", similar_sql, -1, 2, similar_expected, 0);
+    expect_sql(
+        db, "obs-fanout-similar-applied", similar_sql, -1, 2,
+        similar_expected, 0
+    );
 
     latest_sql = make_latest_sql("A.Id ", "12");
     latest_expected = make_latest_expected("A.Id ", "12");
-    expect_sql(db, "obs-dashboard-latest-applied", latest_sql, -1, 2, latest_expected, 0);
+    expect_sql(
+        db, "obs-dashboard-latest-applied", latest_sql, -1, 2,
+        latest_expected, 0
+    );
     latest_new_corr_sql = replace_once(latest_sql, "in (100)", "in (101)");
     latest_new_corr_expected = make_latest_expected_form("A.Id ", "101", "12");
-    expect_sql(db, "obs-dashboard-latest-new-corr", latest_new_corr_sql,
-               -1, 2, latest_new_corr_expected, 0);
-    expect_sql(db, "obs-dashboard-latest-new-corr-repeat", latest_new_corr_sql,
-               -1, 2, latest_new_corr_expected, 0);
+    expect_sql(
+        db, "obs-dashboard-latest-new-corr", latest_new_corr_sql, -1, 2,
+        latest_new_corr_expected, 0
+    );
+    expect_sql(
+        db, "obs-dashboard-latest-new-corr-repeat", latest_new_corr_sql,
+        -1, 2, latest_new_corr_expected, 0
+    );
 
     latest_miss_sql = make_latest_sql("(A.DateCreated) ", "12");
-    expect_sql(db, "obs-dashboard-capture-miss", latest_miss_sql, -1, 2, latest_miss_sql, 0);
+    expect_sql(
+        db, "obs-dashboard-capture-miss", latest_miss_sql, -1, 2,
+        latest_miss_sql, 0
+    );
     latest_unsupported_sql = make_latest_sql("A.Id ", "11");
-    expect_sql(db, "obs-dashboard-limit-unsupported", latest_unsupported_sql,
-               -1, 2, latest_unsupported_sql, 0);
+    expect_sql(
+        db, "obs-dashboard-limit-unsupported", latest_unsupported_sql,
+        -1, 2, latest_unsupported_sql, 0
+    );
     latest_bind_sql = replace_once(
         latest_sql,
         "select A.Id from mediaitems A",
         "select ? AS bound,A.Id from mediaitems A"
     );
-    expect_sql(db, "obs-dashboard-bind-out-of-scope", latest_bind_sql,
-               -1, 2, latest_bind_sql, 0);
-    latest_series_sql = read_text_file(
-        "tests/fixtures/emby-fts-rewrite/latest-series-browse-negative.sql"
+    expect_sql(
+        db, "obs-dashboard-bind-out-of-scope", latest_bind_sql, -1, 2,
+        latest_bind_sql, 0
     );
-    expect_sql(db, "obs-dashboard-series-browse-clean-miss", latest_series_sql,
-               -1, 2, latest_series_sql, 0);
+    expect_sql(
+        db, "obs-dashboard-series-browse-clean-miss",
+        emby_d8_latest_series_browse_sql, -1, 2,
+        emby_d8_latest_series_browse_sql, 0
+    );
 
     movies_sql = make_movies_latest_sql(1, "100", "42", "12");
     movies_expected = make_movies_latest_expected("100", "42", "12");
-    expect_sql(db, "obs-dashboard-movies-applied", movies_sql, -1, 2,
-               movies_expected, 0);
-    movies_miss_sql = replace_once(movies_sql, " Group by A.PresentationUniqueKey",
-                                   " Group by A.Id");
-    expect_sql(db, "obs-dashboard-movies-capture-miss", movies_miss_sql, -1, 2,
-               movies_miss_sql, 0);
+    expect_sql(
+        db, "obs-dashboard-movies-applied", movies_sql, -1, 2,
+        movies_expected, 0
+    );
+    movies_miss_sql = replace_once(
+        movies_sql, " Group by A.PresentationUniqueKey", " Group by A.Id"
+    );
+    expect_sql(
+        db, "obs-dashboard-movies-capture-miss", movies_miss_sql, -1, 2,
+        movies_miss_sql, 0
+    );
     movies_unsupported_sql = make_movies_latest_sql(1, "100", "42", "21");
-    expect_sql(db, "obs-dashboard-movies-limit-unsupported",
-               movies_unsupported_sql, -1, 2, movies_unsupported_sql, 0);
+    expect_sql(
+        db, "obs-dashboard-movies-limit-unsupported",
+        movies_unsupported_sql, -1, 2, movies_unsupported_sql, 0
+    );
     movies_bind_sql = replace_once(
         movies_sql, "A.Id,A.Name", "? AS bound,A.Id,A.Name"
     );
-    expect_sql(db, "obs-dashboard-movies-bind-out-of-scope", movies_bind_sql,
-               -1, 2, movies_bind_sql, 0);
+    expect_sql(
+        db, "obs-dashboard-movies-bind-out-of-scope", movies_bind_sql,
+        -1, 2, movies_bind_sql, 0
+    );
     movies_no_guard_sql = make_movies_latest_sql(0, "100", "42", "12");
-    expect_sql(db, "obs-dashboard-movies-no-guard", movies_no_guard_sql, -1, 2,
-               movies_no_guard_sql, 0);
+    expect_sql(
+        db, "obs-dashboard-movies-no-guard", movies_no_guard_sql,
+        -1, 2, movies_no_guard_sql, 0
+    );
+
     mixed_sql = make_mixed_latest_sql("42", "3");
     mixed_expected = make_mixed_latest_expected("42", "3");
     expect_mixed_latest_sql(
         db, "obs-dashboard-mixed-applied", mixed_sql, mixed_expected, 0, 0
     );
-    mixed_miss_sql = replace_once(
-        mixed_sql, "A.type,A.Id", "A.Type,A.Id"
+    mixed_miss_sql = replace_once(mixed_sql, "A.type,A.Id", "A.Type,A.Id");
+    expect_sql(
+        db, "obs-dashboard-mixed-capture-miss", mixed_miss_sql, -1, 2,
+        mixed_miss_sql, 0
     );
-    expect_sql(db, "obs-dashboard-mixed-capture-miss", mixed_miss_sql, -1, 2,
-               mixed_miss_sql, 0);
     mixed_bind_sql = make_mixed_latest_sql("?1", "3");
-    expect_sql(db, "obs-dashboard-mixed-bind-out-of-scope", mixed_bind_sql,
-               -1, 2, mixed_bind_sql, 0);
-    require_int("observability/index-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+    expect_sql(
+        db, "obs-dashboard-mixed-bind-out-of-scope", mixed_bind_sql,
+        -1, 2, mixed_bind_sql, 0
+    );
 
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 0, 1);
-    seed_movies_latest_rows(db);
-    expect_sql(db, "obs-dashboard-movies-outer-missing", movies_sql, -1, 2,
-               movies_sql, 0);
-    expect_sql(db, "obs-dashboard-movies-outer-missing-repeat", movies_sql, -1, 2,
-               movies_sql, 0);
-    require_int("observability/movies-outer-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+    free(links_sql);
+    free(links_repl);
+    free(links_expected);
+    free(links_two_level_expected);
+    free(links_miss_sql);
+    free(resume_simple_sql);
+    free(resume_simple_expected);
+    free(resume_early_sql);
+    free(similar_sql);
+    free(similar_expected);
+    free(latest_sql);
+    free(latest_expected);
+    free(latest_new_corr_sql);
+    free(latest_new_corr_expected);
+    free(latest_miss_sql);
+    free(latest_unsupported_sql);
+    free(latest_bind_sql);
+    free(movies_sql);
+    free(movies_expected);
+    free(movies_miss_sql);
+    free(movies_unsupported_sql);
+    free(movies_bind_sql);
+    free(movies_no_guard_sql);
+    free(mixed_sql);
+    free(mixed_expected);
+    free(mixed_miss_sql);
+    free(mixed_bind_sql);
+    return SQLITE_OK;
+}
 
-    make_temp_dir();
-    db = open_seeded_temp_with_dashboard_indexes("library.db", 1, 1, 1, 0);
-    seed_movies_latest_rows(db);
-    expect_sql(db, "obs-dashboard-movies-inner-missing", movies_sql, -1, 2,
-               movies_sql, 0);
-    expect_sql(db, "obs-dashboard-movies-inner-missing-repeat", movies_sql, -1, 2,
-               movies_sql, 0);
-    require_int("observability/movies-inner-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+typedef enum emby_d8_observability_missing_kind {
+    EMBY_D8_MISSING_MOVIES_OUTER = 0,
+    EMBY_D8_MISSING_MOVIES_INNER,
+    EMBY_D8_MISSING_MIXED,
+    EMBY_D8_MISSING_EPISODES_DATE,
+    EMBY_D8_MISSING_EPISODES_GROUP,
+    EMBY_D8_MISSING_EPISODES_BOTH
+} emby_d8_observability_missing_kind;
 
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 0, 1);
-    expect_sql(db, "obs-dashboard-mixed-index-missing", mixed_sql, -1, 2,
-               mixed_sql, 0);
-    expect_sql(db, "obs-dashboard-mixed-index-missing-repeat", mixed_sql, -1, 2,
-               mixed_sql, 0);
-    require_int("observability/mixed-missing-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+typedef struct emby_d8_observability_missing_spec {
+    emby_d8_observability_missing_kind kind;
+    const char *first_label;
+    const char *second_label;
+} emby_d8_observability_missing_spec;
 
-    make_temp_dir();
-    db = open_seeded_temp_with_latest_indexes("library.db", 1, 0);
-    expect_sql(db, "obs-dashboard-date-index-missing", latest_sql, -1, 2,
-               latest_sql, 0);
-    expect_sql(db, "obs-dashboard-date-index-missing-repeat", latest_sql, -1, 2,
-               latest_sql, 0);
-    require_int("observability/date-index-missing-close",
-                sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+static const emby_d8_observability_missing_spec
+    emby_d8_movies_outer_missing_spec = {
+        EMBY_D8_MISSING_MOVIES_OUTER,
+        "obs-dashboard-movies-outer-missing",
+        "obs-dashboard-movies-outer-missing-repeat"
+    };
+static const emby_d8_observability_missing_spec
+    emby_d8_movies_inner_missing_spec = {
+        EMBY_D8_MISSING_MOVIES_INNER,
+        "obs-dashboard-movies-inner-missing",
+        "obs-dashboard-movies-inner-missing-repeat"
+    };
+static const emby_d8_observability_missing_spec emby_d8_mixed_missing_spec = {
+    EMBY_D8_MISSING_MIXED,
+    "obs-dashboard-mixed-index-missing",
+    "obs-dashboard-mixed-index-missing-repeat"
+};
+static const emby_d8_observability_missing_spec
+    emby_d8_episodes_date_missing_spec = {
+        EMBY_D8_MISSING_EPISODES_DATE,
+        "obs-dashboard-date-index-missing",
+        "obs-dashboard-date-index-missing-repeat"
+    };
+static const emby_d8_observability_missing_spec
+    emby_d8_episodes_group_missing_spec = {
+        EMBY_D8_MISSING_EPISODES_GROUP,
+        "obs-dashboard-group-index-missing-new-connection",
+        NULL
+    };
+static const emby_d8_observability_missing_spec
+    emby_d8_episodes_both_missing_spec = {
+        EMBY_D8_MISSING_EPISODES_BOTH,
+        "obs-dashboard-both-indexes-missing-new-connection",
+        NULL
+    };
 
-    make_temp_dir();
-    db = open_seeded_temp_with_latest_indexes("library.db", 0, 1);
-    expect_sql(db, "obs-dashboard-group-index-missing-new-connection", latest_sql,
-               -1, 2, latest_sql, 0);
-    require_int("observability/group-index-missing-new-connection-close",
-                sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+static int rsh_custom_adapter_emby_d8_observability_missing_producer(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const emby_d8_observability_missing_spec *spec =
+        (const emby_d8_observability_missing_spec *)immutable_data;
+    sqlite3 *db = rsh_context_db(context, "candidate");
+    char *sql;
 
-    make_temp_dir();
-    db = open_seeded_temp_with_latest_indexes("library.db", 0, 0);
-    expect_sql(db, "obs-dashboard-both-indexes-missing-new-connection", latest_sql,
-               -1, 2, latest_sql, 0);
-    require_int("observability/both-indexes-missing-new-connection-close",
-                sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+    if (spec->kind == EMBY_D8_MISSING_MOVIES_OUTER ||
+        spec->kind == EMBY_D8_MISSING_MOVIES_INNER) {
+        sql = make_movies_latest_sql(1, "100", "42", "12");
+    } else if (spec->kind == EMBY_D8_MISSING_MIXED) {
+        sql = make_mixed_latest_sql("42", "3");
+    } else {
+        sql = make_latest_sql("A.Id ", "12");
+    }
+    expect_sql(db, spec->first_label, sql, -1, 2, sql, 0);
+    if (spec->second_label) {
+        expect_sql(db, spec->second_label, sql, -1, 2, sql, 0);
+    }
+    free(sql);
+    return SQLITE_OK;
+}
 
-    make_temp_dir();
-    db = open_seeded_temp_with_mixed_indexes("library.db", 1, 1);
-    seed_movies_latest_rows(db);
-    require_int("observability/probe-authorizer/set",
-                sqlite3_set_authorizer(db, deny_sqlite_master_read, NULL), SQLITE_OK);
-    expect_sql(db, "obs-dashboard-index-probe-error", latest_sql, -1, 2, latest_sql, 0);
-    expect_sql(db, "obs-dashboard-index-probe-error-repeat", latest_sql,
-               -1, 2, latest_sql, 0);
-    expect_sql(db, "obs-dashboard-movies-index-probe-error", movies_sql, -1, 2,
-               movies_sql, 0);
-    expect_sql(db, "obs-dashboard-movies-index-probe-error-repeat", movies_sql,
-               -1, 2, movies_sql, 0);
-    expect_sql(db, "obs-dashboard-mixed-index-probe-error", mixed_sql, -1, 2,
-               mixed_sql, 0);
-    expect_sql(db, "obs-dashboard-mixed-index-probe-error-repeat", mixed_sql,
-               -1, 2, mixed_sql, 0);
-    require_int("observability/probe-authorizer/clear", sqlite3_set_authorizer(db, NULL, NULL),
-                SQLITE_OK);
-    require_int("observability/probe-error-close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
+static int rsh_custom_adapter_emby_d8_observability_probe_error_producer(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *db = rsh_context_db(context, "candidate");
+    char *latest_sql = make_latest_sql("A.Id ", "12");
+    char *movies_sql = make_movies_latest_sql(1, "100", "42", "12");
+    char *mixed_sql = make_mixed_latest_sql("42", "3");
 
-    log_output = end_stderr_capture(capture, saved_stderr_fd);
+    (void)immutable_data;
+    require_int(
+        "observability/probe-authorizer/set",
+        sqlite3_set_authorizer(db, deny_sqlite_master_read, NULL), SQLITE_OK
+    );
+    expect_sql(
+        db, "obs-dashboard-index-probe-error", latest_sql, -1, 2,
+        latest_sql, 0
+    );
+    expect_sql(
+        db, "obs-dashboard-index-probe-error-repeat", latest_sql, -1, 2,
+        latest_sql, 0
+    );
+    expect_sql(
+        db, "obs-dashboard-movies-index-probe-error", movies_sql, -1, 2,
+        movies_sql, 0
+    );
+    expect_sql(
+        db, "obs-dashboard-movies-index-probe-error-repeat", movies_sql,
+        -1, 2, movies_sql, 0
+    );
+    expect_sql(
+        db, "obs-dashboard-mixed-index-probe-error", mixed_sql, -1, 2,
+        mixed_sql, 0
+    );
+    expect_sql(
+        db, "obs-dashboard-mixed-index-probe-error-repeat", mixed_sql,
+        -1, 2, mixed_sql, 0
+    );
+    require_int(
+        "observability/probe-authorizer/clear",
+        sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK
+    );
+    free(latest_sql);
+    free(movies_sql);
+    free(mixed_sql);
+    return SQLITE_OK;
+}
+
+static const rsh_db_spec emby_d8_observability_primary_dbs[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D8_MIXED_ALL_INDEXES_WITH_MOVIES_SEED
+    }
+};
+
+static const rsh_case_spec emby_d8_observability_primary_cases[] = {
+    {
+        .label = "observability-primary-producer",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom =
+                rsh_custom_adapter_emby_d8_observability_primary_producer,
+        }
+    }
+};
+
+#define EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE( \
+    name, phase_label, profile_value, spec_value) \
+    static const rsh_db_spec name##_dbs[] = { \
+        { \
+            .role = "candidate", \
+            .relative_path = "library.db", \
+            .kind = RSH_DB_CANDIDATE, \
+            .storage = RSH_DB_RELATIVE, \
+            .setup_profile = (profile_value) \
+        } \
+    }; \
+    static const rsh_case_spec name##_cases[] = { \
+        { \
+            .label = (phase_label), \
+            .kind = RSH_CASE_CUSTOM, \
+            .build_mask = RSH_BUILD_EMBY_LINKED, \
+            .data.custom = { \
+                .kind = RSH_CUSTOM_FAULT_MATRIX, \
+                .assert_custom = rsh_custom_adapter_emby_d8_observability_missing_producer, \
+                .immutable_data = &(spec_value) \
+            } \
+        } \
+    }
+
+EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE(
+    emby_d8_movies_outer_missing,
+    "observability-movies-outer-missing",
+    EMBY_PROFILE_MOVIES_OUTER_INDEX_MISSING,
+    emby_d8_movies_outer_missing_spec
+);
+EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE(
+    emby_d8_movies_inner_missing,
+    "observability-movies-inner-missing",
+    EMBY_PROFILE_MOVIES_INNER_INDEX_MISSING,
+    emby_d8_movies_inner_missing_spec
+);
+EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE(
+    emby_d8_mixed_missing,
+    "observability-mixed-missing",
+    EMBY_PROFILE_D5B_MIXED_OUTER_MISSING,
+    emby_d8_mixed_missing_spec
+);
+EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE(
+    emby_d8_episodes_date_missing,
+    "observability-date-index-missing",
+    EMBY_PROFILE_D8_EPISODES_DATE_MISSING,
+    emby_d8_episodes_date_missing_spec
+);
+EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE(
+    emby_d8_episodes_group_missing,
+    "observability-group-index-missing-new-connection",
+    EMBY_PROFILE_D8_EPISODES_GROUP_MISSING,
+    emby_d8_episodes_group_missing_spec
+);
+EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE(
+    emby_d8_episodes_both_missing,
+    "observability-both-indexes-missing-new-connection",
+    EMBY_PROFILE_D8_EPISODES_BOTH_MISSING,
+    emby_d8_episodes_both_missing_spec
+);
+
+static const rsh_db_spec emby_d8_observability_probe_error_dbs[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D8_MIXED_ALL_INDEXES_WITH_MOVIES_SEED
+    }
+};
+
+static const rsh_case_spec emby_d8_observability_probe_error_cases[] = {
+    {
+        .label = "observability-probe-error-producer",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom =
+                rsh_custom_adapter_emby_d8_observability_probe_error_producer,
+        }
+    }
+};
+
+static const rsh_phase_spec emby_d8_observability_phases[] = {
+    {
+        .label = "observability-primary",
+        .dbs = emby_d8_observability_primary_dbs,
+        .db_count = sizeof(emby_d8_observability_primary_dbs) /
+                    sizeof(emby_d8_observability_primary_dbs[0]),
+        .cases = emby_d8_observability_primary_cases,
+        .case_count = sizeof(emby_d8_observability_primary_cases) /
+                      sizeof(emby_d8_observability_primary_cases[0])
+    },
+    {
+        .label = "observability-movies-outer-missing",
+        .dbs = emby_d8_movies_outer_missing_dbs,
+        .db_count = sizeof(emby_d8_movies_outer_missing_dbs) /
+                    sizeof(emby_d8_movies_outer_missing_dbs[0]),
+        .cases = emby_d8_movies_outer_missing_cases,
+        .case_count = sizeof(emby_d8_movies_outer_missing_cases) /
+                      sizeof(emby_d8_movies_outer_missing_cases[0])
+    },
+    {
+        .label = "observability-movies-inner-missing",
+        .dbs = emby_d8_movies_inner_missing_dbs,
+        .db_count = sizeof(emby_d8_movies_inner_missing_dbs) /
+                    sizeof(emby_d8_movies_inner_missing_dbs[0]),
+        .cases = emby_d8_movies_inner_missing_cases,
+        .case_count = sizeof(emby_d8_movies_inner_missing_cases) /
+                      sizeof(emby_d8_movies_inner_missing_cases[0])
+    },
+    {
+        .label = "observability-mixed-missing",
+        .dbs = emby_d8_mixed_missing_dbs,
+        .db_count = sizeof(emby_d8_mixed_missing_dbs) /
+                    sizeof(emby_d8_mixed_missing_dbs[0]),
+        .cases = emby_d8_mixed_missing_cases,
+        .case_count = sizeof(emby_d8_mixed_missing_cases) /
+                      sizeof(emby_d8_mixed_missing_cases[0])
+    },
+    {
+        .label = "observability-date-index-missing",
+        .dbs = emby_d8_episodes_date_missing_dbs,
+        .db_count = sizeof(emby_d8_episodes_date_missing_dbs) /
+                    sizeof(emby_d8_episodes_date_missing_dbs[0]),
+        .cases = emby_d8_episodes_date_missing_cases,
+        .case_count = sizeof(emby_d8_episodes_date_missing_cases) /
+                      sizeof(emby_d8_episodes_date_missing_cases[0])
+    },
+    {
+        .label = "observability-group-index-missing-new-connection",
+        .dbs = emby_d8_episodes_group_missing_dbs,
+        .db_count = sizeof(emby_d8_episodes_group_missing_dbs) /
+                    sizeof(emby_d8_episodes_group_missing_dbs[0]),
+        .cases = emby_d8_episodes_group_missing_cases,
+        .case_count = sizeof(emby_d8_episodes_group_missing_cases) /
+                      sizeof(emby_d8_episodes_group_missing_cases[0])
+    },
+    {
+        .label = "observability-both-indexes-missing-new-connection",
+        .dbs = emby_d8_episodes_both_missing_dbs,
+        .db_count = sizeof(emby_d8_episodes_both_missing_dbs) /
+                    sizeof(emby_d8_episodes_both_missing_dbs[0]),
+        .cases = emby_d8_episodes_both_missing_cases,
+        .case_count = sizeof(emby_d8_episodes_both_missing_cases) /
+                      sizeof(emby_d8_episodes_both_missing_cases[0])
+    },
+    {
+        .label = "observability-probe-error",
+        .dbs = emby_d8_observability_probe_error_dbs,
+        .db_count = sizeof(emby_d8_observability_probe_error_dbs) /
+                    sizeof(emby_d8_observability_probe_error_dbs[0]),
+        .cases = emby_d8_observability_probe_error_cases,
+        .case_count = sizeof(emby_d8_observability_probe_error_cases) /
+                      sizeof(emby_d8_observability_probe_error_cases[0])
+    }
+};
+
+static int rsh_custom_adapter_emby_d8_observability_log_assert(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const char *log_output = context->captured_stderr;
+    char *resume_sql;
+    char *resume_early_sql;
+    char *latest_sql;
+    char *latest_new_corr_sql;
+    char *latest_miss_sql;
+
+    (void)immutable_data;
+    resume_sql = make_resume_sql();
+    resume_early_sql = replace_once(
+        resume_sql,
+        "AND LastWatchedEpisodes.LastPlayedDateInt not null",
+        "AND 1=1"
+    );
+    free(resume_sql);
+    latest_sql = make_latest_sql("A.Id ", "12");
+    latest_new_corr_sql = replace_once(latest_sql, "in (100)", "in (101)");
+    latest_miss_sql = make_latest_sql("(A.DateCreated) ", "12");
+
     require_contains(
         "observability/fanout-applied",
         log_output,
@@ -5399,16 +9262,30 @@ static int child_observability_logs(void) {
             metadata, sizeof(metadata),
             "sql_len=%lu corr=%016llx",
             (unsigned long)strlen(latest_miss_sql),
-            (unsigned long long)sql_corr_key(latest_miss_sql, strlen(latest_miss_sql))
+            (unsigned long long)sql_corr_key(
+                latest_miss_sql, strlen(latest_miss_sql)
+            )
         );
         if (rc < 0 || (size_t)rc >= sizeof(metadata)) {
             failf("FATAL: observability capture metadata overflow");
         }
-        require_contains("observability/dashboard-capture-correlation", log_output, metadata);
-        require_contains("observability/dashboard-capture-source", log_output, latest_miss_sql);
+        require_contains(
+            "observability/dashboard-capture-correlation",
+            log_output, metadata
+        );
+        require_contains(
+            "observability/dashboard-capture-source",
+            log_output, latest_miss_sql
+        );
     }
-    require_absent("observability/series-early-miss-source", log_output, latest_series_sql);
-    require_absent("observability/resume-early-miss-source", log_output, resume_early_sql);
+    require_absent(
+        "observability/series-early-miss-source", log_output,
+        emby_d8_latest_series_browse_sql
+    );
+    require_absent(
+        "observability/resume-early-miss-source", log_output,
+        resume_early_sql
+    );
     require_int(
         "observability/dashboard-capture-miss-count",
         count_occurrences(
@@ -5558,247 +9435,693 @@ static int child_observability_logs(void) {
         log_output,
         "event=rewrite_skipped target=emby reason=rewritten_prepare_failed mode=dashboard+movies_latest"
     );
-    require_absent("observability/old-dashboard-mode", log_output, "dashboard+" "latest");
+    require_absent(
+        "observability/old-dashboard-mode", log_output, "dashboard+" "latest"
+    );
 
-    free(log_output);
-    free(links_sql);
-    free(links_repl);
-    free(links_expected);
-    free(links_two_level_expected);
-    free(links_miss_sql);
-    free(resume_simple_sql);
-    free(resume_simple_expected);
     free(resume_early_sql);
-    free(similar_sql);
-    free(similar_expected);
     free(latest_sql);
-    free(latest_expected);
     free(latest_new_corr_sql);
-    free(latest_new_corr_expected);
     free(latest_miss_sql);
-    free(latest_unsupported_sql);
-    free(latest_bind_sql);
-    free(latest_series_sql);
-    free(movies_sql);
-    free(movies_expected);
-    free(movies_miss_sql);
-    free(movies_unsupported_sql);
-    free(movies_bind_sql);
-    free(movies_no_guard_sql);
-    free(mixed_sql);
-    free(mixed_expected);
-    free(mixed_miss_sql);
-    free(mixed_bind_sql);
-    printf("PASS [observability-logs]\n");
-    return 0;
+    return SQLITE_OK;
 }
 
-static int child_observability_master_disabled(void) {
-    sqlite3 *db;
-    FILE *capture;
-    char *log_output;
-    char *latest_sql;
-    char *latest_expected;
-    char *latest_miss_sql;
-    int saved_stderr_fd;
-
-    configure_env("1", "1", "0");
-    if (setenv("SQLITE3_DISABLE_STMT_TRACE", "0", 1) != 0) {
-        failf("setenv STMT trace failed");
+static const rsh_case_spec emby_d8_observability_post_close_cases[] = {
+    {
+        .label = "observability-log-assert",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_LOG_CAPTURE,
+            .assert_custom =
+                rsh_custom_adapter_emby_d8_observability_log_assert,
+        }
     }
-    make_temp_dir();
-    capture = begin_stderr_capture(&saved_stderr_fd);
-    db = open_seeded_temp_with_latest_indexes("library.db", 1, 1);
-    latest_sql = make_latest_sql("A.Id ", "12");
-    latest_expected = make_latest_expected("A.Id ", "12");
-    latest_miss_sql = make_latest_sql("(A.DateCreated) ", "12");
-    expect_sql(db, "master-disabled-applied", latest_sql, -1, 2, latest_expected, 0);
-    expect_sql(db, "master-disabled-capture", latest_miss_sql, -1, 2,
-               latest_miss_sql, 0);
-    exec_sql(db, "master-disabled-stmt", latest_sql);
-    require_int("master-disabled/close", sqlite3_close(db), SQLITE_OK);
-    log_output = end_stderr_capture(capture, saved_stderr_fd);
+};
+
+static int rsh_custom_adapter_emby_d8_master_disabled_producer(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *db = rsh_context_db(context, "candidate");
+    sqlite3_stmt *stmt = NULL;
+    char *latest_sql = make_latest_sql("A.Id ", "12");
+    char *latest_expected = make_latest_expected("A.Id ", "12");
+    char *latest_miss_sql = make_latest_sql("(A.DateCreated) ", "12");
+    const char *failure_stage = "prepare";
+    int rc;
+
+    (void)immutable_data;
+    expect_sql(
+        db, "master-disabled-applied", latest_sql, -1, 2,
+        latest_expected, 0
+    );
+    expect_sql(
+        db, "master-disabled-capture", latest_miss_sql, -1, 2,
+        latest_miss_sql, 0
+    );
+    rc = sqlite3_prepare_v2(db, latest_sql, -1, &stmt, NULL);
+    if (rc == SQLITE_OK && !stmt) rc = SQLITE_ERROR;
+    if (rc == SQLITE_OK) {
+        failure_stage = "step";
+        while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {}
+        if (rc == SQLITE_DONE) rc = SQLITE_OK;
+    }
+    if (stmt) {
+        int finalize_rc = sqlite3_finalize(stmt);
+        stmt = NULL;
+        if (rc == SQLITE_OK && finalize_rc != SQLITE_OK) {
+            failure_stage = "finalize";
+            rc = finalize_rc;
+        }
+    }
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [master-disabled-stmt]: expected=%d actual=%d stage=%s err=%s",
+            SQLITE_OK, rc, failure_stage, sqlite3_errmsg(db)
+        );
+    }
+    free(latest_sql);
+    free(latest_expected);
+    free(latest_miss_sql);
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_emby_d8_master_disabled_log_assert(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    const char *log_output = context->captured_stderr;
+
+    (void)immutable_data;
     require_absent("master-disabled/capture", log_output, "reason=capture_miss");
     require_absent("master-disabled/applied", log_output, "event=rewrite_applied");
     require_absent("master-disabled/stmt", log_output, "event=SQLITE_TRACE_STMT");
-    free(log_output);
-    free(latest_sql);
-    free(latest_expected);
-    free(latest_miss_sql);
-    cleanup_temp_dir();
-    printf("PASS [observability-master-disabled]\n");
-    return 0;
+    return SQLITE_OK;
 }
 
-static int child_collision(void) {
-    sqlite3 *db;
-    char *sql;
+static const rsh_db_spec emby_d8_master_disabled_dbs[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_LATEST_INDEXES
+    }
+};
 
-    configure_env("0", "1", "1");
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    g_collision_scalar_calls = 0;
-    require_int("collision/register",
-                sqlite3_create_function_v2(db, "dshadow_emby_fts_rewrite", 1, SQLITE_UTF8,
-                                           NULL, scalar_collision_tripwire,
-                                           NULL, NULL, NULL),
-                SQLITE_OK);
-    sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    expect_sql(db, "collision", sql, -1, 2, sql, 0);
-    require_int("collision/scalar-calls", g_collision_scalar_calls, 0);
-    free(sql);
-    require_int("collision/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [collision]\n");
-    return 0;
-}
+static const rsh_case_spec emby_d8_master_disabled_producer_cases[] = {
+    {
+        .label = "observability-master-disabled-producer",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_IDENTITY,
+            .assert_custom =
+                rsh_custom_adapter_emby_d8_master_disabled_producer,
+        }
+    }
+};
 
-static int child_authorizer_and_ownership(void) {
-    sqlite3 *db;
-    char *sql;
-    char *expected;
+static const rsh_phase_spec emby_d8_master_disabled_phases[] = {
+    {
+        .label = "observability-master-disabled",
+        .dbs = emby_d8_master_disabled_dbs,
+        .db_count = sizeof(emby_d8_master_disabled_dbs) /
+                    sizeof(emby_d8_master_disabled_dbs[0]),
+        .cases = emby_d8_master_disabled_producer_cases,
+        .case_count = sizeof(emby_d8_master_disabled_producer_cases) /
+                      sizeof(emby_d8_master_disabled_producer_cases[0])
+    }
+};
 
-    configure_env("0", "1", "1");
-    make_temp_dir();
-    db = open_seeded_temp("library.db");
-    sql = make_emby_sql(0, "100", "100", "6", "7", 1);
-    expected = make_expected_sql(0, "100", "100", "6", "7", 1);
-
-    require_int("authorizer/set", sqlite3_set_authorizer(db, deny_pragma_function_list, NULL), SQLITE_OK);
-    expect_sql(db, "authorizer-deny-probe", sql, -1, 2, sql, 0);
-    require_int("authorizer/clear", sqlite3_set_authorizer(db, NULL, NULL), SQLITE_OK);
-
-    expect_sql(db, "ownership-ready", sql, -1, 2, expected, 1);
-    require_int("ownership/replace",
-                sqlite3_create_function_v2(db, "dshadow_emby_fts_rewrite", 1, SQLITE_UTF8,
-                                           NULL, scalar_owner_spoof,
-                                           NULL, NULL, NULL),
-                SQLITE_OK);
-    expect_sql(db, "ownership-replaced", sql, -1, 2, sql, 0);
-
-    free(sql);
-    free(expected);
-    require_int("authorizer-ownership/close", sqlite3_close(db), SQLITE_OK);
-    cleanup_temp_dir();
-    printf("PASS [authorizer-ownership]\n");
-    return 0;
-}
-
-#define DEFINE_LEGACY_THUNK(name, call) \
-    static int legacy_##name(void) { return (call); }
+static const rsh_case_spec emby_d8_master_disabled_post_close_cases[] = {
+    {
+        .label = "observability-master-disabled-log-assert",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .data.custom = {
+            .kind = RSH_CUSTOM_LOG_CAPTURE,
+            .assert_custom =
+                rsh_custom_adapter_emby_d8_master_disabled_log_assert,
+        }
+    }
+};
 
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST
-DEFINE_LEGACY_THUNK(direct_test_api, child_direct_test_api())
-DEFINE_LEGACY_THUNK(direct_fail_open_episodes, child_direct_fail_open_episodes())
-DEFINE_LEGACY_THUNK(direct_fail_open_movies, child_direct_fail_open_movies())
-DEFINE_LEGACY_THUNK(direct_fail_open_mixed, child_direct_fail_open_mixed())
+
+#ifdef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
+static const rsh_case_spec emby_direct_test_api_literal_assertion = {
+    .label = "direct-literal-rhs-positive",
+    .kind = RSH_CASE_SQL_EXACT,
+    .build_mask = RSH_BUILD_EMBY_DIRECT,
+    .data.sql_exact = {
+        .role = "candidate",
+        .sql = emby_positive_literal_sql,
+        .expected_sql = emby_positive_literal_expected_sql,
+        .prepare = EMBY_PREPARE_V2
+    }
+};
 #endif
-DEFINE_LEGACY_THUNK(positive, child_positive())
-DEFINE_LEGACY_THUNK(fts_default_on, child_fts_env(NULL, "fts-default-on", 1))
-DEFINE_LEGACY_THUNK(fts_zero_enables, child_fts_env("0", "fts-zero-enables", 1))
-DEFINE_LEGACY_THUNK(fts_one_disables, child_fts_env("1", "fts-one-disables", 0))
-DEFINE_LEGACY_THUNK(fts_garbage_enables, child_fts_env("xyz", "fts-garbage-enables", 1))
-DEFINE_LEGACY_THUNK(path_negative, child_path_negative())
-DEFINE_LEGACY_THUNK(nonmatch, child_nonmatch())
-DEFINE_LEGACY_THUNK(collision, child_collision())
-DEFINE_LEGACY_THUNK(authorizer_ownership, child_authorizer_and_ownership())
-DEFINE_LEGACY_THUNK(fixture_canary, child_fixture_canary())
-DEFINE_LEGACY_THUNK(row_parity, child_row_parity())
-DEFINE_LEGACY_THUNK(
-    complex_resume_watched_progress_row_parity,
-    child_complex_resume_watched_progress_row_parity()
-)
-DEFINE_LEGACY_THUNK(
-    fanout_default_on, child_fanout_env(NULL, "fanout-default-on", 1)
-)
-DEFINE_LEGACY_THUNK(
-    fanout_zero_enables, child_fanout_env("0", "fanout-zero-enables", 1)
-)
-DEFINE_LEGACY_THUNK(
-    fanout_one_disables, child_fanout_env("1", "fanout-one-disables", 0)
-)
-DEFINE_LEGACY_THUNK(
-    fanout_garbage_enables,
-    child_fanout_env("false", "fanout-garbage-enables", 1)
-)
-DEFINE_LEGACY_THUNK(fanout_matrix, child_fanout_matrix())
-DEFINE_LEGACY_THUNK(links_two_level_row_parity, child_links_two_level_row_parity())
-DEFINE_LEGACY_THUNK(emby_slow_search_matrix, child_emby_slow_search_matrix())
-DEFINE_LEGACY_THUNK(dashboard_default_off, child_dashboard_default_off())
-DEFINE_LEGACY_THUNK(
-    dashboard_one_off, child_dashboard_off_value("1", "dashboard-one-off")
-)
-DEFINE_LEGACY_THUNK(
-    dashboard_empty_off, child_dashboard_off_value("", "dashboard-empty-off")
-)
-DEFINE_LEGACY_THUNK(
-    dashboard_garbage_off,
-    child_dashboard_off_value("false", "dashboard-garbage-off")
-)
-DEFINE_LEGACY_THUNK(dashboard_matrix, child_dashboard_matrix())
-DEFINE_LEGACY_THUNK(dashboard_fix_b_c, child_dashboard_fix_b_c())
-DEFINE_LEGACY_THUNK(dashboard_mixed_latest, child_dashboard_mixed_latest())
-DEFINE_LEGACY_THUNK(dashboard_mixed_disabled, child_dashboard_mixed_disabled())
-DEFINE_LEGACY_THUNK(dashboard_mixed_identity, child_dashboard_mixed_identity())
-DEFINE_LEGACY_THUNK(dashboard_matcher_negatives, child_dashboard_matcher_negatives())
-DEFINE_LEGACY_THUNK(dashboard_release_matrix, child_dashboard_release_matrix())
-DEFINE_LEGACY_THUNK(latest_limit20, child_latest_limit20())
-DEFINE_LEGACY_THUNK(
-    latest_capture_miss_negative,
-    child_latest_fixture_passthrough("latest-capture-miss-negative")
-)
-DEFINE_LEGACY_THUNK(
-    latest_series_browse_negative,
-    child_latest_fixture_passthrough("latest-series-browse-negative")
-)
-DEFINE_LEGACY_THUNK(latest_resume_no_misfire, child_latest_resume_no_misfire())
-DEFINE_LEGACY_THUNK(
-    dashboard_index_definition_gate, child_dashboard_index_definition_gate()
-)
-DEFINE_LEGACY_THUNK(observability_logs, child_observability_logs())
-DEFINE_LEGACY_THUNK(
-    observability_master_disabled, child_observability_master_disabled()
-)
 
-#undef DEFINE_LEGACY_THUNK
+static int rsh_custom_adapter_emby_direct_test_api(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *db = rsh_context_db(context, "candidate");
 
-static const char *const emby_controlled_env_gates[] = {
-    "SQLITE3_DISABLE_AUTOPRAGMA",
-    "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
-    "SQLITE3_DISABLE_OBSERVABILITY",
-    "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
-    "SQLITE3_DISABLE_EMBY_FTS_REWRITE",
-    "SQLITE3_DISABLE_EMBY_FANOUT_REWRITE",
-    "SQLITE3_DISABLE_EMBY_DASHBOARD_REWRITE",
-    "SQLITE3_DISABLE_STMT_TRACE",
-    "SQLITE3_DISABLE_REWRITE_APPLIED_SQL"
+    (void)immutable_data;
+#ifdef EMBY_FTS_REWRITE_TEST_LITERAL_MATCH
+    rsh_run_sql_exact(
+        &emby_suite_spec, &emby_direct_test_api_literal_assertion, context,
+        &emby_direct_test_api_literal_assertion.data.sql_exact
+    );
+#endif
+#ifdef EMBY_FTS_REWRITE_TEST_API
+    require_int(
+        "direct-duplicate-anchor-guard",
+        emby_fts_rewrite_test_duplicate_anchor_guard(), 0
+    );
+    require_int(
+        "direct-string-anchor-immunity",
+        emby_fts_rewrite_test_string_anchor_immunity(), 1
+    );
+    expect_scalar_counter(db, emby_fts_env_sql);
+#endif
+    return SQLITE_OK;
+}
+
+static const rsh_case_spec emby_direct_test_api_cases[] = {
+    {
+        .label = "direct-test-api",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_DIRECT,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom = rsh_custom_adapter_emby_direct_test_api,
+        }
+    }
 };
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_direct_test_api_phases, "direct-test-api",
+    emby_env_candidate_db, emby_direct_test_api_cases
+);
 
-static const rsh_env_assignment emby_exec_observable_env[] = {
+typedef struct emby_direct_fail_open_family_spec {
+    int movies;
+} emby_direct_fail_open_family_spec;
+
+static const emby_direct_fail_open_family_spec
+    emby_direct_fail_open_episodes_spec = {0};
+static const emby_direct_fail_open_family_spec
+    emby_direct_fail_open_movies_spec = {1};
+
+static int rsh_custom_adapter_emby_direct_fail_open_family(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    static const enum direct_fault_mode faults[] = {
+        DIRECT_FAULT_CANDIDATE_ERROR,
+        DIRECT_FAULT_CANDIDATE_ERROR_WITH_STMT,
+        DIRECT_FAULT_CANDIDATE_WRONG_TAIL
+    };
+    const emby_direct_fail_open_family_spec *spec =
+        (const emby_direct_fail_open_family_spec *)immutable_data;
+    sqlite3 *db = rsh_context_db(context, "candidate");
+    sqlite3_stmt *baseline[64];
+    int baseline_n = 0;
+    sqlite3_stmt *baseline_stmt;
+    char *raw = spec->movies
+        ? make_movies_latest_sql(1, "100", "42", "12")
+        : make_latest_sql("A.Id ", "12");
+    size_t i;
+
+    for (baseline_stmt = sqlite3_next_stmt(db, NULL); baseline_stmt;
+         baseline_stmt = sqlite3_next_stmt(db, baseline_stmt)) {
+        if (baseline_n >= (int)(sizeof(baseline) / sizeof(baseline[0]))) {
+            failf(
+                "FAIL [direct-fail-open/baseline-overflow]: got=%d want<%lu",
+                baseline_n + 1,
+                (unsigned long)(sizeof(baseline) / sizeof(baseline[0]))
+            );
+        }
+        baseline[baseline_n++] = baseline_stmt;
+    }
+
+    for (i = 0; i < sizeof(faults) / sizeof(faults[0]); i++) {
+        sqlite3_stmt *stmt = NULL;
+        const char *tail = NULL;
+        sqlite3_stmt *open_stmt;
+        int found = 0;
+        int rc;
+
+        direct_original_sql = raw;
+        direct_fault = faults[i];
+        direct_candidate_calls = 0;
+        direct_original_calls = 0;
+        rc = emby_fts_rewrite_prepare(
+            db, raw, -1, 0, &stmt, &tail, FTS_REWRITE_PREPARE_V2
+        );
+        require_int("direct-fail-open/rc", rc, SQLITE_OK);
+        require_int(
+            "direct-fail-open/candidate-calls", direct_candidate_calls, 1
+        );
+        require_int(
+            "direct-fail-open/original-calls", direct_original_calls, 1
+        );
+        require_str_eq("direct-fail-open/sql", sqlite3_sql(stmt), raw);
+        if (tail != raw + strlen(raw)) {
+            failf(
+                "FAIL [direct-fail-open/tail]: got=%ld want=%ld",
+                (long)(tail - raw), (long)strlen(raw)
+            );
+        }
+        for (open_stmt = sqlite3_next_stmt(db, NULL); open_stmt;
+             open_stmt = sqlite3_next_stmt(db, open_stmt)) {
+            if (open_stmt == stmt) {
+                found = 1;
+            } else if (!direct_stmt_is_baseline(
+                           open_stmt, baseline, baseline_n
+                       )) {
+                failf(
+                    "FAIL [direct-fail-open/next-stmt]: "
+                    "got=non-baseline-non-result want=baseline-or-result "
+                    "fault=%d",
+                    (int)faults[i]
+                );
+            }
+        }
+        if (!found) {
+            failf(
+                "FAIL [direct-fail-open/next-stmt]: got_result_count=0 "
+                "want_result_count=1 fault=%d",
+                (int)faults[i]
+            );
+        }
+        require_int(
+            "direct-fail-open/finalize", sqlite3_finalize(stmt), SQLITE_OK
+        );
+        for (open_stmt = sqlite3_next_stmt(db, NULL); open_stmt;
+             open_stmt = sqlite3_next_stmt(db, open_stmt)) {
+            if (!direct_stmt_is_baseline(open_stmt, baseline, baseline_n)) {
+                failf(
+                    "FAIL [direct-fail-open/post-finalize]: "
+                    "got=non-baseline want=baseline-only fault=%d",
+                    (int)faults[i]
+                );
+            }
+        }
+    }
+
     {
-        .name = "SQLITE3_DISABLE_OBSERVABILITY",
-        .value = {.state = RSH_ENV_UNSET}
-    },
+        char *invalid = make_latest_sql("A.NoSuchColumn ", "12");
+        sqlite3_stmt *stmt = NULL;
+        const char *tail = NULL;
+        int rc;
+
+        direct_original_sql = invalid;
+        direct_fault = DIRECT_FAULT_CANDIDATE_ERROR;
+        direct_candidate_calls = 0;
+        direct_original_calls = 0;
+        rc = emby_fts_rewrite_prepare(
+            db, invalid, -1, 0, &stmt, &tail, FTS_REWRITE_PREPARE_V2
+        );
+        require_int("direct-invalid-original/rc", rc, SQLITE_ERROR);
+        require_int(
+            "direct-invalid-original/candidate-calls", direct_candidate_calls, 1
+        );
+        require_int(
+            "direct-invalid-original/original-calls", direct_original_calls, 1
+        );
+        if (stmt != NULL) {
+            failf(
+                "FAIL [direct-invalid-original/stmt]: got=non-NULL want=NULL"
+            );
+        }
+        free(invalid);
+    }
+
+    direct_original_sql = NULL;
+    direct_fault = DIRECT_FAULT_NONE;
+    free(raw);
+    return SQLITE_OK;
+}
+
+static const rsh_db_spec emby_direct_fail_open_family_dbs[] = {
     {
-        .name = "SQLITE3_DISABLE_STMT_TRACE",
-        .value = {.state = RSH_ENV_VALUE, .value = "1"}
-    },
-    {
-        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
-        .value = {.state = RSH_ENV_UNSET}
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_FIXTURE_CANARY
     }
 };
 
-static const rsh_env_assignment emby_exec_master_disabled_env[] = {
+static const rsh_case_spec emby_direct_fail_open_episodes_cases[] = {
     {
-        .name = "SQLITE3_DISABLE_OBSERVABILITY",
-        .value = {.state = RSH_ENV_VALUE, .value = "1"}
-    },
-    {
-        .name = "SQLITE3_DISABLE_STMT_TRACE",
-        .value = {.state = RSH_ENV_VALUE, .value = "0"}
+        .label = "direct-fail-open-episodes",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_DIRECT,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom = rsh_custom_adapter_emby_direct_fail_open_family,
+            .immutable_data = &emby_direct_fail_open_episodes_spec
+        }
     }
 };
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_direct_fail_open_episodes_phases, "direct-fail-open-episodes",
+    emby_direct_fail_open_family_dbs, emby_direct_fail_open_episodes_cases
+);
+
+static const rsh_case_spec emby_direct_fail_open_movies_cases[] = {
+    {
+        .label = "direct-fail-open-movies",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_DIRECT,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom = rsh_custom_adapter_emby_direct_fail_open_family,
+            .immutable_data = &emby_direct_fail_open_movies_spec
+        }
+    }
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_direct_fail_open_movies_phases, "direct-fail-open-movies",
+    emby_direct_fail_open_family_dbs, emby_direct_fail_open_movies_cases
+);
+
+static const direct_mixed_fail_open_case emby_direct_fail_open_mixed_cells[] = {
+    {"build-failure", DIRECT_FAULT_NONE, 1, 0, "build_failed", 0, -1, -1, -1, -1},
+    {"rewritten-prepare-failure", DIRECT_FAULT_CANDIDATE_ERROR, 0, 1,
+     "rewritten_prepare_failed", 0, -1, -1, 1, 1},
+    {"partial-candidate", DIRECT_FAULT_CANDIDATE_ERROR_WITH_STMT, 0, 1,
+     "rewritten_prepare_failed", 1, 0, 19, 1, 1},
+    {"tail-mismatch", DIRECT_FAULT_CANDIDATE_WRONG_TAIL, 0, 1,
+     "tail_mismatch", 1, 0, 19, 1, 1},
+    {"accept-bind-mismatch", DIRECT_FAULT_MIXED_BIND_MISMATCH, 0, 1,
+     "candidate_bind_mismatch", 1, 1, 1, 1, 1},
+    {"accept-column-mismatch", DIRECT_FAULT_MIXED_COLUMN_MISMATCH, 0, 1,
+     "candidate_column_mismatch", 1, 0, 1, 1, 1},
+    {"accept-index-mismatch", DIRECT_FAULT_MIXED_INDEX_MISMATCH, 0, 1,
+     "candidate_index_mismatch", 1, 0, 19, 0, 1}
+};
+
+static void rsh_require_native_direct_mixed_stmt_set(
+    const char *case_name,
+    sqlite3 *db,
+    sqlite3_stmt **baseline,
+    int baseline_n,
+    sqlite3_stmt *result_stmt
+) {
+    sqlite3_stmt *open_stmt;
+    int result_count = 0;
+
+    for (open_stmt = sqlite3_next_stmt(db, NULL); open_stmt;
+         open_stmt = sqlite3_next_stmt(db, open_stmt)) {
+        if (open_stmt == result_stmt) {
+            result_count++;
+        } else if (!direct_stmt_is_baseline(open_stmt, baseline, baseline_n)) {
+            failf(
+                "FAIL [direct-fail-open-mixed/%s/next-stmt]: "
+                "got=non-baseline-non-result want=baseline-or-result",
+                case_name
+            );
+        }
+    }
+    if (result_count != 1) {
+        failf(
+            "FAIL [direct-fail-open-mixed/%s/next-stmt]: "
+            "got_result_count=%d want_result_count=1",
+            case_name, result_count
+        );
+    }
+}
+
+static void rsh_require_native_direct_mixed_baseline_only(
+    const char *case_name,
+    sqlite3 *db,
+    sqlite3_stmt **baseline,
+    int baseline_n
+) {
+    sqlite3_stmt *open_stmt;
+
+    for (open_stmt = sqlite3_next_stmt(db, NULL); open_stmt;
+         open_stmt = sqlite3_next_stmt(db, open_stmt)) {
+        if (!direct_stmt_is_baseline(open_stmt, baseline, baseline_n)) {
+            failf(
+                "FAIL [direct-fail-open-mixed/%s/post-finalize]: "
+                "got=non-baseline want=baseline-only",
+                case_name
+            );
+        }
+    }
+}
+
+static int rsh_custom_adapter_emby_direct_fail_open_mixed(
+    const rsh_case_context *context,
+    const void *immutable_data
+) {
+    sqlite3 *db = rsh_context_db(context, "candidate");
+    sqlite3_stmt *baseline[64];
+    int baseline_n = 0;
+    sqlite3_stmt *baseline_stmt;
+    char *raw = make_mixed_latest_sql("42", "3");
+    char *expected = make_mixed_latest_expected("42", "3");
+    int prior_sql_limit;
+    size_t i;
+
+    (void)immutable_data;
+    require_int(
+        "direct-fail-open-mixed/rewrite-longer-than-source",
+        strlen(expected) > strlen(raw), 1
+    );
+    require_int(
+        "direct-fail-open-mixed/rewrite-length-fits-int",
+        strlen(expected) <= (size_t)INT_MAX, 1
+    );
+    prior_sql_limit = sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1);
+    for (baseline_stmt = sqlite3_next_stmt(db, NULL); baseline_stmt;
+         baseline_stmt = sqlite3_next_stmt(db, baseline_stmt)) {
+        if (baseline_n >= (int)(sizeof(baseline) / sizeof(baseline[0]))) {
+            failf(
+                "FAIL [direct-fail-open-mixed/baseline-overflow]: "
+                "got=%d want<%lu",
+                baseline_n + 1,
+                (unsigned long)(sizeof(baseline) / sizeof(baseline[0]))
+            );
+        }
+        baseline[baseline_n++] = baseline_stmt;
+    }
+
+    for (i = 0;
+         i < sizeof(emby_direct_fail_open_mixed_cells) /
+             sizeof(emby_direct_fail_open_mixed_cells[0]);
+         i++) {
+        const direct_mixed_fail_open_case *test_case =
+            &emby_direct_fail_open_mixed_cells[i];
+        sqlite3_stmt *stmt = NULL;
+        const char *tail = NULL;
+        char label[160];
+        int rc;
+
+        direct_original_sql = raw;
+        direct_fault = test_case->fault;
+        direct_candidate_calls = 0;
+        direct_original_calls = 0;
+        direct_candidate_input_len = 0;
+        direct_candidate_had_stmt = 0;
+        direct_candidate_bind_count = -1;
+        direct_candidate_column_count = -1;
+        direct_candidate_outer_index_count = -1;
+        direct_candidate_inner_index_count = -1;
+        direct_skipped_calls = 0;
+        direct_skipped_reason = NULL;
+        direct_skipped_mode = OBS_MODE_NONE;
+
+        if (test_case->constrain_sql_limit) {
+            int constrained_limit = (int)strlen(expected) - 1;
+            require_int(
+                "direct-fail-open-mixed/build/source-fits-limit",
+                strlen(raw) <= (size_t)constrained_limit, 1
+            );
+            sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, constrained_limit);
+            require_int(
+                "direct-fail-open-mixed/build/sql-limit",
+                sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, -1),
+                constrained_limit
+            );
+        }
+
+        rc = emby_fts_rewrite_prepare(
+            db, raw, -1, 0, &stmt, &tail, FTS_REWRITE_PREPARE_V2
+        );
+        if (test_case->constrain_sql_limit) {
+            sqlite3_limit(db, SQLITE_LIMIT_SQL_LENGTH, prior_sql_limit);
+        }
+
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/rc",
+            test_case->name
+        );
+        require_int(label, rc, SQLITE_OK);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/result-stmt",
+            test_case->name
+        );
+        require_int(label, stmt != NULL, 1);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/candidate-calls",
+            test_case->name
+        );
+        require_int(label, direct_candidate_calls, test_case->candidate_calls);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/original-calls",
+            test_case->name
+        );
+        require_int(label, direct_original_calls, 1);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/skipped-calls",
+            test_case->name
+        );
+        require_int(label, direct_skipped_calls, 1);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/skipped-reason",
+            test_case->name
+        );
+        require_str_eq(label, direct_skipped_reason, test_case->skip_reason);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/skipped-mode",
+            test_case->name
+        );
+        require_int(label, direct_skipped_mode, EMBY_SMOKE_MODE_MIXED_LATEST);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/candidate-length",
+            test_case->name
+        );
+        require_int(
+            label, (int)direct_candidate_input_len,
+            test_case->candidate_calls ? (int)strlen(expected) : 0
+        );
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/candidate-had-stmt",
+            test_case->name
+        );
+        require_int(
+            label, direct_candidate_had_stmt, test_case->candidate_had_stmt
+        );
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/candidate-binds",
+            test_case->name
+        );
+        require_int(
+            label, direct_candidate_bind_count, test_case->candidate_bind_count
+        );
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/candidate-columns",
+            test_case->name
+        );
+        require_int(
+            label, direct_candidate_column_count,
+            test_case->candidate_column_count
+        );
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/outer-index-count",
+            test_case->name
+        );
+        require_int(
+            label, direct_candidate_outer_index_count,
+            test_case->candidate_outer_index_count
+        );
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/inner-index-count",
+            test_case->name
+        );
+        require_int(
+            label, direct_candidate_inner_index_count,
+            test_case->candidate_inner_index_count
+        );
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/source-sql",
+            test_case->name
+        );
+        require_str_eq(label, sqlite3_sql(stmt), raw);
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/source-tail",
+            test_case->name
+        );
+        require_int(label, tail == raw + strlen(raw), 1);
+        rsh_require_native_direct_mixed_stmt_set(
+            test_case->name, db, baseline, baseline_n, stmt
+        );
+        snprintf(
+            label, sizeof(label), "direct-fail-open-mixed/%s/finalize",
+            test_case->name
+        );
+        require_int(label, sqlite3_finalize(stmt), SQLITE_OK);
+        rsh_require_native_direct_mixed_baseline_only(
+            test_case->name, db, baseline, baseline_n
+        );
+    }
+
+    direct_original_sql = NULL;
+    direct_fault = DIRECT_FAULT_NONE;
+    free(raw);
+    free(expected);
+    return SQLITE_OK;
+}
+
+static const rsh_db_spec emby_direct_fail_open_mixed_dbs[] = {
+    {
+        .role = "candidate",
+        .relative_path = "library.db",
+        .kind = RSH_DB_CANDIDATE,
+        .storage = RSH_DB_RELATIVE,
+        .setup_profile = EMBY_PROFILE_D6_MIXED_IDENTITY
+    }
+};
+
+static const rsh_case_spec emby_direct_fail_open_mixed_cases[] = {
+    {
+        .label = "direct-fail-open-mixed",
+        .kind = RSH_CASE_CUSTOM,
+        .build_mask = RSH_BUILD_EMBY_DIRECT,
+        .data.custom = {
+            .kind = RSH_CUSTOM_FAULT_MATRIX,
+            .assert_custom = rsh_custom_adapter_emby_direct_fail_open_mixed,
+        }
+    }
+};
+DEFINE_EMBY_SCALAR_PHASE(
+    emby_direct_fail_open_mixed_phases, "direct-fail-open-mixed",
+    emby_direct_fail_open_mixed_dbs, emby_direct_fail_open_mixed_cases
+);
+
+#endif
+
+#undef EMBY_D8_DEFINE_OBSERVABILITY_MISSING_PHASE
+
+#undef EMBY_D8_DEFINE_INDEX_DEFINITION_PHASE
+
+#undef EMBY_D5B_CASE_MATRIX_PHASE
+#undef EMBY_D5B_PROFILE_DBS
+
+#undef EMBY_DASHBOARD_MATRIX_DBS
+#undef EMBY_DEFINE_MATRIX_AXIS_3
+#undef EMBY_DEFINE_MATRIX_AXIS_2
+#undef EMBY_DEFINE_MATRIX_AXIS_1
+#undef EMBY_DYNAMIC_MATRIX_PHASE
+#undef EMBY_MATRIX_AXIS_VALUE
+
+#undef EMBY_FIXTURE_NEGATIVE_CASE
+#undef EMBY_FTS_FIXTURE_SQL_CASE
+#undef EMBY_FIXTURE_SQL_CASE
+
+#undef DEFINE_EMBY_DASHBOARD_OFF_ROW
+#undef DEFINE_EMBY_SCALAR_PHASE
+#undef EMBY_FTS_SQL_CASE
+#undef EMBY_SQL_CASE
+#undef EMBY_PREPARE_V2
 
 static const rsh_env_assignment emby_negative_control_env[] = {
     {
@@ -5969,142 +10292,286 @@ static const rsh_suite_spec emby_suite_spec = {
         sizeof(emby_controlled_env_gates) / sizeof(emby_controlled_env_gates[0]),
     .open = rsh_open,
     .base_seed = rsh_base_seed,
-    .resolve_setup_profile = rsh_resolve_setup_profile,
+    .resolve_setup_profile = rsh_resolve_native_setup_profile,
     .failure = failf
 };
 
-#define LEGACY_RUN(dispatch, label, process, mask, body) \
+#define NATIVE_RUN(dispatch, env, phase_rows) \
     { \
         .dispatch_name = (dispatch), \
-        .pass_label = (label), \
-        .process_kind = (process), \
+        .pass_label = (dispatch), \
+        .process_kind = RSH_PROCESS_FORK, \
         .outcome = RSH_OUTCOME_SUCCESS, \
-        .build_mask = (mask), \
-        .capture_scope = RSH_CAPTURE_NONE, \
-        .legacy_body = (body) \
-    }
-
-#define LEGACY_EXEC_RUN(dispatch, label, env, mask, body) \
-    { \
-        .dispatch_name = (dispatch), \
-        .pass_label = (label), \
-        .process_kind = RSH_PROCESS_EXEC, \
-        .outcome = RSH_OUTCOME_SUCCESS, \
-        .build_mask = (mask), \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
         .preload_env = (env), \
         .preload_env_count = sizeof(env) / sizeof((env)[0]), \
         .capture_scope = RSH_CAPTURE_NONE, \
-        .legacy_body = (body) \
+        .phases = (phase_rows), \
+        .phase_count = sizeof(phase_rows) / sizeof((phase_rows)[0]) \
+    }
+
+#define NATIVE_DIRECT_RUN(dispatch, env, phase_rows) \
+    { \
+        .dispatch_name = (dispatch), \
+        .pass_label = (dispatch), \
+        .process_kind = RSH_PROCESS_FORK, \
+        .outcome = RSH_OUTCOME_SUCCESS, \
+        .build_mask = RSH_BUILD_EMBY_DIRECT, \
+        .preload_env = (env), \
+        .preload_env_count = sizeof(env) / sizeof((env)[0]), \
+        .capture_scope = RSH_CAPTURE_NONE, \
+        .phases = (phase_rows), \
+        .phase_count = sizeof(phase_rows) / sizeof((phase_rows)[0]) \
+    }
+
+#define NATIVE_MATRIX_RUN(dispatch, env, matrix_rows) \
+    { \
+        .dispatch_name = (dispatch), \
+        .pass_label = (dispatch), \
+        .process_kind = RSH_PROCESS_FORK, \
+        .outcome = RSH_OUTCOME_SUCCESS, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .preload_env = (env), \
+        .preload_env_count = sizeof(env) / sizeof((env)[0]), \
+        .capture_scope = RSH_CAPTURE_NONE, \
+        .matrix_phases = (matrix_rows), \
+        .matrix_phase_count = sizeof(matrix_rows) / sizeof((matrix_rows)[0]) \
+    }
+
+#define NATIVE_EXEC_LOG_RUN(dispatch, env, phase_rows, post_close_rows) \
+    { \
+        .dispatch_name = (dispatch), \
+        .pass_label = (dispatch), \
+        .process_kind = RSH_PROCESS_EXEC, \
+        .outcome = RSH_OUTCOME_SUCCESS, \
+        .build_mask = RSH_BUILD_EMBY_LINKED, \
+        .preload_env = (env), \
+        .preload_env_count = sizeof(env) / sizeof((env)[0]), \
+        .capture_scope = RSH_CAPTURE_STDERR, \
+        .phases = (phase_rows), \
+        .phase_count = sizeof(phase_rows) / sizeof((phase_rows)[0]), \
+        .post_close_cases = (post_close_rows), \
+        .post_close_case_count = \
+            sizeof(post_close_rows) / sizeof((post_close_rows)[0]) \
     }
 
 static const rsh_run_spec emby_runs[] = {
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST
-    LEGACY_RUN("direct-test-api", "direct-test-api", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_DIRECT, legacy_direct_test_api),
-    LEGACY_RUN("direct-fail-open-episodes", "direct-fail-open-episodes",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_DIRECT,
-               legacy_direct_fail_open_episodes),
-    LEGACY_RUN("direct-fail-open-movies", "direct-fail-open-movies",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_DIRECT,
-               legacy_direct_fail_open_movies),
-    LEGACY_RUN("direct-fail-open-mixed", "direct-fail-open-mixed",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_DIRECT,
-               legacy_direct_fail_open_mixed),
+    NATIVE_DIRECT_RUN(
+        "direct-test-api", emby_fts_zero_env, emby_direct_test_api_phases
+    ),
+    NATIVE_DIRECT_RUN(
+        "direct-fail-open-episodes", emby_latest_native_env,
+        emby_direct_fail_open_episodes_phases
+    ),
+    NATIVE_DIRECT_RUN(
+        "direct-fail-open-movies", emby_latest_native_env,
+        emby_direct_fail_open_movies_phases
+    ),
+    NATIVE_DIRECT_RUN(
+        "direct-fail-open-mixed", emby_latest_native_env,
+        emby_direct_fail_open_mixed_phases
+    ),
 #endif
-    LEGACY_RUN("positive", "positive", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_positive),
-    LEGACY_RUN("fts-default-on", "fts-default-on", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fts_default_on),
-    LEGACY_RUN("fts-zero-enables", "fts-zero-enables", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fts_zero_enables),
-    LEGACY_RUN("fts-one-disables", "fts-one-disables", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fts_one_disables),
-    LEGACY_RUN("fts-garbage-enables", "fts-garbage-enables", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fts_garbage_enables),
-    LEGACY_RUN("path-negative", "path-negative", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_path_negative),
-    LEGACY_RUN("nonmatch", "nonmatch", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_nonmatch),
-    LEGACY_RUN("collision", "collision", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_collision),
-    LEGACY_RUN("authorizer-ownership", "authorizer-ownership", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_authorizer_ownership),
-    LEGACY_RUN("fixture-canary", "fixture-canary", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fixture_canary),
-    LEGACY_RUN("row-parity", "row-parity", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_row_parity),
-    LEGACY_RUN("complex-resume-watched-progress-row-parity",
-               "complex-resume-watched-progress-row-parity", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED,
-               legacy_complex_resume_watched_progress_row_parity),
-    LEGACY_RUN("fanout-default-on", "fanout-default-on", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fanout_default_on),
-    LEGACY_RUN("fanout-zero-enables", "fanout-zero-enables", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fanout_zero_enables),
-    LEGACY_RUN("fanout-one-disables", "fanout-one-disables", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fanout_one_disables),
-    LEGACY_RUN("fanout-garbage-enables", "fanout-garbage-enables",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_fanout_garbage_enables),
-    LEGACY_RUN("fanout-matrix", "fanout-matrix", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_fanout_matrix),
-    LEGACY_RUN("links-two-level-row-parity", "links-two-level-row-parity",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_links_two_level_row_parity),
-    LEGACY_RUN("emby-slow-search-matrix", "emby-slow-search-matrix",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_emby_slow_search_matrix),
-    LEGACY_RUN("dashboard-default-off", "dashboard-default-off", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_dashboard_default_off),
-    LEGACY_RUN("dashboard-one-off", "dashboard-one-off", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_dashboard_one_off),
-    LEGACY_RUN("dashboard-empty-off", "dashboard-empty-off", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_dashboard_empty_off),
-    LEGACY_RUN("dashboard-garbage-off", "dashboard-garbage-off", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_dashboard_garbage_off),
-    LEGACY_RUN("dashboard-matrix", "dashboard-matrix", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_dashboard_matrix),
-    LEGACY_RUN("dashboard-fix-b-c", "dashboard-fix-b-c", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_dashboard_fix_b_c),
-    LEGACY_RUN("dashboard-mixed-latest", "dashboard-mixed-latest-real-path",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_dashboard_mixed_latest),
-    LEGACY_RUN("dashboard-mixed-disabled", "dashboard-mixed-disabled",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_dashboard_mixed_disabled),
-    LEGACY_RUN("dashboard-mixed-identity", "dashboard-mixed-identity",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_dashboard_mixed_identity),
-    LEGACY_RUN("dashboard-matcher-negatives", "dashboard-matcher-negatives",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_dashboard_matcher_negatives),
-    LEGACY_RUN("dashboard-release-matrix", "dashboard-release-matrix",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_dashboard_release_matrix),
-    LEGACY_RUN("latest-limit20", "latest-limit20", RSH_PROCESS_FORK,
-               RSH_BUILD_EMBY_LINKED, legacy_latest_limit20),
-    LEGACY_RUN("latest-capture-miss-negative", "latest-capture-miss-negative",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_latest_capture_miss_negative),
-    LEGACY_RUN("latest-series-browse-negative", "latest-series-browse-negative",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_latest_series_browse_negative),
-    LEGACY_RUN("latest-resume-no-misfire", "latest-resume-no-misfire",
-               RSH_PROCESS_FORK, RSH_BUILD_EMBY_LINKED,
-               legacy_latest_resume_no_misfire),
-    LEGACY_EXEC_RUN(
-        "dashboard-index-definition-gate", "dashboard-index-definition-gate",
-        emby_exec_observable_env, RSH_BUILD_EMBY_LINKED,
-        legacy_dashboard_index_definition_gate
+    NATIVE_RUN(
+        "positive", emby_fts_default_env, emby_positive_phases
     ),
-    LEGACY_EXEC_RUN(
-        "observability-logs", "observability-logs", emby_exec_observable_env,
-        RSH_BUILD_EMBY_LINKED, legacy_observability_logs
+    NATIVE_RUN("fts-default-on", emby_fts_default_env, emby_fts_default_phases),
+    NATIVE_RUN("fts-zero-enables", emby_fts_zero_env, emby_fts_zero_phases),
+    NATIVE_RUN("fts-one-disables", emby_fts_one_env, emby_fts_one_phases),
+    NATIVE_RUN(
+        "fts-garbage-enables", emby_fts_garbage_env,
+        emby_fts_garbage_phases
     ),
-    LEGACY_EXEC_RUN(
-        "observability-master-disabled", "observability-master-disabled",
-        emby_exec_master_disabled_env, RSH_BUILD_EMBY_LINKED,
-        legacy_observability_master_disabled
+    NATIVE_RUN(
+        "path-negative", emby_fts_zero_env, emby_path_negative_phases
+    ),
+    NATIVE_RUN("nonmatch", emby_fts_zero_env, emby_nonmatch_phases),
+    NATIVE_RUN("collision", emby_fts_zero_env, emby_collision_phases),
+    NATIVE_RUN(
+        "authorizer-ownership", emby_fts_zero_env,
+        emby_authorizer_ownership_phases
+    ),
+    NATIVE_RUN(
+        "fixture-canary", emby_fixture_canary_env,
+        emby_fixture_canary_phases
+    ),
+    NATIVE_RUN(
+        "row-parity", emby_fts_zero_env, emby_d6_row_parity_phases
+    ),
+    NATIVE_RUN(
+        "complex-resume-watched-progress-row-parity",
+        emby_d6_fanout_zero_env, emby_d6_complex_resume_phases
+    ),
+    NATIVE_RUN(
+        "fanout-default-on", emby_fanout_default_env,
+        emby_fanout_default_phases
+    ),
+    NATIVE_RUN(
+        "fanout-zero-enables", emby_fanout_zero_env,
+        emby_fanout_zero_phases
+    ),
+    NATIVE_RUN(
+        "fanout-one-disables", emby_fanout_one_env,
+        emby_fanout_one_phases
+    ),
+    NATIVE_RUN(
+        "fanout-garbage-enables", emby_fanout_garbage_env,
+        emby_fanout_garbage_phases
+    ),
+    NATIVE_MATRIX_RUN(
+        "fanout-matrix", emby_fanout_zero_env, emby_fanout_matrix_phases
+    ),
+    NATIVE_RUN(
+        "links-two-level-row-parity", emby_d6_fanout_zero_env,
+        emby_d6_links_two_level_phases
+    ),
+    NATIVE_MATRIX_RUN(
+        "emby-slow-search-matrix", emby_fanout_zero_env,
+        emby_slow_search_matrix_phases
+    ),
+    NATIVE_RUN(
+        "dashboard-default-off", emby_dashboard_default_env,
+        emby_dashboard_default_phases
+    ),
+    NATIVE_RUN(
+        "dashboard-one-off", emby_dashboard_one_env,
+        emby_dashboard_one_phases
+    ),
+    NATIVE_RUN(
+        "dashboard-empty-off", emby_dashboard_empty_env,
+        emby_dashboard_empty_phases
+    ),
+    NATIVE_RUN(
+        "dashboard-garbage-off", emby_dashboard_garbage_env,
+        emby_dashboard_garbage_phases
+    ),
+    NATIVE_MATRIX_RUN(
+        "dashboard-matrix", emby_latest_native_env,
+        emby_dashboard_matrix_phases
+    ),
+    {
+        .dispatch_name = "dashboard-fix-b-c",
+        .pass_label = "dashboard-fix-b-c",
+        .process_kind = RSH_PROCESS_FORK,
+        .outcome = RSH_OUTCOME_SUCCESS,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .preload_env = emby_latest_native_env,
+        .preload_env_count = sizeof(emby_latest_native_env) /
+                             sizeof(emby_latest_native_env[0]),
+        .capture_scope = RSH_CAPTURE_STDERR,
+        .phases = emby_dashboard_fix_b_c_identity_phases,
+        .phase_count = sizeof(emby_dashboard_fix_b_c_identity_phases) /
+                       sizeof(emby_dashboard_fix_b_c_identity_phases[0]),
+        .matrix_phases = emby_dashboard_fix_b_c_matrix_phases,
+        .matrix_phase_count = sizeof(emby_dashboard_fix_b_c_matrix_phases) /
+                              sizeof(emby_dashboard_fix_b_c_matrix_phases[0]),
+        .post_close_cases = emby_dashboard_fix_b_c_post_close_cases,
+        .post_close_case_count =
+            sizeof(emby_dashboard_fix_b_c_post_close_cases) /
+            sizeof(emby_dashboard_fix_b_c_post_close_cases[0])
+    },
+    {
+        .dispatch_name = "dashboard-mixed-latest",
+        .pass_label = "dashboard-mixed-latest-real-path",
+        .process_kind = RSH_PROCESS_FORK,
+        .outcome = RSH_OUTCOME_SUCCESS,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .preload_env = emby_latest_native_env,
+        .preload_env_count = sizeof(emby_latest_native_env) /
+                             sizeof(emby_latest_native_env[0]),
+        .capture_scope = RSH_CAPTURE_NONE,
+        .matrix_phases = emby_dashboard_mixed_latest_matrix_phases,
+        .matrix_phase_count =
+            sizeof(emby_dashboard_mixed_latest_matrix_phases) /
+            sizeof(emby_dashboard_mixed_latest_matrix_phases[0])
+    },
+    {
+        .dispatch_name = "dashboard-mixed-disabled",
+        .pass_label = "dashboard-mixed-disabled",
+        .process_kind = RSH_PROCESS_FORK,
+        .outcome = RSH_OUTCOME_SUCCESS,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .preload_env = emby_dashboard_default_env,
+        .preload_env_count = sizeof(emby_dashboard_default_env) /
+                             sizeof(emby_dashboard_default_env[0]),
+        .capture_scope = RSH_CAPTURE_NONE,
+        .matrix_phases = emby_dashboard_mixed_disabled_matrix_phases,
+        .matrix_phase_count =
+            sizeof(emby_dashboard_mixed_disabled_matrix_phases) /
+            sizeof(emby_dashboard_mixed_disabled_matrix_phases[0])
+    },
+    NATIVE_MATRIX_RUN(
+        "dashboard-mixed-identity", emby_latest_native_env,
+        emby_d6_mixed_identity_matrix_phases
+    ),
+    {
+        .dispatch_name = "dashboard-matcher-negatives",
+        .pass_label = "dashboard-matcher-negatives",
+        .process_kind = RSH_PROCESS_FORK,
+        .outcome = RSH_OUTCOME_SUCCESS,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .preload_env = emby_dashboard_matcher_negatives_env,
+        .preload_env_count =
+            sizeof(emby_dashboard_matcher_negatives_env) /
+            sizeof(emby_dashboard_matcher_negatives_env[0]),
+        .capture_scope = RSH_CAPTURE_STDERR,
+        .matrix_phases = emby_dashboard_matcher_negative_phases,
+        .matrix_phase_count =
+            sizeof(emby_dashboard_matcher_negative_phases) /
+            sizeof(emby_dashboard_matcher_negative_phases[0]),
+        .post_close_cases = emby_dashboard_matcher_negative_post_close_cases,
+        .post_close_case_count =
+            sizeof(emby_dashboard_matcher_negative_post_close_cases) /
+            sizeof(emby_dashboard_matcher_negative_post_close_cases[0])
+    },
+    {
+        .dispatch_name = "dashboard-release-matrix",
+        .pass_label = "dashboard-release-matrix",
+        .process_kind = RSH_PROCESS_FORK,
+        .outcome = RSH_OUTCOME_SUCCESS,
+        .build_mask = RSH_BUILD_EMBY_LINKED,
+        .preload_env = emby_latest_native_env,
+        .preload_env_count = sizeof(emby_latest_native_env) /
+                             sizeof(emby_latest_native_env[0]),
+        .capture_scope = RSH_CAPTURE_NONE,
+        .phases = emby_d7_release_preflight_phases,
+        .phase_count = sizeof(emby_d7_release_preflight_phases) /
+                       sizeof(emby_d7_release_preflight_phases[0]),
+        .matrix_phases = emby_d7_release_matrix_phases,
+        .matrix_phase_count = sizeof(emby_d7_release_matrix_phases) /
+                              sizeof(emby_d7_release_matrix_phases[0])
+    },
+    NATIVE_RUN(
+        "latest-limit20", emby_latest_native_env,
+        emby_latest_limit20_phases
+    ),
+    NATIVE_RUN(
+        "latest-capture-miss-negative", emby_latest_native_env,
+        emby_latest_capture_miss_negative_phases
+    ),
+    NATIVE_RUN(
+        "latest-series-browse-negative", emby_latest_native_env,
+        emby_latest_series_browse_negative_phases
+    ),
+    NATIVE_RUN(
+        "latest-resume-no-misfire", emby_latest_native_env,
+        emby_latest_resume_no_misfire_phases
+    ),
+    NATIVE_EXEC_LOG_RUN(
+        "dashboard-index-definition-gate", emby_d8_index_definition_env,
+        emby_d8_index_definition_phases,
+        emby_d8_index_definition_post_close_cases
+    ),
+    NATIVE_EXEC_LOG_RUN(
+        "observability-logs", emby_d8_observability_env,
+        emby_d8_observability_phases,
+        emby_d8_observability_post_close_cases
+    ),
+    NATIVE_EXEC_LOG_RUN(
+        "observability-master-disabled", emby_d8_master_disabled_env,
+        emby_d8_master_disabled_phases,
+        emby_d8_master_disabled_post_close_cases
     ),
     {
         .dispatch_name = "negative-control-vendor-prepare",
@@ -6138,8 +10605,10 @@ static const rsh_run_spec emby_runs[] = {
     }
 };
 
-#undef LEGACY_EXEC_RUN
-#undef LEGACY_RUN
+#undef NATIVE_EXEC_LOG_RUN
+#undef NATIVE_MATRIX_RUN
+#undef NATIVE_DIRECT_RUN
+#undef NATIVE_RUN
 
 int main(int argc, char **argv) {
 #ifdef EMBY_FTS_REWRITE_DIRECT_TEST

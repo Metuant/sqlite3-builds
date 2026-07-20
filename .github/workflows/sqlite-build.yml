@@ -126,6 +126,8 @@ jobs:
           set -euo pipefail
           bash tests/check_pin_alignment.sh
           bash tests/check_multi_version_pin_alignment.sh
+      - name: Custom adapter guard
+        run: bash tests/check_custom_adapter_guard.sh
       - name: Build.sh precheck paths
         run: bash tests/check_build_sh_prechecks.sh
 
