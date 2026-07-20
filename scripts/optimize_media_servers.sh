@@ -89,41 +89,10 @@ quote_sql_ident() {
     printf '"%s"' "${ident//\"/\"\"}"
 }
 
-sqlite_source_id_pin_value() {
-    local script_dir
-    local pin_file
-    local encoded_source_id
-
-    script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
-    pin_file="${script_dir}/../pins/versions.env"
-    if ! encoded_source_id="$(awk -F= '
-        $1 == "SQLITE_SOURCE_ID" {
-            value = substr($0, index($0, "=") + 1)
-            count++
-        }
-        END {
-            if (count == 1 && value != "") print value
-            else exit 1
-        }
-    ' "${pin_file}" 2>/dev/null)"; then
-        echo "ERROR: canonical SQLite source-id pin missing or ambiguous: ${pin_file}" >&2
-        return 1
-    fi
-    if [[ ! "${encoded_source_id}" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}%20[0-9]{2}:[0-9]{2}:[0-9]{2}%20[0-9a-f]{64}$ ]]; then
-        echo "ERROR: canonical SQLite source-id pin is malformed: ${pin_file}" >&2
-        return 1
-    fi
-    printf '%s\n' "${encoded_source_id//%20/ }"
-}
-
 plex_patched_engine_preflight() {
     local binary="${1}"
-    local expected_source_id
+    local expected_source_id="2026-06-26 20:14:12 d4c0e51e4aeb96955b99185ab9cde75c339e2c29c3f3f12428d364a10d782c62"
     local source_id
-
-    if ! expected_source_id="$(sqlite_source_id_pin_value)"; then
-        return 1
-    fi
 
     if ! source_id=$("${binary}" ":memory:" "SELECT sqlite_source_id();" 2>&1); then
         echo "ERROR: patched Plex maintenance engine pre-flight failed for ${binary}" >&2

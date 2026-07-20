@@ -695,13 +695,12 @@ rt_pmasz="$(extract_single_int \
 assert_eq 'SORTERREF compile<->runtime alignment' "$build_sorterref" "$rt_sorterref"
 assert_eq 'PMASZ compile<->runtime alignment' "$build_pmasz" "$rt_pmasz"
 
-require_line scripts/optimize_media_servers.sh '    pin_file="${script_dir}/../pins/versions.env"'
-require_line scripts/optimize_media_servers.sh '    if ! expected_source_id="$(sqlite_source_id_pin_value)"; then'
+reject_pattern scripts/optimize_media_servers.sh 'versions[.]env'
+require_line scripts/optimize_media_servers.sh "    local expected_source_id=\"${sqlite_source_id_decoded}\""
 require_line lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run 'versions_env="/opt/sqlite3-lsio-mod/pins/versions.env"'
 require_line lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run 'source_id_new="${source_id_new_encoded//%20/ }"'
 require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh 'versions_env="${RENDER_LSIO_MOD_VERSIONS_ENV:-pins/versions.env}"'
 require_line tools/lsio-mod/render-lsio-mod-baked-pins.sh '  plex_source_id_new="${encoded_source_id//%20/ }"'
-reject_pattern scripts/optimize_media_servers.sh 'expected_source_id="[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]][0-9a-f]{64}"'
 reject_pattern lsio-mods/plex/root-fs/etc/s6-overlay/s6-rc.d/init-mod-sqlite3-plexpatch/run "source_id_new='[0-9]{4}-[0-9]{2}-[0-9]{2}[[:space:]][0-9]{2}:[0-9]{2}:[0-9]{2}[[:space:]][0-9a-f]{64}'"
 
 source_id_wrapper_arg_count="$(grep -Fc -- '--build-arg SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID}"' build/build_static_sqlite.sh || true)"

@@ -116,9 +116,40 @@ It proves:
   Separate children prove invalid-reason-first miss validation, master-disable
   silence, and registered ineligible index suppression.
 
+### Shared rewrite-smoke harness
+
+`tests/rewrite_smoke_harness.h` is the header-only runner shared by
+`plex_fts_rewrite_smoke`, `emby_fts_rewrite_smoke`, and
+`emby_fts_rewrite_direct_test`. Each suite supplies its open, base-seed,
+setup-profile, failure, and raw prepare callbacks. The raw prepare seam maps
+legacy, v2, and v3 prepare kinds to public SQLite calls in linked builds and to
+the guarded Emby engine seam in the direct build.
+
+Each suite has one ordered `rsh_run_spec` registry for parent iteration and
+`--child` lookup. Run rows select the Plex-linked, Emby-linked, or Emby-direct
+build, fork or exec processing, complete pre-load environment assignments,
+optional exceptional post-load assignments, scalar and bounded matrix phases,
+stderr capture, post-close assertions, and PASS/SKIP text. The runner validates
+the registry, applies environment only in children, creates and cleans
+PID-scoped roots, opens/seeds/closes declared database roles and sidecars, and
+owns per-cell setup and `ANALYZE`. The suite files and shared header contain
+only the native registry execution path: every row uses complete pre-load
+validation, and all legacy suite dispatch and prepare scaffolding is revoked.
+
+Custom assertion adapters receive immutable case data plus already-open
+handles. They may prepare, bind, step, finalize, manage connection-local fault
+state, and assert; environment, paths, open/close, process creation, seed/setup,
+capture, and cleanup remain runner-owned. `tests/check_custom_adapter_guard.sh`
+scans test C/header sources, requires every `.assert_custom` assignment to use
+the `rsh_custom_adapter_` prefix, and rejects lifecycle API references in those
+adapter bodies. Its planted-`setenv` negative demonstration must fail before the
+clean-tree check can pass. CI runs the guard in `preflight`, and
+`tests/check_pin_alignment.sh` pins that workflow invocation.
+
 ### `plex_fts_rewrite_smoke`
 
-`tests/plex_fts_rewrite_smoke.c` runs in generic/Plex library Docker builds.
+`tests/plex_fts_rewrite_smoke.c` supplies the Plex-linked suite and native run,
+phase, matrix, and case registry used in generic/Plex library Docker builds.
 
 It proves:
 
@@ -165,7 +196,9 @@ It proves:
 
 ### `emby_fts_rewrite_smoke`
 
-`tests/emby_fts_rewrite_smoke.c` runs in generic/Plex library Docker builds.
+`tests/emby_fts_rewrite_smoke.c` supplies separate linked and direct prepare
+seams plus one native registry whose build masks select the applicable rows. It
+runs in generic/Plex library Docker builds.
 The Dockerfile also builds `emby_fts_rewrite_direct_test` by linking the smoke
 directly with `src/emby_fts_rewrite.c`, `src/fts_lex.c`, and the pristine
 amalgamation. Its isolated direct-test block provides typed no-op miss,

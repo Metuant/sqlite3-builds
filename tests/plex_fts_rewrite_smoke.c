@@ -954,30 +954,6 @@ static int ondeck_failure_authorizer_cb(
     return SQLITE_OK;
 }
 
-static sqlite3_stmt *prepare_entry(
-    sqlite3 *db,
-    const char *label,
-    const char *sql,
-    int nbyte,
-    int entry,
-    const char **tail
-) {
-    sqlite3_stmt *stmt = NULL;
-    int rc;
-
-    if (entry == 3) {
-        rc = sqlite3_prepare_v3(db, sql, nbyte, SQLITE_PREPARE_PERSISTENT, &stmt, tail);
-    } else if (entry == 2) {
-        rc = sqlite3_prepare_v2(db, sql, nbyte, &stmt, tail);
-    } else {
-        rc = sqlite3_prepare(db, sql, nbyte, &stmt, tail);
-    }
-    if (rc != SQLITE_OK) {
-        failf("FAIL [%s]: prepare entry=%d rc=%d err=%s", label, entry, rc, sqlite3_errmsg(db));
-    }
-    return stmt;
-}
-
 static void expect_saved_sql(
     sqlite3 *db,
     const char *label,
@@ -987,7 +963,20 @@ static void expect_saved_sql(
     const char *want_sql
 ) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, nbyte, entry, &tail);
+    sqlite3_stmt *stmt = NULL;
+    rsh_prepare_kind kind = entry == 3
+        ? RSH_PREPARE_V3
+        : entry == 2 ? RSH_PREPARE_V2 : RSH_PREPARE_LEGACY;
+    int rc = plex_suite_spec.prepare(
+        db, sql, nbyte, kind, &stmt, &tail
+    );
+
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [%s]: prepare entry=%d rc=%d err=%s",
+            label, entry, rc, sqlite3_errmsg(db)
+        );
+    }
     require_str_eq(label, sqlite3_sql(stmt), want_sql);
     if (tail != sql + strlen(sql)) {
         failf("FAIL [%s]: tail_offset=%ld want=%ld",
@@ -1101,11 +1090,19 @@ static void collect_first_int_ids(
     size_t out_n
 ) {
     const char *tail = NULL;
-    sqlite3_stmt *stmt = prepare_entry(db, label, sql, nbyte, 2, &tail);
-    int rc;
+    sqlite3_stmt *stmt = NULL;
+    int rc = plex_suite_spec.prepare(
+        db, sql, nbyte, RSH_PREPARE_V2, &stmt, &tail
+    );
     int rows = 0;
     size_t used = 0;
 
+    if (rc != SQLITE_OK) {
+        failf(
+            "FAIL [%s]: prepare entry=2 rc=%d err=%s",
+            label, rc, sqlite3_errmsg(db)
+        );
+    }
     if (tail != sql + strlen(sql)) {
         failf("FAIL [%s/tail]: tail_offset=%ld want=%ld",
               label, (long)(tail - sql), (long)strlen(sql));

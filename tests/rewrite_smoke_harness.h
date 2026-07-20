@@ -531,9 +531,6 @@ typedef struct rsh_pass_detail {
     rsh_run_predicate_fn predicate;
 } rsh_pass_detail;
 
-/* Migration-only child body; native rows leave this NULL. */
-typedef int (*rsh_legacy_body_fn)(void);
-
 struct rsh_run_spec {
     const char *dispatch_name;
     const char *pass_label;
@@ -555,7 +552,6 @@ struct rsh_run_spec {
     size_t post_close_case_count;
     const rsh_abort_expectation *abort_expectation;
     rsh_run_predicate_fn runtime_predicate;
-    rsh_legacy_body_fn legacy_body;
 };
 
 typedef struct rsh_capture {
@@ -1227,17 +1223,6 @@ static void rsh_apply_preload_env(
     rsh_apply_env_profile(
         suite, run, "preload", run->preload_env, run->preload_env_count,
         1
-    );
-}
-
-/* Legacy exec rows preserve only the partial profile applied by the old wrapper. */
-static void rsh_apply_legacy_preexec_env(
-    const rsh_suite_spec *suite,
-    const rsh_run_spec *run
-) {
-    rsh_apply_env_profile(
-        suite, run, "legacy-preexec",
-        run->preload_env, run->preload_env_count, 0
     );
 }
 
@@ -3067,14 +3052,6 @@ static int rsh_execute_run_body(
     int cleanup_errors;
     size_t i;
 
-    if (run->legacy_body) {
-        int rc;
-        rsh_contract_suite = suite;
-        rc = run->legacy_body();
-        rsh_contract_suite = NULL;
-        return rc;
-    }
-
     memset(&capture, 0, sizeof(capture));
     capture.saved_stderr = -1;
     rsh_apply_postload_env(suite, run);
@@ -3212,28 +3189,6 @@ static void rsh_validate_run(
         rsh_failf(suite, "FAIL [%s/pass-detail]: invalid dynamic metadata",
                   run->dispatch_name);
     }
-    if (run->legacy_body) {
-        if ((run->process_kind == RSH_PROCESS_FORK &&
-             (run->preload_env || run->preload_env_count != 0)) ||
-            (run->process_kind == RSH_PROCESS_EXEC &&
-             (!run->preload_env || run->preload_env_count == 0)) ||
-            run->postload_env || run->postload_env_count != 0 ||
-            run->capture_scope != RSH_CAPTURE_NONE ||
-            run->phases || run->phase_count != 0 ||
-            run->matrix_phases || run->matrix_phase_count != 0 ||
-            run->post_close_cases || run->post_close_case_count != 0 ||
-            run->outcome != RSH_OUTCOME_SUCCESS || run->abort_expectation) {
-            rsh_failf(suite, "FAIL [%s/legacy-contract]: native fields are set",
-                      run->dispatch_name);
-        }
-        if (run->process_kind == RSH_PROCESS_EXEC) {
-            rsh_validate_env_profile(
-                suite, run, "legacy-preexec",
-                run->preload_env, run->preload_env_count, 0
-            );
-        }
-        return;
-    }
     rsh_validate_env_profile(
         suite, run, "preload", run->preload_env, run->preload_env_count,
         1
@@ -3317,7 +3272,7 @@ static int rsh_run_child(
                   dispatch_name ? dispatch_name : "(null)");
     }
     rsh_validate_run(suite, run);
-    if (!run->legacy_body) rsh_apply_preload_env(suite, run);
+    rsh_apply_preload_env(suite, run);
     return rsh_execute_run_body(suite, run, getpid(), active_build);
 }
 
@@ -3428,13 +3383,7 @@ static void rsh_run_one_parent(
             if (fd != STDERR_FILENO) (void)fclose(abort_capture);
             clearerr(stderr);
         }
-        if (run->legacy_body) {
-            if (run->process_kind == RSH_PROCESS_EXEC) {
-                rsh_apply_legacy_preexec_env(suite, run);
-            }
-        } else {
-            rsh_apply_preload_env(suite, run);
-        }
+        rsh_apply_preload_env(suite, run);
         if (run->process_kind == RSH_PROCESS_EXEC) {
             char *const args[] = {
                 (char *)program_path,

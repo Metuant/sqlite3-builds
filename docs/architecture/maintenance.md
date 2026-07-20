@@ -75,12 +75,14 @@ library, and the staged `Plex Media Server` sibling must carry the matching
 source-id guard. Stage the coherent files from a container after the Plex LSIO
 mod has completed. Do not restore `libsqlite3.so.bundled.bak` over the staged
 patched library. Before any container or database work, the script executes
-`PLEX_BINARY`. If `sqlite_source_id()` does not equal the required patched id,
-the script skips all Plex maintenance without evaluating Plex instance gates
-and continues independent Emby maintenance. The skip contributes status value
-`2`, so a run cannot report success after dropping configured Plex work. The
-built `release/library-plex/libsqlite3.so` can supply the library only when it
-is paired with a wrapper and PMS guard patched for that exact source id.
+`PLEX_BINARY` and compares `sqlite_source_id()` with a baked source-id literal.
+`tests/check_pin_alignment.sh` keeps the literal aligned with the canonical pin,
+so the standalone deploy unit does not read the repository pin tree. A mismatch
+skips all Plex maintenance without evaluating Plex instance gates and continues
+independent Emby maintenance. The skip contributes status value `2`, so a run
+cannot report success after dropping configured Plex work. The built
+`release/library-plex/libsqlite3.so` can supply the library only when it is
+paired with a wrapper and PMS guard patched for that exact source id.
 
 The generic SQLite engine preflight runs before configured Emby instance work.
 If it fails, the script skips all Emby maintenance without evaluating Emby

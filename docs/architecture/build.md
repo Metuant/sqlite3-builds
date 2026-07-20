@@ -324,8 +324,10 @@ digit-prefixed tag pushes matching `[0-9]*`, pull requests to `main`, and
 manual dispatch. The workflow jobs are `base`, `preflight`, `build-cli`,
 `build-generic`, `build-plex`, `mod-static-tests`, `release`, `mod-build`, and
 `mod-publish`. The `base` job resolves the generic `BASE_IMAGE`. `preflight`
-loads the pins and compatibility-group artifact stems, then runs pin alignment
-and Build.sh prechecks once. The three artifact jobs wait for `preflight`;
+loads the pins and compatibility-group artifact stems, then runs pin alignment,
+the rewrite-smoke custom-adapter guard, and Build.sh prechecks once. Pin
+alignment also requires the exact custom-adapter guard workflow step. The three
+artifact jobs wait for `preflight`;
 `build-generic` and `build-plex` also wait for `base`. A tag-gated `release`
 waits for all three artifact jobs and the `mod-static-tests` suite.
 

@@ -26,7 +26,10 @@ Project-specific guidance:
   `dd`, `od`, and `printf`.
 - Keep `LIBRARY_VARIANT=plex` limited to the Plex ICU build path.
 - Keep SQLite pins aligned across wrapper, workflow, Dockerfiles, and
-  `build/Build.sh`; keep the SORTERREF and PMASZ compile defaults
+  `build/Build.sh`; keep the baked patched source-id literal in
+  `scripts/optimize_media_servers.sh` aligned with `pins/versions.env`
+  `SQLITE_SOURCE_ID`, enforced by `tests/check_pin_alignment.sh`; keep the
+  SORTERREF and PMASZ compile defaults
   (`-DSQLITE_DEFAULT_SORTERREF_SIZE`, `-DSQLITE_SORTER_PMASZ` in
   `build/Build.sh`) aligned with their runtime `sqlite3_config` values in
   `src/auto_extension.c`, enforced by `tests/check_pin_alignment.sh`; keep ICU

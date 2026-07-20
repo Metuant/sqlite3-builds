@@ -558,6 +558,23 @@ mutated = matches[0].replace("%20", "+20", 1)
 path.write_text(pattern.sub(f"SQLITE_SOURCE_ID={mutated}", text, count=1))
 PY
       ;;
+    maintenance-source-id-literal-drift)
+      python3 - "$scratch/pins/versions.env" <<'PY'
+from pathlib import Path
+import sys
+
+path = Path(sys.argv[1])
+text = path.read_text()
+old = "SQLITE_SOURCE_ID=2026-06-26%2020:14:12%20"
+new = "SQLITE_SOURCE_ID=2026-06-26%2020:14:13%20"
+if text.count(old) != 1:
+    raise SystemExit("maintenance source-id pin fixture missing or ambiguous")
+path.write_text(text.replace(old, new, 1))
+PY
+      ;;
+    maintenance-versions-env-reintroduced)
+      printf '%s\n' 'pin_file="${script_dir}/../pins/versions.env"' >> "$scratch/scripts/optimize_media_servers.sh"
+      ;;
     source-id-build-assertion-missing)
       python3 - "$scratch/build/Build.sh" <<'PY'
 from pathlib import Path
@@ -617,6 +634,8 @@ assert_rejected pins-source pins/versions.env
 assert_rejected scripts-source scripts/reintroduced-pin.sh
 assert_rejected retired-scalar-under-base-context docker-build-base/reintroduced-pin.sh
 assert_fails_with source-id-pin-format 'pins/versions.env SQLITE_SOURCE_ID must be an 84-byte SQLite source id with spaces encoded as %20'
+assert_fails_with maintenance-source-id-literal-drift 'scripts/optimize_media_servers.sh missing exact line:     local expected_source_id="'
+assert_fails_with maintenance-versions-env-reintroduced 'scripts/optimize_media_servers.sh contains rejected pattern: versions[.]env'
 assert_fails_with source-id-build-assertion-missing 'build/Build.sh missing exact line:   rc = prepare(db, "SELECT sqlite_source_id()", -1, &stmt, NULL);'
 assert_fails_with source-id-workflow-arg-missing 'Build sqlite library SQLITE_SOURCE_ID build arg exact-line count drift: observed=0 expected=1'
 assert_fails_with curated-source-id-detector 'pins/runtime-baselines.tsv contains rejected pattern:'
