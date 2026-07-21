@@ -27,7 +27,12 @@
 
 typedef enum {
     STATS_EXPECT_NONE = 0,
-    STATS_EXPECT_ANALYZED = 1
+    STATS_EXPECT_ANALYZED = 1,
+    /* WHY: The LIMITED tier runs PRAGMA optimize with SQLite's bounded
+     * temporary analysis limit (mask bit 0x10), and a bounded ANALYZE
+     * populates sqlite_stat1 but never sqlite_stat4. Full-shape stats come
+     * only from the unbounded FULL tier. */
+    STATS_EXPECT_STAT1_ONLY = 2
 } stats_expectation;
 
 typedef struct {
@@ -67,8 +72,11 @@ static int reset_runtime_env(void) {
     int ok = 1;
     if (!safe_unsetenv("SQLITE3_DISABLE_AUTOPRAGMA")) ok = 0;
     if (!safe_unsetenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE")) ok = 0;
+    if (!safe_unsetenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE_FULL")) ok = 0;
     if (!safe_unsetenv("SQLITE3_RUNTIME_OPTIMIZE_LIMITED_SECONDS")) ok = 0;
     if (!safe_unsetenv("SQLITE3_RUNTIME_OPTIMIZE_FULL_SECONDS")) ok = 0;
+    if (!safe_unsetenv("SQLITE3_RUNTIME_OPTIMIZE_FULL_DEADLINE_MS")) ok = 0;
+    if (!safe_unsetenv("SQLITE3_RUNTIME_OPTIMIZE_LIMITED_DEADLINE_MS")) ok = 0;
     if (!safe_unsetenv("SQLITE3_DISABLE_OBSERVABILITY")) ok = 0;
     if (!safe_unsetenv("SQLITE3_DISABLE_STMT_TRACE")) ok = 0;
     if (!safe_unsetenv("SQLITE3_DISABLE_SLOW_QUERY")) ok = 0;
@@ -296,6 +304,7 @@ static int stat_table_count(sqlite3 *db, const char *table, sqlite3_int64 *count
 static const char *stats_expectation_name(stats_expectation expect) {
     if (expect == STATS_EXPECT_NONE) return "none";
     if (expect == STATS_EXPECT_ANALYZED) return "analyzed";
+    if (expect == STATS_EXPECT_STAT1_ONLY) return "stat1-only";
     return "unknown";
 }
 
@@ -309,6 +318,7 @@ static int assert_stats_db(sqlite3 *db, const char *label, stats_expectation exp
 
     if (expect == STATS_EXPECT_NONE) pass = stat1 == 0 && stat4 == 0;
     else if (expect == STATS_EXPECT_ANALYZED) pass = stat1 > 0 && stat4 > 0;
+    else if (expect == STATS_EXPECT_STAT1_ONLY) pass = stat1 > 0 && stat4 == 0;
 
     if (pass) {
         printf("PASS [%s]: sqlite_stat1=%lld sqlite_stat4=%lld\n",
@@ -2208,11 +2218,18 @@ static int run_icu_failsafe_retry_case(void) {
     if (ok && !assert_stats_db(db, "icu-retry-after-failure", STATS_EXPECT_NONE)) ok = 0;
     sleep(2);
     if (ok && !register_icu_root_collation(db)) ok = 0;
+    /* WHY: The failed FULL attempt arms the one-shot fairness rotation, so
+     * the first post-failure reservation goes to LIMITED (bounded: stat1
+     * only). This is the starvation fix under test, not a regression. */
     if (ok && !trigger_inline_sql_done(db, "icu-retry-success",
             "SELECT count(*) FROM runtime_optimize_icu;")) ok = 0;
-    if (ok && !assert_stats_db(db, "icu-retry-after-success", STATS_EXPECT_ANALYZED)) ok = 0;
-    if (!disable_runtime_optimize()) ok = 0;
+    if (ok && !assert_stats_db(db, "icu-retry-after-rotation", STATS_EXPECT_STAT1_ONLY)) ok = 0;
+    /* The rotation is consumed; the close hook (which bypasses the inline
+     * blocked-rearm cache) retries FULL, which now succeeds with the
+     * collation registered and writes full-shape stats. */
     if (db && !close_db(db, "icu-retry")) ok = 0;
+    db = NULL;
+    if (ok && !inspect_stats(path, "icu-retry-after-success", STATS_EXPECT_ANALYZED)) ok = 0;
     if (!reset_runtime_env()) ok = 0;
     return ok;
 }
@@ -2239,7 +2256,58 @@ static int run_env_shortened_cadence_case(void) {
     if (db && !close_db(db, "short-cadence-limited")) ok = 0;
     if (!reset_runtime_env()) ok = 0;
     if (!ok) return 0;
-    return inspect_stats(path, "short-cadence-limited", STATS_EXPECT_ANALYZED);
+    /* WHY: LIMITED runs PRAGMA optimize under SQLite's bounded temporary
+     * analysis limit (mask bit 0x10), which populates sqlite_stat1 but not
+     * sqlite_stat4 -- full-shape stats are the FULL tier's job. */
+    return inspect_stats(path, "short-cadence-limited", STATS_EXPECT_STAT1_ONLY);
+}
+
+static int run_full_deadline_gate_case(void) {
+    const char *path = "/tmp/runtime-optimize-deadline-gate-library.db";
+    sqlite3 *db = NULL;
+    int ok = 1;
+
+    if (!reset_runtime_env()) return 0;
+    /* WHY: A 1ms FULL deadline guarantees the seeded ANALYZE (about 10ms) is
+     * interrupted by OUR progress deadline, exercising the
+     * SQLITE_INTERRUPT+deadline_reached classification deterministically. */
+    if (!safe_setenv("SQLITE3_RUNTIME_OPTIMIZE_FULL_DEADLINE_MS", "1")) ok = 0;
+    if (ok && !create_seeded_db_without_runtime_optimize(path, "deadline-gate-seed")) ok = 0;
+    if (ok && !enable_runtime_optimize()) ok = 0;
+    if (ok && !open_db(path, RW_FLAGS, &db, "deadline-gate")) ok = 0;
+    if (ok && !trigger_inline_step_done(db, "deadline-gate-full")) ok = 0;
+    /* The interrupted ANALYZE rolled back: no stats. */
+    if (ok && !assert_stats_db(db, "deadline-gate-after-interrupt", STATS_EXPECT_NONE)) ok = 0;
+    /* WHY: The close hook is the core gate assertion. FULL is deadline-gated
+     * on its cadence, so close must NOT retry it (stat4 would appear if it
+     * did); LIMITED is due and no shared backoff was set by the deadline, so
+     * the previously-starved tier runs instead (stat1 only). */
+    if (db && !close_db(db, "deadline-gate")) ok = 0;
+    db = NULL;
+    if (ok && !inspect_stats(path, "deadline-gate-close", STATS_EXPECT_STAT1_ONLY)) ok = 0;
+    if (!reset_runtime_env()) ok = 0;
+    return ok;
+}
+
+static int run_full_kill_switch_tier_case(void) {
+    const char *path = "/tmp/runtime-optimize-full-kill-library.db";
+    sqlite3 *db = NULL;
+    int ok = 1;
+
+    if (!reset_runtime_env()) return 0;
+    if (!safe_setenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE_FULL", "1")) ok = 0;
+    if (ok && !create_seeded_db_without_runtime_optimize(path, "full-kill-seed")) ok = 0;
+    if (ok && !enable_runtime_optimize()) ok = 0;
+    if (ok && !open_db(path, RW_FLAGS, &db, "full-kill")) ok = 0;
+    /* WHY: With FULL disabled, the very first reservation goes to LIMITED
+     * (previously FULL always won the first turn); LIMITED's bounded analyze
+     * writes stat1 only, so any stat4 row means FULL ran despite the switch. */
+    if (ok && !trigger_inline_step_done(db, "full-kill-limited")) ok = 0;
+    if (db && !close_db(db, "full-kill")) ok = 0;
+    db = NULL;
+    if (ok && !inspect_stats(path, "full-kill-stats", STATS_EXPECT_STAT1_ONLY)) ok = 0;
+    if (!reset_runtime_env()) ok = 0;
+    return ok;
 }
 
 static int run_busy_peer_inline_case(void) {
@@ -3028,6 +3096,8 @@ int main(int argc, char **argv) {
     if (!run_reentrancy_case()) failures++;
     if (!run_icu_failsafe_retry_case()) failures++;
     if (!run_env_shortened_cadence_case()) failures++;
+    if (!run_full_deadline_gate_case()) failures++;
+    if (!run_full_kill_switch_tier_case()) failures++;
     if (!run_busy_peer_inline_case()) failures++;
     if (!run_telemetry_off_defer_case(argv[0])) failures++;
     if (!run_write_and_commit_defer_case()) failures++;
