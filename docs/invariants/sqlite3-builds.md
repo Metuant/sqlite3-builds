@@ -420,10 +420,16 @@ milestone lands.
   of `SQLITE3_DISABLE_AUTOPRAGMA`.
 - Runtime optimize has two successful per-path cadences: LIMITED defaults to
   1800 seconds, sets `PRAGMA main.analysis_limit=0`, and runs
-  `PRAGMA main.optimize=0x10002` with a 3-second deadline; FULL defaults to
+  `PRAGMA main.optimize=0x10012` (bounded temporary analysis limit; stat1 only) with a 3-second deadline; FULL defaults to
   86400 seconds, sets `PRAGMA main.analysis_limit=0`, and runs
   `ANALYZE main;` with a 15-second deadline and no trailing optimize. A
-  successful FULL pass also satisfies the LIMITED cadence.
+  successful FULL pass also satisfies the LIMITED cadence. A tier interrupted
+  by its own wall-clock deadline re-arms on its cadence from the
+  deadline-attempt stamp, never on the short failure backoff, and a deadline
+  sets no shared backoff; after any non-success FULL attempt the next
+  reservation goes to LIMITED once (one-shot rotation). Literal
+  `SQLITE3_DISABLE_RUNTIME_OPTIMIZE_FULL=1` disables only the FULL tier; the
+  deadlines are tunable via `SQLITE3_RUNTIME_OPTIMIZE_{FULL,LIMITED}_DEADLINE_MS`.
 - Inline runtime optimize runs only after a provably fast plain read statement:
   `sqlite3_stmt_readonly(self_stmt)` is true, the SQL is not transaction or
   connection control, and the fresh PROFILE elapsed time is below

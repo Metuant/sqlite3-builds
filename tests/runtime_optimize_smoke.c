@@ -963,7 +963,7 @@ static int collect_optimize_trace_cb(unsigned trace, void *ctx, void *p, void *x
         counts->analysis_limit_1024_count++;
     } else if (strcmp(sql, "PRAGMA main.optimize;") == 0) {
         counts->bare_optimize_count++;
-    } else if (strcmp(sql, "PRAGMA main.optimize=0x10002;") == 0) {
+    } else if (strcmp(sql, "PRAGMA main.optimize=0x10012;") == 0) {
         counts->limited_optimize_count++;
         counts->tier_sql_seq = counts->seq;
     } else if (strcmp(sql, "ANALYZE main;") == 0) {
@@ -982,7 +982,7 @@ static int assert_trace_tier_shape(
     int expect_full = strcmp(tier, "full") == 0;
     int tier_count = expect_full ? counts->analyze_main_count : counts->limited_optimize_count;
     int other_count = expect_full ? counts->limited_optimize_count : counts->analyze_main_count;
-    const char *tier_sql = expect_full ? "ANALYZE main;" : "PRAGMA main.optimize=0x10002;";
+    const char *tier_sql = expect_full ? "ANALYZE main;" : "PRAGMA main.optimize=0x10012;";
 
     if (counts->analysis_limit_zero_count < 1 ||
         counts->first_analysis_limit_zero_seq == 0 ||
@@ -1161,7 +1161,7 @@ static int assert_internal_sql_suppressed(const char *label, const char *output)
     };
     static const char *const internal_sql[] = {
         "PRAGMA main.analysis_limit=0;",
-        "PRAGMA main.optimize=0x10002;",
+        "PRAGMA main.optimize=0x10012;",
         "ANALYZE main;",
     };
     int ok = 1;
@@ -1294,7 +1294,9 @@ static int run_limited_analyzed_case(void) {
     if (db && !close_db(db, "limited-second")) ok = 0;
     if (!reset_runtime_env()) ok = 0;
     if (!ok) return 0;
-    return inspect_stats(path, "limited-second", STATS_EXPECT_ANALYZED);
+    /* WHY: the second pass is the LIMITED tier, which analyzes under
+     * SQLite's bounded temporary limit: sqlite_stat1 only, never stat4. */
+    return inspect_stats(path, "limited-second", STATS_EXPECT_STAT1_ONLY);
 }
 
 static int run_fast_inline_success_case(void) {
@@ -2268,11 +2270,13 @@ static int run_full_deadline_gate_case(void) {
     int ok = 1;
 
     if (!reset_runtime_env()) return 0;
-    /* WHY: A 1ms FULL deadline guarantees the seeded ANALYZE (about 10ms) is
-     * interrupted by OUR progress deadline, exercising the
-     * SQLITE_INTERRUPT+deadline_reached classification deterministically. */
+    /* WHY: 400k rows make the unbounded ANALYZE take tens of milliseconds on
+     * any hardware, so the 1ms FULL deadline is guaranteed to expire before
+     * completion and the interruption is deterministic (the default 3000-row
+     * seed can finish faster than 1ms on a fast runner, turning this into a
+     * race). */
     if (!safe_setenv("SQLITE3_RUNTIME_OPTIMIZE_FULL_DEADLINE_MS", "1")) ok = 0;
-    if (ok && !create_seeded_db_without_runtime_optimize(path, "deadline-gate-seed")) ok = 0;
+    if (ok && !create_seeded_db_without_runtime_optimize_rows(path, "deadline-gate-seed", 400000)) ok = 0;
     if (ok && !enable_runtime_optimize()) ok = 0;
     if (ok && !open_db(path, RW_FLAGS, &db, "deadline-gate")) ok = 0;
     if (ok && !trigger_inline_step_done(db, "deadline-gate-full")) ok = 0;

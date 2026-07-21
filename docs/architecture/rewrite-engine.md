@@ -190,7 +190,7 @@ Execution tiers:
 ```sql
 -- LIMITED
 PRAGMA main.analysis_limit=0;
-PRAGMA main.optimize=0x10002;
+PRAGMA main.optimize=0x10012;
 
 -- FULL
 PRAGMA main.analysis_limit=0;
@@ -204,7 +204,7 @@ that guard before restoring connection state. Inline optimize snapshots the full
 busy-handler state, installs a 1 ms built-in busy timeout while the tier
 statement runs, and restores the exact prior handler and timeout afterward. The
 close trigger keeps the close-only 1 ms busy-timeout behavior. LIMITED runs
-conditional `PRAGMA main.optimize=0x10002`; FULL runs unconditional
+conditional `PRAGMA main.optimize=0x10012` (bit 0x10 engages SQLite's bounded temporary analysis limit, so a LIMITED-triggered ANALYZE writes sqlite_stat1 only); FULL runs unconditional
 `ANALYZE main;` with no trailing optimize. Neither tier optimizes attached
 schemas or starts a background thread or separate connection. It uses the
 application's own connection, so Plex ICU/collation/tokenizer registrations are
@@ -226,7 +226,7 @@ inline statements log at most once per 30-second re-arm interval. Not-due hot
 skips emit no optimize log.
 
 Runtime optimize's own `PRAGMA main.analysis_limit=0`,
-`PRAGMA main.optimize=0x10002`, and `ANALYZE main` statements are suppressed
+`PRAGMA main.optimize=0x10012`, and `ANALYZE main` statements are suppressed
 from `trace_stmt`, `slow_query`, and `slow_query_expanded` output. The
 `runtime_optimize` start/done/failed lines remain visible through the
 observability sink.
