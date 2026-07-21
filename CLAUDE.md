@@ -66,8 +66,14 @@ Project-specific guidance:
   process-wide `obs_mode_unregistered` diagnostic while observability is
   enabled.
 - Keep runtime optimize opt-in: literal `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0`
-  enables; unset, literal `1`, and every other value disable. Keep maintenance
-  defaults exact: `PLEX_OPTIMIZE_API=0`. For configured Plex instances,
+  enables; unset, literal `1`, and every other value disable. Keep the FULL
+  tier kill-switch opt-out: literal `SQLITE3_DISABLE_RUNTIME_OPTIMIZE_FULL=1`
+  disables only the FULL tier (LIMITED keeps running); unset and every other
+  value keep FULL enabled. Keep tier scheduling deadline-aware: a tier
+  interrupted by its own wall-clock deadline re-arms on its cadence (from the
+  deadline-attempt stamp), never on the short failure backoff; a failed FULL
+  attempt gives LIMITED the next reservation (one-shot rotation). Keep
+  maintenance defaults exact: `PLEX_OPTIMIZE_API=0`. For configured Plex instances,
   `main()` derives internal STAT4 capability state from `GENERIC_SQLITE_BINARY`
   preflight; the Plex main-DB STAT4 pass runs only when that state is `1`.
 - Keep Plex FTS rewrite opt-out (default-on in the Plex/ICU build): literal

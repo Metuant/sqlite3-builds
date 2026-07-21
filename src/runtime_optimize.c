@@ -83,11 +83,30 @@ typedef enum {
     RUNTIME_OPTIMIZE_TIER_FULL = 2
 } runtime_optimize_tier;
 
+typedef enum {
+    RUNTIME_OPTIMIZE_OUTCOME_FAILURE = 0,
+    RUNTIME_OPTIMIZE_OUTCOME_SUCCESS = 1,
+    RUNTIME_OPTIMIZE_OUTCOME_DEADLINE = 2
+} runtime_optimize_outcome;
+
 typedef struct {
     int used;
     char path[RUNTIME_OPTIMIZE_PATH_MAX];
     sqlite3_int64 last_limited_success_ns;
     sqlite3_int64 last_full_success_ns;
+    /* WHY: A tier interrupted by its own wall-clock deadline records the
+     * attempt here; due computation treats it like a success for cadence
+     * purposes, so a tier whose work cannot finish inside its deadline
+     * retries once per cadence instead of once per failure backoff (which
+     * on large databases turned the FULL tier into a permanent ~15s
+     * write-lock tax that also starved the LIMITED tier). */
+    sqlite3_int64 last_limited_deadline_ns;
+    sqlite3_int64 last_full_deadline_ns;
+    /* WHY: One-shot fairness. Reservation checks FULL before LIMITED, so a
+     * persistently failing FULL (e.g. SQLITE_BUSY under write contention)
+     * would otherwise starve LIMITED for the whole contention window. After
+     * any non-success FULL attempt, LIMITED gets the next reservation. */
+    int full_failed_since_limited;
     sqlite3_int64 backoff_until_ns;
     runtime_optimize_tier inflight_tier;
 } runtime_optimize_slot;
@@ -99,6 +118,12 @@ typedef enum {
 
 typedef struct {
     sqlite3_int64 deadline_ns;
+    /* WHY: Set by the progress callback immediately before it returns
+     * nonzero, so an SQLITE_INTERRUPT from the tier statement can be
+     * attributed to OUR deadline rather than an external
+     * sqlite3_interrupt(). Outcome classification must never infer a
+     * deadline from elapsed time or error text. */
+    int deadline_reached;
 } runtime_optimize_progress_ctx;
 
 typedef struct {
@@ -126,6 +151,17 @@ static int runtime_optimize_is_enabled(void) {
     const char *value = getenv("SQLITE3_DISABLE_RUNTIME_OPTIMIZE");
     if (!value) return RUNTIME_OPTIMIZE_UNSET_DEFAULT_ENABLED;
     return strcmp(value, "0") == 0;
+}
+
+/* WHY: FULL-only kill switch for databases where an unbounded ANALYZE can
+ * never finish inside the FULL deadline; literal "1" disables the FULL tier
+ * while the LIMITED tier keeps running (unset and every other value keep
+ * FULL enabled, matching the SQLITE3_DISABLE_* literal-1 convention). It is
+ * consulted in BOTH authoritative due paths -- the slot due computation and
+ * tier reservation -- so a disabled FULL is never reserved and never wakes
+ * the per-connection due cache. */
+static int runtime_optimize_full_tier_disabled(void) {
+    return env_is_literal_1("SQLITE3_DISABLE_RUNTIME_OPTIMIZE_FULL");
 }
 
 static int runtime_optimize_copy_path_key(
@@ -206,6 +242,40 @@ static sqlite3_int64 runtime_optimize_full_cadence_ns(void) {
     );
 }
 
+#define RUNTIME_OPTIMIZE_NS_PER_MS 1000000LL
+#define RUNTIME_OPTIMIZE_DEADLINE_MS_MAX 600000LL
+
+/* WHY: Deadline overrides exist so the deadline-interruption classification
+ * and gating logic are deterministically testable (the compile-time deadlines
+ * are far too long to exercise in a test) and tunable in the field. Digits
+ * only; 0, empty, junk, and unset use the compile-time default; values above
+ * ten minutes clamp. */
+static sqlite3_int64 runtime_optimize_parse_deadline_ns(
+    const char *name,
+    sqlite3_int64 default_ns
+) {
+    const char *value = getenv(name);
+    unsigned long long acc = 0;
+    int ok = 1;
+    const char *p;
+
+    if (!value || value[0] < '0' || value[0] > '9') return default_ns;
+    for (p = value; *p; p++) {
+        if (*p < '0' || *p > '9') {
+            ok = 0;
+            break;
+        }
+        if (acc <= (unsigned long long)RUNTIME_OPTIMIZE_DEADLINE_MS_MAX) {
+            acc = acc * 10ULL + (unsigned long long)(*p - '0');
+        }
+    }
+    if (!ok || acc == 0ULL) return default_ns;
+    if (acc > (unsigned long long)RUNTIME_OPTIMIZE_DEADLINE_MS_MAX) {
+        acc = (unsigned long long)RUNTIME_OPTIMIZE_DEADLINE_MS_MAX;
+    }
+    return (sqlite3_int64)acc * RUNTIME_OPTIMIZE_NS_PER_MS;
+}
+
 static sqlite3_int64 runtime_optimize_failure_backoff_ns(sqlite3_int64 limited_cadence_ns) {
     sqlite3_int64 max_backoff = RUNTIME_OPTIMIZE_BACKOFF_MAX_SECONDS * RUNTIME_OPTIMIZE_NS_PER_SECOND;
     sqlite3_int64 backoff = limited_cadence_ns < max_backoff ? limited_cadence_ns : max_backoff;
@@ -241,12 +311,18 @@ static runtime_optimize_slot *runtime_optimize_find_slot_locked(const char *path
 static runtime_optimize_slot *runtime_optimize_insert_slot_locked(const char *path) {
     int empty = -1;
     int evict = -1;
+    int evict_gated = -1;
     sqlite3_int64 oldest_seen = 0;
+    sqlite3_int64 oldest_gated_seen = 0;
+    sqlite3_int64 now_ns = runtime_optimize_now_ns();
+    sqlite3_int64 limited_cadence_ns = runtime_optimize_limited_cadence_ns();
+    sqlite3_int64 full_cadence_ns = runtime_optimize_full_cadence_ns();
     int i;
 
     for (i = 0; i < RUNTIME_OPTIMIZE_REGISTRY_CAP; i++) {
         runtime_optimize_slot *slot = &g_runtime_optimize_slots[i];
         sqlite3_int64 slot_age;
+        int gate_active;
         if (!slot->used) {
             empty = i;
             break;
@@ -255,13 +331,31 @@ static runtime_optimize_slot *runtime_optimize_insert_slot_locked(const char *pa
         slot_age = slot->last_full_success_ns ?
                    slot->last_full_success_ns :
                    slot->last_limited_success_ns;
-        if (evict < 0 || slot_age < oldest_seen) {
+        /* WHY: Eviction recreates a slot with zeroed timestamps, which makes
+         * every tier immediately due again -- exactly what the deadline gate
+         * exists to prevent. Prefer victims without an unexpired deadline
+         * gate; fall back to gated slots only when every candidate is gated,
+         * because refusing to insert would deny new paths entirely. */
+        gate_active =
+            (slot->last_full_deadline_ns != 0 &&
+             now_ns < runtime_optimize_safe_add_ns(
+                 slot->last_full_deadline_ns, full_cadence_ns)) ||
+            (slot->last_limited_deadline_ns != 0 &&
+             now_ns < runtime_optimize_safe_add_ns(
+                 slot->last_limited_deadline_ns, limited_cadence_ns));
+        if (gate_active) {
+            if (evict_gated < 0 || slot_age < oldest_gated_seen) {
+                evict_gated = i;
+                oldest_gated_seen = slot_age;
+            }
+        } else if (evict < 0 || slot_age < oldest_seen) {
             evict = i;
             oldest_seen = slot_age;
         }
     }
 
     if (empty >= 0) evict = empty;
+    if (evict < 0) evict = evict_gated;
     if (evict < 0) return NULL;
 
     memset(&g_runtime_optimize_slots[evict], 0, sizeof(g_runtime_optimize_slots[evict]));
@@ -270,6 +364,26 @@ static runtime_optimize_slot *runtime_optimize_insert_slot_locked(const char *pa
              sizeof(g_runtime_optimize_slots[evict].path),
              "%s", path);
     return &g_runtime_optimize_slots[evict];
+}
+
+/* WHY: A tier's next due time is max(success + cadence, deadline-attempt +
+ * cadence). The deadline branch is what breaks the historical retry loop: a
+ * tier whose statement is always interrupted by its own deadline never
+ * records success, and treating "no recent success" alone as immediately-due
+ * re-armed it after every short failure backoff. 0 (immediately due)
+ * survives only when the tier has never been attempted at all. */
+static sqlite3_int64 runtime_optimize_tier_next_due_ns(
+    sqlite3_int64 last_success_ns,
+    sqlite3_int64 last_deadline_ns,
+    sqlite3_int64 cadence_ns
+) {
+    sqlite3_int64 success_due = last_success_ns == 0 ?
+        0 :
+        runtime_optimize_safe_add_ns(last_success_ns, cadence_ns);
+    sqlite3_int64 deadline_due = last_deadline_ns == 0 ?
+        0 :
+        runtime_optimize_safe_add_ns(last_deadline_ns, cadence_ns);
+    return success_due > deadline_due ? success_due : deadline_due;
 }
 
 static sqlite3_int64 runtime_optimize_slot_due_ns(
@@ -284,12 +398,18 @@ static sqlite3_int64 runtime_optimize_slot_due_ns(
     if (!slot->used) return LLONG_MAX;
     if (slot->inflight_tier != RUNTIME_OPTIMIZE_TIER_NONE) return LLONG_MAX;
 
-    limited_due = slot->last_limited_success_ns == 0 ?
-                  0 :
-                  runtime_optimize_safe_add_ns(slot->last_limited_success_ns, limited_cadence_ns);
-    full_due = slot->last_full_success_ns == 0 ?
-               0 :
-               runtime_optimize_safe_add_ns(slot->last_full_success_ns, full_cadence_ns);
+    limited_due = runtime_optimize_tier_next_due_ns(
+        slot->last_limited_success_ns,
+        slot->last_limited_deadline_ns,
+        limited_cadence_ns
+    );
+    full_due = runtime_optimize_full_tier_disabled() ?
+               LLONG_MAX :
+               runtime_optimize_tier_next_due_ns(
+                   slot->last_full_success_ns,
+                   slot->last_full_deadline_ns,
+                   full_cadence_ns
+               );
     due = limited_due < full_due ? limited_due : full_due;
     if (slot->backoff_until_ns > due) due = slot->backoff_until_ns;
     return due;
@@ -311,14 +431,25 @@ static sqlite3_int64 runtime_optimize_connection_due_value(
     return due;
 }
 
+/* WHY: This and runtime_optimize_slot_due_ns are the two authoritative due
+ * paths (this one also serves the CLOSE trigger, which bypasses the
+ * per-connection cache); both funnel through
+ * runtime_optimize_tier_next_due_ns so the deadline gate cannot be applied
+ * asymmetrically. A now_ns earlier than the stamps (clock fallback) simply
+ * reads as not-yet-due. */
 static int runtime_optimize_tier_due(
     sqlite3_int64 now_ns,
     sqlite3_int64 last_success_ns,
+    sqlite3_int64 last_deadline_ns,
     sqlite3_int64 cadence_ns
 ) {
-    if (last_success_ns == 0) return 1;
-    if (now_ns < last_success_ns) return 0;
-    return now_ns - last_success_ns >= cadence_ns;
+    sqlite3_int64 next_due = runtime_optimize_tier_next_due_ns(
+        last_success_ns,
+        last_deadline_ns,
+        cadence_ns
+    );
+    if (next_due == 0) return 1;
+    return now_ns >= next_due;
 }
 
 static void runtime_optimize_connection_state_free(void *arg) {
@@ -518,7 +649,9 @@ static runtime_optimize_tier runtime_optimize_reserve(
 ) {
     runtime_optimize_slot *slot;
     runtime_optimize_tier tier = RUNTIME_OPTIMIZE_TIER_NONE;
-    sqlite3_int64 last_success_ns = 0;
+    sqlite3_int64 last_attempt_ns = 0;
+    int full_due;
+    int limited_due;
 
     *path_next_due_ns = 0;
     *tier_since_last_ns = RUNTIME_OPTIMIZE_SINCE_LAST_NEVER_NS;
@@ -530,15 +663,40 @@ static runtime_optimize_tier runtime_optimize_reserve(
     if (slot->backoff_until_ns > now_ns) goto done;
     if (slot->inflight_tier != RUNTIME_OPTIMIZE_TIER_NONE) goto done;
 
-    if (runtime_optimize_tier_due(now_ns, slot->last_full_success_ns, full_cadence_ns)) {
+    full_due = !runtime_optimize_full_tier_disabled() &&
+               runtime_optimize_tier_due(
+                   now_ns,
+                   slot->last_full_success_ns,
+                   slot->last_full_deadline_ns,
+                   full_cadence_ns
+               );
+    limited_due = runtime_optimize_tier_due(
+        now_ns,
+        slot->last_limited_success_ns,
+        slot->last_limited_deadline_ns,
+        limited_cadence_ns
+    );
+
+    if (full_due && !(slot->full_failed_since_limited && limited_due)) {
         tier = RUNTIME_OPTIMIZE_TIER_FULL;
-        last_success_ns = slot->last_full_success_ns;
-    } else if (runtime_optimize_tier_due(now_ns, slot->last_limited_success_ns, limited_cadence_ns)) {
+        last_attempt_ns = slot->last_full_success_ns > slot->last_full_deadline_ns ?
+                          slot->last_full_success_ns :
+                          slot->last_full_deadline_ns;
+    } else if (limited_due) {
         tier = RUNTIME_OPTIMIZE_TIER_LIMITED;
-        last_success_ns = slot->last_limited_success_ns;
+        last_attempt_ns = slot->last_limited_success_ns > slot->last_limited_deadline_ns ?
+                          slot->last_limited_success_ns :
+                          slot->last_limited_deadline_ns;
+        /* WHY: LIMITED got its one-shot turn; the next FULL retry may
+         * proceed (this also clears the flag on a naturally-selected
+         * LIMITED, which satisfies the same fairness goal). */
+        slot->full_failed_since_limited = 0;
     }
-    if (last_success_ns > 0) {
-        *tier_since_last_ns = now_ns >= last_success_ns ? now_ns - last_success_ns : 0;
+    /* WHY: since-last reports the most recent ATTEMPT (success or deadline)
+     * so a deadline-gated tier re-firing after its cadence is
+     * distinguishable in the obs log from a tier that never ran. */
+    if (last_attempt_ns > 0) {
+        *tier_since_last_ns = now_ns >= last_attempt_ns ? now_ns - last_attempt_ns : 0;
     }
     if (tier != RUNTIME_OPTIMIZE_TIER_NONE) slot->inflight_tier = tier;
 
@@ -558,7 +716,7 @@ done:
 static void runtime_optimize_finish(
     const char *path,
     runtime_optimize_tier tier,
-    int success,
+    runtime_optimize_outcome outcome,
     sqlite3_int64 finish_ns,
     sqlite3_int64 failure_backoff_ns,
     sqlite3_int64 *path_next_due_ns
@@ -572,15 +730,36 @@ static void runtime_optimize_finish(
         if (slot->inflight_tier == tier) {
             slot->inflight_tier = RUNTIME_OPTIMIZE_TIER_NONE;
         }
-        if (success) {
+        if (outcome == RUNTIME_OPTIMIZE_OUTCOME_SUCCESS) {
             if (tier == RUNTIME_OPTIMIZE_TIER_FULL) {
                 slot->last_full_success_ns = finish_ns;
                 slot->last_limited_success_ns = finish_ns;
+                slot->last_full_deadline_ns = 0;
+                slot->last_limited_deadline_ns = 0;
+                slot->full_failed_since_limited = 0;
             } else if (tier == RUNTIME_OPTIMIZE_TIER_LIMITED) {
                 slot->last_limited_success_ns = finish_ns;
+                slot->last_limited_deadline_ns = 0;
             }
             slot->backoff_until_ns = 0;
+        } else if (outcome == RUNTIME_OPTIMIZE_OUTCOME_DEADLINE) {
+            /* WHY: The tier ran to its own wall-clock deadline and was
+             * interrupted; retrying after the short failure backoff would
+             * re-run work that cannot finish, so gate the tier on its
+             * cadence via the deadline stamp instead. The shared backoff is
+             * deliberately NOT set: the per-tier gate already throttles this
+             * tier, and setting the shared backoff would needlessly suppress
+             * the OTHER (possibly cheap and due) tier. */
+            if (tier == RUNTIME_OPTIMIZE_TIER_FULL) {
+                slot->last_full_deadline_ns = finish_ns;
+                slot->full_failed_since_limited = 1;
+            } else if (tier == RUNTIME_OPTIMIZE_TIER_LIMITED) {
+                slot->last_limited_deadline_ns = finish_ns;
+            }
         } else {
+            if (tier == RUNTIME_OPTIMIZE_TIER_FULL) {
+                slot->full_failed_since_limited = 1;
+            }
             slot->backoff_until_ns = runtime_optimize_safe_add_ns(finish_ns, failure_backoff_ns);
         }
         *path_next_due_ns = runtime_optimize_connection_due_value(
@@ -722,33 +901,52 @@ static int runtime_optimize_restore_analysis_limit(sqlite3 *db, int value, char 
 
 static int runtime_optimize_progress_cb(void *arg) {
     runtime_optimize_progress_ctx *ctx = (runtime_optimize_progress_ctx*)arg;
-    return runtime_optimize_now_ns() >= ctx->deadline_ns;
+    if (runtime_optimize_now_ns() < ctx->deadline_ns) return 0;
+    ctx->deadline_reached = 1;
+    return 1;
 }
 
 static sqlite3_int64 runtime_optimize_tier_deadline_ns(runtime_optimize_tier tier) {
     return tier == RUNTIME_OPTIMIZE_TIER_FULL ?
-           RUNTIME_OPTIMIZE_FULL_DEADLINE_NS :
-           RUNTIME_OPTIMIZE_LIMITED_DEADLINE_NS;
+           runtime_optimize_parse_deadline_ns(
+               "SQLITE3_RUNTIME_OPTIMIZE_FULL_DEADLINE_MS",
+               RUNTIME_OPTIMIZE_FULL_DEADLINE_NS
+           ) :
+           runtime_optimize_parse_deadline_ns(
+               "SQLITE3_RUNTIME_OPTIMIZE_LIMITED_DEADLINE_MS",
+               RUNTIME_OPTIMIZE_LIMITED_DEADLINE_NS
+           );
 }
 
 static const char *runtime_optimize_tier_sql(runtime_optimize_tier tier) {
+    /* WHY: LIMITED uses mask 0x10012, not the maintenance scripts' 0x10002.
+     * runtime_optimize_run forces the session analysis_limit to 0 (FULL needs
+     * exact stat1/stat4 or nothing), and in SQLite 3.53.3 PRAGMA optimize
+     * applies its temporary bounded analysis limit
+     * (SQLITE_DEFAULT_OPTIMIZE_LIMIT=2000, scaled down when many btrees
+     * qualify) only when mask bit 0x10 is set -- with 0x10 omitted and the
+     * session limit at 0, any ANALYZE that optimize decides to run is
+     * unbounded, which turns the "cheap incremental" tier into a statement
+     * that can only end at its 3s deadline on a large changed table. Bit
+     * 0x10000 (examine all tables, not just queried ones) is kept from the
+     * maintenance mask. */
     return tier == RUNTIME_OPTIMIZE_TIER_FULL ?
            "ANALYZE main;" :
-           "PRAGMA main.optimize=0x10002;";
+           "PRAGMA main.optimize=0x10012;";
 }
 
 static const char *runtime_optimize_tier_name(runtime_optimize_tier tier) {
     return tier == RUNTIME_OPTIMIZE_TIER_FULL ? "full" : "limited";
 }
 
-static int runtime_optimize_run(
+static runtime_optimize_outcome runtime_optimize_run(
     sqlite3 *db,
     const char *path,
     runtime_optimize_tier tier,
     runtime_optimize_trigger trigger,
     sqlite3_int64 since_last_ns
 ) {
-    int success = 0;
+    runtime_optimize_outcome outcome = RUNTIME_OPTIMIZE_OUTCOME_FAILURE;
     int rc = SQLITE_OK;
     int saved_limit = 0;
     int analysis_limit_changed = 0;
@@ -798,6 +996,10 @@ static int runtime_optimize_run(
         runtime_optimize_now_ns(),
         runtime_optimize_tier_deadline_ns(tier)
     );
+    /* WHY: progress_ctx is stack storage that is never memset; without this
+     * explicit init the deadline flag is stack garbage and outcome
+     * classification becomes nondeterministic. */
+    progress_ctx.deadline_reached = 0;
     auto_extension_progress_handler_push(
         db,
         RUNTIME_OPTIMIZE_PROGRESS_OPS,
@@ -842,13 +1044,21 @@ static int runtime_optimize_run(
     changes_after = sqlite3_total_changes64(db);
     if (changes_after >= changes_before) stat_rows = changes_after - changes_before;
     if (rc != SQLITE_OK) {
+        /* WHY: Classify a deadline interruption ONLY from our own progress
+         * callback having fired paired with SQLITE_INTERRUPT from the tier
+         * statement. An external sqlite3_interrupt() (flag unset) and every
+         * other error stay ordinary failures with the short retry backoff. */
+        if (rc == SQLITE_INTERRUPT && progress_ctx.deadline_reached) {
+            outcome = RUNTIME_OPTIMIZE_OUTCOME_DEADLINE;
+        }
         sqlite3_log(rc, "auto_extension: runtime optimize %s failed on %s: %s",
                     runtime_optimize_tier_name(tier), path, err ? err : "(no message)");
         obs_logf("runtime_optimize",
-                 "event=optimize_failed db=%p path=\"%s\" tier=%s elapsed_ms=%.3f stat_rows=%lld since_last_ms=%lld rc=%d err=\"%s\"",
+                 "event=optimize_failed db=%p path=\"%s\" tier=%s elapsed_ms=%.3f stat_rows=%lld since_last_ms=%lld rc=%d deadline_reached=%d err=\"%s\"",
                  (void*)db, path, runtime_optimize_tier_name(tier),
                  runtime_optimize_ns_to_ms(optimize_end_ns - optimize_start_ns),
-                 (long long)stat_rows, since_last_ms, rc, err ? err : "");
+                 (long long)stat_rows, since_last_ms, rc,
+                 progress_ctx.deadline_reached, err ? err : "");
         goto cleanup;
     }
     obs_logf("runtime_optimize",
@@ -856,7 +1066,7 @@ static int runtime_optimize_run(
              (void*)db, path, runtime_optimize_tier_name(tier),
              runtime_optimize_ns_to_ms(optimize_end_ns - optimize_start_ns),
              (long long)stat_rows, since_last_ms);
-    success = 1;
+    outcome = RUNTIME_OPTIMIZE_OUTCOME_SUCCESS;
 
 cleanup:
     if (progress_pushed) {
@@ -870,7 +1080,13 @@ cleanup:
         if (restore_rc != SQLITE_OK) {
             int residual_limit = -1;
             int residual_rc;
-            success = 0;
+            /* WHY: The outcome is deliberately NOT downgraded here. If the
+             * tier statement completed, its stat rows are already committed
+             * -- discarding the success record would re-run a full ANALYZE
+             * in ~60s for a connection-local PRAGMA hiccup. The residual
+             * limit is logged below; the connection's analysis_limit remains
+             * whatever the failed restore left (saved_limit is almost always
+             * 0, SQLite's default, making the residual state benign). */
             residual_rc = runtime_optimize_read_analysis_limit(db, &residual_limit);
             sqlite3_log(restore_rc,
                         "auto_extension: runtime optimize restore analysis_limit failed on %s: %s; residual analysis_limit=%s%d read_rc=%d",
@@ -898,7 +1114,7 @@ cleanup:
     }
     sqlite3_free(err);
     g_runtime_optimize_depth--;
-    return success;
+    return outcome;
 }
 
 static void runtime_optimize_maybe_run(
@@ -917,7 +1133,7 @@ static void runtime_optimize_maybe_run(
     sqlite3_int64 failure_backoff_ns;
     sqlite3_int64 tier_since_last_ns = RUNTIME_OPTIMIZE_SINCE_LAST_NEVER_NS;
     runtime_optimize_tier tier;
-    int success;
+    runtime_optimize_outcome outcome;
     int rc;
 
     if (!db) return;
@@ -1028,7 +1244,7 @@ static void runtime_optimize_maybe_run(
             runtime_optimize_finish(
                 path,
                 tier,
-                0,
+                RUNTIME_OPTIMIZE_OUTCOME_FAILURE,
                 runtime_optimize_now_ns(),
                 failure_backoff_ns,
                 &path_next_due_ns
@@ -1038,11 +1254,11 @@ static void runtime_optimize_maybe_run(
         }
     }
 
-    success = runtime_optimize_run(db, path, tier, trigger, tier_since_last_ns);
+    outcome = runtime_optimize_run(db, path, tier, trigger, tier_since_last_ns);
     runtime_optimize_finish(
         path,
         tier,
-        success,
+        outcome,
         runtime_optimize_now_ns(),
         failure_backoff_ns,
         &path_next_due_ns
