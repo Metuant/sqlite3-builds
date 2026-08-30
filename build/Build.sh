@@ -15,9 +15,9 @@ sqlite_src_sha3="${SQLITE_SRC_SHA3_256:-}"
 SQLITE_SOURCE_ID="${SQLITE_SOURCE_ID:-}"
 LIBRARY_VARIANT="${LIBRARY_VARIANT:-generic}"
 MARCH="${MARCH:-x86-64-v3}"
-MIMALLOC_VERSION="${MIMALLOC_VERSION:-3.3.2}"
-MIMALLOC_URL="${MIMALLOC_URL:-https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz}"
-MIMALLOC_SHA512="${MIMALLOC_SHA512:-226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1}"
+MIMALLOC_VERSION="${MIMALLOC_VERSION:-3.5.0}"
+MIMALLOC_URL="${MIMALLOC_URL:-https://github.com/microsoft/mimalloc/archive/refs/tags/v3.5.0.tar.gz}"
+MIMALLOC_SHA512="${MIMALLOC_SHA512:-c5d92b42302c564b5949a9002f92ae096f7afaaf283ec21e01db6529ae4f1fa979ce0dc7bf268c25ad6e13d0bb2273df41f7f7304c39e2ab01ff2463e2878329}"
 mimalloc_link_inputs=""
 
 if [ "${LIBRARY_VARIANT}" = "plex" ] && [ -z "${SQLITE_SRC_URL:-}" ]; then

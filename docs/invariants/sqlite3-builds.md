@@ -29,7 +29,7 @@ milestone lands.
   the `ICU_SOURCE_*` defaults come from the compatibility-groups TSV, and
   asserts SORTERREF/PMASZ compile defaults match their constructor-102 runtime
   config values.
-- Mimalloc v3.3.2 Wire-2 link-time interposition applies to both library
+- Mimalloc v3.5.0 Wire-2 link-time interposition applies to both library
   variants only; CLI stays on the platform allocator. Keep the full
   VERSION + URL + SHA512 pin tuple aligned across `build/Build.sh`,
   `build/build_static_sqlite.sh`, `docker-library/Dockerfile`, and
@@ -462,7 +462,7 @@ milestone lands.
   aligned at 32 GiB.
 - Mimalloc replaces the default glibc/musl allocator for all
   SQLite-internal allocations in both library variants; the CLI continues
-  using the platform allocator. `MIMALLOC_ALLOW_THP=1` is the v3.3.2
+  using the platform allocator. `MIMALLOC_ALLOW_THP=1` is the v3.5.0
   default and fits the deploy environment's THP=always + defer+madvise
   posture.
 

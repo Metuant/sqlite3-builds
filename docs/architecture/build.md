@@ -57,12 +57,12 @@ They are not per-run generic library build-stage inputs. The generic library
 build consumes `BASE_IMAGE`, resolved to a GHCR digest by CI or to a local tag by
 the wrapper fallback.
 
-The library build also pins mimalloc v3.3.2:
+The library build also pins mimalloc v3.5.0:
 
 | Input | Current value |
 |---|---|
-| Mimalloc version | `3.3.2` |
-| Mimalloc URL | `https://github.com/microsoft/mimalloc/archive/refs/tags/v3.3.2.tar.gz` |
+| Mimalloc version | `3.5.0` |
+| Mimalloc URL | `https://github.com/microsoft/mimalloc/archive/refs/tags/v3.5.0.tar.gz` |
 | Mimalloc SHA-512 | `226bbd51eca36d7737ce5e2edba7e0a3beeca448462a861bcbfb6726a0994bc077b4c684d7ff8b0805d71bf770e00df14f10ed598256ee54a154d8cc08e6a5c1` |
 | Mimalloc install prefix | `/opt/mimalloc` |
 
@@ -249,7 +249,7 @@ the current run. The per-run generic branch performs no `apt` work, no PPA
 registration, and no CMake installation. Those steps belong to the generic
 build-base image.
 
-The same Dockerfile builds mimalloc v3.3.2 in a dedicated layer, installs it
+The same Dockerfile builds mimalloc v3.5.0 in a dedicated layer, installs it
 under `/opt/mimalloc`, writes `/opt/mimalloc/SHA512`, and exports
 `MIMALLOC_OBJ` plus `MIMALLOC_LIB` into `Build.sh`. The Plex branch adds
 `-DMI_LIBC_MUSL=ON`; the generic branch does not. The ICU and mimalloc

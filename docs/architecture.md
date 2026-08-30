@@ -128,7 +128,7 @@ Two shared-library variants are built from the same source tree.
 
 The intentional variant delta is ICU support for Plex.
 
-Both library variants also link mimalloc v3.3.2 by link-time interposition;
+Both library variants also link mimalloc v3.5.0 by link-time interposition;
 the static CLI remains on the platform allocator.
 
 Everything else is shared: the SQLite amalgamation pin, `src/auto_extension.c`,
