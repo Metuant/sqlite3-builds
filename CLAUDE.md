@@ -45,7 +45,7 @@ Project-specific guidance:
   `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`, and
   `tests/check_pin_alignment.sh`; keep the `docker-library/Dockerfile` ICU and
-  mimalloc dependency layers above all 19 project `COPY` lines; keep the
+  mimalloc dependency layers above all 22 project `COPY` lines; keep the
   `.github/workflows/sqlite-build.yml` GHCR `type=registry` cache contract
   (import the event ref and then the baseline ref; export the event ref only,
   gated on `CACHE_EXPORT_ENABLED` and `continue-on-error: true`; forbid

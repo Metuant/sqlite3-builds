@@ -776,7 +776,11 @@ require_line src/rewrite_modes.h '    X(EMBY_RESUME_SIMPLE, "emby", "fanout+resu
 require_line src/rewrite_modes.h '    X(EMBY_SIMILAR, "emby", "fanout+similar", "emby_fts_rewrite", 0) \'
 require_line src/rewrite_modes.h '    X(EMBY_EPISODES_LATEST, "emby", "dashboard+episodes_latest", "emby_fts_rewrite", 1) \'
 require_line src/rewrite_modes.h '    X(EMBY_MOVIES_LATEST, "emby", "dashboard+movies_latest", "emby_fts_rewrite", 1) \'
-require_line src/rewrite_modes.h '    X(EMBY_MIXED_LATEST, "emby", "dashboard+mixed_latest", "emby_fts_rewrite", 1)'
+require_line src/rewrite_modes.h '    X(EMBY_MIXED_LATEST, "emby", "dashboard+mixed_latest", "emby_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(PLEX_FTS_JOIN, "plex", "fts+tag-join-chain", "plex_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(PLEX_TITLE_SCOPE, "plex", "fts+title-user-scope", "plex_fts_rewrite", 0) \'
+require_line src/rewrite_modes.h '    X(PLEX_COLLECTION_TAG, "plex", "collection+tag-first", "plex_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(PLEX_RECENT_EPISODE, "plex", "recent-episode-prefilter", "plex_fts_rewrite", 1)'
 require_line src/rewrite_modes.h 'typedef int32_t obs_rewrite_mode;'
 require_line src/rewrite_modes.h '    OBS_MODE_NONE = 0,'
 require_line src/rewrite_modes.h '    OBS_MODE_COUNT'
@@ -794,7 +798,7 @@ awk '
     if ($0 ~ /, 1\)( \\)?$/) eligible[suffix]++
   }
   END {
-    if (rows != 15) exit 1
+    if (rows != 19) exit 1
     for (suffix in suffix_seen) {
       if (suffix_seen[suffix] != 1) exit 1
       suffix_count++
@@ -804,11 +808,11 @@ awk '
       wire_count++
     }
     for (suffix in eligible) eligible_count++
-    if (suffix_count != 15 || wire_count != 15 || eligible_count != 5) exit 1
+    if (suffix_count != 19 || wire_count != 19 || eligible_count != 7) exit 1
     if (!eligible["PLEX_TAGGINGS"] || !eligible["PLEX_ONDECK"] ||
         !eligible["EMBY_EPISODES_LATEST"] ||
         !eligible["EMBY_MOVIES_LATEST"] ||
-        !eligible["EMBY_MIXED_LATEST"]) exit 1
+        !eligible["EMBY_MIXED_LATEST"] || !eligible["PLEX_COLLECTION_TAG"] || !eligible["PLEX_RECENT_EPISODE"]) exit 1
   }
 ' src/rewrite_modes.h || fail 'rewrite mode catalogue cardinality, uniqueness, or eligibility invalid'
 
@@ -824,9 +828,15 @@ require_range_token_count src/plex_fts_rewrite.c \
   'static plex_match_result match_ondeck_query(' \
   'static int plex_prepare_input_lengths(' OBS_MODE_PLEX_ONDECK 2 \
   'Plex On-Deck producer manifest'
+# The literal counter includes PLEX_FTS_JOIN in PLEX_FTS. Four total
+# occurrences minus the separately checked two JOIN occurrences leaves two legacy.
 for manifest in \
   'OBS_MODE_PLEX_GUID_LIKE 2' \
-  'OBS_MODE_PLEX_FTS 2' \
+  'OBS_MODE_PLEX_FTS 4' \
+  'OBS_MODE_PLEX_FTS_JOIN 2' \
+  'OBS_MODE_PLEX_TITLE_SCOPE 2' \
+  'OBS_MODE_PLEX_COLLECTION_TAG 2' \
+  'OBS_MODE_PLEX_RECENT_EPISODE 1' \
   'OBS_MODE_PLEX_TAGGINGS 2' \
   'OBS_MODE_PLEX_ONDECK 2'
 do
@@ -907,10 +917,10 @@ require_range_token_count src/emby_fts_rewrite.c \
   __EOF__ OBS_MODE_EMBY_FTS 5 'Emby FTS producer manifest'
 plex_mode_token_count="$(grep -Eo 'OBS_MODE_PLEX_[A-Z_]+' src/plex_fts_rewrite.c | wc -l | tr -d ' ')"
 emby_mode_token_count="$(grep -Eo 'OBS_MODE_EMBY_[A-Z_]+' src/emby_fts_rewrite.c | wc -l | tr -d ' ')"
-assert_eq 'Plex producer token total' 13 "$plex_mode_token_count"
+assert_eq 'Plex producer token total' 20 "$plex_mode_token_count"
 assert_eq 'Emby producer token total' 61 "$emby_mode_token_count"
 
-raw_mode_wire_ere='"(fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest|dashboard[+]mixed_latest)"'
+raw_mode_wire_ere='"(collection[+]tag-first|fts[+]title-user-scope|fts[+]tag-join-chain|fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest|dashboard[+]mixed_latest)"'
 for file in \
   src/auto_extension.c \
   src/emby_fts_rewrite.c \
@@ -1024,7 +1034,7 @@ require_line docs/env-vars.md '| `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` | kill-sw
 require_line docs/env-vars.md '| `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` | kill-switch | Disable sampling for explicitly enabled STMT trace. | Enabled STMT trace logs the first callback, each bounded first-seen `corr` shape, and every 1024th callback per connection. | opt-out | Literal `1` logs every enabled STMT callback. | Unset, literal `0`, and any other value retain `sample=first`, `sample=periodic`, and `sample=new` hybrid sampling. | generic and Plex-ICU shared libraries. | Cached once per process. Never enables STMT trace; `SQLITE3_DISABLE_STMT_TRACE=0` and observability enabled are still required. |'
 require_pattern CLAUDE.md 'SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1' 'CLAUDE rewrite-applied SQL knob'
 require_pattern CLAUDE.md 'SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1' 'CLAUDE STMT sampling knob'
-require_line CLAUDE.md '  mimalloc dependency layers above all 19 project `COPY` lines; keep the'
+require_line CLAUDE.md '  mimalloc dependency layers above all 23 project `COPY` lines; keep the'
 require_line CLAUDE.md '- Keep `src/rewrite_modes.h` as the only rewrite-mode catalogue. Producers pass'
 require_pattern CLAUDE.md 'Applied counters remain per connection' 'CLAUDE applied counter lifetime'
 require_pattern CLAUDE.md 'miss and index-missing counters remain process-global' 'CLAUDE global counter lifetimes'
@@ -1291,9 +1301,10 @@ require_line docker-library/Dockerfile 'CMD ["/bin/sh"]'
 require_project_copies_after \
   docker-library/Dockerfile \
   'ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a' \
-  19 \
+  23 \
   'library dependency layers before all project COPY lines'
 require_line docker-library/Dockerfile 'COPY src/rewrite_modes.h /app/rewrite_modes.h'
+require_line docker-library/Dockerfile 'COPY src/plex_fts_join_rewrite.h /app/plex_fts_join_rewrite.h'
 require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_URL'
 require_line docker-library/Dockerfile 'ARG SQLITE_AMALG_SHA3_256'
 require_line docker-library/Dockerfile 'ARG SQLITE_SRC_URL=""'

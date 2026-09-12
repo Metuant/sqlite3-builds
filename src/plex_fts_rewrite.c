@@ -1,5 +1,11 @@
 #include "plex_fts_rewrite.h"
 #include "fts_lex.h"
+#ifdef SQLITE_ENABLE_ICU
+#include "plex_fts_join_rewrite.h"
+#include "plex_title_scope_rewrite.h"
+#include "plex_collection_tag_rewrite.h"
+#include "plex_recent_episode_rewrite.h"
+#endif
 #include "observability.h"
 
 #include <limits.h>
@@ -157,6 +163,46 @@ static void plex_log_rewrite_applied(
     size_t rewritten_len,
     obs_rewrite_mode mode
 );
+
+static pthread_once_t g_plex_recent_once=PTHREAD_ONCE_INIT;
+static int g_plex_recent_enabled;
+static void plex_recent_init(void){const char*v=getenv("SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE");g_plex_recent_enabled=v&&strcmp(v,"1")==0;}
+static int plex_recent_enabled(void){pthread_once(&g_plex_recent_once,plex_recent_init);return g_plex_recent_enabled;}
+
+static pthread_once_t g_plex_collection_tag_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_collection_tag_enabled;
+static void plex_collection_tag_init_once(void) {
+    const char *v = getenv("SQLITE3_ENABLE_PLEX_COLLECTION_TAG_REWRITE");
+    atomic_store_explicit(&g_plex_collection_tag_enabled,
+        v && v[0]=='1' && v[1]==0, memory_order_relaxed);
+}
+static int plex_collection_tag_enabled(void) {
+    pthread_once(&g_plex_collection_tag_once, plex_collection_tag_init_once);
+    return atomic_load_explicit(&g_plex_collection_tag_enabled,memory_order_relaxed);
+}
+
+static pthread_once_t g_plex_title_scope_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_title_scope_enabled;
+static void plex_title_scope_init_once(void) {
+    const char *value = getenv("SQLITE3_ENABLE_PLEX_TITLE_SCOPE_REWRITE");
+    atomic_store_explicit(&g_plex_title_scope_enabled,
+        value && strcmp(value, "1") == 0, memory_order_release);
+}
+static int plex_title_scope_enabled(void) {
+    pthread_once(&g_plex_title_scope_once, plex_title_scope_init_once);
+    return atomic_load_explicit(&g_plex_title_scope_enabled, memory_order_acquire);
+}
+static pthread_once_t g_plex_join_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_join_enabled;
+static void plex_join_init_once(void) {
+    const char *value = getenv("SQLITE3_ENABLE_PLEX_FTS_JOIN_REWRITE");
+    atomic_store_explicit(&g_plex_join_enabled,
+        value && strcmp(value, "1") == 0, memory_order_release);
+}
+static int plex_join_enabled(void) {
+    pthread_once(&g_plex_join_once, plex_join_init_once);
+    return atomic_load_explicit(&g_plex_join_enabled, memory_order_acquire);
+}
 
 static pthread_once_t g_plex_rewrite_once = PTHREAD_ONCE_INIT;
 static atomic_int g_plex_rewrite_enabled;
@@ -1732,7 +1778,7 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
     guid_like_on = plex_guid_like_rewrite_enabled();
     tag_on = plex_tag_rewrite_enabled();
     ondeck_on = plex_ondeck_rewrite_enabled();
-    if ((!fts_on && !guid_like_on && !tag_on && !ondeck_on) ||
+    if ((!fts_on && !guid_like_on && !tag_on && !ondeck_on && !plex_collection_tag_enabled() && !plex_recent_enabled()) ||
         !db || !zSql || !ppStmt || nByte == 0) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
@@ -1762,6 +1808,61 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
             obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_GUID_LIKE);
             free(candidate.sql);
             return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
+        }
+    }
+
+    if (plex_recent_enabled()) {
+        size_t recent_scan=0,recent_len=0;
+        rewritten=plex_build_recent_episode_sql(zSql,bounded_len,scan_len,&recent_scan,&recent_len);
+        if(rewritten) return plex_prepare_rewritten_sql(kind,db,zSql,nByte,prepFlags,ppStmt,pzTail,
+            rewritten,scan_len,recent_scan,recent_len,0,0,1,1,OBS_MODE_PLEX_RECENT_EPISODE);
+    }
+    if (plex_collection_tag_enabled()) {
+        size_t collection_scan=0,collection_len=0;
+        int columns=0;
+        rewritten=plex_build_collection_tag_sql(zSql,bounded_len,scan_len,
+            &collection_scan,&collection_len,&columns);
+        if (rewritten) {
+            if (plex_tag_index_ready(db)==PLEX_INDEX_PRESENT) {
+                return plex_prepare_rewritten_sql(kind,db,zSql,nByte,prepFlags,
+                    ppStmt,pzTail,rewritten,scan_len,collection_scan,collection_len,
+                    0,0,columns,1,OBS_MODE_PLEX_COLLECTION_TAG);
+            }
+            obs_log_rewrite_skipped(db,"collection_tag_index_unavailable",OBS_MODE_PLEX_COLLECTION_TAG);
+            free(rewritten);rewritten=NULL;
+        }
+    }
+    if (fts_on && plex_title_scope_enabled()) {
+        size_t scope_scan = 0, scope_len = 0;
+        rewritten = plex_build_title_scope_sql(zSql, bounded_len, scan_len,
+                                               &scope_scan, &scope_len);
+        if (rewritten) {
+            if (plex_tag_index_ready(db) == PLEX_INDEX_PRESENT) {
+                return plex_prepare_rewritten_sql(
+                    kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
+                    rewritten, scan_len, scope_scan, scope_len,
+                    0, 0, 1, 1, OBS_MODE_PLEX_TITLE_SCOPE);
+            }
+            obs_log_rewrite_skipped(db, "title_scope_index_unavailable", OBS_MODE_PLEX_TITLE_SCOPE);
+            free(rewritten);
+            rewritten = NULL;
+        }
+    }
+    if (fts_on && plex_join_enabled()) {
+        size_t join_scan = 0, join_len = 0;
+        rewritten = plex_build_fts_join_sql(zSql, bounded_len, scan_len,
+                                            &join_scan, &join_len);
+        if (rewritten) {
+            /* Read-only readiness probe; do not create an index here. */
+            if (plex_tag_index_ready(db) == PLEX_INDEX_PRESENT) {
+                return plex_prepare_rewritten_sql(
+                    kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
+                    rewritten, scan_len, join_scan, join_len,
+                    0, 0, 1, 1, OBS_MODE_PLEX_FTS_JOIN);
+            }
+            obs_log_rewrite_skipped(db, "join_index_unavailable", OBS_MODE_PLEX_FTS_JOIN);
+            free(rewritten);
+            rewritten = NULL;
         }
     }
 

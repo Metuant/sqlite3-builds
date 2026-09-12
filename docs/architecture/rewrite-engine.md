@@ -2,6 +2,9 @@
 
 Part of the [Repository Architecture index](../architecture.md).
 
+The disabled-by-default [PMS aggregate FTS join-order rewrite](fts-join-rewrite.md)
+is an additional, narrowly scoped mode; see its test and release gates before enabling it.
+
 ## Per-Connection PRAGMA Injection
 
 `src/auto_extension.c` and `src/runtime_optimize.c` are compiled into both
