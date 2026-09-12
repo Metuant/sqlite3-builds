@@ -21,4 +21,5 @@ for name in plex_fts_join plex_title_scope plex_collection_tag plex_recent_episo
   ASAN_OPTIONS=detect_leaks=1 "$work/fuzz"
 done
 python3 "$root/tests/plex_review_regression_test.py" "$work/private-test.so"
-echo 'PASS: four private Python suites, four ASan/UBSan fuzzers, review regressions'
+python3 "$root/tests/plex_hub_type_or_test.py" "$work/private-test.so"
+echo 'PASS: four private Python suites, four ASan/UBSan fuzzers, review regressions, hub bounds/binds/faults'

@@ -572,7 +572,37 @@ static int rsh_base_seed(sqlite3 *db, void *suite_ctx) {
     return SQLITE_OK;
 }
 
+static int hub_binary_collation(void *ctx, int an, const void *a, int bn, const void *b) {
+    int result = memcmp(a, b, (size_t)(an < bn ? an : bn));
+    (void)ctx;
+    return result ? result : (an > bn) - (an < bn);
+}
+static void setup_hub_fixture(sqlite3 *db) {
+    if (sqlite3_compileoption_used("ENABLE_ICU"))
+        exec_sql(db, "hub-icu", "SELECT icu_load_collation('root','icu_root')");
+    else require_int("hub-test-collation", sqlite3_create_collation(db, "icu_root", SQLITE_UTF8,
+        NULL, hub_binary_collation), SQLITE_OK);
+    exec_sql(db, "hub-fixture",
+        "DELETE FROM metadata_items; DELETE FROM tags; DELETE FROM taggings;"
+        "ALTER TABLE metadata_items ADD COLUMN title TEXT;"
+        "ALTER TABLE metadata_items ADD COLUMN added_at INTEGER;"
+        "CREATE INDEX hub_parent ON metadata_items(parent_id);"
+        "CREATE INDEX hub_section_type_added ON metadata_items(library_section_id,metadata_type,added_at DESC);"
+        "WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<360)"
+        " INSERT INTO metadata_items(id,library_section_id,metadata_type,title,title_sort,added_at)"
+        " SELECT i,CASE WHEN i%11=0 THEN 6 ELSE 5 END,CASE WHEN i%7=0 THEN 10 ELSE 2 END,"
+        " 'Show',printf('show%04d',i),2000000000-i FROM n;"
+        "INSERT INTO metadata_items(id,library_section_id,metadata_type,parent_id,added_at)"
+        " SELECT id+1000,library_section_id,3,id,0 FROM metadata_items WHERE id<=360;"
+        "INSERT INTO metadata_items(id,library_section_id,metadata_type,parent_id,added_at)"
+        " SELECT id+2000,library_section_id,4,id,1900000000 FROM metadata_items WHERE metadata_type=3;"
+        "INSERT INTO metadata_items(id,library_section_id,metadata_type,parent_id,added_at)"
+        " SELECT id+4000,library_section_id,4,id,1900000001 FROM metadata_items WHERE metadata_type=3;"
+        "ANALYZE;");
+}
+
 enum {
+    PLEX_PROFILE_HUB = 4,
     PLEX_PROFILE_TAG_MEMBERSHIP_INDEX = 1,
     PLEX_PROFILE_ONDECK_INDEX,
     PLEX_PROFILE_TAG_ROW_PARITY
@@ -589,7 +619,7 @@ static rsh_apply_profile_fn rsh_resolve_setup_profile(
     void *suite_ctx
 ) {
     (void)suite_ctx;
-    if (profile == PLEX_PROFILE_TAG_MEMBERSHIP_INDEX ||
+    if (profile == PLEX_PROFILE_HUB || profile == PLEX_PROFILE_TAG_MEMBERSHIP_INDEX ||
         profile == PLEX_PROFILE_ONDECK_INDEX ||
         profile == PLEX_PROFILE_TAG_ROW_PARITY) {
         return rsh_apply_plex_profile;
@@ -615,7 +645,9 @@ static int rsh_apply_plex_profile(
     void *suite_ctx
 ) {
     (void)suite_ctx;
-    if (profile == PLEX_PROFILE_TAG_MEMBERSHIP_INDEX) {
+    if (profile == PLEX_PROFILE_HUB) {
+        setup_hub_fixture(db);
+    } else if (profile == PLEX_PROFILE_TAG_MEMBERSHIP_INDEX) {
         create_tag_membership_index(db);
     } else if (profile == PLEX_PROFILE_ONDECK_INDEX) {
         create_ondeck_index(db);
@@ -1140,7 +1172,9 @@ static const char *const plex_controlled_env_gates[] = {
     "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
     "SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE",
     "SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE",
-    "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE"
+    "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
+    "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE",
+    "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE"
 };
 
 #define PLEX_ENV_UNSET(gate_name) \
@@ -1161,7 +1195,9 @@ static const rsh_env_assignment plex_fts_default_env[] = {
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_FTS_REWRITE"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE")
+    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_fts_enabled_env[] = {
@@ -1169,7 +1205,9 @@ static const rsh_env_assignment plex_fts_enabled_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "0"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE")
+    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_fts_disabled_env[] = {
@@ -1177,7 +1215,9 @@ static const rsh_env_assignment plex_fts_disabled_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE")
+    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_fts_garbage_env[] = {
@@ -1185,7 +1225,9 @@ static const rsh_env_assignment plex_fts_garbage_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "false"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE")
+    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_all_rewrites_disabled_env[] = {
@@ -1193,7 +1235,9 @@ static const rsh_env_assignment plex_all_rewrites_disabled_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_guid_like_enabled_env[] = {
@@ -1201,7 +1245,9 @@ static const rsh_env_assignment plex_guid_like_enabled_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE", "0"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_guid_like_disabled_env[] = {
@@ -1209,7 +1255,9 @@ static const rsh_env_assignment plex_guid_like_disabled_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE", "1"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_guid_like_garbage_env[] = {
@@ -1217,7 +1265,9 @@ static const rsh_env_assignment plex_guid_like_garbage_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE", "false"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_tag_default_env[] = {
@@ -1225,7 +1275,9 @@ static const rsh_env_assignment plex_tag_default_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_tag_enabled_env[] = {
@@ -1233,7 +1285,9 @@ static const rsh_env_assignment plex_tag_enabled_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "0"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_tag_garbage_env[] = {
@@ -1241,7 +1295,9 @@ static const rsh_env_assignment plex_tag_garbage_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "false"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "1"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_ondeck_default_env[] = {
@@ -1249,7 +1305,9 @@ static const rsh_env_assignment plex_ondeck_default_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE")
+    PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_ondeck_enabled_env[] = {
@@ -1257,7 +1315,9 @@ static const rsh_env_assignment plex_ondeck_enabled_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "0")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "0"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_ondeck_garbage_env[] = {
@@ -1265,7 +1325,9 @@ static const rsh_env_assignment plex_ondeck_garbage_env[] = {
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_FTS_REWRITE", "1"),
     PLEX_ENV_UNSET("SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE"),
     PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE", "1"),
-    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "false")
+    PLEX_ENV_SET("SQLITE3_DISABLE_PLEX_ONDECK_REWRITE", "false"),
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 #undef PLEX_NATIVE_ENV_COMMON
@@ -1312,7 +1374,9 @@ static const rsh_env_assignment plex_exec_fts_env[] = {
     {
         .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
         .value = {.state = RSH_ENV_UNSET}
-    }
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_exec_guid_like_env[] = {
@@ -1355,7 +1419,9 @@ static const rsh_env_assignment plex_exec_guid_like_env[] = {
     {
         .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
         .value = {.state = RSH_ENV_VALUE, .value = "1"}
-    }
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_exec_tag_visible_env[] = {
@@ -1398,7 +1464,9 @@ static const rsh_env_assignment plex_exec_tag_visible_env[] = {
     {
         .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
         .value = {.state = RSH_ENV_UNSET}
-    }
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_exec_tag_suppressed_env[] = {
@@ -1441,7 +1509,9 @@ static const rsh_env_assignment plex_exec_tag_suppressed_env[] = {
     {
         .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
         .value = {.state = RSH_ENV_VALUE, .value = "1"}
-    }
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_env_assignment plex_exec_ondeck_env[] = {
@@ -1484,7 +1554,9 @@ static const rsh_env_assignment plex_exec_ondeck_env[] = {
     {
         .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
         .value = {.state = RSH_ENV_UNSET}
-    }
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static int rsh_case_icu_available(
@@ -2261,6 +2333,196 @@ static int rsh_custom_adapter_ondeck_capture_miss_assert(
     return SQLITE_OK;
 }
 
+#define HUB_HEAD "select metadata_items.id from metadata_items  join metadata_items as children on children.parent_id=metadata_items.id  join metadata_items as grandchildren on grandchildren.parent_id=children.id  where metadata_items.library_section_id "
+#define HUB_FILTER "metadata_items.title NOT LIKE 'Naked News' and metadata_items.id not in (select taggings.metadata_item_id from taggings join tags on tags.id=taggings.tag_id where tags.id=1554) and grandchildren.added_at>1788033716"
+#define HUB_OR "(metadata_items.metadata_type=2 or metadata_items.metadata_type=10)"
+#define HUB_ORDER "metadata_items.added_at desc,metadata_items.title_sort collate icu_root ,metadata_items.title_sort collate icu_root "
+
+static char *hub_sql(const char *section, const char *filter, const char *group,
+                     const char *equality, const char *page) {
+    return sqlite3_mprintf(HUB_HEAD "%s and (%s%s%s)  and metadata_items.metadata_type=%s  order by " HUB_ORDER " limit %s",
+        section, filter, *filter && *group ? " and " : "", group, equality, page);
+}
+
+/* This shape projects exactly one INTEGER PRIMARY KEY. Assert its storage
+ * class, value and multiplicity, including every LIMIT/OFFSET page. */
+static int hub_rows(sqlite3 *db, const char *sql, const char *expected, int api,
+                    int nbyte, int bind_mode, sqlite3_int64 *ids, int *types,
+                    char names[1024]) {
+    sqlite3_stmt *stmt = NULL;
+    const char *tail = NULL;
+    int i, rc, rows = 0, count;
+    if (api == 0) rc = sqlite3_prepare(db, sql, nbyte, &stmt, &tail);
+    else if (api == 1) rc = sqlite3_prepare_v2(db, sql, nbyte, &stmt, &tail);
+    else rc = sqlite3_prepare_v3(db, sql, nbyte, SQLITE_PREPARE_PERSISTENT, &stmt, &tail);
+    if (rc != SQLITE_OK) failf("hub prepare: %s SQL=%s", sqlite3_errmsg(db), sql);
+    /* Legacy sqlite3_prepare can fail column verification in the linked hook;
+     * v2/v3 must hit. Legacy must still execute correctly and map its tail. */
+    if (api != 0) require_int("hub exact SQL", strcmp(sqlite3_sql(stmt), expected), 0);
+    require_int("hub column count", sqlite3_column_count(stmt), 1);
+    require_int("hub tail", (int)(tail-sql), (int)(strchr(sql, ';') ? strchr(sql, ';')-sql+1 : strlen(sql)));
+    count = sqlite3_bind_parameter_count(stmt);
+    names[0] = 0;
+    for (i = 1; i <= count; ++i) {
+        const char *name = sqlite3_bind_parameter_name(stmt, i);
+        size_t used = strlen(names);
+        snprintf(names+used, 1024-used, "%s|", name ? name : "?");
+        if (bind_mode == 2 && i == 2) rc = sqlite3_bind_text(stmt, i, "Naked News", -1, SQLITE_STATIC);
+        else rc = sqlite3_bind_int(stmt, i, bind_mode == 2 ? (i == 1 ? 5 : i == 7 ? 39 : 0) : 5);
+        require_int("hub binding", rc, SQLITE_OK);
+    }
+    while ((rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        if (rows >= 1024) failf("hub row capacity");
+        types[rows] = sqlite3_column_type(stmt, 0);
+        require_int("hub typed integer", types[rows], SQLITE_INTEGER);
+        ids[rows++] = sqlite3_column_int64(stmt, 0);
+    }
+    require_int("hub step", rc, SQLITE_DONE);
+    require_int("hub finalize", sqlite3_finalize(stmt), SQLITE_OK);
+    return rows;
+}
+
+static void hub_pair(sqlite3 *vendor, sqlite3 *candidate, const char *sql,
+                     const char *expected, int bind_mode) {
+    sqlite3_int64 a[1024], b[1024]; int ta[1024], tb[1024]; char na[1024], nb[1024];
+    int api, n, ar, br;
+    for (api = 0; api < 3; ++api) for (n = 0; n < 3; ++n) {
+        int bytes = n == 0 ? -1 : (int)strlen(sql)+(n == 2);
+        char *vendor_expected = strchr(sql, ';') ? sqlite3_mprintf("%.*s", (int)(strchr(sql, ';')-sql+1), sql) : sqlite3_mprintf("%s", sql);
+        ar = hub_rows(vendor, sql, vendor_expected, api, bytes, bind_mode, a, ta, na);
+        sqlite3_free(vendor_expected);
+        br = hub_rows(candidate, sql, expected, api, bytes, bind_mode, b, tb, nb);
+        require_int("hub row count", ar, br);
+        require_int("hub typed rows", memcmp(ta, tb, (size_t)ar*sizeof(int)), 0);
+        require_int("hub row values", memcmp(a, b, (size_t)ar*sizeof(sqlite3_int64)), 0);
+        require_int("hub parameter identities", strcmp(na, nb), 0);
+    }
+}
+
+static int rsh_custom_adapter_hub_cases(const rsh_case_context *context, const void *data) {
+    sqlite3 *vendor = rsh_context_db(context, "vendor");
+    sqlite3 *candidate = rsh_context_db(context, "candidate");
+    int flags = *(const int *)data;
+    int enabled = (flags&1) && sqlite3_compileoption_used("ENABLE_ICU");
+    size_t i;
+    /* Spec 6.1-8, including both offsets and both section bind forms. */
+    static const struct { const char *section, *filter, *group, *eq, *page; int binds; } positives[] = {
+        {"in (5)",HUB_FILTER,HUB_OR,"2","39 offset 0",0},
+        {"in (5)",HUB_FILTER,HUB_OR,"2","39 offset 273",0},
+        {"in (5,6)",HUB_FILTER,HUB_OR,"2","39 offset 0",0},
+        {"= 5",HUB_FILTER,HUB_OR,"2","39 offset 0",0},
+        {"= ?",HUB_FILTER,HUB_OR,"2","39 offset 0",1},
+        {"in (?1)",HUB_FILTER,HUB_OR,"2","39 offset 0",1},
+        {"in (5)",HUB_FILTER,"(metadata_items.metadata_type=10 or metadata_items.metadata_type=2)","2","39 offset 0",0},
+        {"in (5)",HUB_FILTER,HUB_OR,"10","39 offset 0",0},
+        {"in (5)","grandchildren.added_at>1788033716",HUB_OR,"2","39 offset 0",0},
+        {"in (5)","metadata_items.title NOT LIKE 'a) and (b'",HUB_OR,"2","39 offset 0",0},
+        /* All bind sites, sparse numbering, named reuse, Tcl-style names. */
+        {"in (?)","metadata_items.title NOT LIKE :pattern and :pattern IS NOT NULL",HUB_OR,"2","?7 offset ?",2},
+        {"in (?1)","metadata_items.title NOT LIKE $user::pattern(suffix)",HUB_OR,"2","?7 offset ?8",2},
+        {"in (?1)","metadata_items.title NOT LIKE @pattern",HUB_OR,"2","?07 offset ?8",2},
+        {"in (5)","metadata_items.title NOT LIKE 'x'' and (metadata_items.metadata_type=2 or metadata_items.metadata_type=10)'",HUB_OR,"2","39 offset 0",0},
+        {"in (5)","exists (select 1 where (metadata_items.metadata_type=2 or metadata_items.metadata_type=10))",HUB_OR,"2","39 offset 0",0},
+        {"in (5)","(metadata_items.title NOT LIKE 'Naked News')",HUB_OR,"2","39 offset 0",0}
+    };
+    for (i = 0; i < sizeof(positives)/sizeof(positives[0]); ++i) {
+        char *sql = hub_sql(positives[i].section,positives[i].filter,positives[i].group,positives[i].eq,positives[i].page);
+        char *expected = hub_sql(positives[i].section,positives[i].filter,"",positives[i].eq,positives[i].page);
+        {
+            sqlite3_int64 ids[1024]; int types[1024]; char names[1024];
+            if (!hub_rows(vendor,sql,sql,1,-1,positives[i].binds,ids,types,names))
+                failf("hub positive fixture unexpectedly empty: case %lu",(unsigned long)i);
+        }
+        hub_pair(vendor,candidate,sql,enabled ? expected : sql,positives[i].binds);
+        sqlite3_free(sql);sqlite3_free(expected);
+    }
+    /* Spec 6.9-14 and supplementary exact-shape failures. */
+    {
+        static const struct {const char *filter, *group, *eq;} negatives[] = {
+            {HUB_FILTER,HUB_OR,"4"},
+            {HUB_FILTER,"(metadata_items.metadata_type=2 or metadata_items.metadata_type=10 or metadata_items.metadata_type=4)","2"},
+            {HUB_FILTER,"(metadata_items.metadata_type=? or metadata_items.metadata_type=10)","2"},
+            {HUB_FILTER,"((metadata_items.metadata_type=2 or metadata_items.metadata_type=10))","2"},
+            {"",HUB_OR,"2"},
+            {HUB_FILTER,"(children.metadata_type=2 or metadata_items.metadata_type=10)","2"},
+            {HUB_FILTER " and " HUB_OR,HUB_OR,"2"},
+            {HUB_FILTER,"(metadata_items.metadata_type=2 OR metadata_items.metadata_type=10)","2"},
+            {HUB_FILTER,HUB_OR,"?"},
+            {"metadata_items.title NOT LIKE \"Naked News\"",HUB_OR,"2"},
+            {"metadata_items.title NOT LIKE 'x' /* comment */",HUB_OR,"2"},
+            {"metadata_items.title NOT LIKE 'x' -- comment\n",HUB_OR,"2"},
+            {HUB_FILTER,"(metadata_items.metadata_type=2 or metadata_items.metadata_type=2)","2"},
+            {HUB_FILTER,"(metadata_items.metadata_type='2' or metadata_items.metadata_type=10)","2"}
+        };
+        for (i = 0; i < sizeof(negatives)/sizeof(negatives[0]); ++i) {
+            char *sql=hub_sql("in (5)",negatives[i].filter,negatives[i].group,negatives[i].eq,"39 offset 0");
+            hub_pair(vendor,candidate,sql,sql,1);sqlite3_free(sql);
+        }
+    }
+    /* Spec 6.15-16: silent wrong-head miss; first statement tail preserved. */
+    hub_pair(vendor,candidate,"select metadata_items.id from metadata_items where metadata_type=2 order by added_at desc limit 39",
+        "select metadata_items.id from metadata_items where metadata_type=2 order by added_at desc limit 39",0);
+    for (i=0;i<2;++i) {
+        char *sql=hub_sql("in (5)",HUB_FILTER,HUB_OR,"2",i ? "39 offset 0; select 42" : "39 offset 0;");
+        char *expected=sqlite3_mprintf("%.*s",(int)(strchr(sql,';')-sql+1),sql);
+        hub_pair(vendor,candidate,sql,expected,0);sqlite3_free(sql);sqlite3_free(expected);
+    }
+    /* Each matcher misses the other family: runs cover hub-only, recent-only
+     * and both gates. The recent query has the SAME exact static join head. */
+    {
+        char *sql=sqlite3_mprintf(HUB_HEAD "in (5) and (" HUB_FILTER " and " HUB_OR ") order by metadata_items.title_sort collate icu_root limit 39 offset 0");
+        sqlite3_stmt *stmt=NULL;
+        require_int("recent coexist prepare",sqlite3_prepare_v2(candidate,sql,-1,&stmt,NULL),SQLITE_OK);
+        require_int("recent coexist selection",strstr(sqlite3_sql(stmt),"WITH recent_parameters") != NULL,
+            (flags&2) && sqlite3_compileoption_used("ENABLE_ICU"));
+        if (!(flags&2)) require_int("hub misses recent",strcmp(sqlite3_sql(stmt),sql),0);
+        sqlite3_finalize(stmt);sqlite3_free(sql);
+    }
+    /* Tied fixture: legal page differences, complete typed bag is the gate.
+     * Count each show ID across ALL pages (duplicates from two episodes). */
+    exec_sql(vendor,"hub-ties","UPDATE metadata_items SET added_at=2000000000,title_sort='same' WHERE id<=360; ANALYZE");
+    exec_sql(candidate,"hub-ties","UPDATE metadata_items SET added_at=2000000000,title_sort='same' WHERE id<=360; ANALYZE");
+    {
+        int bags[2][361]={{0}}, side, off, total=0;
+        for (side=0;side<2;++side) for(off=0;;off+=39) {
+            sqlite3_int64 ids[1024];int types[1024],n,j;char names[1024];
+            char *page=sqlite3_mprintf("39 offset %d",off);
+            char *sql=hub_sql("in (5)",HUB_FILTER,HUB_OR,"2",page);
+            char *expected=hub_sql("in (5)",HUB_FILTER,"","2",page);
+            n=hub_rows(side?candidate:vendor,sql,side&&enabled?expected:sql,1,-1,0,ids,types,names);
+            for(j=0;j<n;++j){if(ids[j]<1||ids[j]>360)failf("hub bad fixture ID");bags[side][ids[j]]++;}
+            if(!side)total+=n;
+            sqlite3_free(page);sqlite3_free(sql);sqlite3_free(expected);
+            if(!n)break;
+            if(off>1000)failf("hub pages did not terminate");
+        }
+        if(!total)failf("hub empty tied fixture");
+        require_int("hub complete typed multiset across all pages",memcmp(bags[0],bags[1],sizeof(bags[0])),0);
+        printf("hub full typed bag: %d rows; tied-page identity unspecified\n",total);
+    }
+    printf("hub spec cases 1-17: flags=%d enabled=%d; 3 APIs x 3 nByte forms; PASS\n",flags,enabled);
+    return SQLITE_OK;
+}
+
+static int rsh_custom_adapter_hub_logs(const rsh_case_context *context, const void *data) {
+    const char *log=context->captured_stderr;
+    int enabled=(*(const int *)data&1) && sqlite3_compileoption_used("ENABLE_ICU");
+    if(enabled){
+        require_contains("hub applied",log,"event=rewrite_applied target=plex mode=hub+type_or");
+        require_contains("hub equality miss",log,"sub_reason=equality");
+        require_contains("hub shape miss",log,"sub_reason=or_shape");
+        require_contains("hub empty block",log,"sub_reason=empty_block");
+        require_contains("hub nested miss",log,"sub_reason=no_or_group");
+        require_contains("hub multiple",log,"sub_reason=multiple_or_groups");
+        require_contains("hub comment",log,"sub_reason=comment");
+        require_contains("hub dqs",log,"sub_reason=dqs");
+        require_contains("hub trailing",log,"sub_reason=trailing");
+        if (!(*(const int *)data&2)) require_contains("hub misses recent tail",log,"sub_reason=tail");
+        require_no_same_line("hub movies silent",log,"mode=hub+type_or","sql=\"select metadata_items.id from metadata_items where");
+    }else require_occurrences("disabled hub emits no records",log,"mode=hub+type_or",0);
+    return SQLITE_OK;
+}
+
 static int rsh_bind_first_int(
     sqlite3_stmt *stmt,
     const char *label,
@@ -2399,6 +2661,27 @@ static const rsh_db_spec plex_candidate_ondeck_index_db[] = {
             .case_count = sizeof(case_rows) / sizeof((case_rows)[0]) \
         } \
     }
+
+static const int hub_flags_only=1, hub_flags_both=3, hub_flags_recent=2, hub_flags_off=0;
+static const rsh_db_spec plex_hub_dbs[] = {
+    {.role="vendor",.relative_path="not-target.db",.kind=RSH_DB_VENDOR,.storage=RSH_DB_RELATIVE,.setup_profile=PLEX_PROFILE_HUB},
+    {.role="candidate",.relative_path="com.plexapp.plugins.library.db",.kind=RSH_DB_CANDIDATE,.storage=RSH_DB_RELATIVE,.setup_profile=PLEX_PROFILE_HUB}
+};
+#define HUB_CASES(name, flags) \
+static const rsh_case_spec name##_cases[] = { \
+    {.label="hub-type-or-cases",.kind=RSH_CASE_CUSTOM,.build_mask=RSH_BUILD_PLEX_LINKED, \
+     .data.custom={.kind=RSH_CUSTOM_IDENTITY,.assert_custom=rsh_custom_adapter_hub_cases,.immutable_data=&flags}} \
+}; \
+static const rsh_case_spec name##_logs[] = { \
+    {.label="hub-type-or-logs",.kind=RSH_CASE_CUSTOM,.build_mask=RSH_BUILD_PLEX_LINKED, \
+     .data.custom={.kind=RSH_CUSTOM_IDENTITY,.assert_custom=rsh_custom_adapter_hub_logs,.immutable_data=&flags}} \
+}; \
+DEFINE_PLEX_SCALAR_PHASE(name##_phases,"hub",plex_hub_dbs,name##_cases)
+HUB_CASES(hub_only,hub_flags_only);
+HUB_CASES(hub_both,hub_flags_both);
+HUB_CASES(hub_recent,hub_flags_recent);
+HUB_CASES(hub_off,hub_flags_off);
+#undef HUB_CASES
 
 static const rsh_db_spec plex_tag_row_parity_dbs[] = {
     {
@@ -3831,7 +4114,9 @@ static const rsh_env_assignment plex_negative_control_env[] = {
     {
         .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
         .value = {.state = RSH_ENV_UNSET}
-    }
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
 };
 
 static const rsh_db_spec plex_negative_control_dbs[] = {
@@ -4021,7 +4306,308 @@ static int rsh_icu_available(const rsh_run_spec *run, void *suite_ctx) {
         .runtime_predicate = rsh_icu_available, \
     }
 
+static const rsh_env_assignment plex_hub_only_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_AUTOPRAGMA",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "0"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE_SAMPLING",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_VALUE, .value = "0"}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
+};
+
+static const rsh_env_assignment plex_hub_both_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_AUTOPRAGMA",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "0"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE_SAMPLING",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_VALUE, .value = "0"}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_VALUE, .value = "1"}}
+};
+
+static const rsh_env_assignment plex_hub_recent_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_AUTOPRAGMA",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "0"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE_SAMPLING",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_VALUE, .value = "1"}}
+};
+
+static const rsh_env_assignment plex_hub_unset_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_AUTOPRAGMA",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "0"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE_SAMPLING",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_UNSET}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
+};
+
+static const rsh_env_assignment plex_hub_one_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_AUTOPRAGMA",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "0"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE_SAMPLING",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_VALUE, .value = "1"}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
+};
+
+static const rsh_env_assignment plex_hub_garbage_env[] = {
+    {
+        .name = "SQLITE3_DISABLE_AUTOPRAGMA",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_RUNTIME_OPTIMIZE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE",
+        .value = {.state = RSH_ENV_VALUE, .value = "0"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_STMT_TRACE_SAMPLING",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_OBSERVABILITY",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_FTS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_PLEX_ONDECK_REWRITE",
+        .value = {.state = RSH_ENV_VALUE, .value = "1"}
+    },
+    {
+        .name = "SQLITE3_DISABLE_REWRITE_APPLIED_SQL",
+        .value = {.state = RSH_ENV_UNSET}
+    },
+    {.name = "SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", .value = {.state = RSH_ENV_VALUE, .value = "true"}},
+    {.name = "SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE", .value = {.state = RSH_ENV_UNSET}}
+};
+
 static const rsh_run_spec plex_runs[] = {
+    {.dispatch_name="hub-only",.pass_label="hub-only",.process_kind=RSH_PROCESS_EXEC,
+     .outcome=RSH_OUTCOME_SUCCESS,.build_mask=RSH_BUILD_PLEX_LINKED,
+     .preload_env=plex_hub_only_env,.preload_env_count=sizeof(plex_hub_only_env)/sizeof(plex_hub_only_env[0]),
+     .capture_scope=RSH_CAPTURE_STDERR,.phases=hub_only_phases,.phase_count=1,
+     .post_close_cases=hub_only_logs,.post_close_case_count=1},
+    {.dispatch_name="hub-both",.pass_label="hub-both",.process_kind=RSH_PROCESS_EXEC,
+     .outcome=RSH_OUTCOME_SUCCESS,.build_mask=RSH_BUILD_PLEX_LINKED,
+     .preload_env=plex_hub_both_env,.preload_env_count=sizeof(plex_hub_both_env)/sizeof(plex_hub_both_env[0]),
+     .capture_scope=RSH_CAPTURE_STDERR,.phases=hub_both_phases,.phase_count=1,
+     .post_close_cases=hub_both_logs,.post_close_case_count=1},
+    {.dispatch_name="hub-recent",.pass_label="hub-recent",.process_kind=RSH_PROCESS_EXEC,
+     .outcome=RSH_OUTCOME_SUCCESS,.build_mask=RSH_BUILD_PLEX_LINKED,
+     .preload_env=plex_hub_recent_env,.preload_env_count=sizeof(plex_hub_recent_env)/sizeof(plex_hub_recent_env[0]),
+     .capture_scope=RSH_CAPTURE_STDERR,.phases=hub_recent_phases,.phase_count=1,
+     .post_close_cases=hub_recent_logs,.post_close_case_count=1},
+    {.dispatch_name="hub-unset",.pass_label="hub-unset",.process_kind=RSH_PROCESS_EXEC,
+     .outcome=RSH_OUTCOME_SUCCESS,.build_mask=RSH_BUILD_PLEX_LINKED,
+     .preload_env=plex_hub_unset_env,.preload_env_count=sizeof(plex_hub_unset_env)/sizeof(plex_hub_unset_env[0]),
+     .capture_scope=RSH_CAPTURE_STDERR,.phases=hub_off_phases,.phase_count=1,
+     .post_close_cases=hub_off_logs,.post_close_case_count=1},
+    {.dispatch_name="hub-one",.pass_label="hub-one",.process_kind=RSH_PROCESS_EXEC,
+     .outcome=RSH_OUTCOME_SUCCESS,.build_mask=RSH_BUILD_PLEX_LINKED,
+     .preload_env=plex_hub_one_env,.preload_env_count=sizeof(plex_hub_one_env)/sizeof(plex_hub_one_env[0]),
+     .capture_scope=RSH_CAPTURE_STDERR,.phases=hub_off_phases,.phase_count=1,
+     .post_close_cases=hub_off_logs,.post_close_case_count=1},
+    {.dispatch_name="hub-garbage",.pass_label="hub-garbage",.process_kind=RSH_PROCESS_EXEC,
+     .outcome=RSH_OUTCOME_SUCCESS,.build_mask=RSH_BUILD_PLEX_LINKED,
+     .preload_env=plex_hub_garbage_env,.preload_env_count=sizeof(plex_hub_garbage_env)/sizeof(plex_hub_garbage_env[0]),
+     .capture_scope=RSH_CAPTURE_STDERR,.phases=hub_off_phases,.phase_count=1,
+     .post_close_cases=hub_off_logs,.post_close_case_count=1},
+
     NATIVE_EXPECT_RUN(
         "positive", plex_fts_enabled_env, plex_positive_phases,
         "expect_rewrite=1", "expect_rewrite=0", rsh_icu_available

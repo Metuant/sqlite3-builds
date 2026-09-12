@@ -546,3 +546,12 @@ milestone lands.
   `ICU_SOURCE_VERSION` / `ICU_SOURCE_SHA512` defaults come from
   `pins/library-compat-groups.tsv` for `icu69`. It also asserts SORTERREF and
   PMASZ compile defaults match their constructor runtime config values.
+
+## Plex hub type-OR
+
+- The hub type-OR rewrite only deletes an OR group whose equality twin is
+  present at top level; it never restructures parentheses.
+- Retained SQL bytes and every bind token stay in their original order. Verify
+  SQLite's whole-statement bind count and one result column before acceptance.
+- Literal `SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE=0` is the only enabling value.
+- Ties do not guarantee stable page membership; compare the complete typed bag.

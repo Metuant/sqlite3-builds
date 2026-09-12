@@ -9,7 +9,9 @@ owner: observability and slow-query controls are cached by constructors with
 first prepare use; `SQLITE3_DISABLE_AUTOPRAGMA` is read by each auto-extension
 callback; runtime optimize enablement and cadence values are read on runtime
 optimize hook paths. Shared-library gates fail open: disabled, bad, unset, or
-rewrite-failure cases do not break application queries.
+candidate prepare failures retry the original. FTS-first private rewrites cannot
+preserve success/error parity for malformed MATCH bindings at step time; see
+[the rewrite limits](architecture/rewrite-engine.md#private-plex-rewrite-limits).
 
 Maintenance controls are read by `scripts/optimize_media_servers.sh` after its
 Bash config is sourced. They are outside the shared-library query path.
@@ -40,6 +42,7 @@ Bash config is sourced. They are outside the shared-library query path.
 | `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` | kill-switch | Control the Plex GUID LIKE NULL-pattern guard rewrite. | GUID LIKE rewrite disabled. | opt-in | Literal `0` enables the rewrite. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; build or verification failure prepares original SQL. |
 | `SQLITE3_DISABLE_PLEX_TAGGINGS_REWRITE` | kill-switch | Control the Plex taggings-membership rewrite. | Taggings rewrite enabled in the Plex-ICU build. | opt-out | Literal `1` disables the rewrite. | Unset, literal `0`, and any other value enable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; missing taggings index or rewrite failure prepares original SQL. |
 | `SQLITE3_DISABLE_PLEX_ONDECK_REWRITE` | kill-switch | Control the Plex On-Deck ranked-subquery rewrite. | On-Deck rewrite disabled. | opt-in | Literal `0` enables both the id-list and `viewed_at > <literal>` selector arms. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only. | Cached once per process. Independent of FTS and `SQLITE3_DISABLE_AUTOPRAGMA`; missing g2 index or rewrite failure prepares original SQL. |
+| `SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE` | kill-switch | Remove the redundant final hub metadata-type OR conjunct. | Hub type-OR rewrite disabled. | opt-in | Literal `0` enables the rewrite. | Unset, literal `1`, and any other value disable the rewrite. | Plex-ICU only; exact Plex library DB target. | Cached once per process. Independent of other rewrite gates; mode `hub+type_or`. Full original bind count and one result column verified; tied-page membership is unspecified. |
 
 ## Emby
 

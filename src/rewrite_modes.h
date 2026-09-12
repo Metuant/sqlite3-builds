@@ -22,7 +22,8 @@
     X(PLEX_FTS_JOIN, "plex", "fts+tag-join-chain", "plex_fts_rewrite", 0) \
     X(PLEX_TITLE_SCOPE, "plex", "fts+title-user-scope", "plex_fts_rewrite", 0) \
     X(PLEX_COLLECTION_TAG, "plex", "collection+tag-first", "plex_fts_rewrite", 1) \
-    X(PLEX_RECENT_EPISODE, "plex", "recent-episode-prefilter", "plex_fts_rewrite", 1)
+    X(PLEX_RECENT_EPISODE, "plex", "recent-episode-prefilter", "plex_fts_rewrite", 1) \
+    X(PLEX_HUB_TYPE_OR, "plex", "hub+type_or", "plex_fts_rewrite", 1)
 
 typedef int32_t obs_rewrite_mode;
 

@@ -104,7 +104,7 @@ It proves:
   fewer records on lexer/set failure and the master gate.
 - Catalogue-derived, delimited
   `event=rewrite_applied target=<target> mode=<mode> db=` matching covers all
-  15 registered modes. The A/A/B/B sequence proves count-1 correlation is
+  20 registered modes. The A/A/B/B sequence proves count-1 correlation is
   observed before schedule selection, and two fake connections prove applied
   counters reset per connection.
 - Signed invalid ids suppress requested records without allocation,
@@ -394,13 +394,37 @@ A duplicate disabled-mode smoke starts Emby with
 ### Private Plex rewrite regression entrypoint
 
 Run `bash tests/plex_private_rewrites_test.sh` on Linux with a C compiler,
-SQLite development library, Python 3 (SQLite enabled), and ASan/UBSan. This
+SQLite development library (3.35+ for MATERIALIZED), Python 3 (SQLite enabled), and ASan/UBSan. This
 single documented local/CI runner executes all four private Python suites
 (FTS join, title scope, collection tag, recent episode), all four guarded
 mutation fuzzers, and `plex_review_regression_test.py`. Failures propagate as
-nonzero exit status. It uses scratch databases and the production wrapper
+nonzero exit status. CI invokes the runner in `.github/workflows/sqlite-build.yml`
+under `preflight`, step `Private Plex rewrite regressions and sanitizers`. It uses scratch databases and the production wrapper
 adapter; it is distinct from the full Plex ICU library Docker smoke suite.
 Recent-episode checks the complete typed row multiset across every page;
 tied-order page identity is explicitly unspecified. Review regressions cover
 DQS positive-original/step-error, prepare/drop-index/step for all three forced
 orders, numeric-token prepare errors, and differing join-column collations.
+
+### Hub type-OR cases in the linked Plex smoke
+
+`tests/plex_fts_rewrite_smoke.c`, executed by `docker-library/Dockerfile`, runs
+spec section 6 cases 1–17: both captured offsets, section lists/equality/binds,
+swapped literals, second-literal equality, minimal and quoted filters; wrong
+equality, three-term/bound/nested/whole-block/wrong-alias OR, movie-head miss,
+semicolon/second-statement tails and disabled gates. It also checks all bind
+sites (sparse, anonymous, named, repeated and Tcl-style), comments, DQS, repeated
+OR candidates, all three prepare APIs and negative/exact/NUL-inclusive nByte.
+Separate hub-only/recent-only/both runs prove disjoint dispatch. Tied fixtures
+assert the complete typed multiset across all pages, not individual page IDs.
+Captured logs assert miss reasons and disabled silence. The prepare bench adds
+`enabled-hub-type-or-head-miss` using the existing On-Deck advisory budgets
+(20 microseconds p50, 100 microseconds p95).
+
+The same runner also executes `plex_hub_type_or_test.py` for every bounded SQL
+prefix, full bind-slot counting, SQLite variable limits, embedded NULs, size
+caps, injected prepare/tail/column/bind verification failures and a best-effort
+STAT4 EQP comparison. The scratch SQLite 3.53.3 fixture used on rs34 chose the
+index-ordered plan for both statements (no temp ORDER BY tree); the
+production-specific original-only sort was not reproduced. This is reported
+explicitly, with text/result equivalence retained as the gate.

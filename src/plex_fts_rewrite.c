@@ -164,6 +164,18 @@ static void plex_log_rewrite_applied(
     obs_rewrite_mode mode
 );
 
+static pthread_once_t g_plex_hub_type_or_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_hub_type_or_enabled;
+static void plex_hub_type_or_init_once(void) {
+    const char *value = getenv("SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE");
+    atomic_store_explicit(&g_plex_hub_type_or_enabled,
+        value && strcmp(value, "0") == 0, memory_order_release);
+}
+static int plex_hub_type_or_rewrite_enabled(void) {
+    pthread_once(&g_plex_hub_type_or_once, plex_hub_type_or_init_once);
+    return atomic_load_explicit(&g_plex_hub_type_or_enabled, memory_order_acquire);
+}
+
 static pthread_once_t g_plex_recent_once=PTHREAD_ONCE_INIT;
 static int g_plex_recent_enabled;
 static void plex_recent_init(void){const char*v=getenv("SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE");g_plex_recent_enabled=v&&strcmp(v,"1")==0;}
@@ -1505,6 +1517,179 @@ static plex_match_result match_ondeck_query(
     return PLEX_MATCH_BUILT;
 }
 
+/* Hub type-OR: delete one redundant final conjunct, never move another byte.
+ * This scanner skips complete quoted/parameter tokens before tracking parens. */
+static int plex_hub_id_byte(unsigned char c) {
+    return fts_lex_is_ident_char(c) || c == '$' || c >= 0x80;
+}
+
+static int plex_hub_token_end(const char *sql, size_t len, size_t p,
+                              size_t *end, const char **reason) {
+    unsigned char c = (unsigned char)sql[p];
+    size_t i = p + 1;
+    if (c == '"') { *reason = "dqs"; return 0; }
+    if (c == ';') { *reason = "trailing"; return 0; }
+    if (i < len && ((c == '-' && sql[i] == '-') ||
+                    (c == '/' && sql[i] == '*'))) {
+        *reason = "comment"; return 0;
+    }
+    if (c == '\'' || c == '`' || c == '[') {
+        unsigned char close = c == '[' ? ']' : c;
+        for (; i < len; ++i) {
+            if ((unsigned char)sql[i] != close) continue;
+            if (c != '[' && i + 1 < len && (unsigned char)sql[i+1] == close) {
+                ++i; continue;
+            }
+            *end = i + 1; return 1;
+        }
+        *reason = "trailing"; return 0;
+    }
+    if (c == '?' || c == ':' || c == '@' || c == '$') {
+        fts_lex lx;
+        fts_lex_token t;
+        fts_lex_init(&lx, sql, len, FTS_LEX_PARAM_SQLITE_VARIABLE);
+        lx.pos = p; t = fts_lex_next_token(&lx);
+        if (t.type != FTS_LEX_TOK_PARAM) { *reason = "bind_site"; return 0; }
+        *end = t.end; return 1;
+    }
+    if (plex_hub_id_byte(c)) {
+        while (i < len && plex_hub_id_byte((unsigned char)sql[i])) ++i;
+    }
+    *end = i; return 1;
+}
+
+static int plex_hub_decimal(const char *sql, size_t len, size_t *pos, plex_span *v) {
+    size_t p = *pos;
+    v->start = p;
+    while (p < len && sql[p] >= '0' && sql[p] <= '9') ++p;
+    if (p == v->start || (p < len && plex_hub_id_byte((unsigned char)sql[p]))) return 0;
+    v->end = p; *pos = p; return 1;
+}
+
+/* Canonical decimal comparison without overflow or floating-point rounding. */
+static int plex_hub_same_decimal(const char *sql, plex_span a, plex_span b) {
+    while (a.start + 1 < a.end && sql[a.start] == '0') ++a.start;
+    while (b.start + 1 < b.end && sql[b.start] == '0') ++b.start;
+    return a.end - a.start == b.end - b.start &&
+        memcmp(sql + a.start, sql + b.start, a.end - a.start) == 0;
+}
+
+static plex_match_result match_hub_type_or_query(
+    sqlite3 *db, const char *sql, size_t bounded_len, size_t scan_len,
+    plex_rewrite_candidate *candidate
+) {
+    static const char head[] =
+        "select metadata_items.id from metadata_items  join metadata_items as children on children.parent_id=metadata_items.id"
+        "  join metadata_items as grandchildren on grandchildren.parent_id=children.id  where metadata_items.library_section_id ";
+    size_t p = sizeof(head)-1, body, end, close = 0, cut_a = 0, cut_b = 0, q;
+    plex_span slot, a = {0,0}, b = {0,0}, c;
+    int max_index = 0, depth = 1, groups = 0, malformed = 0, first = 0;
+    int variable_limit, rc, section_items = 0, section_has_bind = 0;
+    const char *reason = "section", *tail = NULL;
+    sqlite3_stmt *original = NULL;
+    if (scan_len < p || scan_len > PLEX_SLOT_CAP || bounded_len < scan_len ||
+        bounded_len - scan_len > 1 || (bounded_len > scan_len && sql[scan_len]) ||
+        memcmp(sql, head, p) != 0) return PLEX_MATCH_MISS;
+    if (memchr(sql, 0, scan_len)) return PLEX_MATCH_MISS;
+    /* Validate all tokens, including the copied ORDER/LIMIT tail. */
+    for (q = p; q < scan_len; q = end) {
+        if (!plex_hub_token_end(sql, scan_len, q, &end, &reason)) goto miss;
+    }
+    variable_limit = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    if (plex_expect_bytes(sql, scan_len, p, "in (", &p)) {
+        for (;;) {
+            if (!plex_parse_ondeck_value_at(sql, scan_len, p, variable_limit,
+                                            &max_index, &slot, &p)) goto miss;
+            section_has_bind |= sql[slot.start] == '?';
+            if (++section_items > 1 && section_has_bind) goto miss;
+            if (p < scan_len && sql[p] == ')') { ++p; break; }
+            if (p >= scan_len || sql[p++] != ',') goto miss;
+            while (p < scan_len && sql[p] == ' ') ++p;
+        }
+    } else if (plex_expect_bytes(sql, scan_len, p, "=", &p)) {
+        if (p < scan_len && sql[p] == ' ') ++p;
+        if (!plex_parse_ondeck_value_at(sql, scan_len, p, variable_limit,
+                                        &max_index, &slot, &p)) goto miss;
+    } else goto miss;
+    if (!plex_expect_bytes(sql, scan_len, p, " and (", &p)) goto miss;
+    body = p;
+    while (p < scan_len) {
+        if (!plex_hub_token_end(sql, scan_len, p, &end, &reason)) goto miss;
+        if (sql[p] == '(') {
+            /* Only direct conjuncts; never anchors inside quotes or subqueries. */
+            if (depth == 1) {
+                fts_lex lx;
+                fts_lex_token t;
+                fts_lex_init(&lx, sql, scan_len, FTS_LEX_PARAM_SQLITE_VARIABLE);
+                lx.pos = p+1; t = fts_lex_next_token(&lx);
+                int type_group = t.type == FTS_LEX_TOK_IDENT;
+                t = fts_lex_next_token(&lx);
+                type_group = type_group && t.type == FTS_LEX_TOK_SYMBOL && t.symbol == '.';
+                t = fts_lex_next_token(&lx);
+                type_group = type_group && t.type == FTS_LEX_TOK_IDENT &&
+                    fts_lex_token_text_eq(sql, &t, "metadata_type");
+                if (type_group) {
+                    ++groups; first = p == body; cut_a = first ? p : p-5;
+                    q = p;
+                    if ((!first && (p < body+5 || memcmp(sql+p-5, " and ", 5) != 0)) ||
+                        !plex_expect_bytes(sql, scan_len, q, "(metadata_items.metadata_type=", &q) ||
+                        !plex_hub_decimal(sql, scan_len, &q, &a) ||
+                        !plex_expect_bytes(sql, scan_len, q, " or metadata_items.metadata_type=", &q) ||
+                        !plex_hub_decimal(sql, scan_len, &q, &b) ||
+                        !plex_expect_bytes(sql, scan_len, q, ")", &q) ||
+                        plex_hub_same_decimal(sql, a, b)) malformed = 1;
+                    else cut_b = q;
+                }
+            }
+            ++depth;
+        } else if (sql[p] == ')') {
+            if (--depth == 0) { close = p; break; }
+        }
+        p = end;
+    }
+    if (groups > 1) { reason = "multiple_or_groups"; goto miss; }
+    if (!groups) { reason = "no_or_group"; goto miss; }
+    if (malformed) { reason = "or_shape"; goto miss; }
+    if (first && cut_b == close) { reason = "empty_block"; goto miss; }
+    if (!close || cut_b != close) { reason = "tail"; goto miss; }
+    p = close+1;
+    if (!plex_expect_bytes(sql, scan_len, p, "  and metadata_items.metadata_type=", &p)) {
+        reason = "tail"; goto miss;
+    }
+    if (!plex_hub_decimal(sql, scan_len, &p, &c) ||
+        (!plex_hub_same_decimal(sql, a, c) && !plex_hub_same_decimal(sql, b, c))) {
+        reason = "equality"; goto miss;
+    }
+    if (!plex_expect_bytes(sql, scan_len, p, "  order by ", &p) || p == scan_len) {
+        reason = "tail"; goto miss;
+    }
+    /* Ask SQLite itself for ALL parameter slots (anonymous, sparse ?N, reused
+     * names, Tcl-style names), on the complete original statement. This hidden
+     * prepare is never stepped and cannot recurse through the rewrite chain.
+     * It also ensures deletion never repairs invalid original SQL. */
+    rc = sqlite3_prepare_v2_real(db, sql, (int)scan_len, &original, &tail);
+    if (rc != SQLITE_OK || !original || tail != sql + scan_len) {
+        sqlite3_finalize(original); reason = "bind_site"; goto miss;
+    }
+    candidate->expected_bind_count = sqlite3_bind_parameter_count(original);
+    sqlite3_finalize(original);
+    candidate->verify_bind_count = 1;
+    candidate->expected_column_count = 1;
+    candidate->verify_column_count = 1;
+    candidate->scan_out_len = scan_len - (cut_b-cut_a);
+    candidate->rewrite_len = bounded_len - (cut_b-cut_a);
+    candidate->sql = malloc(candidate->rewrite_len+1);
+    if (!candidate->sql) return PLEX_MATCH_BUILD_FAILED;
+    memcpy(candidate->sql, sql, cut_a);
+    memcpy(candidate->sql+cut_a, sql+cut_b, bounded_len-cut_b);
+    candidate->sql[candidate->rewrite_len] = 0;
+    return PLEX_MATCH_BUILT;
+miss:
+    obs_log_rewrite_miss(OBS_MODE_PLEX_HUB_TYPE_OR, OBS_MISS_CAPTURE, reason,
+        db, sql, scan_len, obs_is_disabled() ? 0 : fts_lex_shape_key(sql, scan_len));
+    return PLEX_MATCH_MISS;
+}
+
 static int plex_prepare_input_lengths(
     const char *zSql,
     int nByte,
@@ -1776,12 +1961,14 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
     int guid_like_on;
     int tag_on;
     int ondeck_on;
+    int hub_type_or_on;
 
     fts_on = plex_rewrite_enabled();
     guid_like_on = plex_guid_like_rewrite_enabled();
     tag_on = plex_tag_rewrite_enabled();
     ondeck_on = plex_ondeck_rewrite_enabled();
-    if ((!fts_on && !guid_like_on && !tag_on && !ondeck_on && !plex_collection_tag_enabled() && !plex_recent_enabled()) ||
+    hub_type_or_on = plex_hub_type_or_rewrite_enabled();
+    if ((!fts_on && !guid_like_on && !tag_on && !ondeck_on && !hub_type_or_on && !plex_collection_tag_enabled() && !plex_recent_enabled()) ||
         !db || !zSql || !ppStmt || nByte == 0) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
@@ -1918,6 +2105,27 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
         }
         if (match_result == PLEX_MATCH_BUILD_FAILED) {
             obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_ONDECK);
+            free(candidate.sql);
+            return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
+        }
+    }
+
+    /* Recent-episode requires the title-only tail; this added_at hub family
+     * requires a top-level type equality. Tests exercise both gates together. */
+    if (hub_type_or_on) {
+        memset(&candidate, 0, sizeof(candidate));
+        match_result = match_hub_type_or_query(db, zSql, bounded_len, scan_len, &candidate);
+        if (match_result == PLEX_MATCH_BUILT) {
+            return plex_prepare_rewritten_sql(
+                kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
+                candidate.sql, scan_len, candidate.scan_out_len, candidate.rewrite_len,
+                candidate.expected_bind_count, candidate.verify_bind_count,
+                candidate.expected_column_count, candidate.verify_column_count,
+                OBS_MODE_PLEX_HUB_TYPE_OR
+            );
+        }
+        if (match_result == PLEX_MATCH_BUILD_FAILED) {
+            obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_HUB_TYPE_OR);
             free(candidate.sql);
             return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
         }

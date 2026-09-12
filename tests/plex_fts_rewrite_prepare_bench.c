@@ -24,8 +24,11 @@ static const char *MATCH_SQL =
 static const char *CAPTURE_MISS_SQL =
     "select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.`index`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id=? and true and metadata_item_settings.view_count>0  and metadata_item_views.account_id=? and grandparents.guid='plex://show/648dd4c8004a8e8652751de2'  group by grandparents.id order by viewed_at desc";
 
+static const char HUB_MISS_SQL[] = "SELECT 1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ";
+
 typedef enum bench_work {
     WORK_PREPARE_SELECT,
+    WORK_PREPARE_HUB_MISS,
     WORK_PREPARE_MATCH,
     WORK_PREPARE_CAPTURE_MISS,
     WORK_EXEC_PRAGMA
@@ -172,6 +175,7 @@ static void *bench_worker(void *arg) {
             sqlite3_stmt *stmt = NULL;
             const char *sql = "SELECT 1";
             if (bt->work == WORK_PREPARE_MATCH) sql = MATCH_SQL;
+            else if (bt->work == WORK_PREPARE_HUB_MISS) sql = HUB_MISS_SQL;
             else if (bt->work == WORK_PREPARE_CAPTURE_MISS) sql = CAPTURE_MISS_SQL;
             int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
             if (rc != SQLITE_OK) failf("prepare rc=%d err=%s", rc, sqlite3_errmsg(db));
@@ -260,6 +264,8 @@ static int child_case(
     bench_stats target;
 
     configure_env(rewrite_value, observability_enabled);
+    if (work == WORK_PREPARE_HUB_MISS &&
+        setenv("SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", "0", 1) != 0) failf("setenv HUB failed");
     make_temp_dir();
     temp_path(path, sizeof(path), basename);
     unlink(path);
@@ -301,6 +307,8 @@ static void run_child(
 }
 
 int main(void) {
+    run_child("enabled-hub-type-or-head-miss", "1", 0, "com.plexapp.plugins.library.db",
+              WORK_PREPARE_HUB_MISS, 0, ASSERT_ADVISORY_LOW_PREPARE_COST);
     run_child("default-nontarget-select", NULL, 0, "library.db", WORK_PREPARE_SELECT, 0,
               ASSERT_ADVISORY_LOW_PREPARE_COST);
     run_child("enabled-nontarget-select", "0", 0, "library.db", WORK_PREPARE_SELECT, 0,

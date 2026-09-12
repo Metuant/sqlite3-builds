@@ -780,7 +780,8 @@ require_line src/rewrite_modes.h '    X(EMBY_MIXED_LATEST, "emby", "dashboard+mi
 require_line src/rewrite_modes.h '    X(PLEX_FTS_JOIN, "plex", "fts+tag-join-chain", "plex_fts_rewrite", 0) \'
 require_line src/rewrite_modes.h '    X(PLEX_TITLE_SCOPE, "plex", "fts+title-user-scope", "plex_fts_rewrite", 0) \'
 require_line src/rewrite_modes.h '    X(PLEX_COLLECTION_TAG, "plex", "collection+tag-first", "plex_fts_rewrite", 1) \'
-require_line src/rewrite_modes.h '    X(PLEX_RECENT_EPISODE, "plex", "recent-episode-prefilter", "plex_fts_rewrite", 1)'
+require_line src/rewrite_modes.h '    X(PLEX_RECENT_EPISODE, "plex", "recent-episode-prefilter", "plex_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(PLEX_HUB_TYPE_OR, "plex", "hub+type_or", "plex_fts_rewrite", 1)'
 require_line src/rewrite_modes.h 'typedef int32_t obs_rewrite_mode;'
 require_line src/rewrite_modes.h '    OBS_MODE_NONE = 0,'
 require_line src/rewrite_modes.h '    OBS_MODE_COUNT'
@@ -798,7 +799,7 @@ awk '
     if ($0 ~ /, 1\)( \\)?$/) eligible[suffix]++
   }
   END {
-    if (rows != 19) exit 1
+    if (rows != 20) exit 1
     for (suffix in suffix_seen) {
       if (suffix_seen[suffix] != 1) exit 1
       suffix_count++
@@ -808,11 +809,11 @@ awk '
       wire_count++
     }
     for (suffix in eligible) eligible_count++
-    if (suffix_count != 19 || wire_count != 19 || eligible_count != 7) exit 1
+    if (suffix_count != 20 || wire_count != 20 || eligible_count != 8) exit 1
     if (!eligible["PLEX_TAGGINGS"] || !eligible["PLEX_ONDECK"] ||
         !eligible["EMBY_EPISODES_LATEST"] ||
         !eligible["EMBY_MOVIES_LATEST"] ||
-        !eligible["EMBY_MIXED_LATEST"] || !eligible["PLEX_COLLECTION_TAG"] || !eligible["PLEX_RECENT_EPISODE"]) exit 1
+        !eligible["EMBY_MIXED_LATEST"] || !eligible["PLEX_COLLECTION_TAG"] || !eligible["PLEX_RECENT_EPISODE"] || !eligible["PLEX_HUB_TYPE_OR"]) exit 1
   }
 ' src/rewrite_modes.h || fail 'rewrite mode catalogue cardinality, uniqueness, or eligibility invalid'
 
@@ -837,6 +838,7 @@ for manifest in \
   'OBS_MODE_PLEX_TITLE_SCOPE 2' \
   'OBS_MODE_PLEX_COLLECTION_TAG 2' \
   'OBS_MODE_PLEX_RECENT_EPISODE 1' \
+  'OBS_MODE_PLEX_HUB_TYPE_OR 2' \
   'OBS_MODE_PLEX_TAGGINGS 2' \
   'OBS_MODE_PLEX_ONDECK 2'
 do
@@ -917,7 +919,7 @@ require_range_token_count src/emby_fts_rewrite.c \
   __EOF__ OBS_MODE_EMBY_FTS 5 'Emby FTS producer manifest'
 plex_mode_token_count="$(grep -Eo 'OBS_MODE_PLEX_[A-Z_]+' src/plex_fts_rewrite.c | wc -l | tr -d ' ')"
 emby_mode_token_count="$(grep -Eo 'OBS_MODE_EMBY_[A-Z_]+' src/emby_fts_rewrite.c | wc -l | tr -d ' ')"
-assert_eq 'Plex producer token total' 20 "$plex_mode_token_count"
+assert_eq 'Plex producer token total' 23 "$plex_mode_token_count"
 assert_eq 'Emby producer token total' 61 "$emby_mode_token_count"
 
 raw_mode_wire_ere='"(collection[+]tag-first|fts[+]title-user-scope|fts[+]tag-join-chain|fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest|dashboard[+]mixed_latest)"'
@@ -1337,3 +1339,8 @@ printf 'pins aligned: sqlite=%s mimalloc=%s base_cmake=%s base_ref_script=%s too
   "$SQLITE_EXPECTED_DBCONFIG_COUNT" \
   "$build_sorterref" \
   "$build_pmasz"
+
+require_range_token_count src/plex_fts_rewrite.c \
+  'static plex_match_result match_hub_type_or_query(' \
+  'static int plex_prepare_input_lengths(' OBS_MODE_PLEX_HUB_TYPE_OR 1 \
+  'Plex hub type-OR miss producer manifest'

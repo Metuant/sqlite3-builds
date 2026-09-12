@@ -646,3 +646,51 @@ integer-ID schema. Its title-only ordering has ties: page membership at ties is
 not guaranteed stable, and a changed plan can choose different tied rows at a
 page boundary. Tests compare the complete typed multiset across all pages,
 not tied-page identity. The query itself never specified a total tie order.
+
+## Plex Hub Type-OR Rewrite
+
+`SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE=0` opts in once per process via
+pthread_once and an atomic flag. Unset, `1`, empty and all other values disable
+it. It is independent of the other gates and runs only in the ICU build on the
+exact Plex library DB target. Mode `hub+type_or` is catalogue-owned (eligible=1).
+
+The exact static head in [spec section 4](../specs/2026-09-12-plex-hub-type-or-rewrite.md)
+includes the shows/children/grandchildren joins and Plex's double spaces. A head
+miss costs one bounded memcmp and emits no record. The section is a nonempty
+`in (...)` decimal list, single positional bind, or `=literal`/`= literal`/positional bind;
+numbered section binds must be canonical and within SQLITE_LIMIT_VARIABLE_NUMBER.
+
+The filter block is otherwise opaque. Complete single-quoted strings (including
+doubled quotes), backtick/bracket identifiers and parameter tokens are skipped
+before tracking parentheses; anchors inside quotes or nested subqueries cannot
+match. Only a direct final ` and (metadata_items.metadata_type=A or
+metadata_items.metadata_type=B)` is removed, with distinct unsigned decimals
+and the exact following `)  and metadata_items.metadata_type=C  order by `,
+where C equals A or B. All retained bytes, including spaces, are unchanged.
+The OR-only block fails open rather than creating empty parentheses.
+
+Capture misses use the existing process-global first/new/every-1024th sampling
+and lexer-normalized shape key, with `section`, `no_or_group`,
+`multiple_or_groups`, `or_shape`, `empty_block`, `equality`, `tail`, `trailing`,
+`comment`, `dqs`, or `bind_site`. Comments and double-quoted tokens are rejected
+throughout the statement; semicolons, embedded NULs and over-bound inputs do not
+rewrite. A malformed original is never repaired by deleting bytes.
+
+For a matched shape, a hidden real v2 prepare of the WHOLE original (never
+stepped) delegates bind counting to SQLite itself, including sparse/reused ?N,
+anonymous and named/Tcl parameters anywhere in the section, filter or tail.
+That temporary statement is finalized before building the candidate. Failure
+of this check falls back (`bind_site`). This adds one prepare on hits only.
+`plex_prepare_rewritten_sql` verifies the exact full bind count and one result
+column, maps tails, logs applied SQL, and retries the original after candidate
+prepare/verification failure. Allocation failure logs `build_failed`.
+
+Dispatch follows On-Deck. The earlier recent-episode matcher requires the
+incompatible title-only tail with no outside type equality; tests run each gate
+alone and both together to prove neither shadows the other.
+
+Changing the plan can change tied-row page membership: equal added_at/title
+keys never defined a stable page boundary in Plex's query. Tests compare the
+complete typed multiset across all pages on tied fixtures. No tie-breaker or
+other ordering change is introduced. The synthetic STAT4 plan check is best
+effort; text/result equivalence is the mandatory gate.

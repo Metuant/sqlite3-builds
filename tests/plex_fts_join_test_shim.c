@@ -14,14 +14,18 @@ char *test_collection_build(const char*s,size_t n,size_t scan,size_t*o,size_t*l)
 static int fault_mode, path_allowed = 1, calls, last_kind;
 static unsigned last_flags;
 static const char *last_skip;
+static int is_test_candidate(const char *sql) {
+    return strstr(sql, "CROSS JOIN") || strstr(sql, "WITH recent_parameters") ||
+        (strstr(sql, "  and metadata_items.metadata_type=") && !strstr(sql, " or "));
+}
 static int real_prepare(int kind, sqlite3 *db, const char *sql, int n,
                         unsigned flags, sqlite3_stmt **stmt, const char **tail) {
     int rc;
     calls++; last_kind = kind; last_flags = flags;
-    if (fault_mode && (strstr(sql, "CROSS JOIN") || strstr(sql, "WITH recent_parameters"))) {
+    if (fault_mode && is_test_candidate(sql)) {
         if (fault_mode == 1) { *stmt = NULL; return SQLITE_ERROR; }
-        if (fault_mode == 3) {
-            rc = sqlite3_prepare_v2(db, "SELECT 1,2", -1, stmt, tail);
+        if (fault_mode == 3 || fault_mode == 4) {
+            rc = sqlite3_prepare_v2(db, fault_mode == 3 ? "SELECT 1,2" : "SELECT ?", -1, stmt, tail);
             if (rc == SQLITE_OK) *tail = sql + strlen(sql);
             return rc;
         }
@@ -29,7 +33,7 @@ static int real_prepare(int kind, sqlite3 *db, const char *sql, int n,
     if (kind == 0) rc = sqlite3_prepare(db, sql, n, stmt, tail);
     else if (kind == 1) rc = sqlite3_prepare_v2(db, sql, n, stmt, tail);
     else rc = sqlite3_prepare_v3(db, sql, n, flags, stmt, tail);
-    if (rc == SQLITE_OK && fault_mode == 2 && (strstr(sql, "CROSS JOIN") || strstr(sql, "WITH recent_parameters"))) *tail = sql;
+    if (rc == SQLITE_OK && fault_mode == 2 && is_test_candidate(sql)) *tail = sql;
     return rc;
 }
 int sqlite3_prepare_real(sqlite3 *d,const char *s,int n,sqlite3_stmt **p,const char **t) {

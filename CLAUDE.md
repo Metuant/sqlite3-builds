@@ -61,8 +61,9 @@ Project-specific guidance:
   positional logger label, and index-missing eligibility metadata; all mode
   counter extents use `OBS_MODE_COUNT`. Applied counters remain per connection;
   miss and index-missing counters remain process-global. Only Plex taggings,
-  Plex On-Deck, Emby Episodes Latest, Emby movies Latest, and Emby mixed-Latest
-  are index-missing eligible. Invalid ids suppress the requested record and can emit at most one
+  Plex On-Deck, Plex collection tag, Plex recent-episode, Plex hub type-OR,
+  Emby Episodes Latest, Emby movies Latest, and Emby mixed-Latest are marked
+  index-missing eligible in the catalogue. Invalid ids suppress the requested record and can emit at most one
   process-wide `obs_mode_unregistered` diagnostic while observability is
   enabled.
 - Keep runtime optimize opt-in: literal `SQLITE3_DISABLE_RUNTIME_OPTIMIZE=0`
@@ -82,7 +83,11 @@ Project-specific guidance:
   `SQLITE3_DISABLE_PLEX_FTS_REWRITE=1` disables; unset, literal `0`, and every
   other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
   `SQLITE3_DISABLE_SLOW_QUERY`, and `SQLITE3_DISABLE_AUTOPRAGMA` kill-switches.
-  Keep Plex GUID-LIKE and On-Deck rewrites opt-in.
+  Keep Plex GUID-LIKE, On-Deck, and hub type-OR rewrites opt-in.
+  `SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE` enables only on literal `0`;
+  unset and every other value disable. It only deletes the exact redundant
+  type-OR conjunct, preserves all remaining bytes, and verifies SQLite's
+  whole-statement bind count and one result column.
   `SQLITE3_DISABLE_PLEX_GUID_LIKE_REWRITE` (GUID LIKE NULL guard) enables on
   literal `0`; unset, literal `1`, and every other value disable. It fails open
   and is independent of `SQLITE3_DISABLE_AUTOPRAGMA` and
