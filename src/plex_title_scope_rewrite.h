@@ -23,8 +23,8 @@ static char *plex_build_title_scope_sql(const char *sql, size_t bounded_len,
         " JOIN metadata_items AS grandparents ON grandparents.id=parents.parent_id";
     static const char from[] =
         " FROM tags CROSS JOIN fts4_metadata_titles_icu"
-        " CROSS JOIN taggings INDEXED BY idx_dshadow_taggings_tag_id_metadata_item_id"
-        " ON tags.id=taggings.tag_id"
+        " CROSS JOIN taggings"
+        " ON taggings.tag_id=tags.id"
         " AND taggings.metadata_item_id=fts4_metadata_titles_icu.rowid"
         " CROSS JOIN metadata_items ON metadata_items.id=fts4_metadata_titles_icu.rowid"
         " AND taggings.metadata_item_id=metadata_items.id";

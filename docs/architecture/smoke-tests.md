@@ -390,3 +390,17 @@ contain startup `sqlite3_config` operations returning `rc=21` (CI pattern:
 A duplicate disabled-mode smoke starts Emby with
 `SQLITE3_DISABLE_OBSERVABILITY=1` and fails if any
 `[sqlite3-builds-obs]` line is emitted.
+
+### Private Plex rewrite regression entrypoint
+
+Run `bash tests/plex_private_rewrites_test.sh` on Linux with a C compiler,
+SQLite development library, Python 3 (SQLite enabled), and ASan/UBSan. This
+single documented local/CI runner executes all four private Python suites
+(FTS join, title scope, collection tag, recent episode), all four guarded
+mutation fuzzers, and `plex_review_regression_test.py`. Failures propagate as
+nonzero exit status. It uses scratch databases and the production wrapper
+adapter; it is distinct from the full Plex ICU library Docker smoke suite.
+Recent-episode checks the complete typed row multiset across every page;
+tied-order page identity is explicitly unspecified. Review regressions cover
+DQS positive-original/step-error, prepare/drop-index/step for all three forced
+orders, numeric-token prepare errors, and differing join-column collations.

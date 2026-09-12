@@ -32,7 +32,7 @@ only the FROM/JOIN region with:
 ```sql
 FROM fts4_tag_titles_icu
 CROSS JOIN tags ON fts4_tag_titles_icu.rowid=tags.id
-CROSS JOIN taggings INDEXED BY idx_dshadow_taggings_tag_id_metadata_item_id
+CROSS JOIN taggings
   ON tags.id=taggings.tag_id
 CROSS JOIN metadata_items ON taggings.metadata_item_id=metadata_items.id
 ```
@@ -62,7 +62,7 @@ Recognition is deliberately strict:
   1–64 scalar section arguments; metadata_type equality, or the exact album
   variant `(metadata_items.metadata_type=<scalar> AND (metadata_items.remote IS NULL))`;
   GROUP BY tags.id; ORDER BY count(*) DESC and final scalar LIMIT.
-- Scalar arguments can preserve string, decimal integer and parameter forms;
+- Scalar arguments can preserve single-quoted string, decimal integer and parameter forms;
   MATCH accepts a string or parameter, never a constructed SQL expression.
 - Input/output are capped at 64 KiB. Positive nByte, optional terminating NUL,
   and returned tail pointers are checked. Embedded-NUL suffixes fall back.
@@ -163,3 +163,15 @@ The small native fixture does not simulate production WAL pressure, concurrency,
 large-library distributions or long-term stability. Forced order is not a
 universal cost win. No production DB/configuration changes, source push or
 production restart occurred during build/test.
+
+## Execution limits (review findings 2–3)
+
+The index-name probe is an admission check only. Generated SQL contains no
+INDEXED BY; CROSS JOIN retains loop order and SQLite chooses the access paths,
+including after schema invalidation between prepare and step.
+
+Recovery is prepare-only. FTS-first evaluation can turn an empty result into a
+step-time malformed MATCH error when the original plan would filter every row
+before evaluating MATCH. Future MATCH bindings cannot be validated at prepare
+time. Success/error parity for arbitrary malformed MATCH bindings is therefore
+not guaranteed; no step-time retry is provided.

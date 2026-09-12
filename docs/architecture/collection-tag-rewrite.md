@@ -8,7 +8,7 @@
 2. Aggregate: `SELECT tags.id,count(*),min(year),max(year),tags.tag,tags.extra_data`; section and metadata-type equalities, literal `tag_type=2`, `GROUP BY tags.id`; six result columns.
 3. Grouped tag IDs: `SELECT tags.id`; the exact aggregate predicates and grouping; one result column. This is the incremental candidate extension.
 
-The implementation preserves original SELECT and WHERE/GROUP BY bytes. It changes inner JOINs to SQLite CROSS JOINs and forces the existing `idx_dshadow_taggings_tag_id_metadata_item_id` covering index. ON equality direction, scalar bytes, parameter names/order, duplicate semantics and GROUP BY semantics remain unchanged. The grouped shapes require literal tag_type=2. Unsupported projections/predicates/aliases, comments, compounds, literal NULLs and missing/unusable indexes fall back. Prepare/tail/column-count failures retry the original through existing cleanup. There is no new DDL, index creation, ANALYZE, or checkpoint.
+The implementation preserves original SELECT and WHERE/GROUP BY bytes. It changes inner JOINs to SQLite CROSS JOINs and checks for the existing `idx_dshadow_taggings_tag_id_metadata_item_id` index at admission. Generated SQL names no index, so automatic reprepare after an index drop can choose another access path. ON equality direction, scalar bytes, parameter names/order, duplicate semantics and GROUP BY semantics remain unchanged. The grouped shapes require literal tag_type=2. Unsupported projections/predicates/aliases, comments, compounds, literal NULLs and missing indexes or probe errors fall back. Prepare/tail/column-count failures retry the original through existing cleanup. There is no new DDL, index creation, ANALYZE, or checkpoint.
 
 ## Tests
 

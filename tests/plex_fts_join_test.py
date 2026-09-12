@@ -214,7 +214,7 @@ with tempfile.TemporaryDirectory(prefix='plex-fts-join-test-') as temp:
         generated = run(db, q)[1]
         plan = [row[3] for row in reference.execute('EXPLAIN QUERY PLAN '+generated)]
         chain = ['fts4_tag_titles_icu', 'tags', 'taggings', 'metadata_items']
-        positions = [next(i for i, line in enumerate(plan) if re.search(r'(?:SCAN|SEARCH) '+name+r'\b', line)) for name in chain]
+        positions = [next(i for i, line in enumerate(plan) if re.search(r'(?:SCAN|SEARCH) (?:TABLE )?'+name+r'\b', line)) for name in chain]
         check(positions == sorted(positions), ('join order', plan))
         check('idx_dshadow_taggings_tag_id_metadata_item_id' in plan[positions[2]], ('covering index', plan))
         check('rowid=?' in plan[positions[3]] or 'id=?' in plan[positions[3]], ('metadata lookup', plan))

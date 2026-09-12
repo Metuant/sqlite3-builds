@@ -632,3 +632,17 @@ to prepare the corresponding anti-join.
 DateCreated storage class is not an enablement
 condition because the templates use only native comparison and ordering with no
 cast, arithmetic, or coercion.
+
+## Private Plex rewrite limits
+
+The [FTS join](fts-join-rewrite.md) and [title scope](title-scope-rewrite.md)
+rewrites provide prepare-only recovery, not complete execution fail-open.
+Under FTS-first evaluation malformed MATCH bindings can raise a step-time error
+where the original filters all rows before evaluating MATCH. Their admission
+index probes do not impose INDEXED BY on generated SQL.
+
+Recent-episode prefiltering preserves the full result bag on the intended Plex
+integer-ID schema. Its title-only ordering has ties: page membership at ties is
+not guaranteed stable, and a changed plan can choose different tied rows at a
+page boundary. Tests compare the complete typed multiset across all pages,
+not tied-page identity. The query itself never specified a total tie order.

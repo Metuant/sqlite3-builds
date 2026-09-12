@@ -33,7 +33,9 @@ static int plex_join_expect(fts_lex *input, const char *pattern) {
 static int plex_join_scalar(fts_lex *input, int match_value) {
     fts_lex_token t = fts_lex_next_token(input);
     size_t i;
-    if (t.type == FTS_LEX_TOK_PARAM || t.type == FTS_LEX_TOK_STRING) return 1;
+    /* DQS may resolve to a later-loop column, not a constant scalar. */
+    if (t.type == FTS_LEX_TOK_PARAM) return 1;
+    if (t.type == FTS_LEX_TOK_STRING) return input->sql[t.start] == '\'';
     if (match_value || t.type != FTS_LEX_TOK_NUMBER || t.start == t.end) return 0;
     for (i = t.start; i < t.end; ++i)
         if (input->sql[i] < '0' || input->sql[i] > '9') return 0;
@@ -47,7 +49,7 @@ static char *plex_build_fts_join_sql(const char *sql, size_t bounded_len,
     static const char from[] =
         " FROM fts4_tag_titles_icu"
         " CROSS JOIN tags ON fts4_tag_titles_icu.rowid=tags.id"
-        " CROSS JOIN taggings INDEXED BY idx_dshadow_taggings_tag_id_metadata_item_id"
+        " CROSS JOIN taggings"
         " ON tags.id=taggings.tag_id"
         " CROSS JOIN metadata_items ON taggings.metadata_item_id=metadata_items.id"
         " WHERE";

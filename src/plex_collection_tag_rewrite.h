@@ -7,7 +7,7 @@
  */
 static char *plex_build_collection_tag_sql(const char *sql,size_t bounded_len,
  size_t scan_len,size_t *out_scan,size_t *out_len,int *columns) {
- static const char from[]=" FROM tags CROSS JOIN taggings INDEXED BY idx_dshadow_taggings_tag_id_metadata_item_id ON taggings.tag_id=tags.id CROSS JOIN metadata_items ON metadata_items.id=taggings.metadata_item_id WHERE";
+ static const char from[]=" FROM tags CROSS JOIN taggings ON taggings.tag_id=tags.id CROSS JOIN metadata_items ON metadata_items.id=taggings.metadata_item_id WHERE";
  fts_lex lx,look;fts_lex_token t;size_t a,b,n,i;int shape=0;char *r;
  if(!sql||!out_scan||!out_len||!columns||bounded_len>64u*1024u||scan_len>bounded_len||bounded_len-scan_len>1||(bounded_len>scan_len&&sql[scan_len]!=0)||memchr(sql,0,scan_len))return NULL;
  /* Reject comments, including conservatively inside string scalars. */

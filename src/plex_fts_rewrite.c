@@ -294,6 +294,9 @@ static int call_real_prepare(
 
 static int parse_match_value(fts_lex *lx, fts_lex_token *value) {
     *value = fts_lex_next_token(lx);
+    /* Keep the review's DQS join miss byte-verbatim through the older FTS
+     * fallback too: a double-quoted RHS may be a column dependency. */
+    if (value->type == FTS_LEX_TOK_STRING && lx->sql[value->start] != '\'') return 0;
     if (!(value->type == FTS_LEX_TOK_NUMBER ||
           value->type == FTS_LEX_TOK_STRING ||
           value->type == FTS_LEX_TOK_PARAM)) {

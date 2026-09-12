@@ -45,12 +45,12 @@ Project-specific guidance:
   `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`, and
   `tests/check_pin_alignment.sh`; keep the `docker-library/Dockerfile` ICU and
-  mimalloc dependency layers above all 22 project `COPY` lines; keep the
+  mimalloc dependency layers above all 23 project `COPY` lines; keep the
   `.github/workflows/sqlite-build.yml` GHCR `type=registry` cache contract
   (import the event ref and then the baseline ref; export the event ref only,
   gated on `CACHE_EXPORT_ENABLED` and `continue-on-error: true`; forbid
   `type=gha`) aligned with the hardcoded counts in
-  `tests/check_pin_alignment.sh` (19 project `COPY` lines, 6 `Load version pins`
+  `tests/check_pin_alignment.sh` (23 project `COPY` lines, 6 `Load version pins`
   steps, each of 3 cache scopes appearing twice, 3 baseline refs, and 6 event
   refs); keep the literal semantics for
   `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` and

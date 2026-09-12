@@ -1,4 +1,5 @@
 import os,sys,random
+from collections import Counter
 os.environ['SQLITE3_ENABLE_PLEX_RECENT_EPISODE_REWRITE']='1'
 import plex_prepare_test_support as h
 from plex_prepare_test_support import *
@@ -9,7 +10,7 @@ CMP=C.CFUNCTYPE(C.c_int,ptr,C.c_int,ptr,C.c_int,ptr)
 def cmp(ctx,na,a,nb,b):
  a=C.string_at(a,na);b=C.string_at(b,nb);return (a>b)-(a<b)
 coll=signature('sqlite3_create_collation',C.c_int,ptr,C.c_char_p,C.c_int,ptr,CMP)
-count=0;mismatches=[];meta=[]
+count=0;meta=[]
 with tempfile.TemporaryDirectory() as tmp:
  for seed in range(40):
   rng=random.Random(seed);path=Path(tmp)/'com.plexapp.plugins.library.db'
@@ -23,14 +24,22 @@ with tempfile.TemporaryDirectory() as tmp:
     for k in range(rng.randrange(5)):d.execute('INSERT INTO metadata_items VALUES(?,?,5,4,?,NULL,NULL)',(1000+i*20+j*5+k,c,rng.randrange(100)))
   d.execute('INSERT INTO tags VALUES(10)');d.execute('INSERT INTO taggings VALUES(4,10)');d.commit();d.close()
   db=ptr();check(open_db(os.fsencode(path),C.byref(db))==0,'open');check(coll(db,b'icu_root',1,None,cmp)==0,'collation')
-  for cutoff,lim,off in [(0,5000,0),(50,7,0),(50,7,7),(99,3,0),(0,0,0)]:
-   params=(5,'Exclude',10,cutoff,2,2,lim,off)
-   set_path(0);base=run(db,q,params);set_path(1);new=run(db,q,params)
-   check(base[0]==101 and new[0]==101,'execute');check('WITH recent_parameters' in new[1],'rewrite hit');count+=1
-   if base[2]!=new[2]:mismatches.append(dict(seed=seed,cutoff=cutoff,limit=lim,offset=off,original=base[2],candidate=new[2]))
-   check(base[3]==new[3],'bind names')
+  for cutoff,lim in [(0,5000),(50,7),(99,3),(0,0)]:
+   # Ties may select different IDs on an individual page. Compare every page's
+   # complete typed rows as one multiset; any missing/extra row fails the suite.
+   bags=[Counter(),Counter()];off=0
+   while True:
+    params=(5,'Exclude',10,cutoff,2,10,lim,off)
+    set_path(0);base=run(db,q,params,typed=True);set_path(1);new=run(db,q,params,typed=True)
+    check(base[0]==101 and new[0]==101,'execute');check('WITH recent_parameters' in new[1],'rewrite hit');count+=1
+    check(base[3]==new[3],'bind names')
+    bags[0].update(base[2]);bags[1].update(new[2])
+    if not base[2] and not new[2]:break
+    off+=lim
+    check(off<10000,'pagination terminates')
+   check(bags[0]==bags[1],('full typed bag differs',seed,cutoff,lim,bags))
   if seed==0:
-   bare=__import__('re').sub(r'\?\d+','?',q);params=(5,'Exclude',10,50,2,2,7,0)
+   bare=__import__('re').sub(r'\?\d+','?',q);params=(5,'Exclude',10,50,2,10,5000,0)
    set_path(0);base=run(db,bare,params);set_path(1);new=run(db,bare,params);meta.append(dict(original=base[3],candidate=new[3]));check(base[3]==new[3] and base[2]==new[2] and new[1].startswith('WITH recent_parameters'),'bare metadata preserved')
    for bad in [q+';',q+'; SELECT 1',q.replace('select metadata_items.id','select distinct metadata_items.id'),q.replace('join metadata_items as children','left join metadata_items as children'),q.replace('?1',':section'),q.replace('?4',':date'),q.replace('>?4','>=?4'),q.replace('?7','-1'),q.replace('order by','/* x */ order by'),q.replace('select metadata_items.id','select count(*)')]:check(raw_build(bad) is None,('reject',bad))
    check(raw_build(q.encode()+b'\0junk') is None,'embedded nul')
@@ -43,4 +52,4 @@ with tempfile.TemporaryDirectory() as tmp:
    set_path(0);postbase=run(db,q,params);set_path(1)
    r=run(db,q,params);check(r[0]==101 and r[1].startswith('WITH recent_parameters'),'concurrent drop survives');check(r[2]==postbase[2],'post-drop results')
   check(close_db(db)==0,'close')
-print(json.dumps(dict(comparisons=count,mismatches=mismatches,bare_bind_metadata=meta,assertions=h.checks),default=lambda x:x.decode()))
+print(json.dumps(dict(status='PASS',page_comparisons=count,tied_pages='full typed bag asserted, page identity unspecified',bare_bind_metadata=meta,assertions=h.checks),default=lambda x:x.decode()))

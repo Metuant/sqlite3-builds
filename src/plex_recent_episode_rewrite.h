@@ -10,6 +10,14 @@
 static int plex_recent_operand(fts_lex *lx,fts_lex_token *out,int string_ok){
  fts_lex_token t=fts_lex_next_token(lx);size_t n=t.end-t.start,i;unsigned v=0;
  const char *s=lx->sql+t.start;
+ /* The shared scanner splits 0AND into two tokens. Relocating only 0 would
+  * repair invalid SQL. Check SQLite identifier bytes at the decimal boundary. */
+ if(t.type==FTS_LEX_TOK_NUMBER){
+  for(i=0;i<n;i++)if(s[i]<'0'||s[i]>'9')return 0;
+  if(t.end<lx->len){unsigned char c=(unsigned char)lx->sql[t.end];
+   if(fts_lex_is_ident_char(c)||c=='$'||c>=0x80)return 0;
+  }
+ }
  if(t.type==FTS_LEX_TOK_PARAM){
   if(!n||s[0]!='?')return 0;
   if(n>1){for(i=1;i<n;i++){if(s[i]<'0'||s[i]>'9'||v>32766u/10u)return 0;v=v*10u+(unsigned)(s[i]-'0');}if(!v||v>32766)return 0;}

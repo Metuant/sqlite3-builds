@@ -103,7 +103,7 @@ def raw_build(sql, bounded=None, scan=None):
     finally:
         release(out)
 
-def run(db, sql, params=(), kind=1, nbyte=-1, flags=0):
+def run(db, sql, params=(), kind=1, nbyte=-1, flags=0, typed=False):
     data = sql.encode() if isinstance(sql, str) else sql
     b = C.create_string_buffer(data)
     stmt, tail = ptr(), ptr()
@@ -128,8 +128,28 @@ def run(db, sql, params=(), kind=1, nbyte=-1, flags=0):
         while True:
             rc = step(stmt)
             if rc != 100: break
-            rows.append((column_int(stmt, 0),))
+            rows.append(typed_row(stmt) if typed else (column_int(stmt, 0),))
         return rc, text, rows, names, tail.value - C.addressof(b) if tail.value else -1
     finally:
         finalize(stmt)
 
+
+column_count = signature('sqlite3_column_count', C.c_int, ptr)
+column_type = signature('sqlite3_column_type', C.c_int, ptr, C.c_int)
+column_double = signature('sqlite3_column_double', C.c_double, ptr, C.c_int)
+column_bytes = signature('sqlite3_column_bytes', C.c_int, ptr, C.c_int)
+column_blob = signature('sqlite3_column_blob', ptr, ptr, C.c_int)
+column_text = signature('sqlite3_column_text', ptr, ptr, C.c_int)
+
+def typed_row(stmt):
+    row = []
+    for i in range(column_count(stmt)):
+        typ = column_type(stmt, i)
+        if typ == 1: value = column_int(stmt, i)
+        elif typ == 2: value = column_double(stmt, i)
+        elif typ in (3, 4):
+            data = (column_text if typ == 3 else column_blob)(stmt, i)
+            value = C.string_at(data, column_bytes(stmt, i)) if data else b''
+        else: value = None
+        row.append((typ, value))
+    return tuple(row)
