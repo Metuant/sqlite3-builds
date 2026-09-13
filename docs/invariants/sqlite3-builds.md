@@ -555,3 +555,12 @@ milestone lands.
   SQLite's whole-statement bind count and one result column before acceptance.
 - Literal `SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE=0` is the only enabling value.
 - Ties do not guarantee stable page membership; compare the complete typed bag.
+
+## Plex fuzzy MATCH canonicalization
+
+- The Plex fuzzy MATCH pre-pass changes only one eligible literal. It preserves
+  term/group order, case, doubled apostrophes and `)*`; `OR*` is a term.
+- Absorption requires ASCII alphanumeric words; bytewise dedupe is unrestricted.
+- Every miss passes the original bytes to existing dispatch. Whole-original bind
+  and column counts and caller-buffer tails are verified before returning a
+  successful rewrite.

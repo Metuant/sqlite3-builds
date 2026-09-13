@@ -22,4 +22,9 @@ for name in plex_fts_join plex_title_scope plex_collection_tag plex_recent_episo
 done
 python3 "$root/tests/plex_review_regression_test.py" "$work/private-test.so"
 python3 "$root/tests/plex_hub_type_or_test.py" "$work/private-test.so"
-echo 'PASS: four private Python suites, four ASan/UBSan fuzzers, review regressions, hub bounds/binds/faults'
+python3 "$root/tests/plex_fuzzy_match_test.py" "$work/private-test.so"
+"$cc" -std=c11 -Wall -Wextra -Werror -O1 -g \
+  -fsanitize=address,undefined -fno-omit-frame-pointer -I"$root/src" \
+  "$root/tests/plex_fuzzy_match_fuzz.c" "$root/src/fts_lex.c" -o "$work/fuzzy-fuzz"
+ASAN_OPTIONS=detect_leaks=1 "$work/fuzzy-fuzz"
+echo 'PASS: four private Python suites, four ASan/UBSan fuzzers, review regressions, hub bounds/binds/faults, fuzzy corpus/grammar/composition and ASan/UBSan'

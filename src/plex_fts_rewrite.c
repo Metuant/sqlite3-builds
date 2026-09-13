@@ -5,6 +5,7 @@
 #include "plex_title_scope_rewrite.h"
 #include "plex_collection_tag_rewrite.h"
 #include "plex_recent_episode_rewrite.h"
+#include "plex_fuzzy_match_rewrite.h"
 #endif
 #include "observability.h"
 
@@ -174,6 +175,18 @@ static void plex_hub_type_or_init_once(void) {
 static int plex_hub_type_or_rewrite_enabled(void) {
     pthread_once(&g_plex_hub_type_or_once, plex_hub_type_or_init_once);
     return atomic_load_explicit(&g_plex_hub_type_or_enabled, memory_order_acquire);
+}
+
+static pthread_once_t g_plex_fuzzy_match_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_fuzzy_match_enabled;
+static void plex_fuzzy_match_init_once(void) {
+    const char *value = getenv("SQLITE3_DISABLE_PLEX_FUZZY_MATCH_REWRITE");
+    atomic_store_explicit(&g_plex_fuzzy_match_enabled,
+        value && strcmp(value, "0") == 0, memory_order_release);
+}
+static int plex_fuzzy_match_rewrite_enabled(void) {
+    pthread_once(&g_plex_fuzzy_match_once, plex_fuzzy_match_init_once);
+    return atomic_load_explicit(&g_plex_fuzzy_match_enabled, memory_order_acquire);
 }
 
 static pthread_once_t g_plex_recent_once=PTHREAD_ONCE_INIT;
@@ -1874,6 +1887,9 @@ static int plex_retry_original_after_rewrite_failure(
     return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
 }
 
+static int plex_dispatch_prepare(sqlite3 *, const char *, int, unsigned int,
+    sqlite3_stmt **, const char **, fts_rewrite_prepare_kind);
+
 static int plex_prepare_rewritten_sql(
     fts_rewrite_prepare_kind kind,
     sqlite3 *db,
@@ -1898,9 +1914,16 @@ static int plex_prepare_rewritten_sql(
     int rc;
 
     if (ppStmt) *ppStmt = NULL;
-    rc = call_real_prepare(
-        kind, db, rewritten, rewrite_nbyte, prepFlags, ppStmt, &rewritten_tail
-    );
+    /* Only the outer pre-pass enters dispatch. All downstream candidates use
+     * the real prepare entry, so this is bounded composition, not recursion. */
+    if (mode == OBS_MODE_PLEX_FUZZY_MATCH) {
+        rc = plex_dispatch_prepare(db, rewritten, rewrite_nbyte, prepFlags,
+            ppStmt, &rewritten_tail, kind);
+    } else {
+        rc = call_real_prepare(
+            kind, db, rewritten, rewrite_nbyte, prepFlags, ppStmt, &rewritten_tail
+        );
+    }
     if (rc != SQLITE_OK) {
         obs_log_rewrite_skipped(db, "rewritten_prepare_failed", mode);
         free(rewritten);
@@ -1940,7 +1963,7 @@ static int plex_prepare_rewritten_sql(
     return rc;
 }
 
-__attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
+static int plex_dispatch_prepare(
     sqlite3 *db,
     const char *zSql,
     int nByte,
@@ -2135,4 +2158,49 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
 #else
     return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
 #endif
+}
+
+__attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
+    sqlite3 *db, const char *zSql, int nByte, unsigned int prepFlags,
+    sqlite3_stmt **ppStmt, const char **pzTail, fts_rewrite_prepare_kind kind
+) {
+#ifdef SQLITE_ENABLE_ICU
+    size_t bounded=0, scan=0, out_scan=0, out_len=0;
+    const char *raw_fn, *reason=NULL, *tail=NULL;
+    char *canonical;
+    sqlite3_stmt *original=NULL;
+    int rc, binds, columns;
+    if (plex_fuzzy_match_rewrite_enabled() && db && zSql && ppStmt && nByte &&
+        (raw_fn=sqlite3_db_filename(db,"main")) != NULL &&
+        auto_extension_path_is_target(raw_fn) &&
+        fts_rewrite_db_basename_matches(raw_fn,PLEX_FTS_TARGET.db_basename) &&
+        plex_prepare_input_lengths(zSql,nByte,&bounded,&scan)) {
+        canonical=plex_build_fuzzy_match_sql(zSql,bounded,scan,&out_scan,&out_len,&reason);
+        if (canonical) {
+            /* Count every original SQLite bind slot and column, never step it.
+             * Do not let canonicalization repair invalid original SQL. */
+            rc=sqlite3_prepare_v2_real(db,zSql,(int)scan,&original,&tail);
+            if (rc==SQLITE_OK && original && tail && tail>=zSql && tail<=zSql+scan &&
+                plex_trailing_space_only(zSql,scan,(size_t)(tail-zSql))) {
+                size_t tail_len=(size_t)(tail-zSql);
+                binds=sqlite3_bind_parameter_count(original);
+                columns=sqlite3_column_count(original);
+                sqlite3_finalize(original);
+                return plex_prepare_rewritten_sql(kind,db,zSql,nByte,prepFlags,
+                    ppStmt,pzTail,canonical,tail_len,out_scan-(scan-tail_len),out_len,
+                    binds,1,columns,1,OBS_MODE_PLEX_FUZZY_MATCH);
+            }
+            sqlite3_finalize(original);
+            free(canonical);
+            reason="grammar";
+        }
+        if (reason) {
+            obs_log_rewrite_miss(OBS_MODE_PLEX_FUZZY_MATCH,OBS_MISS_CAPTURE,reason,
+                db,zSql,scan,obs_is_disabled() ? 0 : fts_lex_shape_key(zSql,scan));
+        } else {
+            obs_log_rewrite_skipped(db,"build_failed",OBS_MODE_PLEX_FUZZY_MATCH);
+        }
+    }
+#endif
+    return plex_dispatch_prepare(db,zSql,nByte,prepFlags,ppStmt,pzTail,kind);
 }

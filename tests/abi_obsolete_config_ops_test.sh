@@ -141,6 +141,7 @@ else
   cp "${repo_root}/src/plex_title_scope_rewrite.h" "${tmpdir}/plex_title_scope_rewrite.h"
   cp "${repo_root}/src/plex_collection_tag_rewrite.h" "${tmpdir}/plex_collection_tag_rewrite.h"
   cp "${repo_root}/src/plex_recent_episode_rewrite.h" "${tmpdir}/plex_recent_episode_rewrite.h"
+  cp "${repo_root}/src/plex_fuzzy_match_rewrite.h" "${tmpdir}/plex_fuzzy_match_rewrite.h"
   cp "${repo_root}/src/emby_fts_rewrite.c" "${tmpdir}/emby_fts_rewrite.c"
   cp "${repo_root}/src/emby_fts_rewrite.h" "${tmpdir}/emby_fts_rewrite.h"
   (

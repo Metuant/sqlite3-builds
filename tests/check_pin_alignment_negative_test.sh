@@ -433,16 +433,16 @@ if text.count(line) != 1:
 path.write_text(text.replace(line, "", 1))
 PY
       ;;
-    rewrite-docker-count-restored-18)
+    rewrite-docker-count-restored-23)
       python3 - "$scratch/tests/check_pin_alignment.sh" <<'PY'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
 text = path.read_text()
-old = "  19 \\\n  'library dependency layers before all project COPY lines'"
-new = "  18 \\\n  'library dependency layers before all project COPY lines'"
+old = "  24 \\\n  'library dependency layers before all project COPY lines'"
+new = "  23 \\\n  'library dependency layers before all project COPY lines'"
 if text.count(old) != 1:
-    raise SystemExit("19-copy checker fixture missing")
+    raise SystemExit("24-copy checker fixture missing")
 path.write_text(text.replace(old, new, 1))
 PY
       ;;
@@ -670,7 +670,7 @@ assert_fails_with rewrite-raw-wire-slow-query \
   'src/slow_query_tracker.c contains rejected pattern:'
 assert_fails_with rewrite-docker-copy-missing \
   'library dependency layers before all project COPY lines invalid'
-assert_fails_with rewrite-docker-count-restored-18 \
+assert_fails_with rewrite-docker-count-restored-23 \
   'library dependency layers before all project COPY lines invalid'
 assert_fails_with rewrite-runbook-row-drift \
   'docs/runbooks/query-measure/families/emby-search.sh missing exact line:'

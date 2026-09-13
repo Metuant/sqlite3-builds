@@ -694,3 +694,40 @@ keys never defined a stable page boundary in Plex's query. Tests compare the
 complete typed multiset across all pages on tied fixtures. No tie-breaker or
 other ordering change is introduced. The synthetic STAT4 plan check is best
 effort; text/result equivalence is the mandatory gate.
+
+## Plex Fuzzy MATCH Canonicalization
+
+`src/plex_fuzzy_match_rewrite.h` implements [spec sections 2-4](../specs/2026-09-12-plex-fuzzy-match-canonicalize-rewrite.md).
+Only literal `SQLITE3_DISABLE_PLEX_FUZZY_MATCH_REWRITE=0` enables this ICU-only
+Plex-library-target pre-pass, cached with pthread_once and an atomic flag.
+It is independent of AUTOPRAGMA and the FTS gate.
+
+The bounded scanner requires one exact supported table.column `match '<literal>'`
+site, complete single-quoted SQL strings, no comments or double-quoted SQL tokens,
+and flat parenthesised groups with single ASCII spaces. Exact `OR` is a keyword;
+`OR*` is a prefix term. AND/NOT/NEAR keywords, broken OR layout, nested/empty
+or truncated groups, bare exact-pass terms, bound operands and multiple MATCH
+sites fail open. The private 64 KiB input cap and embedded-NUL guards also apply.
+One final semicolon and trailing whitespace are preserved; a second statement
+fails original-prepare tail verification. Calls to matchinfo/offsets/snippet/rank fail open as `grammar`
+to enforce section 2's membership-only scope. No index is required or created.
+
+Within each group, byte-identical terms are deduplicated, then ASCII alphanumeric
+prefix absorption is applied according to OR/AND membership semantics. Case,
+order, apostrophe pairs and group stars are preserved; all bytes outside the
+literal are copied unchanged. Non-ASCII and punctuation terms only deduplicate.
+An unchanged literal is a `noop` miss.
+
+The public Plex entry runs this pre-pass before `plex_dispatch_prepare`, whose
+existing matcher order is unchanged. Ineligible input reaches dispatch unchanged.
+Eligible input gets a hidden real v2 prepare of the original (never stepped) to
+capture every bind slot and result column. `plex_prepare_rewritten_sql` feeds the
+canonical text through dispatch, verifies the final counts with both verify flags
+set, maps the tail back into the caller's buffer, and retries the original on
+verification failure. Downstream MATCH handling remains opaque.
+
+Catalogue mode `PLEX_FUZZY_MATCH`, wire `fuzzy+match_canon`, has index-missing
+eligibility 0. Successful canonicalizations use the existing applied SQL sampler.
+`OBS_MISS_CAPTURE` sub-reasons are `no_match`, `multi_match`, `bind_operand`,
+`quote`, `comment`, `dqs`, `grammar`, `keyword`, `or_layout`, `empty_group`, `noop`.
+Allocation failures use the existing `build_failed` skip path.

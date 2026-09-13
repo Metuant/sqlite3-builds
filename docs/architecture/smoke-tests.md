@@ -104,7 +104,7 @@ It proves:
   fewer records on lexer/set failure and the master gate.
 - Catalogue-derived, delimited
   `event=rewrite_applied target=<target> mode=<mode> db=` matching covers all
-  20 registered modes. The A/A/B/B sequence proves count-1 correlation is
+  21 registered modes. The A/A/B/B sequence proves count-1 correlation is
   observed before schedule selection, and two fake connections prove applied
   counters reset per connection.
 - Signed invalid ids suppress requested records without allocation,
@@ -428,3 +428,24 @@ STAT4 EQP comparison. The scratch SQLite 3.53.3 fixture used on rs34 chose the
 index-ordered plan for both statements (no temp ORDER BY tree); the
 production-specific original-only sort was not reproduced. This is reported
 explicitly, with text/result equivalence retained as the gate.
+
+### Fuzzy MATCH canonicalization
+
+`plex_private_rewrites_test.sh` also runs `plex_fuzzy_match_test.py` and the
+ASan/UBSan guarded-prefix/mutation fuzzer. The Python suite checks every corpus
+row against committed golden literals, diagnostics, idempotence, escapes,
+ASCII-only absorption, all UTF-8 prepare APIs, nByte/tail behavior, SQLite bind
+numbering, columns, injected verification failures and downstream composition.
+The three truncated parenthesised captures fail grammar validation; the complete
+parenthesised captures are accepted. Gate values run in fresh processes.
+
+`plex_fuzzy_match_native.py` runs against a disposable Plex runtime with the
+candidate library mounted read-only and a fresh fixture. It requires the native
+`collating 'root@colStrength=primary;colAlternate=shifted'` tokenizer and tests
+plain and prefix='2,3' tables, both EXCEPT directions, seeded non-empty matches,
+actual applied telemetry and per-corpus-literal timings. See the implementation
+report for exact isolated rs34 commands and results.
+
+Applied sampling/SQL-suppression assertions in the linked Plex smoke filter to
+the owning GUID/tag mode; the On-Deck early-miss assertion is also mode-specific.
+This permits independent fuzzy capture-miss telemetry when both gates are on.

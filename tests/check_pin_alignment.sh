@@ -781,7 +781,8 @@ require_line src/rewrite_modes.h '    X(PLEX_FTS_JOIN, "plex", "fts+tag-join-cha
 require_line src/rewrite_modes.h '    X(PLEX_TITLE_SCOPE, "plex", "fts+title-user-scope", "plex_fts_rewrite", 0) \'
 require_line src/rewrite_modes.h '    X(PLEX_COLLECTION_TAG, "plex", "collection+tag-first", "plex_fts_rewrite", 1) \'
 require_line src/rewrite_modes.h '    X(PLEX_RECENT_EPISODE, "plex", "recent-episode-prefilter", "plex_fts_rewrite", 1) \'
-require_line src/rewrite_modes.h '    X(PLEX_HUB_TYPE_OR, "plex", "hub+type_or", "plex_fts_rewrite", 1)'
+require_line src/rewrite_modes.h '    X(PLEX_HUB_TYPE_OR, "plex", "hub+type_or", "plex_fts_rewrite", 1) \'
+require_line src/rewrite_modes.h '    X(PLEX_FUZZY_MATCH, "plex", "fuzzy+match_canon", "plex_fts_rewrite", 0)'
 require_line src/rewrite_modes.h 'typedef int32_t obs_rewrite_mode;'
 require_line src/rewrite_modes.h '    OBS_MODE_NONE = 0,'
 require_line src/rewrite_modes.h '    OBS_MODE_COUNT'
@@ -799,7 +800,7 @@ awk '
     if ($0 ~ /, 1\)( \\)?$/) eligible[suffix]++
   }
   END {
-    if (rows != 20) exit 1
+    if (rows != 21) exit 1
     for (suffix in suffix_seen) {
       if (suffix_seen[suffix] != 1) exit 1
       suffix_count++
@@ -809,7 +810,7 @@ awk '
       wire_count++
     }
     for (suffix in eligible) eligible_count++
-    if (suffix_count != 20 || wire_count != 20 || eligible_count != 8) exit 1
+    if (suffix_count != 21 || wire_count != 21 || eligible_count != 8) exit 1
     if (!eligible["PLEX_TAGGINGS"] || !eligible["PLEX_ONDECK"] ||
         !eligible["EMBY_EPISODES_LATEST"] ||
         !eligible["EMBY_MOVIES_LATEST"] ||
@@ -839,12 +840,13 @@ for manifest in \
   'OBS_MODE_PLEX_COLLECTION_TAG 2' \
   'OBS_MODE_PLEX_RECENT_EPISODE 1' \
   'OBS_MODE_PLEX_HUB_TYPE_OR 2' \
+  'OBS_MODE_PLEX_FUZZY_MATCH 3' \
   'OBS_MODE_PLEX_TAGGINGS 2' \
   'OBS_MODE_PLEX_ONDECK 2'
 do
   set -- $manifest
   require_range_token_count src/plex_fts_rewrite.c \
-    '__attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(' \
+    'static int plex_dispatch_prepare(' \
     __EOF__ "$1" "$2" "Plex prepare producer manifest $1"
 done
 
@@ -919,7 +921,7 @@ require_range_token_count src/emby_fts_rewrite.c \
   __EOF__ OBS_MODE_EMBY_FTS 5 'Emby FTS producer manifest'
 plex_mode_token_count="$(grep -Eo 'OBS_MODE_PLEX_[A-Z_]+' src/plex_fts_rewrite.c | wc -l | tr -d ' ')"
 emby_mode_token_count="$(grep -Eo 'OBS_MODE_EMBY_[A-Z_]+' src/emby_fts_rewrite.c | wc -l | tr -d ' ')"
-assert_eq 'Plex producer token total' 23 "$plex_mode_token_count"
+assert_eq 'Plex producer token total' 27 "$plex_mode_token_count"
 assert_eq 'Emby producer token total' 61 "$emby_mode_token_count"
 
 raw_mode_wire_ere='"(collection[+]tag-first|fts[+]title-user-scope|fts[+]tag-join-chain|fts[+]tag_type|guid[+]like-null|taggings[+]membership|ondeck|fts[+]membership|fanout[+]browse|fanout[+]favorites|fanout[+]links_search|fanout[+]people|fanout[+]resume|fanout[+]resume_simple|fanout[+]similar|dashboard[+]episodes_latest|dashboard[+]movies_latest|dashboard[+]mixed_latest)"'
@@ -1036,7 +1038,7 @@ require_line docs/env-vars.md '| `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` | kill-sw
 require_line docs/env-vars.md '| `SQLITE3_DISABLE_STMT_TRACE_SAMPLING` | kill-switch | Disable sampling for explicitly enabled STMT trace. | Enabled STMT trace logs the first callback, each bounded first-seen `corr` shape, and every 1024th callback per connection. | opt-out | Literal `1` logs every enabled STMT callback. | Unset, literal `0`, and any other value retain `sample=first`, `sample=periodic`, and `sample=new` hybrid sampling. | generic and Plex-ICU shared libraries. | Cached once per process. Never enables STMT trace; `SQLITE3_DISABLE_STMT_TRACE=0` and observability enabled are still required. |'
 require_pattern CLAUDE.md 'SQLITE3_DISABLE_REWRITE_APPLIED_SQL=1' 'CLAUDE rewrite-applied SQL knob'
 require_pattern CLAUDE.md 'SQLITE3_DISABLE_STMT_TRACE_SAMPLING=1' 'CLAUDE STMT sampling knob'
-require_line CLAUDE.md '  mimalloc dependency layers above all 23 project `COPY` lines; keep the'
+require_line CLAUDE.md '  mimalloc dependency layers above all 24 project `COPY` lines; keep the'
 require_line CLAUDE.md '- Keep `src/rewrite_modes.h` as the only rewrite-mode catalogue. Producers pass'
 require_pattern CLAUDE.md 'Applied counters remain per connection' 'CLAUDE applied counter lifetime'
 require_pattern CLAUDE.md 'miss and index-missing counters remain process-global' 'CLAUDE global counter lifetimes'
@@ -1303,7 +1305,7 @@ require_line docker-library/Dockerfile 'CMD ["/bin/sh"]'
 require_project_copies_after \
   docker-library/Dockerfile \
   'ENV MIMALLOC_LIB=/opt/mimalloc/lib/libmimalloc.a' \
-  23 \
+  24 \
   'library dependency layers before all project COPY lines'
 require_line docker-library/Dockerfile 'COPY src/rewrite_modes.h /app/rewrite_modes.h'
 require_line docker-library/Dockerfile 'COPY src/plex_fts_join_rewrite.h /app/plex_fts_join_rewrite.h'

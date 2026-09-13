@@ -1904,6 +1904,27 @@ static int rsh_custom_adapter_guid_like_sampling_producer(
     return SQLITE_OK;
 }
 
+/* Independent enabled modes may emit their own sampled miss records. Applied
+ * sampling and SQL-suppression assertions must inspect only their owner mode. */
+static char *copy_matching_log_lines(const char *text, const char *needle) {
+    char *out = malloc(strlen(text) + 1), *write;
+    const char *line = text;
+    if (!out) failf("FATAL: log filter allocation failed");
+    write = out;
+    while (*line) {
+        const char *end = strchr(line, '\n');
+        const char *match = strstr(line, needle);
+        size_t len = end ? (size_t)(end + 1 - line) : strlen(line);
+        if (match && match < line + len) {
+            memcpy(write, line, len);
+            write += len;
+        }
+        line += len;
+    }
+    *write = 0;
+    return out;
+}
+
 static int rsh_custom_adapter_guid_like_sampling_assert(
     const rsh_case_context *context,
     const void *immutable_data
@@ -1912,7 +1933,7 @@ static int rsh_custom_adapter_guid_like_sampling_assert(
         "event=rewrite_applied target=plex mode=guid+like-null db=";
     char source_field[512];
     char rewritten_field[512];
-    const char *log_text = context->captured_stderr;
+    char *log_text = copy_matching_log_lines(context->captured_stderr, needle);
     int rc;
 
     (void)immutable_data;
@@ -1949,6 +1970,7 @@ static int rsh_custom_adapter_guid_like_sampling_assert(
     require_occurrences(
         "guid-like-applied/rewritten SQL", log_text, rewritten_field, 4
     );
+    free(log_text);
     return SQLITE_OK;
 }
 
@@ -1991,7 +2013,7 @@ static int rsh_custom_adapter_tag_applied_visible_assert(
 ) {
     static const char *needle =
         "event=rewrite_applied target=plex mode=taggings+membership";
-    const char *log_text = context->captured_stderr;
+    char *log_text = copy_matching_log_lines(context->captured_stderr, needle);
 
     (void)immutable_data;
     require_occurrences("tag-applied-log/rewrite-applied", log_text, needle, 3);
@@ -2007,6 +2029,7 @@ static int rsh_custom_adapter_tag_applied_visible_assert(
     require_occurrences(
         "tag-applied-log/source-full", log_text, "source_sql=\"", 3
     );
+    free(log_text);
     return SQLITE_OK;
 }
 
@@ -2016,7 +2039,7 @@ static int rsh_custom_adapter_tag_applied_suppressed_assert(
 ) {
     static const char *needle =
         "event=rewrite_applied target=plex mode=taggings+membership";
-    const char *log_text = context->captured_stderr;
+    char *log_text = copy_matching_log_lines(context->captured_stderr, needle);
 
     (void)immutable_data;
     require_contains(
@@ -2050,6 +2073,7 @@ static int rsh_custom_adapter_tag_applied_suppressed_assert(
     require_no_same_line(
         "tag-applied-suppressed/rewritten", log_text, needle, " sql=\""
     );
+    free(log_text);
     return SQLITE_OK;
 }
 
@@ -2328,7 +2352,7 @@ static int rsh_custom_adapter_ondeck_capture_miss_assert(
     );
     require_no_same_line(
         "ondeck-early-head-source", log_text,
-        "event=rewrite_skipped target=plex", " sql=\"select 1\""
+        " mode=ondeck ", " sql=\"select 1\""
     );
     return SQLITE_OK;
 }

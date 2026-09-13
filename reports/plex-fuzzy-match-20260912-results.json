@@ -1,0 +1,741 @@
+{
+  "status": "PASS",
+  "parity_cases": 352,
+  "accepted_literals": 13,
+  "records": [
+    {
+      "corpus_row": 1,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 2,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 3,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 4.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 4,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 4.0,
+      "rewritten_ms": 4.0
+    },
+    {
+      "corpus_row": 5,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 1,
+      "original_ms": 3.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 6,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 2.0,
+      "rewritten_ms": 2.0
+    },
+    {
+      "corpus_row": 7,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 8,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 1.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 9,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 5653,
+      "original_ms": 1.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 10,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 11,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 2.0,
+      "rewritten_ms": 2.0
+    },
+    {
+      "corpus_row": 12,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 4.0,
+      "rewritten_ms": 4.0
+    },
+    {
+      "corpus_row": 13,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 14,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 5653,
+      "original_ms": 1.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 15,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 1.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 16,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 4.0,
+      "rewritten_ms": 4.0
+    },
+    {
+      "corpus_row": 17,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 1,
+      "original_ms": 4.0,
+      "rewritten_ms": 4.0
+    },
+    {
+      "corpus_row": 18,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 19,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 20,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 2826,
+      "original_ms": 5.0,
+      "rewritten_ms": 2.0
+    },
+    {
+      "corpus_row": 21,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 7065,
+      "original_ms": 9.0,
+      "rewritten_ms": 7.0
+    },
+    {
+      "corpus_row": 22,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 52.0,
+      "rewritten_ms": 32.0
+    },
+    {
+      "corpus_row": 23,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 4240,
+      "original_ms": 5.0,
+      "rewritten_ms": 4.0
+    },
+    {
+      "corpus_row": 24,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 42.0,
+      "rewritten_ms": 39.0
+    },
+    {
+      "corpus_row": 25,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 2827,
+      "original_ms": 7.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 26,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 5652,
+      "original_ms": 9.0,
+      "rewritten_ms": 8.0
+    },
+    {
+      "corpus_row": 27,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 36.0,
+      "rewritten_ms": 27.0
+    },
+    {
+      "corpus_row": 28,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 34.0,
+      "rewritten_ms": 27.0
+    },
+    {
+      "corpus_row": 29,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 4240,
+      "original_ms": 152.0,
+      "rewritten_ms": 108.0
+    },
+    {
+      "corpus_row": 30,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 31,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 7065,
+      "original_ms": 11.0,
+      "rewritten_ms": 8.0
+    },
+    {
+      "corpus_row": 32,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 7065,
+      "original_ms": 10.0,
+      "rewritten_ms": 8.0
+    },
+    {
+      "corpus_row": 33,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 34,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 35,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 36,
+      "table": "plain",
+      "status": "accepted",
+      "hits": 5652,
+      "original_ms": 7.0,
+      "rewritten_ms": 6.0
+    },
+    {
+      "corpus_row": 37,
+      "table": "plain",
+      "status": "truncated: grammar rejection"
+    },
+    {
+      "corpus_row": 38,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 39,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 40,
+      "table": "plain",
+      "status": "truncated: grammar rejection"
+    },
+    {
+      "corpus_row": 41,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 42,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 43,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 44,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 45,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 46,
+      "table": "plain",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 47,
+      "table": "plain",
+      "status": "truncated: grammar rejection"
+    },
+    {
+      "corpus_row": 1,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 2,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 3,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 3.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 4,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 3.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 5,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 1,
+      "original_ms": 1.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 6,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 1.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 7,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 8,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 0.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 9,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 5653,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 10,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 11,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 1.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 12,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 3.0,
+      "rewritten_ms": 4.0
+    },
+    {
+      "corpus_row": 13,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 14,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 5653,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 15,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 1.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 16,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 3.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 17,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 1,
+      "original_ms": 1.0,
+      "rewritten_ms": 2.0
+    },
+    {
+      "corpus_row": 18,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 19,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 0,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 20,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 2826,
+      "original_ms": 3.0,
+      "rewritten_ms": 2.0
+    },
+    {
+      "corpus_row": 21,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 7065,
+      "original_ms": 8.0,
+      "rewritten_ms": 6.0
+    },
+    {
+      "corpus_row": 22,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 14.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 23,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 4240,
+      "original_ms": 4.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 24,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 22.0,
+      "rewritten_ms": 8.0
+    },
+    {
+      "corpus_row": 25,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 2827,
+      "original_ms": 3.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 26,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 5652,
+      "original_ms": 8.0,
+      "rewritten_ms": 5.0
+    },
+    {
+      "corpus_row": 27,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 19.0,
+      "rewritten_ms": 4.0
+    },
+    {
+      "corpus_row": 28,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 1414,
+      "original_ms": 14.0,
+      "rewritten_ms": 3.0
+    },
+    {
+      "corpus_row": 29,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 4240,
+      "original_ms": 32.0,
+      "rewritten_ms": 10.0
+    },
+    {
+      "corpus_row": 30,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 31,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 7065,
+      "original_ms": 9.0,
+      "rewritten_ms": 7.0
+    },
+    {
+      "corpus_row": 32,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 7065,
+      "original_ms": 10.0,
+      "rewritten_ms": 7.0
+    },
+    {
+      "corpus_row": 33,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 34,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 0.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 35,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 7065,
+      "original_ms": 0.0,
+      "rewritten_ms": 1.0
+    },
+    {
+      "corpus_row": 36,
+      "table": "prefix23",
+      "status": "accepted",
+      "hits": 5652,
+      "original_ms": 11.0,
+      "rewritten_ms": 6.0
+    },
+    {
+      "corpus_row": 37,
+      "table": "prefix23",
+      "status": "truncated: grammar rejection"
+    },
+    {
+      "corpus_row": 38,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 39,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 4240,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 40,
+      "table": "prefix23",
+      "status": "truncated: grammar rejection"
+    },
+    {
+      "corpus_row": 41,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 42,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 5652,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 43,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 44,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2826,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 45,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 46,
+      "table": "prefix23",
+      "status": "bare/noop",
+      "hits": 2827,
+      "original_ms": 0.0,
+      "rewritten_ms": 0.0
+    },
+    {
+      "corpus_row": 47,
+      "table": "prefix23",
+      "status": "truncated: grammar rejection"
+    }
+  ]
+}

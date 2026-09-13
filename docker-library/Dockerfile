@@ -120,6 +120,7 @@ COPY src/plex_fts_join_rewrite.h /app/plex_fts_join_rewrite.h
 COPY src/plex_title_scope_rewrite.h /app/plex_title_scope_rewrite.h
 COPY src/plex_collection_tag_rewrite.h /app/plex_collection_tag_rewrite.h
 COPY src/plex_recent_episode_rewrite.h /app/plex_recent_episode_rewrite.h
+COPY src/plex_fuzzy_match_rewrite.h /app/plex_fuzzy_match_rewrite.h
 COPY src/emby_fts_rewrite.c /app/emby_fts_rewrite.c
 COPY src/emby_fts_rewrite.h /app/emby_fts_rewrite.h
 COPY build/sqlite-amalgamation.patch /app/build/sqlite-amalgamation.patch
