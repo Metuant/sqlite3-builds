@@ -731,3 +731,28 @@ eligibility 0. Successful canonicalizations use the existing applied SQL sampler
 `OBS_MISS_CAPTURE` sub-reasons are `no_match`, `multi_match`, `bind_operand`,
 `quote`, `comment`, `dqs`, `grammar`, `keyword`, `or_layout`, `empty_group`, `noop`.
 Allocation failures use the existing `build_failed` skip path.
+
+## Plex App ANALYZE Rewrite
+
+`src/plex_app_analyze_rewrite.h` implements [spec sections 2-4](../specs/2026-09-13-plex-app-analyze-noop-rewrite.md).
+Only literal `SQLITE3_DISABLE_PLEX_APP_ANALYZE_REWRITE=0` enables this ICU-only
+Plex-library-target check, cached with pthread_once and an atomic flag. It runs
+first in `plex_fts_rewrite_prepare`, before the fuzzy pre-pass, and is independent
+of AUTOPRAGMA, runtime optimize, analysis_limit and the other rewrite gates.
+
+Only `ANALYZE` and `ANALYZE main` match, with ASCII-case-insensitive keywords,
+optional surrounding whitespace and one optional trailing semicolon. Targeted
+statements, additional bytes/statements, comments and double-quoted tokens fail
+open with capture sub-reasons `targeted`, `trailing`, `comment`, `dqs` respectively.
+Unrelated statements are silent misses. Input lengths are bounded by the existing
+prepare helper; embedded NULs fail open.
+
+The exact replacement `ANALYZE sqlite_stat1` bypasses other matchers and uses
+`plex_prepare_rewritten_sql` with zero expected binds and columns and both verify
+flags set. It returns no rows and leaves statistics unchanged, while still
+opening a tiny write transaction and reloading statistics. Missing sqlite_stat1
+causes candidate prepare failure and the existing retry prepares the original,
+so a fresh database gets its first ANALYZE. Catalogue mode `PLEX_APP_ANALYZE`, wire
+`analyze+noop`, has index-missing eligibility 0 and uses the existing applied SQL
+sampler. Planned-downtime maintenance keeps the gate unset and continues full
+ANALYZE; no maintenance or runtime-optimize code changes are required.

@@ -564,3 +564,16 @@ milestone lands.
 - Every miss passes the original bytes to existing dispatch. Whole-original bind
   and column counts and caller-buffer tails are verified before returning a
   successful rewrite.
+
+## Plex app ANALYZE
+
+- Only literal `SQLITE3_DISABLE_PLEX_APP_ANALYZE_REWRITE=0` enables the ICU-only
+  exact Plex library DB rewrite. Before fuzzy MATCH, only bare `ANALYZE` or
+  `ANALYZE main` (ASCII case-insensitive, optional whitespace/single semicolon)
+  becomes `ANALYZE sqlite_stat1`. Comments, DQS, targeted and trailing SQL fail
+  open. Verify zero binds and zero columns through the common prepare helper;
+  missing sqlite_stat1 retries the original so first-time stats are created.
+- Mode `PLEX_APP_ANALYZE` / `analyze+noop` is index-missing ineligible. The gate
+  is independent of AUTOPRAGMA, runtime optimize, analysis_limit and other
+  rewrites. Planned-downtime maintenance keeps it unset; statistics maintenance
+  remains external when the application rewrite is enabled.

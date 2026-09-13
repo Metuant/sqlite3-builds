@@ -45,12 +45,12 @@ Project-specific guidance:
   `GENERIC_GLIBC_MAX=2.27` aligned across `pins/versions.env`,
   `docker-cli/Dockerfile`, `docker-library/Dockerfile`, and
   `tests/check_pin_alignment.sh`; keep the `docker-library/Dockerfile` ICU and
-  mimalloc dependency layers above all 24 project `COPY` lines; keep the
+  mimalloc dependency layers above all 25 project `COPY` lines; keep the
   `.github/workflows/sqlite-build.yml` GHCR `type=registry` cache contract
   (import the event ref and then the baseline ref; export the event ref only,
   gated on `CACHE_EXPORT_ENABLED` and `continue-on-error: true`; forbid
   `type=gha`) aligned with the hardcoded counts in
-  `tests/check_pin_alignment.sh` (24 project `COPY` lines, 6 `Load version pins`
+  `tests/check_pin_alignment.sh` (25 project `COPY` lines, 6 `Load version pins`
   steps, each of 3 cache scopes appearing twice, 3 baseline refs, and 6 event
   refs); keep the literal semantics for
   `SQLITE3_DISABLE_REWRITE_APPLIED_SQL` and
@@ -84,6 +84,12 @@ Project-specific guidance:
   other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
   `SQLITE3_DISABLE_SLOW_QUERY`, and `SQLITE3_DISABLE_AUTOPRAGMA` kill-switches.
   Keep Plex GUID-LIKE, On-Deck, and hub type-OR rewrites opt-in.
+  `SQLITE3_DISABLE_PLEX_APP_ANALYZE_REWRITE` enables only on literal `0`;
+  unset and every other value disable. Before the fuzzy pre-pass, exact bare
+  `ANALYZE` / `ANALYZE main` on the Plex library DB becomes
+  `ANALYZE sqlite_stat1`, with zero binds and columns verified. Missing stats
+  fail open to the original. Independent of AUTOPRAGMA, runtime optimize,
+  analysis_limit and all other rewrite gates; maintenance keeps the gate unset.
   `SQLITE3_DISABLE_PLEX_FUZZY_MATCH_REWRITE` enables only on literal `0`;
   unset and every other value disable. Its literal-only pre-pass is independent
   of AUTOPRAGMA and FTS gates and verifies original whole-statement bind and

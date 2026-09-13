@@ -24,7 +24,8 @@
     X(PLEX_COLLECTION_TAG, "plex", "collection+tag-first", "plex_fts_rewrite", 1) \
     X(PLEX_RECENT_EPISODE, "plex", "recent-episode-prefilter", "plex_fts_rewrite", 1) \
     X(PLEX_HUB_TYPE_OR, "plex", "hub+type_or", "plex_fts_rewrite", 1) \
-    X(PLEX_FUZZY_MATCH, "plex", "fuzzy+match_canon", "plex_fts_rewrite", 0)
+    X(PLEX_FUZZY_MATCH, "plex", "fuzzy+match_canon", "plex_fts_rewrite", 0) \
+    X(PLEX_APP_ANALYZE, "plex", "analyze+noop", "plex_fts_rewrite", 0)
 
 typedef int32_t obs_rewrite_mode;
 

@@ -6,6 +6,7 @@
 #include "plex_collection_tag_rewrite.h"
 #include "plex_recent_episode_rewrite.h"
 #include "plex_fuzzy_match_rewrite.h"
+#include "plex_app_analyze_rewrite.h"
 #endif
 #include "observability.h"
 
@@ -175,6 +176,18 @@ static void plex_hub_type_or_init_once(void) {
 static int plex_hub_type_or_rewrite_enabled(void) {
     pthread_once(&g_plex_hub_type_or_once, plex_hub_type_or_init_once);
     return atomic_load_explicit(&g_plex_hub_type_or_enabled, memory_order_acquire);
+}
+
+static pthread_once_t g_plex_app_analyze_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_app_analyze_enabled;
+static void plex_app_analyze_init_once(void) {
+    const char *value = getenv("SQLITE3_DISABLE_PLEX_APP_ANALYZE_REWRITE");
+    atomic_store_explicit(&g_plex_app_analyze_enabled,
+        value && strcmp(value, "0") == 0, memory_order_release);
+}
+static int plex_app_analyze_rewrite_enabled(void) {
+    pthread_once(&g_plex_app_analyze_once, plex_app_analyze_init_once);
+    return atomic_load_explicit(&g_plex_app_analyze_enabled, memory_order_acquire);
 }
 
 static pthread_once_t g_plex_fuzzy_match_once = PTHREAD_ONCE_INIT;
@@ -2170,6 +2183,28 @@ __attribute__((visibility("hidden"))) int plex_fts_rewrite_prepare(
     char *canonical;
     sqlite3_stmt *original=NULL;
     int rc, binds, columns;
+    if (plex_app_analyze_rewrite_enabled() && db && zSql && ppStmt && nByte &&
+        (raw_fn=sqlite3_db_filename(db,"main")) != NULL &&
+        auto_extension_path_is_target(raw_fn) &&
+        fts_rewrite_db_basename_matches(raw_fn,PLEX_FTS_TARGET.db_basename) &&
+        plex_prepare_input_lengths(zSql,nByte,&bounded,&scan)) {
+        if (plex_match_app_analyze(zSql,bounded,scan,&reason)) {
+            static const char replacement[] = "ANALYZE sqlite_stat1";
+            char *rewritten = malloc(sizeof(replacement));
+            if (rewritten) {
+                memcpy(rewritten,replacement,sizeof(replacement));
+                return plex_prepare_rewritten_sql(kind,db,zSql,nByte,prepFlags,
+                    ppStmt,pzTail,rewritten,scan,sizeof(replacement)-1,
+                    sizeof(replacement)-1,0,1,0,1,OBS_MODE_PLEX_APP_ANALYZE);
+            }
+            obs_log_rewrite_skipped(db,"build_failed",OBS_MODE_PLEX_APP_ANALYZE);
+            return call_real_prepare(kind,db,zSql,nByte,prepFlags,ppStmt,pzTail);
+        }
+        if (reason) {
+            obs_log_rewrite_miss(OBS_MODE_PLEX_APP_ANALYZE,OBS_MISS_CAPTURE,reason,
+                db,zSql,scan,obs_is_disabled() ? 0 : fts_lex_shape_key(zSql,scan));
+        }
+    }
     if (plex_fuzzy_match_rewrite_enabled() && db && zSql && ppStmt && nByte &&
         (raw_fn=sqlite3_db_filename(db,"main")) != NULL &&
         auto_extension_path_is_target(raw_fn) &&

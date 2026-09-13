@@ -439,10 +439,10 @@ from pathlib import Path
 import sys
 path = Path(sys.argv[1])
 text = path.read_text()
-old = "  24 \\\n  'library dependency layers before all project COPY lines'"
+old = "  25 \\\n  'library dependency layers before all project COPY lines'"
 new = "  23 \\\n  'library dependency layers before all project COPY lines'"
 if text.count(old) != 1:
-    raise SystemExit("24-copy checker fixture missing")
+    raise SystemExit("25-copy checker fixture missing")
 path.write_text(text.replace(old, new, 1))
 PY
       ;;
