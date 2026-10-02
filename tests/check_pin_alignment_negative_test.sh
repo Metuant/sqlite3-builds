@@ -392,6 +392,18 @@ if text.count(old) != 1:
 path.write_text(text.replace(old, new, 1))
 PY
       ;;
+    rewrite-catalogue-related-ineligible)
+      python3 - "$scratch/src/rewrite_modes.h" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text()
+old = '    X(PLEX_RELATED_TAG_ORDER, "plex", "related+join_order", "plex_fts_rewrite", 1)'
+if text.count(old) != 1:
+    raise SystemExit("PLEX_RELATED_TAG_ORDER eligibility fixture missing")
+path.write_text(text.replace(old, old[:-2] + '0)', 1))
+PY
+      ;;
     rewrite-resume-wrong-valid-token)
       python3 - "$scratch/src/emby_fts_rewrite.c" <<'PY'
 from pathlib import Path
@@ -662,6 +674,8 @@ assert_fails_with rewrite-catalogue-missing-guid \
   'src/rewrite_modes.h missing exact line:     X(PLEX_GUID_LIKE'
 assert_fails_with rewrite-catalogue-browse-eligible \
   'src/rewrite_modes.h missing exact line:     X(EMBY_BROWSE'
+assert_fails_with rewrite-catalogue-related-ineligible \
+  'src/rewrite_modes.h missing exact line:     X(PLEX_RELATED_TAG_ORDER'
 assert_fails_with rewrite-resume-wrong-valid-token \
   'Emby resume producer manifest invalid'
 assert_fails_with rewrite-guid-raw-producer \

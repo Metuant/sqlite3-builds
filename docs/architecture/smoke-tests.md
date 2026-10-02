@@ -449,3 +449,23 @@ report for exact isolated rs34 commands and results.
 Applied sampling/SQL-suppression assertions in the linked Plex smoke filter to
 the owning GUID/tag mode; the On-Deck early-miss assertion is also mode-specific.
 This permits independent fuzzy capture-miss telemetry when both gates are on.
+
+## Plex related-tag join order
+
+`tests/plex_private_rewrites_test.sh` runs `plex_related_tag_order_test.py`
+against the production wrapper and real SQLite. It checks exact rewritten bytes
+and identical ordered typed rows for anonymous/numbered/sparse/reused binds,
+literals, two sections, 1/2/3/16 exclusions, and optional semicolon/whitespace.
+The fixture includes duplicate taggings, a genre, a collection, an empty type-9
+tag shared by many items, excluded types and a tag absent from the other section.
+Negative cases verify filter drift, DQS, comments, extra statements, head spacing,
+invalid values/list sizes/separators, variable limits, bounded inputs, target gates,
+and injected prepare/tail/bind/column failures. Fresh gate processes cover unset,
+empty, `1`, `00`, ` 0`, `false`, `0` and all other Plex matchers enabled together.
+Existing public/private SQL heads must silently miss the related matcher.
+
+The mandatory plan check asserts taggings -> tags -> related -> metadata_items in
+rewritten EXPLAIN QUERY PLAN; reproducing the original tags-last synthetic cost
+choice is not required. The prepare bench adds related head-miss and hit cases;
+a head miss reaches only one bounded memcmp before returning. The existing
+20 us p50 / 100 us p95 head-miss budgets remain advisory.

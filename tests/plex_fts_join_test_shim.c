@@ -15,6 +15,11 @@ static const char *fuzzy_reason, *fuzzy_miss;
 static int fuzzy_applied;
 static const char *analyze_miss;
 static int analyze_applied;
+static const char *related_miss;
+static int related_applied, other_applied;
+const char *test_related_miss(void){return related_miss ? related_miss : "";}
+int test_related_applied(void){return related_applied;}
+int test_other_applied(void){return other_applied;}
 const char *test_analyze_miss(void){return analyze_miss ? analyze_miss : "";}
 int test_analyze_applied(void){return analyze_applied;}
 char *test_fuzzy_build(const char*s,size_t n,size_t k,size_t*a,size_t*b){return plex_build_fuzzy_match_sql(s,n,k,a,b,&fuzzy_reason);}
@@ -26,7 +31,7 @@ static int fault_mode, path_allowed = 1, calls, last_kind;
 static unsigned last_flags;
 static const char *last_skip;
 static int is_test_candidate(const char *sql) {
-    return strcmp(sql, "ANALYZE sqlite_stat1") == 0 || strstr(sql, "match '(fault*)'") || strstr(sql, "CROSS JOIN") || strstr(sql, "WITH recent_parameters") ||
+    return strstr(sql, "cross join tags on taggings.tag_id=tags.id") || strcmp(sql, "ANALYZE sqlite_stat1") == 0 || strstr(sql, "match '(fault*)'") || strstr(sql, "CROSS JOIN") || strstr(sql, "WITH recent_parameters") ||
         (strstr(sql, "  and metadata_items.metadata_type=") && !strstr(sql, " or "));
 }
 static int real_prepare(int kind, sqlite3 *db, const char *sql, int n,
@@ -36,7 +41,8 @@ static int real_prepare(int kind, sqlite3 *db, const char *sql, int n,
     if (fault_mode && is_test_candidate(sql)) {
         if (fault_mode == 1) { *stmt = NULL; return SQLITE_ERROR; }
         if (fault_mode == 3 || fault_mode == 4) {
-            rc = sqlite3_prepare_v2(db, fault_mode == 3 ? "SELECT 1,2" : "SELECT ?", -1, stmt, tail);
+            const char *wrong_columns = strstr(sql, "cross join tags on taggings.tag_id=tags.id") ? "SELECT 1" : "SELECT 1,2";
+            rc = sqlite3_prepare_v2(db, fault_mode == 3 ? wrong_columns : "SELECT ?", -1, stmt, tail);
             if (rc == SQLITE_OK) *tail = sql + strlen(sql);
             return rc;
         }
@@ -58,13 +64,13 @@ int sqlite3_prepare_v3_real(sqlite3 *d,const char *s,int n,unsigned f,sqlite3_st
 }
 int auto_extension_path_is_target(const char *s) { return s && path_allowed; }
 int obs_is_disabled(void) { return 1; }
-void obs_log_rewrite_miss(obs_rewrite_mode m,obs_miss_reason r,const char *s,sqlite3 *d,const char *q,size_t n,uint64_t h) {if(m==OBS_MODE_PLEX_FUZZY_MATCH)fuzzy_miss=s;if(m==OBS_MODE_PLEX_APP_ANALYZE)analyze_miss=s;(void)r;(void)d;(void)q;(void)n;(void)h;}
+void obs_log_rewrite_miss(obs_rewrite_mode m,obs_miss_reason r,const char *s,sqlite3 *d,const char *q,size_t n,uint64_t h) {if(m==OBS_MODE_PLEX_FUZZY_MATCH)fuzzy_miss=s;if(m==OBS_MODE_PLEX_APP_ANALYZE)analyze_miss=s;if(m==OBS_MODE_PLEX_RELATED_TAG_ORDER)related_miss=s;(void)r;(void)d;(void)q;(void)n;(void)h;}
 void obs_log_index_missing(sqlite3 *d,obs_rewrite_mode m) {(void)d;(void)m;}
-void obs_log_rewrite_applied(obs_rewrite_mode m,sqlite3 *d,const char *s,size_t n,const char *r,size_t k) {if(m==OBS_MODE_PLEX_FUZZY_MATCH)++fuzzy_applied;if(m==OBS_MODE_PLEX_APP_ANALYZE)++analyze_applied;(void)d;(void)s;(void)n;(void)r;(void)k;}
+void obs_log_rewrite_applied(obs_rewrite_mode m,sqlite3 *d,const char *s,size_t n,const char *r,size_t k) {if(m==OBS_MODE_PLEX_FUZZY_MATCH)++fuzzy_applied;if(m==OBS_MODE_PLEX_APP_ANALYZE)++analyze_applied;if(m==OBS_MODE_PLEX_RELATED_TAG_ORDER)++related_applied;else ++other_applied;(void)d;(void)s;(void)n;(void)r;(void)k;}
 void obs_log_rewrite_skipped(sqlite3 *d,const char *s,obs_rewrite_mode m) {(void)d;(void)m;last_skip=s;}
 const char *test_last_skip(void) { return last_skip ? last_skip : ""; }
 int test_prepare(sqlite3 *d,const char *s,int n,unsigned f,sqlite3_stmt **p,const char **t,int k) {
-    calls = 0; fuzzy_miss=NULL; fuzzy_applied=0; analyze_miss=NULL; analyze_applied=0; last_skip=NULL;
+    calls = 0; related_miss=NULL; related_applied=0; other_applied=0; fuzzy_miss=NULL; fuzzy_applied=0; analyze_miss=NULL; analyze_applied=0; last_skip=NULL;
     return plex_fts_rewrite_prepare(d,s,n,f,p,t,(fts_rewrite_prepare_kind)k);
 }
 void test_fault(int mode) { fault_mode = mode; }

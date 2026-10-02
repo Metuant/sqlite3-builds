@@ -24,11 +24,16 @@ static const char *MATCH_SQL =
 static const char *CAPTURE_MISS_SQL =
     "select grandparents.id,metadata_item_views.originally_available_at,metadata_item_views.parent_index,metadata_item_views.`index`,max(viewed_at),grandparents.library_section_id,grandparentsSettings.extra_data from metadata_item_views indexed by index_metadata_item_views_on_guid join metadata_items as grandparents indexed by index_metadata_items_on_guid on grandparents.guid=grandparent_guid join metadata_item_settings indexed by index_metadata_item_settings_on_account_id on metadata_item_settings.guid=metadata_item_views.guid and metadata_item_views.account_id=metadata_item_settings.account_id join metadata_item_settings as grandparentsSettings indexed by index_metadata_item_settings_on_guid on grandparentsSettings.guid=metadata_item_views.grandparent_guid and metadata_item_views.account_id=grandparentsSettings.account_id where metadata_item_views.library_section_id=? and true and metadata_item_settings.view_count>0  and metadata_item_views.account_id=? and grandparents.guid='plex://show/648dd4c8004a8e8652751de2'  group by grandparents.id order by viewed_at desc";
 
+static const char RELATED_SQL[] =
+    "select taggings.id, count(*) as taggings_count from tags   join taggings on taggings.tag_id=tags.id   join taggings as related on taggings.tag_id=related.tag_id   join metadata_items on metadata_items.id=related.metadata_item_id  where taggings.metadata_item_id=? and metadata_items.library_section_id=?  and tags.tag != ''  and tags.tag_type not in (?, ?) group by taggings.id;";
+
 static const char HUB_MISS_SQL[] = "SELECT 1                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ";
 
 typedef enum bench_work {
     WORK_PREPARE_SELECT,
     WORK_PREPARE_HUB_MISS,
+    WORK_PREPARE_RELATED_MISS,
+    WORK_PREPARE_RELATED_MATCH,
     WORK_PREPARE_MATCH,
     WORK_PREPARE_CAPTURE_MISS,
     WORK_EXEC_PRAGMA
@@ -146,8 +151,8 @@ static void setup_schema(const char *path) {
     sqlite3 *db = open_db(path);
     exec_sql(db, "schema",
         "CREATE TABLE metadata_items(id INTEGER PRIMARY KEY, library_section_id INTEGER NOT NULL, metadata_type INTEGER NOT NULL, guid TEXT);"
-        "CREATE TABLE tags(id INTEGER PRIMARY KEY, tag_type INTEGER NOT NULL);"
-        "CREATE TABLE taggings(metadata_item_id INTEGER NOT NULL, tag_id INTEGER NOT NULL);"
+        "CREATE TABLE tags(id INTEGER PRIMARY KEY, tag_type INTEGER NOT NULL, tag TEXT);"
+        "CREATE TABLE taggings(metadata_item_id INTEGER NOT NULL, tag_id INTEGER NOT NULL, id INTEGER PRIMARY KEY);"
         "CREATE TABLE metadata_item_views(id INTEGER PRIMARY KEY, originally_available_at TEXT, parent_index INTEGER, `index` INTEGER, viewed_at INTEGER, library_section_id INTEGER, guid TEXT, account_id INTEGER, grandparent_guid TEXT);"
         "CREATE TABLE metadata_item_settings(id INTEGER PRIMARY KEY, guid TEXT, account_id INTEGER, view_count INTEGER, extra_data TEXT);"
         "CREATE INDEX index_metadata_item_views_on_guid ON metadata_item_views(guid);"
@@ -156,8 +161,8 @@ static void setup_schema(const char *path) {
         "CREATE INDEX index_metadata_item_settings_on_guid ON metadata_item_settings(guid);"
         "CREATE VIRTUAL TABLE fts4_tag_titles_icu USING fts4(tag);"
         "INSERT INTO metadata_items(id,library_section_id,metadata_type) VALUES(1,1,1),(2,1,1);"
-        "INSERT INTO tags VALUES(10,6),(11,1);"
-        "INSERT INTO taggings VALUES(1,10),(2,11);"
+        "INSERT INTO tags(id,tag_type) VALUES(10,6),(11,1);"
+        "INSERT INTO taggings(metadata_item_id,tag_id) VALUES(1,10),(2,11);"
         "INSERT INTO fts4_tag_titles_icu(rowid, tag) VALUES(10,'Django Alpha'),(11,'Django Other');"
     );
     if (sqlite3_close(db) != SQLITE_OK) failf("schema close failed");
@@ -175,7 +180,8 @@ static void *bench_worker(void *arg) {
             sqlite3_stmt *stmt = NULL;
             const char *sql = "SELECT 1";
             if (bt->work == WORK_PREPARE_MATCH) sql = MATCH_SQL;
-            else if (bt->work == WORK_PREPARE_HUB_MISS) sql = HUB_MISS_SQL;
+            else if (bt->work == WORK_PREPARE_HUB_MISS || bt->work == WORK_PREPARE_RELATED_MISS) sql = HUB_MISS_SQL;
+            else if (bt->work == WORK_PREPARE_RELATED_MATCH) sql = RELATED_SQL;
             else if (bt->work == WORK_PREPARE_CAPTURE_MISS) sql = CAPTURE_MISS_SQL;
             int rc = sqlite3_prepare_v2(db, sql, -1, &stmt, NULL);
             if (rc != SQLITE_OK) failf("prepare rc=%d err=%s", rc, sqlite3_errmsg(db));
@@ -266,6 +272,8 @@ static int child_case(
     configure_env(rewrite_value, observability_enabled);
     if (work == WORK_PREPARE_HUB_MISS &&
         setenv("SQLITE3_DISABLE_PLEX_HUB_TYPE_OR_REWRITE", "0", 1) != 0) failf("setenv HUB failed");
+    if ((work == WORK_PREPARE_RELATED_MISS || work == WORK_PREPARE_RELATED_MATCH) &&
+        setenv("SQLITE3_DISABLE_PLEX_RELATED_TAG_ORDER_REWRITE", "0", 1) != 0) failf("setenv RELATED failed");
     make_temp_dir();
     temp_path(path, sizeof(path), basename);
     unlink(path);
@@ -307,6 +315,10 @@ static void run_child(
 }
 
 int main(void) {
+    run_child("enabled-related-tag-order-head-miss", "1", 0, "com.plexapp.plugins.library.db",
+              WORK_PREPARE_RELATED_MISS, 0, ASSERT_ADVISORY_LOW_PREPARE_COST);
+    run_child("enabled-related-tag-order-match", "1", 0, "com.plexapp.plugins.library.db",
+              WORK_PREPARE_RELATED_MATCH, 1, ASSERT_NONE);
     run_child("enabled-hub-type-or-head-miss", "1", 0, "com.plexapp.plugins.library.db",
               WORK_PREPARE_HUB_MISS, 0, ASSERT_ADVISORY_LOW_PREPARE_COST);
     run_child("default-nontarget-select", NULL, 0, "library.db", WORK_PREPARE_SELECT, 0,

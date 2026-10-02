@@ -178,6 +178,18 @@ static int plex_hub_type_or_rewrite_enabled(void) {
     return atomic_load_explicit(&g_plex_hub_type_or_enabled, memory_order_acquire);
 }
 
+static pthread_once_t g_plex_related_tag_order_once = PTHREAD_ONCE_INIT;
+static atomic_int g_plex_related_tag_order_enabled;
+static void plex_related_tag_order_init_once(void) {
+    const char *value = getenv("SQLITE3_DISABLE_PLEX_RELATED_TAG_ORDER_REWRITE");
+    atomic_store_explicit(&g_plex_related_tag_order_enabled,
+        value && strcmp(value, "0") == 0, memory_order_release);
+}
+static int plex_related_tag_order_rewrite_enabled(void) {
+    pthread_once(&g_plex_related_tag_order_once, plex_related_tag_order_init_once);
+    return atomic_load_explicit(&g_plex_related_tag_order_enabled, memory_order_acquire);
+}
+
 static pthread_once_t g_plex_app_analyze_once = PTHREAD_ONCE_INIT;
 static atomic_int g_plex_app_analyze_enabled;
 static void plex_app_analyze_init_once(void) {
@@ -1716,6 +1728,95 @@ miss:
     return PLEX_MATCH_MISS;
 }
 
+/* Related tag counts: only replace the FROM prefix; retain every body byte. */
+static plex_match_result match_related_tag_order_query(
+    sqlite3 *db, const char *sql, size_t bounded_len, size_t scan_len,
+    plex_rewrite_candidate *candidate, size_t *original_len
+) {
+    static const char head[] =
+        "select taggings.id, count(*) as taggings_count from tags"
+        "   join taggings on taggings.tag_id=tags.id"
+        "   join taggings as related on taggings.tag_id=related.tag_id"
+        "   join metadata_items on metadata_items.id=related.metadata_item_id  where ";
+    static const char replacement[] =
+        "select taggings.id, count(*) as taggings_count from taggings"
+        " cross join tags on taggings.tag_id=tags.id"
+        " cross join taggings as related on taggings.tag_id=related.tag_id"
+        " cross join metadata_items on metadata_items.id=related.metadata_item_id  where ";
+    size_t p = sizeof(head)-1, q;
+    int max_index = 0, values = 0, variable_limit, rc;
+    plex_span slot;
+    const char *reason = "filter", *tail = NULL;
+    sqlite3_stmt *original = NULL;
+
+    /* The common head miss does one bounded memcmp, with no token scan. */
+    if (scan_len < p || memcmp(sql, head, p) != 0) return PLEX_MATCH_MISS;
+    if (scan_len > PLEX_SLOT_CAP || bounded_len < scan_len ||
+        bounded_len - scan_len > 1 || (bounded_len > scan_len && sql[scan_len]) ||
+        memchr(sql, 0, scan_len)) return PLEX_MATCH_MISS;
+    /* The exact grammar below admits only the empty single-quoted string.
+     * Reject comments/DQS before reporting a more general grammar drift. */
+    for (q = p; q < scan_len; ++q) {
+        if (sql[q] == '"') { reason = "dqs"; goto miss; }
+        if (q+1 < scan_len && ((sql[q] == '-' && sql[q+1] == '-') ||
+                               (sql[q] == '/' && sql[q+1] == '*'))) {
+            reason = "comment"; goto miss;
+        }
+    }
+    variable_limit = sqlite3_limit(db, SQLITE_LIMIT_VARIABLE_NUMBER, -1);
+    if (!plex_expect_bytes(sql, scan_len, p, "taggings.metadata_item_id=", &p)) goto miss;
+    reason = "value";
+    if (!plex_parse_ondeck_value_at(sql, scan_len, p, variable_limit,
+                                    &max_index, &slot, &p)) goto miss;
+    reason = "filter";
+    if (!plex_expect_bytes(sql, scan_len, p, " and metadata_items.library_section_id=", &p)) goto miss;
+    reason = "value";
+    if (!plex_parse_ondeck_value_at(sql, scan_len, p, variable_limit,
+                                    &max_index, &slot, &p)) goto miss;
+    reason = "filter";
+    if (!plex_expect_bytes(sql, scan_len, p,
+            "  and tags.tag != ''  and tags.tag_type not in (", &p)) goto miss;
+    reason = "not_in";
+    for (;;) {
+        if (++values > 16 || !plex_parse_ondeck_value_at(sql, scan_len, p,
+                variable_limit, &max_index, &slot, &p)) goto miss;
+        if (plex_expect_bytes(sql, scan_len, p, ")", &p)) break;
+        if (!plex_expect_bytes(sql, scan_len, p, ", ", &p)) goto miss;
+    }
+    reason = "filter";
+    if (!plex_expect_bytes(sql, scan_len, p, " group by taggings.id", &p)) goto miss;
+    reason = "trailing";
+    if (p < scan_len && sql[p] == ';') ++p;
+    if (!plex_trailing_space_only(sql, scan_len, p)) goto miss;
+
+    /* SQLite counts the whole original, including sparse/reused ?N slots.
+     * Never step it; malformed SQL must not be repaired by the replacement. */
+    rc = sqlite3_prepare_v2_real(db, sql, (int)scan_len, &original, &tail);
+    if (rc != SQLITE_OK || !original || !tail || tail < sql || tail > sql+scan_len ||
+        !plex_trailing_space_only(sql, scan_len, (size_t)(tail-sql))) {
+        sqlite3_finalize(original); reason = "value"; goto miss;
+    }
+    *original_len = (size_t)(tail-sql);
+    candidate->expected_bind_count = sqlite3_bind_parameter_count(original);
+    sqlite3_finalize(original);
+    candidate->verify_bind_count = 1;
+    candidate->expected_column_count = 2;
+    candidate->verify_column_count = 1;
+    candidate->scan_out_len = *original_len - (sizeof(head)-1) + sizeof(replacement)-1;
+    candidate->rewrite_len = bounded_len - (sizeof(head)-1) + sizeof(replacement)-1;
+    candidate->sql = malloc(candidate->rewrite_len+1);
+    if (!candidate->sql) return PLEX_MATCH_BUILD_FAILED;
+    memcpy(candidate->sql, replacement, sizeof(replacement)-1);
+    memcpy(candidate->sql+sizeof(replacement)-1, sql+sizeof(head)-1,
+        bounded_len-(sizeof(head)-1));
+    candidate->sql[candidate->rewrite_len] = 0;
+    return PLEX_MATCH_BUILT;
+miss:
+    obs_log_rewrite_miss(OBS_MODE_PLEX_RELATED_TAG_ORDER, OBS_MISS_CAPTURE, reason,
+        db, sql, scan_len, obs_is_disabled() ? 0 : fts_lex_shape_key(sql, scan_len));
+    return PLEX_MATCH_MISS;
+}
+
 static int plex_prepare_input_lengths(
     const char *zSql,
     int nByte,
@@ -1998,13 +2099,15 @@ static int plex_dispatch_prepare(
     int tag_on;
     int ondeck_on;
     int hub_type_or_on;
+    int related_tag_order_on;
 
     fts_on = plex_rewrite_enabled();
     guid_like_on = plex_guid_like_rewrite_enabled();
     tag_on = plex_tag_rewrite_enabled();
     ondeck_on = plex_ondeck_rewrite_enabled();
     hub_type_or_on = plex_hub_type_or_rewrite_enabled();
-    if ((!fts_on && !guid_like_on && !tag_on && !ondeck_on && !hub_type_or_on && !plex_collection_tag_enabled() && !plex_recent_enabled()) ||
+    related_tag_order_on = plex_related_tag_order_rewrite_enabled();
+    if ((!fts_on && !guid_like_on && !tag_on && !ondeck_on && !hub_type_or_on && !related_tag_order_on && !plex_collection_tag_enabled() && !plex_recent_enabled()) ||
         !db || !zSql || !ppStmt || nByte == 0) {
         return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
     }
@@ -2141,6 +2244,27 @@ static int plex_dispatch_prepare(
         }
         if (match_result == PLEX_MATCH_BUILD_FAILED) {
             obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_ONDECK);
+            free(candidate.sql);
+            return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
+        }
+    }
+
+    if (related_tag_order_on) {
+        size_t original_len = 0;
+        memset(&candidate, 0, sizeof(candidate));
+        match_result = match_related_tag_order_query(db, zSql, bounded_len, scan_len,
+            &candidate, &original_len);
+        if (match_result == PLEX_MATCH_BUILT) {
+            return plex_prepare_rewritten_sql(
+                kind, db, zSql, nByte, prepFlags, ppStmt, pzTail,
+                candidate.sql, original_len, candidate.scan_out_len, candidate.rewrite_len,
+                candidate.expected_bind_count, candidate.verify_bind_count,
+                candidate.expected_column_count, candidate.verify_column_count,
+                OBS_MODE_PLEX_RELATED_TAG_ORDER
+            );
+        }
+        if (match_result == PLEX_MATCH_BUILD_FAILED) {
+            obs_log_rewrite_skipped(db, "build_failed", OBS_MODE_PLEX_RELATED_TAG_ORDER);
             free(candidate.sql);
             return call_real_prepare(kind, db, zSql, nByte, prepFlags, ppStmt, pzTail);
         }

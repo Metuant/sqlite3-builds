@@ -756,3 +756,38 @@ so a fresh database gets its first ANALYZE. Catalogue mode `PLEX_APP_ANALYZE`, w
 `analyze+noop`, has index-missing eligibility 0 and uses the existing applied SQL
 sampler. Planned-downtime maintenance keeps the gate unset and continues full
 ANALYZE; no maintenance or runtime-optimize code changes are required.
+
+## Plex Related Tag Join-Order Rewrite
+
+Only literal `SQLITE3_DISABLE_PLEX_RELATED_TAG_ORDER_REWRITE=0` enables this
+ICU-only Plex-library-DB rewrite, cached via pthread_once and an atomic flag.
+Unset, `1`, empty and every other value disable it, independently of AUTOPRAGMA
+and all other rewrite gates. Catalogue mode `PLEX_RELATED_TAG_ORDER`, wire
+`related+join_order`, has index-missing eligibility 1; no index probe is required.
+
+The exact head in [spec section 3](../specs/2026-10-02-plex-related-tag-join-order-rewrite.md)
+must match from offset zero, including three spaces before each join and two
+before WHERE. A head miss performs one bounded memcmp and emits no diagnostic.
+The body requires item and section values, the exact empty-tag filter, 1..16
+NOT IN values separated by comma-space, and ` group by taggings.id`. Values use
+the On-Deck parser: unsigned decimals, anonymous `?`, or canonical `?N` within
+SQLITE_LIMIT_VARIABLE_NUMBER. One optional semicolon and trailing whitespace
+are accepted. Embedded NULs and inputs over the existing 64 KiB cap fail open.
+
+Only the FROM prefix changes: taggings → tags → related → metadata_items,
+using CROSS JOINs to fix the inner-join order. WHERE/GROUP BY and trailing bytes
+are copied unchanged. A hidden prepare of the whole original, never stepped,
+gets SQLite's bind count and statement tail. `plex_prepare_rewritten_sql`
+verifies that count and two result columns, maps the tail (including whitespace
+after a semicolon), logs applied SQL and retries the original on candidate
+prepare or verification failure. Allocation failure is `build_failed`.
+Capture sub-reasons are `value`, `filter`, `not_in`, `trailing`, `comment`, `dqs`;
+original preparation failure is also a `value` miss. Dispatch follows On-Deck;
+the disjoint public/private matcher heads cannot shadow this statement.
+
+The original planner can visit millions of related taggings before discarding
+empty or excluded tags. The spec's read-only Gaius measurements improved
+1459870/section 11 from 24.18 s to 0.017 s and 638005/section 10 from 27.94 s
+to 0.51 s. The synthetic regression asserts the rewritten four-table order;
+it does not require reproducing the production cost knife-edge. The implementation
+report records the built artifact's validation and fresh live read-only timings.

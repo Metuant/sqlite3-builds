@@ -24,8 +24,9 @@ python3 "$root/tests/plex_review_regression_test.py" "$work/private-test.so"
 python3 "$root/tests/plex_hub_type_or_test.py" "$work/private-test.so"
 python3 "$root/tests/plex_fuzzy_match_test.py" "$work/private-test.so"
 python3 "$root/tests/plex_app_analyze_test.py" "$work/private-test.so"
+python3 "$root/tests/plex_related_tag_order_test.py" "$work/private-test.so"
 "$cc" -std=c11 -Wall -Wextra -Werror -O1 -g \
   -fsanitize=address,undefined -fno-omit-frame-pointer -I"$root/src" \
   "$root/tests/plex_fuzzy_match_fuzz.c" "$root/src/fts_lex.c" -o "$work/fuzzy-fuzz"
 ASAN_OPTIONS=detect_leaks=1 "$work/fuzzy-fuzz"
-echo 'PASS: four private Python suites, four ASan/UBSan fuzzers, review regressions, hub bounds/binds/faults, fuzzy corpus/grammar/composition and ASan/UBSan, app ANALYZE exact bytes/stats/fail-open/gates'
+echo 'PASS: four private Python suites, four ASan/UBSan fuzzers, review regressions, hub bounds/binds/faults, fuzzy corpus/grammar/composition and ASan/UBSan, app ANALYZE exact bytes/stats/fail-open/gates, related-tag bytes/rows/order/plan/bounds/gates/fail-open'

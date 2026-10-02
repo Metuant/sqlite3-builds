@@ -61,7 +61,7 @@ Project-specific guidance:
   positional logger label, and index-missing eligibility metadata; all mode
   counter extents use `OBS_MODE_COUNT`. Applied counters remain per connection;
   miss and index-missing counters remain process-global. Only Plex taggings,
-  Plex On-Deck, Plex collection tag, Plex recent-episode, Plex hub type-OR,
+  Plex On-Deck, Plex collection tag, Plex recent-episode, Plex hub type-OR, Plex related-tag join order,
   Emby Episodes Latest, Emby movies Latest, and Emby mixed-Latest are marked
   index-missing eligible in the catalogue. Invalid ids suppress the requested record and can emit at most one
   process-wide `obs_mode_unregistered` diagnostic while observability is
@@ -84,6 +84,10 @@ Project-specific guidance:
   other value enable -- matching the `SQLITE3_DISABLE_OBSERVABILITY`,
   `SQLITE3_DISABLE_SLOW_QUERY`, and `SQLITE3_DISABLE_AUTOPRAGMA` kill-switches.
   Keep Plex GUID-LIKE, On-Deck, and hub type-OR rewrites opt-in.
+  `SQLITE3_DISABLE_PLEX_RELATED_TAG_ORDER_REWRITE` enables only on literal `0`;
+  unset and every other value disable. Only the exact related-tag count FROM
+  prefix is reordered into CROSS JOINs; WHERE/GROUP BY bytes never change.
+  Verify SQLite's whole-statement bind count and two columns; fail open on drift.
   `SQLITE3_DISABLE_PLEX_APP_ANALYZE_REWRITE` enables only on literal `0`;
   unset and every other value disable. Before the fuzzy pre-pass, exact bare
   `ANALYZE` / `ANALYZE main` on the Plex library DB becomes

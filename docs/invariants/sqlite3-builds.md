@@ -577,3 +577,12 @@ milestone lands.
   is independent of AUTOPRAGMA, runtime optimize, analysis_limit and other
   rewrites. Planned-downtime maintenance keeps it unset; statistics maintenance
   remains external when the application rewrite is enabled.
+
+## Plex related-tag join order
+
+- The related-tag rewrite only reorders the four inner joins of this exact
+  statement into CROSS JOINs; WHERE/GROUP BY bytes are never touched.
+- Only literal `SQLITE3_DISABLE_PLEX_RELATED_TAG_ORDER_REWRITE=0` enables it,
+  independently of other gates, on the ICU Plex library database target.
+- Bind tokens never move; SQLite's full original bind count and two output
+  columns are verified. Drift and preparation/verification failures fail open.
